@@ -82,12 +82,14 @@ public sealed class IntakeCoordinatorTests
     {
         var result = IntakeCoordinator.ParseResponse("""
             INTAKE_STATUS: NEEDS_CLARIFICATION
+            TASK_TITLE: Clarify onboarding outcome
             CUSTOMER_REPLY: What observable result defines success?
             TASK_BRIEF: NONE
             """);
 
         Assert.False(result.Ready);
         Assert.Equal(AccountManagerIntakeStatus.NeedsClarification, result.Status);
+        Assert.Equal("Clarify onboarding outcome", result.TaskTitle);
         Assert.Contains("observable result", result.Reply);
         Assert.Empty(result.TaskBrief);
     }
@@ -97,6 +99,7 @@ public sealed class IntakeCoordinatorTests
     {
         var result = IntakeCoordinator.ParseResponse("""
             INTAKE_STATUS: AWAITING_CONFIRMATION
+            TASK_TITLE: Add persistent onboarding checklist
             CUSTOMER_REPLY: Do I understand correctly that you want a persistent onboarding checklist? If yes, I'll ask the team to implement it.
             TASK_BRIEF:
             Outcome: Add a persistent onboarding checklist.
@@ -107,6 +110,7 @@ public sealed class IntakeCoordinatorTests
 
         Assert.False(result.Ready);
         Assert.True(result.AwaitingConfirmation);
+        Assert.Equal("Add persistent onboarding checklist", result.TaskTitle);
         Assert.Contains("persistent onboarding", result.TaskBrief);
         Assert.Contains("keyboard navigation", result.TaskBrief);
         Assert.Contains("automated tests", result.TaskBrief);
@@ -117,6 +121,7 @@ public sealed class IntakeCoordinatorTests
     {
         var result = IntakeCoordinator.ParseResponse("""
             INTAKE_STATUS: CONFIRMED
+            TASK_TITLE: Add persistent onboarding checklist
             CUSTOMER_REPLY: Thanks - I'll ask the team to implement it now.
             TASK_BRIEF:
             Outcome: Add a persistent onboarding checklist.
@@ -124,6 +129,7 @@ public sealed class IntakeCoordinatorTests
 
         Assert.True(result.Ready);
         Assert.Equal(AccountManagerIntakeStatus.Confirmed, result.Status);
+        Assert.Equal("Add persistent onboarding checklist", result.TaskTitle);
     }
 
     [Fact]
@@ -136,6 +142,19 @@ public sealed class IntakeCoordinatorTests
     }
 
     [Fact]
+    public void ParseResponse_FailsClosedWhenTaskTitleIsMissing()
+    {
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => IntakeCoordinator.ParseResponse("""
+                INTAKE_STATUS: AWAITING_CONFIRMATION
+                CUSTOMER_REPLY: Do I understand correctly that you want a refreshed public site?
+                TASK_BRIEF: Outcome: Refresh the public site.
+                """));
+
+        Assert.Contains("TASK_TITLE", exception.Message);
+    }
+
+    [Fact]
     public void AccountManagerContract_RequiresExplicitConfirmationWithoutAnInterview()
     {
         var contract = CopilotReasoningHost.ResponseContract("account-manager");
@@ -143,6 +162,8 @@ public sealed class IntakeCoordinatorTests
         Assert.Contains("Default to AWAITING_CONFIRMATION", contract);
         Assert.Contains("explicitly and unambiguously approves", contract);
         Assert.Contains("most recent AWAITING_CONFIRMATION brief", contract);
+        Assert.Contains("TASK_TITLE", contract);
+        Assert.Contains("never copy or truncate the opening message", contract);
         Assert.Contains("something the customer can click is actionable", contract);
         Assert.Contains("Never ask about technologies", contract);
         Assert.Contains("deployment, hosting, credentials", contract);
@@ -216,6 +237,7 @@ public sealed class IntakeCoordinatorTests
         var response = new AccountManagerResponse(
             AccountManagerIntakeStatus.Confirmed,
             "I'll ask the team to implement it now.",
+            "Add persistent onboarding checklist",
             "Unreviewed brief");
 
         var exception = Assert.Throws<InvalidOperationException>(
@@ -231,29 +253,33 @@ public sealed class IntakeCoordinatorTests
         var response = new AccountManagerResponse(
             AccountManagerIntakeStatus.Confirmed,
             "I'll ask the team to implement it now.",
+            "Refresh public pages",
             "A changed brief");
 
         var confirmed = IntakeCoordinator.ApplyConfirmationGate(response, approvedBrief);
 
         Assert.Equal(approvedBrief, confirmed.TaskBrief);
+        Assert.Equal("Refresh public pages", confirmed.TaskTitle);
     }
 
     [Fact]
-    public void ConfirmedBrief_QueuesTheFlowAndRecordsTheTransition()
+    public void IntakeOutcome_AppliesGeneratedTitleAndQueuesConfirmedBrief()
     {
         var flow = new FlowRun
         {
-            Title = "Refresh the public pages",
+            Title = "I want new fresh design for our site because old one",
             OriginalRequest = "Give the public pages a fresh design."
         };
         var response = new AccountManagerResponse(
             AccountManagerIntakeStatus.Confirmed,
             "I'll ask the team to implement it now.",
+            "Refresh public site design",
             "Outcome: Refresh the public pages.");
 
-        var queuedEvent = IntakeCoordinator.PrepareConfirmedHandoff(flow, response);
+        var queuedEvent = IntakeCoordinator.ApplyIntakeOutcome(flow, response);
 
         Assert.NotNull(queuedEvent);
+        Assert.Equal("Refresh public site design", flow.Title);
         Assert.Equal(FlowStatus.Queued, flow.Status);
         Assert.Equal("flow.queued", queuedEvent.Type);
         Assert.Contains(queuedEvent, flow.Events);

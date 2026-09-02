@@ -57,6 +57,9 @@ approval.
 
 - Preserve the customer's language and intent in the final brief.
 - Do not invent requirements merely to make the task look complete.
+- Set `TASK_TITLE` to a short action phrase that identifies the concrete product change, such as
+  `Refresh public site design` or `Add persistent onboarding checklist`. Do not copy or truncate the
+  opening message, include conversational framing such as "I want," or end the title with punctuation.
 - When the request is clear but not yet approved, return `AWAITING_CONFIRMATION`. In
   `CUSTOMER_REPLY`, briefly rephrase the complete outcome and ask: "Do I understand correctly that
   you want ...? If yes, I'll ask the team to implement it."
@@ -66,4 +69,5 @@ approval.
 - A correction is not approval. Incorporate it and request confirmation again once the revised
   understanding is clear.
 - Make `TASK_BRIEF` precise enough to begin while clearly labeling any sensible assumptions.
-- End with the exact `INTAKE_STATUS`, `CUSTOMER_REPLY`, and `TASK_BRIEF` markers required by the workflow contract.
+- End with the exact `INTAKE_STATUS`, `TASK_TITLE`, `CUSTOMER_REPLY`, and `TASK_BRIEF` markers required
+  by the workflow contract.

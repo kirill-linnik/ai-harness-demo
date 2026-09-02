@@ -257,6 +257,7 @@ public sealed class CopilotReasoningHost(
               Move a workable customer request toward delivery without treating clarity as customer approval.
               Return exactly these plain-text markers with no text before INTAKE_STATUS:
               INTAKE_STATUS: NEEDS_CLARIFICATION, AWAITING_CONFIRMATION, or CONFIRMED
+              TASK_TITLE: a 3-8 word action phrase naming the concrete product change, with no conversational framing or trailing punctuation; never copy or truncate the opening message
               CUSTOMER_REPLY: one short plain-language line; ask one focused question when clarification is essential, ask the customer to validate your concise understanding when awaiting confirmation, or state that the confirmed brief is going to the team
               TASK_BRIEF: the complete proposed brief when awaiting confirmation or confirmed, otherwise NONE; the brief may continue on following lines
               Default to AWAITING_CONFIRMATION as soon as the delivery team can take a meaningful first action.

@@ -25,6 +25,10 @@ public sealed partial class IntakeCoordinator(
     private static partial Regex IntakeStatusPattern();
 
     [GeneratedRegex(
+        @"(?im)^\s*(?:\*\*)?TASK_TITLE(?:\*\*)?\s*:\s*(.+?)\s*$")]
+    private static partial Regex TaskTitlePattern();
+
+    [GeneratedRegex(
         @"(?im)^\s*(?:\*\*)?CUSTOMER_REPLY(?:\*\*)?\s*:\s*(.+?)\s*$")]
     private static partial Regex CustomerReplyPattern();
 
@@ -270,7 +274,7 @@ public sealed partial class IntakeCoordinator(
         };
         flow.Events.Add(intakeEvent);
         database.Entry(intakeEvent).State = EntityState.Added;
-        var queuedEvent = PrepareConfirmedHandoff(flow, response);
+        var queuedEvent = ApplyIntakeOutcome(flow, response);
         if (queuedEvent is not null)
         {
             database.Entry(queuedEvent).State = EntityState.Added;
@@ -292,13 +296,14 @@ public sealed partial class IntakeCoordinator(
     public static AccountManagerResponse ParseResponse(string output)
     {
         var status = IntakeStatusPattern().Match(output);
+        var title = TaskTitlePattern().Match(output);
         var reply = CustomerReplyPattern().Match(output);
         var brief = TaskBriefPattern().Match(output);
-        if (!status.Success || !reply.Success || !brief.Success)
+        if (!status.Success || !title.Success || !reply.Success || !brief.Success)
         {
             throw new InvalidOperationException(
                 "Copilot Account Manager returned an invalid intake contract. " +
-                "Expected INTAKE_STATUS, CUSTOMER_REPLY, and TASK_BRIEF markers.");
+                "Expected INTAKE_STATUS, TASK_TITLE, CUSTOMER_REPLY, and TASK_BRIEF markers.");
         }
 
         var intakeStatus = status.Groups[1].Value.ToUpperInvariant() switch
@@ -309,6 +314,13 @@ public sealed partial class IntakeCoordinator(
             _ => throw new InvalidOperationException(
                 "Copilot Account Manager returned an unsupported intake status.")
         };
+        var taskTitle = BuildTitle(title.Groups[1].Value);
+        if (string.IsNullOrWhiteSpace(taskTitle) ||
+            string.Equals(taskTitle, "NONE", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Copilot Account Manager returned no usable TASK_TITLE.");
+        }
         var taskBrief = brief.Groups[1].Value.Trim();
         var requiresBrief = intakeStatus is
             AccountManagerIntakeStatus.AwaitingConfirmation or
@@ -324,6 +336,7 @@ public sealed partial class IntakeCoordinator(
         return new AccountManagerResponse(
             intakeStatus,
             reply.Groups[1].Value.Trim(),
+            taskTitle,
             requiresBrief ? taskBrief : string.Empty);
     }
 
@@ -344,10 +357,11 @@ public sealed partial class IntakeCoordinator(
         return response with { TaskBrief = pendingConfirmationBrief.Trim() };
     }
 
-    internal static FlowEvent? PrepareConfirmedHandoff(
+    internal static FlowEvent? ApplyIntakeOutcome(
         FlowRun flow,
         AccountManagerResponse response)
     {
+        flow.Title = response.TaskTitle;
         if (!response.Ready)
         {
             return null;
@@ -490,6 +504,7 @@ public enum AccountManagerIntakeStatus
 public sealed record AccountManagerResponse(
     AccountManagerIntakeStatus Status,
     string Reply,
+    string TaskTitle,
     string TaskBrief)
 {
     public bool Ready => Status == AccountManagerIntakeStatus.Confirmed;
