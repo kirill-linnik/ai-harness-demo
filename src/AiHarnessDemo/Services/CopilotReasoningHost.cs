@@ -194,6 +194,7 @@ public sealed class CopilotReasoningHost(
             [
                 "--available-tools",
                 "--disable-builtin-mcps",
+                "--effort", "low",
                 "--no-custom-instructions",
                 "--no-eager-powershell-resolution"
             ]);

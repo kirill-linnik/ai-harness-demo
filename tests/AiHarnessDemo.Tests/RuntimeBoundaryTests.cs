@@ -116,7 +116,7 @@ public sealed class CopilotCliRuntimeTests
             var command = CreateCliShim(
                 root,
                 "--agent --allow-all-tools --available-tools --disable-builtin-mcps " +
-                "--model --no-ask-user --no-custom-instructions " +
+                "--effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --output-format");
             var status = await CreateRuntime(root).RefreshAsync(command);
 

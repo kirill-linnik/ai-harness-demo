@@ -167,7 +167,7 @@ public sealed class IntakeCoordinatorTests
 public sealed class ModelSelectorTests
 {
     [Theory]
-    [InlineData("account-manager", 1, "claude-haiku-4.5")]
+    [InlineData("account-manager", 1, "claude-sonnet-5")]
     [InlineData("software-engineer", 2, "gpt-5.4-mini")]
     [InlineData("software-engineer", 5, "gpt-5.4")]
     [InlineData("architect", 4, "claude-sonnet-5")]
@@ -232,7 +232,7 @@ public sealed class CopilotReasoningHostTests
             @"C:\harness",
             "account-manager",
             "account-manager",
-            "claude-haiku-4.5",
+            "claude-sonnet-5",
             "Prompt");
         var environment = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
             CopilotReasoningHost.BuildProcessEnvironment(
@@ -241,6 +241,11 @@ public sealed class CopilotReasoningHostTests
 
         Assert.Contains("--available-tools", arguments);
         Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.Equal(
+            ["--effort", "low"],
+            arguments
+                .SkipWhile(argument => argument != "--effort")
+                .Take(2));
         Assert.Contains("--no-custom-instructions", arguments);
         Assert.Contains("--no-eager-powershell-resolution", arguments);
         Assert.DoesNotContain("--allow-all-tools", arguments);

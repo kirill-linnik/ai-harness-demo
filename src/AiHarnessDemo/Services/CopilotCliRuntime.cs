@@ -27,6 +27,7 @@ public sealed partial class CopilotCliRuntime(
         "--allow-all-tools",
         "--available-tools",
         "--disable-builtin-mcps",
+        "--effort",
         "--model",
         "--no-ask-user",
         "--no-custom-instructions",
