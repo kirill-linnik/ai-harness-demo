@@ -11,6 +11,7 @@ import {
   useFlowQuery,
   useStartFlowMutation
 } from "../../api/queries";
+import type { FlowMessageDto } from "../../api/types";
 import { ArrowIcon, MicIcon, SendIcon, waveMarkup } from "../../lib/icons";
 import { consumeDraftPrompt, consumeStartVoiceHint } from "../../lib/session";
 import { speak, toggleVoice } from "../../lib/voice";
@@ -31,8 +32,12 @@ export function IntakePage() {
   const startFlow = useStartFlowMutation();
 
   const [message, setMessage] = useState("");
+  const [pendingMessage, setPendingMessage] = useState<FlowMessageDto | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
   const initialized = useRef(false);
+  const submitting = useRef(false);
+  const messages = flow?.messages ?? [];
+  const visibleMessages = pendingMessage ? [...messages, pendingMessage] : messages;
 
   useEffect(() => {
     if (initialized.current) return;
@@ -47,7 +52,7 @@ export function IntakePage() {
   useEffect(() => {
     const log = logRef.current;
     if (log) log.scrollTop = log.scrollHeight;
-  }, [flow?.messages.length]);
+  }, [visibleMessages.length]);
 
   // Existing flows (already queued/running/etc.) remain reachable even if the factory has since
   // been disabled; only a brand-new intake conversation is gated, mirroring the original
@@ -67,26 +72,42 @@ export function IntakePage() {
     );
   }
 
-  const messages = flow?.messages ?? [];
   const latestAccountManagerMessage = [...messages].reverse().find(item => item.role === "AccountManager");
   const ready = Boolean(latestAccountManagerMessage) && !latestAccountManagerMessage!.isQuestion;
 
   async function submitIntake() {
+    if (submitting.current) return;
+
     const trimmed = message.trim();
     if (!trimmed) {
       toast("Describe the change before sending.", "error");
       return;
     }
+
+    submitting.current = true;
+    setPendingMessage({
+      id: "pending-customer-message",
+      role: "Customer",
+      content: trimmed,
+      isQuestion: false,
+      createdAt: new Date().toISOString()
+    });
+    setMessage("");
+
     try {
       const response = await continueIntake.mutateAsync({ flowId: flow?.id ?? null, message: trimmed });
       queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
-      setMessage("");
+      setPendingMessage(null);
       if (response.shouldSpeak) speak(response.reply);
       if (!params.id || params.id !== response.flow.id) {
         navigate(`/intake/${response.flow.id}`, { replace: true });
       }
     } catch (error) {
+      setPendingMessage(null);
+      setMessage(current => current || trimmed);
       toast(error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      submitting.current = false;
     }
   }
 
@@ -101,7 +122,7 @@ export function IntakePage() {
     }
   }
 
-  const sending = continueIntake.isPending;
+  const sending = continueIntake.isPending || pendingMessage !== null;
   const starting = startFlow.isPending;
 
   return (
@@ -131,7 +152,7 @@ export function IntakePage() {
               <h3>Live brief</h3>
               <p>
                 {flow
-                  ? `Flow ${flow.id.slice(0, 8)} · ${messages.length} dialogue turns`
+                  ? `Flow ${flow.id.slice(0, 8)} · ${visibleMessages.length} dialogue turns`
                   : "A new flow starts with your first message."}
               </p>
             </div>
@@ -142,8 +163,8 @@ export function IntakePage() {
             )}
           </div>
           <div className="conversation-log" id="conversation-log" ref={logRef}>
-            {messages.length ? (
-              messages.map(item => <MessageBubble key={item.id} message={item} />)
+            {visibleMessages.length ? (
+              visibleMessages.map(item => <MessageBubble key={item.id} message={item} />)
             ) : (
               <div className="message accountmanager">
                 <div className="message-avatar">AM</div>
