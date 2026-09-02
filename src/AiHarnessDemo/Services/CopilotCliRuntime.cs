@@ -23,6 +23,7 @@ public sealed partial class CopilotCliRuntime(
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(15);
     private static readonly string[] RequiredOptions =
     [
+        "--add-dir",
         "--agent",
         "--allow-all-tools",
         "--available-tools",
@@ -32,7 +33,8 @@ public sealed partial class CopilotCliRuntime(
         "--no-ask-user",
         "--no-custom-instructions",
         "--no-eager-powershell-resolution",
-        "--output-format"
+        "--output-format",
+        "--session-id"
     ];
 
     private readonly Lock _statusLock = new();

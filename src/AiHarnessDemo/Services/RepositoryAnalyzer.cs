@@ -291,7 +291,8 @@ public sealed class RepositoryAnalyzer(
         builder.AppendLine($"# {Path.GetFileName(repositoryPath)}");
         builder.AppendLine();
         builder.AppendLine("## Repository profile");
-        builder.AppendLine($"- **Location:** `{repositoryPath}`");
+        builder.AppendLine(
+            "- **Project files:** Materialized into a per-flow isolated workspace before agent execution.");
         builder.AppendLine(
             $"- **Git repositories:** {string.Join(", ", gitRepositories.Select(path => RepositoryLabel(repositoryPath, path)))}");
         builder.AppendLine($"- **Source files studied:** {files.Count:N0}");

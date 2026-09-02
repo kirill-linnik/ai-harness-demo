@@ -18,6 +18,7 @@ export function SettingsPage() {
   const [repositoryPath, setRepositoryPath] = useState(settings?.repositoryPath ?? "");
   const [knowledge, setKnowledge] = useState(settings?.repositoryKnowledge ?? "");
   const [outcome, setOutcome] = useState<OutcomeType>(settings?.outcome ?? "PullRequest");
+  const [maxHandoffRetries, setMaxHandoffRetries] = useState(settings?.maxHandoffRetries ?? 2);
   const [runCopilotInit, setRunCopilotInit] = useState(true);
   const [browserOpen, setBrowserOpen] = useState(false);
 
@@ -27,11 +28,22 @@ export function SettingsPage() {
   const enabledCount = agents.filter(agent => agent.enabled).length;
 
   async function onSave() {
+    if (!Number.isInteger(maxHandoffRetries) || maxHandoffRetries < 0 || maxHandoffRetries > 10) {
+      toast("Handoff retries must be a whole number between 0 and 10.", "error");
+      return;
+    }
+
     try {
-      const saved = await saveSettings.mutateAsync({ repositoryPath, repositoryKnowledge: knowledge, outcome });
+      const saved = await saveSettings.mutateAsync({
+        repositoryPath,
+        repositoryKnowledge: knowledge,
+        outcome,
+        maxHandoffRetries
+      });
       setRepositoryPath(saved.repositoryPath);
       setKnowledge(saved.repositoryKnowledge);
       setOutcome(saved.outcome);
+      setMaxHandoffRetries(saved.maxHandoffRetries);
       toast("Harness settings saved.", "success");
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error), "error");
@@ -223,8 +235,8 @@ export function SettingsPage() {
           <div className="card">
             <div className="card-header">
               <div>
-                <h3>Factory outcome</h3>
-                <p>Release Engineer packages every approved implementation this way.</p>
+                <h3>Delivery and recovery</h3>
+                <p>Choose the release artifact and bound agent-to-agent revision loops.</p>
               </div>
             </div>
             <div className="card-body">
@@ -244,6 +256,22 @@ export function SettingsPage() {
                     Pull request
                   </button>
                 </div>
+              </div>
+              <div className="field" style={{ marginTop: 16 }}>
+                <label htmlFor="max-handoff-retries">Handoff retries</label>
+                <input
+                  id="max-handoff-retries"
+                  type="number"
+                  min={0}
+                  max={10}
+                  step={1}
+                  value={maxHandoffRetries}
+                  onChange={event => setMaxHandoffRetries(Number(event.target.value))}
+                />
+                <small>
+                  Maximum corrective upstream turns for one blocked agent. The flow stops only after this limit is
+                  exhausted.
+                </small>
               </div>
               <div className="callout" style={{ marginTop: 16 }}>
                 <span>

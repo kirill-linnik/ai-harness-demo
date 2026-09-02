@@ -131,7 +131,18 @@ public static class DemoApi
             settings.RepositoryKnowledge = request.RepositoryKnowledge.Trim();
         }
 
+        if (request.MaxHandoffRetries is < 0 or > 10)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(request.MaxHandoffRetries),
+                "Handoff retries must be between 0 and 10.");
+        }
+
         settings.Outcome = request.Outcome;
+        if (request.MaxHandoffRetries is { } maxHandoffRetries)
+        {
+            settings.MaxHandoffRetries = maxHandoffRetries;
+        }
         settings.RuntimeMarker = "LiveCopilot";
         settings.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);

@@ -1,6 +1,7 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Services;
+using System.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
@@ -33,6 +34,7 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
         {
             entity.HasKey(item => item.Id);
             entity.Property(item => item.Outcome).HasConversion<string>();
+            entity.Property(item => item.MaxHandoffRetries).HasDefaultValue(2);
             entity.Property(item => item.RuntimeMarker).HasColumnName("ExecutionMode");
         });
 
@@ -157,6 +159,7 @@ public static class DatabaseInitializer
         await using var database = await factory.CreateDbContextAsync();
 
         await database.Database.EnsureCreatedAsync();
+        await EnsureSettingsSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         var settings = await database.Settings.SingleOrDefaultAsync();
@@ -184,5 +187,43 @@ public static class DatabaseInitializer
 
         var catalog = scope.ServiceProvider.GetRequiredService<AgentCatalog>();
         await catalog.SyncAsync();
+    }
+
+    internal static async Task EnsureSettingsSchemaAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken = default)
+    {
+        var connection = database.Database.GetDbConnection();
+        var shouldClose = connection.State != ConnectionState.Open;
+        if (shouldClose)
+        {
+            await database.Database.OpenConnectionAsync(cancellationToken);
+        }
+        try
+        {
+            await using var probe = connection.CreateCommand();
+            probe.CommandText =
+                "SELECT COUNT(*) FROM pragma_table_info('Settings') " +
+                "WHERE name = 'MaxHandoffRetries';";
+            var exists = Convert.ToInt64(
+                await probe.ExecuteScalarAsync(cancellationToken));
+            if (exists > 0)
+            {
+                return;
+            }
+
+            await using var migration = connection.CreateCommand();
+            migration.CommandText =
+                "ALTER TABLE Settings ADD COLUMN MaxHandoffRetries " +
+                "INTEGER NOT NULL DEFAULT 2;";
+            await migration.ExecuteNonQueryAsync(cancellationToken);
+        }
+        finally
+        {
+            if (shouldClose)
+            {
+                await database.Database.CloseConnectionAsync();
+            }
+        }
     }
 }

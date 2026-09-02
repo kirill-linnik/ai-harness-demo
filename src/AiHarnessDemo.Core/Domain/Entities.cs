@@ -48,6 +48,8 @@ public sealed class HarnessSettings
 
     public OutcomeType Outcome { get; set; } = OutcomeType.PullRequest;
 
+    public int MaxHandoffRetries { get; set; } = 2;
+
     // Retains compatibility with databases created before Copilot CLI became the only host.
     public string RuntimeMarker { get; set; } = "LiveCopilot";
 

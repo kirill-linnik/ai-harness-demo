@@ -1,11 +1,12 @@
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Core.Workflow;
 using AiHarnessDemo.Infrastructure;
+using System.Text.RegularExpressions;
 
 namespace AiHarnessDemo.Services;
 
 /// <summary>Reasoning host that runs enabled custom agents through the local Copilot CLI.</summary>
-public sealed class CopilotReasoningHost(
+public sealed partial class CopilotReasoningHost(
     AgentCatalog agentCatalog,
     ProcessRunner processRunner,
     HarnessPaths paths,
@@ -17,6 +18,11 @@ public sealed class CopilotReasoningHost(
 {
     private const int MaximumPromptCharacters = 24_000;
     private const int AccountManagerRepositoryKnowledgeCharacters = 2_000;
+
+    [GeneratedRegex(
+        @"(?im)^- \*\*Location:\*\*\s*`[^`\r\n]+`\s*$",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex RepositoryLocationPattern();
 
     public override ReasoningHostReadiness CheckReadiness(
         CancellationToken cancellationToken = default)
@@ -63,7 +69,10 @@ public sealed class CopilotReasoningHost(
                 ["agent.instructions"] = Clip(manifest.Instructions, 4_000),
                 ["task"] = Clip(context.Task, 6_000),
                 ["repository.knowledge"] = Clip(
-                    context.RepositoryKnowledge,
+                    PrepareRepositoryKnowledge(
+                        context.RepositoryKnowledge,
+                        context.SourceProjectPath,
+                        request.WorkingDirectory),
                     isAccountManager ? AccountManagerRepositoryKnowledgeCharacters : 6_000),
                 ["plan"] = Clip(context.PlanSummary, 2_000),
                 ["handoffs"] = isAccountManager
@@ -72,7 +81,8 @@ public sealed class CopilotReasoningHost(
                     ? "No prior handoff."
                     : string.Join(
                         Environment.NewLine,
-                        context.PreviousOutputs.TakeLast(4).Select(item => $"- {Clip(item, 1_500)}")),
+                        context.PreviousOutputs.TakeLast(4).Select(item =>
+                            $"- {Clip(RemoveSourceProjectPath(item, context.SourceProjectPath), 1_500)}")),
                 ["learnings"] = context.Learnings.Count == 0
                     ? "No prior prompt refinement applies."
                     : string.Join(
@@ -90,6 +100,7 @@ public sealed class CopilotReasoningHost(
             context.AgentId,
             context.AgentRole,
             request.Model,
+            request.CopilotSessionId,
             prompt);
         var environmentVariables = BuildProcessEnvironment(
             context.AgentRole,
@@ -175,14 +186,17 @@ public sealed class CopilotReasoningHost(
         string agentId,
         string agentRole,
         string model,
+        Guid copilotSessionId,
         string prompt)
     {
         var arguments = new List<string>
         {
             "-C", workingDirectory,
+            "--add-dir", workingDirectory,
             "--add-dir", harnessRoot,
             "--agent", agentId,
             "--model", model,
+            "--session-id", copilotSessionId.ToString("D"),
             "--output-format", "json",
             "--no-color",
             "--no-ask-user"
@@ -206,6 +220,39 @@ public sealed class CopilotReasoningHost(
 
         arguments.AddRange(["-p", prompt]);
         return arguments;
+    }
+
+    internal static string PrepareRepositoryKnowledge(
+        string knowledge,
+        string sourceProjectPath,
+        string workingDirectory)
+    {
+        var sanitized = RepositoryLocationPattern().Replace(
+            RemoveSourceProjectPath(knowledge, sourceProjectPath),
+            "- **Project files:** Use the isolated workspace declared above; the original source path is metadata only.");
+        return
+            $"- **Isolated project root:** `{Path.GetFullPath(workingDirectory)}`{Environment.NewLine}" +
+            "- **Path rule:** Work in this root; do not access the original source folder." +
+            Environment.NewLine + Environment.NewLine +
+            sanitized;
+    }
+
+    internal static string RemoveSourceProjectPath(
+        string value,
+        string sourceProjectPath)
+    {
+        if (string.IsNullOrWhiteSpace(sourceProjectPath))
+        {
+            return value;
+        }
+
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        return value.Replace(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceProjectPath)),
+            "the original source folder (intentionally unavailable)",
+            comparison);
     }
 
     internal static IReadOnlyDictionary<string, string>? BuildProcessEnvironment(
@@ -273,8 +320,11 @@ public sealed class CopilotReasoningHost(
               """
             : """
               Complete the assigned role in the isolated workspace; do not merely advise.
+              Start with exactly one marker: HANDOFF_STATUS: COMPLETE or HANDOFF_STATUS: PUSHBACK.
+              When pushing back, follow it with PUSHBACK_REASON: the exact missing detail and responsible upstream owner.
               Return concise sections named Decision, Deliverable, Evidence, and Next owner.
-              If an upstream handoff is insufficient, stop and state PUSHBACK plus the exact missing detail.
+              If an upstream handoff is insufficient, stop this turn and select the PUSHBACK status.
+              The harness will resume that owner's Copilot session with your pushback, then resume your session with the corrected handoff.
               """;
 
     private static bool IsAccountManager(string agentRole) =>

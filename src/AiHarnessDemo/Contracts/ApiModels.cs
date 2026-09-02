@@ -8,6 +8,7 @@ public sealed record SettingsDto(
     string RepositoryPath,
     string RepositoryKnowledge,
     OutcomeType Outcome,
+    int MaxHandoffRetries,
     DateTimeOffset UpdatedAt);
 
 public sealed record AgentDto(
@@ -173,7 +174,8 @@ public sealed record BootstrapDto(
 public sealed record SaveSettingsRequest(
     string? RepositoryPath,
     string? RepositoryKnowledge,
-    OutcomeType Outcome);
+    OutcomeType Outcome,
+    int? MaxHandoffRetries);
 
 public sealed record ToggleAgentRequest(bool Enabled);
 
@@ -227,6 +229,7 @@ public static class ApiMappings
             settings.RepositoryPath,
             settings.RepositoryKnowledge,
             settings.Outcome,
+            settings.MaxHandoffRetries,
             settings.UpdatedAt);
 
     public static AgentDto ToDto(this AgentRecord agent) =>

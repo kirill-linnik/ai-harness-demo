@@ -1,10 +1,13 @@
 using AiHarnessDemo.Data;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Workflow;
 using AiHarnessDemo.Services;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AiHarnessDemo.Tests;
 
@@ -355,6 +358,7 @@ public sealed class CopilotReasoningHostTests
             "account-manager",
             "account-manager",
             "claude-sonnet-5",
+            Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             "Prompt");
         var environment = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
             CopilotReasoningHost.BuildProcessEnvironment(
@@ -371,6 +375,11 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("--no-custom-instructions", arguments);
         Assert.Contains("--no-eager-powershell-resolution", arguments);
         Assert.DoesNotContain("--allow-all-tools", arguments);
+        Assert.Contains(
+            Enumerable.Range(0, arguments.Count - 1),
+            index =>
+                arguments[index] == "--add-dir" &&
+                arguments[index + 1] == @"C:\worktree");
         Assert.EndsWith(
             Path.Combine("copilot-home", "account-manager"),
             environment["COPILOT_HOME"]);
@@ -385,15 +394,437 @@ public sealed class CopilotReasoningHostTests
             "software-engineer",
             "software-engineer",
             "gpt-5.4-mini",
+            Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
             "Prompt");
 
         Assert.Contains("--allow-all-tools", arguments);
+        Assert.Contains(
+            Enumerable.Range(0, arguments.Count - 1),
+            index =>
+                arguments[index] == "--add-dir" &&
+                arguments[index + 1] == @"C:\worktree");
+        Assert.DoesNotContain("--allow-all-paths", arguments);
+        Assert.DoesNotContain("--allow-all", arguments);
+        Assert.Contains(
+            Enumerable.Range(0, arguments.Count - 1),
+            index =>
+                arguments[index] == "--session-id" &&
+                arguments[index + 1] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
         Assert.DoesNotContain("--available-tools", arguments);
         Assert.DoesNotContain("--disable-builtin-mcps", arguments);
         Assert.Null(
             CopilotReasoningHost.BuildProcessEnvironment(
                 "software-engineer",
                 Path.Combine(Path.GetTempPath(), "harness", "ai-harness.db")));
+    }
+
+    [Fact]
+    public void RepositoryKnowledge_DoesNotRedirectAgentsToTheOriginalSourcePath()
+    {
+        var knowledge = """
+            # demo
+
+            ## Repository profile
+            - **Location:** `E:\source-project`
+            - **Detected stack:** Angular
+            """;
+
+        var prepared = CopilotReasoningHost.PrepareRepositoryKnowledge(
+            knowledge,
+            @"E:\source-project",
+            @"E:\worktrees\flow-123");
+
+        Assert.DoesNotContain(@"E:\source-project", prepared);
+        Assert.Contains(@"E:\worktrees\flow-123", prepared);
+        Assert.Contains("isolated workspace", prepared);
+        Assert.Contains("Angular", prepared);
+    }
+
+    [Fact]
+    public void PriorHandoffs_CannotRedirectLaterAgentsToTheSourceFolder()
+    {
+        const string handoff =
+            @"Inspect E:\source-project first, then make changes in E:\SOURCE-PROJECT\site.";
+
+        var prepared = CopilotReasoningHost.RemoveSourceProjectPath(
+            handoff,
+            @"E:\source-project");
+
+        Assert.DoesNotContain(@"E:\source-project", prepared, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, prepared.Split("intentionally unavailable").Length - 1);
+    }
+
+    [Fact]
+    public void DeliveryContract_RequiresAnUnambiguousHandoffStatus()
+    {
+        var contract = CopilotReasoningHost.ResponseContract("quality-engineer");
+
+        Assert.Contains("HANDOFF_STATUS: COMPLETE", contract);
+        Assert.Contains("HANDOFF_STATUS: PUSHBACK", contract);
+        Assert.Contains("PUSHBACK_REASON", contract);
+        Assert.Contains("resume", contract, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+public sealed class PushbackRecoveryTests
+{
+    [Fact]
+    public void AgentSessionIdentity_IsStablePerFlowIterationAndAgent()
+    {
+        var flowId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+
+        var first = AgentSessionIdentity.Create(flowId, 2, "software-engineer");
+        var resumed = AgentSessionIdentity.Create(flowId, 2, "software-engineer");
+
+        Assert.Equal(first, resumed);
+        Assert.NotEqual(first, AgentSessionIdentity.Create(flowId, 2, "quality-engineer"));
+        Assert.NotEqual(first, AgentSessionIdentity.Create(flowId, 3, "software-engineer"));
+        Assert.Equal('5', first.ToString("D")[14]);
+        Assert.Contains(first.ToString("D")[19], "89ab");
+    }
+
+    [Theory]
+    [InlineData(1, 2, true)]
+    [InlineData(2, 2, true)]
+    [InlineData(3, 2, false)]
+    [InlineData(1, 0, false)]
+    public void HandoffRetryLimit_IsBounded(
+        int observedPushbacks,
+        int configuredRetries,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            WorkflowEngine.HasHandoffRetryAvailable(
+                observedPushbacks,
+                configuredRetries));
+    }
+
+    [Fact]
+    public void RecoverySteps_ResumeUpstreamThenRetryBlockedAgent()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Refresh site",
+            OriginalRequest = "Refresh site",
+            Iteration = 1
+        };
+        var blocked = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 50,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Pushback,
+            Attempt = 1,
+            PushbackReason = "The implementation handoff has no test mapping.",
+            OutputSummary = "PUSHBACK: Add acceptance-to-test evidence."
+        };
+        var upstream = new AgentRecord
+        {
+            Id = "software-engineer",
+            Name = "Software Engineer",
+            Description = "Implements changes.",
+            Role = "software-engineer",
+            SourcePath = "software-engineer.agent.md"
+        };
+
+        var (revision, retry) = WorkflowEngine.CreateRecoverySteps(
+            flow,
+            blocked,
+            upstream,
+            revisionAttempt: 2);
+
+        Assert.Equal("software-engineer", revision.AgentId);
+        Assert.Equal(60, revision.Sequence);
+        Assert.Equal(2, revision.Attempt);
+        Assert.Contains(blocked.PushbackReason, revision.InputSummary);
+        Assert.Equal("quality-engineer", retry.AgentId);
+        Assert.Equal(70, retry.Sequence);
+        Assert.Equal(2, retry.Attempt);
+    }
+
+    [Fact]
+    public void PushbackLearning_TargetsTheResponsibleUpstreamAgent()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Refresh site",
+            OriginalRequest = "Refresh site"
+        };
+        var blocked = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 50,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            PushbackReason = "No acceptance-to-test mapping."
+        };
+        var upstream = new AgentRecord
+        {
+            Id = "software-engineer",
+            Name = "Software Engineer",
+            Description = "Implements changes.",
+            Role = "software-engineer",
+            SourcePath = "software-engineer.agent.md"
+        };
+
+        var learning = WorkflowEngine.CreatePushbackLearning(
+            flow,
+            blocked,
+            upstream);
+
+        Assert.Equal("software-engineer", learning.AgentId);
+        Assert.Equal("Handoff pushback", learning.Category);
+        Assert.Contains("No acceptance-to-test mapping", learning.PromptRefinement);
+        Assert.Contains("Quality Engineer", learning.PromptRefinement);
+    }
+
+    [Fact]
+    public void StepTask_IncludesTheCorrectiveTurnMessage()
+    {
+        var task = WorkflowEngine.BuildStepTask(
+            "Implement the approved change.",
+            "Quality Engineer cannot continue; add exact validation evidence.");
+
+        Assert.Contains("Implement the approved change", task);
+        Assert.Contains("Assignment for this turn", task);
+        Assert.Contains("Quality Engineer cannot continue", task);
+    }
+}
+
+public sealed class WorkflowPushbackLoopTests
+{
+    [Fact]
+    public async Task RunAsync_ResumesUpstreamAndBlockedSessionsUntilHandoffSucceeds()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-pushback-loop-{Guid.NewGuid():N}");
+        var agentsDirectory = Path.Combine(root, ".github", "agents");
+        var workspacePath = Path.Combine(root, "workspace");
+        var databasePath = Path.Combine(root, "harness.db");
+        Directory.CreateDirectory(agentsDirectory);
+        Directory.CreateDirectory(workspacePath);
+        foreach (var (id, name) in new[]
+                 {
+                     ("team-lead", "Team Lead"),
+                     ("software-engineer", "Software Engineer"),
+                     ("quality-engineer", "Quality Engineer"),
+                     ("release-engineer", "Release Engineer")
+                 })
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(agentsDirectory, $"{id}.agent.md"),
+                $"""
+                 ---
+                 name: {name}
+                 description: Test agent.
+                 ---
+
+                 Complete the assigned role.
+                 """);
+        }
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "WORKFLOW.md"),
+            """
+            ---
+            workspace:
+              root: workspace
+            agent:
+              max_concurrent_agents: 1
+              max_attempts: 1
+            ---
+
+            Test workflow for {{ agent.name }} on {{ task }}.
+            """);
+
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite($"Data Source={databasePath};Pooling=False")
+            .Options;
+        var databaseFactory = new TestDbContextFactory(options);
+        var flow = new FlowRun
+        {
+            Title = "Implement feature",
+            OriginalRequest = "Implement feature",
+            ConsolidatedRequest = "Implement a focused product feature.",
+            Status = FlowStatus.Queued,
+            RepositoryPath = root,
+            RepositoryKnowledge = "Test repository."
+        };
+        await using (var database = await databaseFactory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+            database.Settings.Add(new HarnessSettings
+            {
+                RepositoryPath = root,
+                RepositoryKnowledge = "Test repository.",
+                MaxHandoffRetries = 2
+            });
+            database.Flows.Add(flow);
+            await database.SaveChangesAsync();
+        }
+
+        var paths = new AiHarnessDemo.Infrastructure.HarnessPaths(
+            root,
+            agentsDirectory,
+            databasePath);
+        var workflowProvider = new WorkflowDefinitionProvider(
+            paths,
+            new WorkflowLoader(),
+            NullLogger<WorkflowDefinitionProvider>.Instance);
+        await workflowProvider.StartAsync(CancellationToken.None);
+        var runner = new PushbackLoopAgentRunner();
+        using var handoffGate = new HandoffGateEngine();
+        handoffGate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
+        handoffGate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
+        handoffGate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
+        var engine = new WorkflowEngine(
+            databaseFactory,
+            new AgentCatalog(paths, databaseFactory),
+            new FlowPlanner(),
+            new ModelSelector(),
+            new FixedWorkspaceManager(workspacePath),
+            runner,
+            handoffGate,
+            workflowProvider,
+            NullLogger<WorkflowEngine>.Instance);
+
+        try
+        {
+            await engine.RunAsync(flow.Id, CancellationToken.None);
+
+            await using var database = await databaseFactory.CreateDbContextAsync();
+            var stored = await database.Flows
+                .Include(item => item.Steps)
+                .Include(item => item.Events)
+                .SingleAsync(item => item.Id == flow.Id);
+            var learning = await database.Learnings.SingleAsync();
+            var engineerRuns = runner.Contexts
+                .Where(item => item.AgentRole == "software-engineer")
+                .ToList();
+            var qualityRuns = runner.Contexts
+                .Where(item => item.AgentRole == "quality-engineer")
+                .ToList();
+
+            Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
+            Assert.Equal(
+                [StepStatus.Completed, StepStatus.Completed, StepStatus.Completed],
+                stored.Steps
+                    .Where(item => item.AgentRole == "software-engineer")
+                    .OrderBy(item => item.Attempt)
+                    .Select(item => item.Status)
+                    .ToArray());
+            Assert.Equal(
+                [StepStatus.Pushback, StepStatus.Pushback, StepStatus.Completed],
+                stored.Steps
+                    .Where(item => item.AgentRole == "quality-engineer")
+                    .OrderBy(item => item.Attempt)
+                    .Select(item => item.Status)
+                    .ToArray());
+            Assert.Equal(3, engineerRuns.Count);
+            Assert.Single(engineerRuns.Select(item => item.CopilotSessionId).Distinct());
+            Assert.Equal(3, qualityRuns.Count);
+            Assert.Single(qualityRuns.Select(item => item.CopilotSessionId).Distinct());
+            Assert.Contains(
+                "Quality Engineer cannot continue",
+                engineerRuns[^1].Task);
+            Assert.Contains(
+                engineerRuns[^1].Learnings,
+                item => item.Category == "Handoff pushback");
+            Assert.Contains(
+                "Software Engineer responded to your pushback",
+                qualityRuns[^1].Task);
+            Assert.Equal("software-engineer", learning.AgentId);
+            Assert.Equal(2, learning.TimesObserved);
+            Assert.True(learning.TimesApplied >= 2);
+            Assert.Contains(
+                stored.Events,
+                item =>
+                    item.Type == "agent.session-resumed" &&
+                    item.Message.StartsWith("Software Engineer", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                stored.Steps,
+                item => item.Status is StepStatus.Failed or StepStatus.Skipped);
+        }
+        finally
+        {
+            workflowProvider.Dispose();
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private sealed class PushbackLoopAgentRunner : IAgentRunner
+    {
+        public List<AgentExecutionContext> Contexts { get; } = [];
+
+        public Task<AgentExecutionResult> ExecuteAsync(
+            AgentExecutionContext context,
+            CancellationToken cancellationToken = default)
+        {
+            Contexts.Add(context);
+            var output =
+                context.AgentRole == "quality-engineer" && context.Attempt <= 2
+                    ? """
+                      HANDOFF_STATUS: PUSHBACK
+                      PUSHBACK_REASON: Software Engineer omitted the acceptance-to-test mapping.
+
+                      ## PUSHBACK
+
+                      Missing detail: The engineering handoff has no acceptance-to-test mapping.
+
+                      ## Next owner
+
+                      Software Engineer
+                      """
+                    : """
+                      HANDOFF_STATUS: COMPLETE
+
+                      ## Decision
+
+                      The assigned role is complete.
+
+                      ## Deliverable
+
+                      The downstream handoff is unblocked.
+
+                      ## Evidence
+
+                      Focused validation passed.
+
+                      ## Next owner
+
+                      Continue the planned flow.
+                      """;
+            return Task.FromResult(new AgentExecutionResult(
+                output,
+                "Fake runner evidence.",
+                1,
+                []));
+        }
+    }
+
+    private sealed class FixedWorkspaceManager(string path) : IWorkspaceManager
+    {
+        public Task<WorkspaceInfo> PrepareAsync(
+            FlowRun flow,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(new WorkspaceInfo(path, "ai-harness/test", CreatedNow: false));
+    }
+
+    private sealed class TestDbContextFactory(
+        DbContextOptions<HarnessDbContext> options)
+        : IDbContextFactory<HarnessDbContext>
+    {
+        public HarnessDbContext CreateDbContext() => new(options);
+
+        public Task<HarnessDbContext> CreateDbContextAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(new HarnessDbContext(options));
     }
 }
 
@@ -415,7 +846,8 @@ public sealed class PersistenceTests
             {
                 RepositoryPath = @"C:\code\demo",
                 RepositoryKnowledge = "A .NET 10 web application.",
-                Outcome = OutcomeType.PullRequest
+                Outcome = OutcomeType.PullRequest,
+                MaxHandoffRetries = 4
             });
             var flow = new FlowRun
             {
@@ -456,9 +888,45 @@ public sealed class PersistenceTests
             var learning = await database.Learnings.SingleAsync();
 
             Assert.Equal(OutcomeType.PullRequest, settings.Outcome);
+            Assert.Equal(4, settings.MaxHandoffRetries);
             Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
             Assert.Equal("gpt-5.4-mini", Assert.Single(flow.Steps).Model);
             Assert.Equal("Evidence must be traceable.", learning.Lesson);
         }
+    }
+
+    [Fact]
+    public async Task SettingsSchema_AddsHandoffRetryLimitToExistingDatabase()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                CREATE TABLE Settings (
+                    Id INTEGER NOT NULL CONSTRAINT PK_Settings PRIMARY KEY,
+                    RepositoryPath TEXT NOT NULL,
+                    RepositoryKnowledge TEXT NOT NULL,
+                    Outcome TEXT NOT NULL,
+                    ExecutionMode TEXT NOT NULL,
+                    UpdatedAt INTEGER NOT NULL
+                );
+                INSERT INTO Settings
+                    (Id, RepositoryPath, RepositoryKnowledge, Outcome, ExecutionMode, UpdatedAt)
+                VALUES
+                    (1, '', '', 'PullRequest', 'LiveCopilot', 0);
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var database = new HarnessDbContext(options);
+
+        await DatabaseInitializer.EnsureSettingsSchemaAsync(database);
+        var settings = await database.Settings.SingleAsync();
+
+        Assert.Equal(2, settings.MaxHandoffRetries);
+        Assert.Equal(System.Data.ConnectionState.Open, connection.State);
     }
 }

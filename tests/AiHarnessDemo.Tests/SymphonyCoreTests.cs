@@ -70,6 +70,19 @@ public sealed class HandoffGateEngineTests
             gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Auto));
     }
 
+    [Fact]
+    public void SubmitProposal_DescribesPushbackAsARevisionRequest()
+    {
+        using var gate = new HandoffGateEngine();
+        gate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
+
+        var record = gate.SubmitProposal(Proposal(HandoffActionType.RequestRevision));
+
+        Assert.Equal(HandoffGateDecision.AutoApproved, record.Decision);
+        Assert.Contains("revision request was accepted", record.Reason);
+        Assert.DoesNotContain("handoff contract passed", record.Reason);
+    }
+
     private static HandoffProposal Proposal(
         HandoffActionType actionType,
         HandoffBlastRadius blastRadius = HandoffBlastRadius.Medium) =>

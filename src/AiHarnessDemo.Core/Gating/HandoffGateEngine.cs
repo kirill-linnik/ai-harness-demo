@@ -273,6 +273,9 @@ public sealed class HandoffGateEngine : IDisposable
             "Customer approval is required before the release outcome is final.",
         HandoffGateDecision.AwaitingHumanApproval =>
             "The proposal is gated because its trust level or blast radius requires human approval.",
+        HandoffGateDecision.AutoApproved
+            when proposal.ActionType == HandoffActionType.RequestRevision =>
+            "The revision request was accepted at the configured automatic trust level.",
         HandoffGateDecision.AutoApproved =>
             "The handoff contract passed at the configured automatic trust level.",
         _ => throw new ArgumentOutOfRangeException(nameof(decision), decision, null)

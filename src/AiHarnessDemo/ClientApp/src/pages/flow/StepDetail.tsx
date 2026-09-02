@@ -19,7 +19,9 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
           style={{ marginTop: 14, borderColor: "rgba(155,135,245,.24)", background: "rgba(155,135,245,.055)" }}
         >
           <span>
-            <strong>Handoff gate: {statusLabel(gate.decision)}</strong>
+            <strong>
+              {gate.actionType === "RequestRevision" ? "Revision request" : "Handoff gate"}: {statusLabel(gate.decision)}
+            </strong>
             <br />
             {gate.reason} · {gate.trustLevelAtDecision} trust
           </span>

@@ -16,7 +16,9 @@ public sealed record AgentExecutionContext(
     int Attempt,
     string Task,
     string RepositoryKnowledge,
-    string RepositoryPath,
+    string SourceProjectPath,
+    string WorkspacePath,
+    Guid CopilotSessionId,
     DeliveryOutcomeType Outcome,
     string PlanSummary,
     IReadOnlyList<string> PreviousOutputs,
@@ -30,6 +32,13 @@ public sealed record AgentExecutionResult(
     int ExecutionAttempts,
     IReadOnlyList<ToolCallRecord> ToolCalls);
 
+public interface IAgentRunner
+{
+    Task<AgentExecutionResult> ExecuteAsync(
+        AgentExecutionContext context,
+        CancellationToken cancellationToken = default);
+}
+
 /// <summary>
 /// Routes one role through Copilot CLI. Retry options are read immediately before each dispatch so
 /// changes to WORKFLOW.md affect the next execution.
@@ -39,6 +48,7 @@ public sealed class AgentRunner(
     RuntimeCircuitBreaker circuitBreaker,
     WorkflowDefinitionProvider workflowProvider,
     ILogger<AgentRunner> logger)
+    : IAgentRunner
 {
     public async Task<AgentExecutionResult> ExecuteAsync(
         AgentExecutionContext context,
@@ -102,7 +112,8 @@ public sealed class AgentRunner(
                             AgentId = context.AgentId,
                             Model = context.Model,
                             CorrelationId = $"{context.FlowId:N}:{context.Iteration}:{context.AgentId}:{context.Attempt}",
-                            WorkingDirectory = context.RepositoryPath,
+                            CopilotSessionId = context.CopilotSessionId,
+                            WorkingDirectory = context.WorkspacePath,
                             InputContext = new Dictionary<string, object?>
                             {
                                 ["execution"] = context

@@ -10,7 +10,7 @@ namespace AiHarnessDemo.Services;
 public sealed class FeedbackCoordinator(
     IDbContextFactory<HarnessDbContext> databaseFactory,
     ModelSelector modelSelector,
-    AgentRunner agentRunner,
+    IAgentRunner agentRunner,
     HandoffGateEngine gateEngine,
     FlowQueue flowQueue)
 {
@@ -116,9 +116,11 @@ public sealed class FeedbackCoordinator(
                         step.Attempt,
                         flow.ConsolidatedRequest,
                         flow.RepositoryKnowledge,
+                        flow.RepositoryPath,
                         string.IsNullOrWhiteSpace(flow.WorkspacePath)
                             ? flow.RepositoryPath
                             : flow.WorkspacePath,
+                        AgentSessionIdentity.Create(flow.Id, flow.Iteration, productManager.Id),
                         flow.Outcome,
                         "Review the execution ledger and help the customer decide.",
                         previousOutputs,

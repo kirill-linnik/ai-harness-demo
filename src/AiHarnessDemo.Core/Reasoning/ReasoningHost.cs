@@ -9,6 +9,8 @@ public sealed class AgentRunRequest
 
     public required string CorrelationId { get; init; }
 
+    public required Guid CopilotSessionId { get; init; }
+
     public required string WorkingDirectory { get; init; }
 
     public Dictionary<string, object?> InputContext { get; init; } = new();

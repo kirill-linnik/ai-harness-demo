@@ -71,9 +71,12 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 - Resolves native and npm-installed Copilot CLI commands, skipping interactive Windows bootstrap
   shims and falling back to the latest app-managed native CLI when available.
 - Creates the same `ai-harness/<task>-<flow-id>` branch in an isolated worktree for each project repository.
-- Loads the generic agents from this project with `--add-dir`.
+- Grants the flow workspace explicitly with `--add-dir`, sets it as Copilot's working directory, and tells agents that original source-folder paths are metadata rather than work targets.
+- Loads the generic agents from this project with a separate `--add-dir`.
 - Selects a model per role and launches non-interactive Copilot CLI execution.
-- Gives each agent tool access inside the isolated project workspace; use only with repositories you trust.
+- Gives each agent project access inside the isolated workspace; use only with repositories you trust.
+- Classifies an explicit `PUSHBACK` before advance gating, records a revision request and reusable prompt refinement, resumes the responsible upstream Copilot session, then resumes the blocked agent with the corrected handoff.
+- Bounds every agent-to-agent correction loop with the persisted Settings retry limit (`0-10`, default `2`); only exhaustion or a missing upstream owner makes the flow terminal and skips downstream steps.
 
 ## API shape
 

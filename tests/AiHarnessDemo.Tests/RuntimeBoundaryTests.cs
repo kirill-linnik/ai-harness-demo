@@ -96,6 +96,113 @@ public sealed class CopilotJsonlParserTests
     }
 }
 
+public sealed class AgentHandoffInspectorTests
+{
+    [Fact]
+    public void GetPushbackReason_UsesStructuredHandoffStatus()
+    {
+        const string output = """
+            HANDOFF_STATUS: PUSHBACK
+            PUSHBACK_REASON: Software Engineer omitted the acceptance-to-test mapping.
+
+            ## Decision
+            Revision required.
+            """;
+
+        Assert.Equal(
+            "Software Engineer omitted the acceptance-to-test mapping.",
+            AgentHandoffInspector.GetPushbackReason(output));
+    }
+
+    [Fact]
+    public void GetPushbackReason_CompleteStatusOverridesIncidentalPushbackText()
+    {
+        const string output = """
+            HANDOFF_STATUS: COMPLETE
+
+            ## Decision
+            PUSHBACK: none; the work is complete.
+            """;
+
+        Assert.Null(AgentHandoffInspector.GetPushbackReason(output));
+    }
+
+    [Theory]
+    [InlineData(
+        "## PUSHBACK\n\n**Missing detail:** Workspace access is unavailable.",
+        "Missing detail: Workspace access is unavailable.")]
+    [InlineData(
+        "## Decision\n\n**PUSHBACK** - I cannot implement without repository access.",
+        "I cannot implement without repository access.")]
+    [InlineData(
+        "- **PUSHBACK** \u2014 Required files are unavailable.",
+        "Required files are unavailable.")]
+    public void GetPushbackReason_RecognizesExplicitContractMarkers(
+        string output,
+        string expectedReason)
+    {
+        var reason = AgentHandoffInspector.GetPushbackReason(output);
+
+        Assert.Equal(expectedReason, reason);
+    }
+
+    [Fact]
+    public void GetPushbackReason_DoesNotRejectACompletedHandoffThatMentionsPushback()
+    {
+        const string output = """
+            ## Decision
+            The implementation is complete; no pushback is required.
+
+            ## Deliverable
+            Working code.
+            """;
+
+        Assert.Null(AgentHandoffInspector.GetPushbackReason(output));
+    }
+
+    [Fact]
+    public void ApplyFlowFailure_SkipsEveryPendingDownstreamStep()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Refresh the site",
+            OriginalRequest = "Refresh the site",
+            Status = FlowStatus.Running
+        };
+        var pending = new[]
+        {
+            new FlowStep
+            {
+                FlowRunId = flow.Id,
+                Iteration = 1,
+                Sequence = 30,
+                AgentId = "software-engineer",
+                AgentName = "Software Engineer",
+                AgentRole = "software-engineer"
+            },
+            new FlowStep
+            {
+                FlowRunId = flow.Id,
+                Iteration = 1,
+                Sequence = 40,
+                AgentId = "quality-engineer",
+                AgentName = "Quality Engineer",
+                AgentRole = "quality-engineer"
+            }
+        };
+
+        var events = WorkflowEngine.ApplyFlowFailure(
+            flow,
+            pending,
+            "Architect pushed back and stopped the flow.");
+
+        Assert.Equal(FlowStatus.Failed, flow.Status);
+        Assert.All(pending, step => Assert.Equal(StepStatus.Skipped, step.Status));
+        Assert.Equal(2, events.Count(item => item.Type == "step.skipped"));
+        Assert.Contains(events, item => item.Type == "flow.failed");
+    }
+}
+
 public sealed class CopilotCliRuntimeTests
 {
     [Fact]
@@ -115,9 +222,9 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--agent --allow-all-tools --available-tools --disable-builtin-mcps " +
+                "--add-dir --agent --allow-all-tools --available-tools --disable-builtin-mcps " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
-                "--no-eager-powershell-resolution --output-format");
+                "--no-eager-powershell-resolution --output-format --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
 
             Assert.True(status.Ready);
@@ -158,6 +265,37 @@ public sealed class CopilotCliRuntimeTests
 
             Assert.False(status.Ready);
             Assert.Contains("--output-format", status.Detail);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RefreshAsync_RejectsACliWithoutExplicitDirectoryGrants()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-copilot-path-capability-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var command = CreateCliShim(
+                root,
+                "--agent --allow-all-tools --available-tools --disable-builtin-mcps " +
+                "--effort --model --no-ask-user --no-custom-instructions " +
+                "--no-eager-powershell-resolution --output-format --session-id");
+            var status = await CreateRuntime(root).RefreshAsync(command);
+
+            Assert.False(status.Ready);
+            Assert.Contains("--add-dir", status.Detail);
         }
         finally
         {

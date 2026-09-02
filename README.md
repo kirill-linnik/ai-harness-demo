@@ -77,7 +77,9 @@ The AI Factory and every new-assignment control remain locked until Settings con
 - All application state is stored in `data\ai-harness.db`.
 - `WORKFLOW.md` is the hot-reloadable, version-controlled Symphony policy and prompt contract.
 - Agent definitions are loaded from `.github\agents\*.agent.md`.
-- Copilot CLI receives tool access only inside `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree.
+- Copilot CLI receives explicit project access to `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree, and source-folder paths remain intentionally inaccessible.
+- An explicit agent `PUSHBACK` is persisted as a rejected handoff, resumes the responsible upstream agent's Copilot session, then retries the blocked agent in its existing session.
+- The handoff retry limit is persisted in Settings (`0-10`, default `2`); only an exhausted limit or an unroutable pushback stops the flow and skips downstream steps.
 - Multiple flows can run in parallel; every flow receives an independent project workspace and a matching branch in each discovered repository.
 - No cloud credentials, private endpoints, or provider-specific work-item integrations are included.
 

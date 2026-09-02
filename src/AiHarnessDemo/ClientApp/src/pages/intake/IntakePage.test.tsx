@@ -13,6 +13,7 @@ const bootstrap: BootstrapDto = {
     repositoryPath: "E:\\projects\\demo",
     repositoryKnowledge: "Demo repository",
     outcome: "Commit",
+    maxHandoffRetries: 2,
     updatedAt: "2026-09-02T12:00:00Z"
   },
   agents: [],

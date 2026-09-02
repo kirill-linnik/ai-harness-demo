@@ -53,6 +53,7 @@ export interface SettingsDto {
   repositoryPath: string;
   repositoryKnowledge: string;
   outcome: OutcomeType;
+  maxHandoffRetries: number;
   updatedAt: string;
 }
 
@@ -234,6 +235,7 @@ export interface SaveSettingsRequest {
   repositoryPath: string;
   repositoryKnowledge: string;
   outcome: OutcomeType;
+  maxHandoffRetries: number;
 }
 
 export interface ToggleAgentRequest {
