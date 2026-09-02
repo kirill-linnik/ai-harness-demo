@@ -119,29 +119,6 @@ export function SettingsPage() {
               </div>
             </div>
           </div>
-          <div className="card">
-            <div className="card-header">
-              <div>
-                <h3>Repository knowledge</h3>
-                <p>Editable shared context injected into every agent execution.</p>
-              </div>
-            </div>
-            <div className="card-body">
-              <div className="field">
-                <label htmlFor="knowledge-editor">Harness learnings about this codebase</label>
-                <textarea
-                  className="knowledge-editor"
-                  id="knowledge-editor"
-                  placeholder="Select and study a repository first."
-                  value={knowledge}
-                  onChange={event => setKnowledge(event.target.value)}
-                />
-                <small>
-                  Correct assumptions, add domain language, and document constraints the code alone cannot reveal.
-                </small>
-              </div>
-            </div>
-          </div>
         </div>
         <div className="settings-stack">
           <div className="card">
@@ -188,6 +165,29 @@ export function SettingsPage() {
               >
                 <RefreshIcon /> {analyzeRepository.isPending ? "Studying code..." : "Initialize and study repository"}
               </button>
+            </div>
+          </div>
+          <div className="card">
+            <div className="card-header">
+              <div>
+                <h3>Repository knowledge</h3>
+                <p>Editable context generated from the selected source project and shared with every agent.</p>
+              </div>
+            </div>
+            <div className="card-body">
+              <div className="field">
+                <label htmlFor="knowledge-editor">Knowledge for the selected project</label>
+                <textarea
+                  className="knowledge-editor"
+                  id="knowledge-editor"
+                  placeholder="Select and study a repository first."
+                  value={knowledge}
+                  onChange={event => setKnowledge(event.target.value)}
+                />
+                <small>
+                  Correct assumptions, add domain language, and document constraints the code alone cannot reveal.
+                </small>
+              </div>
             </div>
           </div>
           <div className="card">
