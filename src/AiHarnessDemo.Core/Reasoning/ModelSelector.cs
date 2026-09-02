@@ -15,7 +15,10 @@ public sealed class ModelSelector
 
         return role switch
         {
-            "account-manager" or "product-manager" => new ModelChoice(
+            "account-manager" => new ModelChoice(
+                "claude-haiku-4.5",
+                "Low-latency conversational model for customer intake."),
+            "product-manager" => new ModelChoice(
                 "gpt-5-mini",
                 "Fast conversational model for structured customer dialogue."),
             "team-lead" or "architect" when complexity >= 3 => new ModelChoice(

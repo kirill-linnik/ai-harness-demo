@@ -16,6 +16,7 @@ public sealed class CopilotReasoningHost(
     : ReasoningHost(new ReasoningHostConfig("copilot-cli"))
 {
     private const int MaximumPromptCharacters = 24_000;
+    private const int AccountManagerRepositoryKnowledgeCharacters = 2_000;
 
     public override ReasoningHostReadiness CheckReadiness(
         CancellationToken cancellationToken = default)
@@ -52,6 +53,7 @@ public sealed class CopilotReasoningHost(
         request.Progress?.Invoke(new AgentRunProgress(
             AgentRunPhase.BuildingPrompt,
             "Rendering WORKFLOW.md with role and repository context."));
+        var isAccountManager = IsAccountManager(context.AgentRole);
         var prompt = Clip(
             promptRenderer.Render(
             workflow.PromptTemplate,
@@ -60,9 +62,13 @@ public sealed class CopilotReasoningHost(
                 ["agent.name"] = context.AgentName,
                 ["agent.instructions"] = Clip(manifest.Instructions, 4_000),
                 ["task"] = Clip(context.Task, 6_000),
-                ["repository.knowledge"] = Clip(context.RepositoryKnowledge, 6_000),
+                ["repository.knowledge"] = Clip(
+                    context.RepositoryKnowledge,
+                    isAccountManager ? AccountManagerRepositoryKnowledgeCharacters : 6_000),
                 ["plan"] = Clip(context.PlanSummary, 2_000),
-                ["handoffs"] = context.PreviousOutputs.Count == 0
+                ["handoffs"] = isAccountManager
+                    ? "Prior Account Manager replies are already included in the customer dialogue."
+                    : context.PreviousOutputs.Count == 0
                     ? "No prior handoff."
                     : string.Join(
                         Environment.NewLine,
@@ -78,6 +84,20 @@ public sealed class CopilotReasoningHost(
                 ["response.contract"] = ResponseContract(context.AgentRole)
             }),
             MaximumPromptCharacters);
+        var arguments = BuildCliArguments(
+            request.WorkingDirectory,
+            paths.Root,
+            context.AgentId,
+            context.AgentRole,
+            request.Model,
+            prompt);
+        var environmentVariables = BuildProcessEnvironment(
+            context.AgentRole,
+            paths.DatabasePath);
+        if (environmentVariables?.TryGetValue("COPILOT_HOME", out var copilotHome) == true)
+        {
+            Directory.CreateDirectory(copilotHome);
+        }
         ProcessResult result;
 
         try
@@ -91,22 +111,13 @@ public sealed class CopilotReasoningHost(
                 $"Launching Copilot CLI {copilotCli.Version} with {request.Model}."));
             result = await processRunner.RunAsync(
                 copilotCli.ResolvedPath,
-                [
-                    "-C", request.WorkingDirectory,
-                    "--add-dir", paths.Root,
-                    "--agent", request.AgentId,
-                    "--model", request.Model,
-                    "--output-format", "json",
-                    "--no-color",
-                    "--no-ask-user",
-                    "--allow-all-tools",
-                    "-p", prompt
-                ],
+                arguments,
                 request.WorkingDirectory,
                 TimeSpan.FromMilliseconds(workflow.Config.Copilot.TurnTimeoutMs),
                 cancellationToken,
                 CopilotJsonlParser.CreateProgressReporter(request.Progress),
-                TimeSpan.FromMilliseconds(workflow.Config.Copilot.StallTimeoutMs));
+                TimeSpan.FromMilliseconds(workflow.Config.Copilot.StallTimeoutMs),
+                environmentVariables);
         }
         catch (ProcessStalledException exception)
         {
@@ -158,6 +169,65 @@ public sealed class CopilotReasoningHost(
             result.StandardError);
     }
 
+    internal static IReadOnlyList<string> BuildCliArguments(
+        string workingDirectory,
+        string harnessRoot,
+        string agentId,
+        string agentRole,
+        string model,
+        string prompt)
+    {
+        var arguments = new List<string>
+        {
+            "-C", workingDirectory,
+            "--add-dir", harnessRoot,
+            "--agent", agentId,
+            "--model", model,
+            "--output-format", "json",
+            "--no-color",
+            "--no-ask-user"
+        };
+
+        if (IsAccountManager(agentRole))
+        {
+            arguments.AddRange(
+            [
+                "--available-tools",
+                "--disable-builtin-mcps",
+                "--no-custom-instructions",
+                "--no-eager-powershell-resolution"
+            ]);
+        }
+        else
+        {
+            arguments.Add("--allow-all-tools");
+        }
+
+        arguments.AddRange(["-p", prompt]);
+        return arguments;
+    }
+
+    internal static IReadOnlyDictionary<string, string>? BuildProcessEnvironment(
+        string agentRole,
+        string databasePath)
+    {
+        if (!IsAccountManager(agentRole))
+        {
+            return null;
+        }
+
+        var dataDirectory = Path.GetDirectoryName(Path.GetFullPath(databasePath))
+            ?? throw new InvalidOperationException(
+                $"Harness database path has no parent directory: {databasePath}");
+        return new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["COPILOT_HOME"] = Path.Combine(
+                dataDirectory,
+                "copilot-home",
+                "account-manager")
+        };
+    }
+
     private static AgentExecutionContext RequireContext(AgentRunRequest request) =>
         request.InputContext.TryGetValue("execution", out var value) &&
         value is AgentExecutionContext context
@@ -180,21 +250,30 @@ public sealed class CopilotReasoningHost(
             FailedDependency = dependency
         };
 
-    private static string ResponseContract(string agentRole) =>
+    internal static string ResponseContract(string agentRole) =>
         agentRole == "account-manager"
             ? """
-              Decide whether the customer request is implementation-ready.
-              Return exactly these plain-text markers with no markdown:
+              Move a workable customer request into delivery; do not exhaustively specify it.
+              Return exactly these plain-text markers with no text before INTAKE_STATUS:
               INTAKE_STATUS: READY or NEEDS_CLARIFICATION
-              CUSTOMER_REPLY: one concise sentence suitable for spoken playback
-              TASK_BRIEF: the complete implementation brief when ready, otherwise NONE
-              Ask only one material question when clarification is needed.
+              CUSTOMER_REPLY: when READY, one brief confirmation of what the team will make; when clarification is essential, one short question; always use plain everyday customer language on one line
+              TASK_BRIEF: the complete implementation brief when ready, otherwise NONE; a ready brief may continue on following lines
+              Default to READY as soon as the delivery team can take a meaningful first action.
+              Use NEEDS_CLARIFICATION only when the target product or visible outcome cannot be identified and no safe reversible assumption lets work start.
+              Treat every earlier answer as settled. Never repeat, reconfirm, or reframe it as another choice.
+              If the dialogue already contains an Account Manager question, or the customer tells you to proceed or shows frustration, you must return READY using reasonable assumptions.
+              A request for something the customer can click is actionable and requires an interactive result; do not ask whether it means pictures, a prototype, implementation, or deployment.
+              Never ask about technologies, tools, file formats, implementation approaches, deployment, hosting, credentials, live release, pull requests, builds, or who deploys.
+              Put reversible assumptions and decisions owned by designers, engineers, or release staff in TASK_BRIEF instead of asking the customer.
               """
             : """
               Complete the assigned role in the isolated workspace; do not merely advise.
               Return concise sections named Decision, Deliverable, Evidence, and Next owner.
               If an upstream handoff is insufficient, stop and state PUSHBACK plus the exact missing detail.
               """;
+
+    private static bool IsAccountManager(string agentRole) =>
+        string.Equals(agentRole, "account-manager", StringComparison.Ordinal);
 
     private static string Tail(string value, int maxCharacters) =>
         value.Length <= maxCharacters ? value : value[^maxCharacters..];

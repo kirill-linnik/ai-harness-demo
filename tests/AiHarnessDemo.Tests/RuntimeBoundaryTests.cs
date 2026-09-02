@@ -115,7 +115,9 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--agent --allow-all-tools --model --no-ask-user --output-format");
+                "--agent --allow-all-tools --available-tools --disable-builtin-mcps " +
+                "--model --no-ask-user --no-custom-instructions " +
+                "--no-eager-powershell-resolution --output-format");
             var status = await CreateRuntime(root).RefreshAsync(command);
 
             Assert.True(status.Ready);
@@ -384,6 +386,56 @@ public sealed class ProcessRunnerTests
             Assert.Equal(
                 $"{longArgument}|two words",
                 result.StandardOutput.Trim());
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_PassesEnvironmentOverridesToTheChildProcess()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-process-environment-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+
+        try
+        {
+            var command = Path.Combine(directory, "environment-command");
+            if (OperatingSystem.IsWindows())
+            {
+                await File.WriteAllTextAsync(
+                    $"{command}.cmd",
+                    "@echo off\r\nexit /b 1\r\n");
+                await File.WriteAllTextAsync(
+                    $"{command}.ps1",
+                    "Write-Output $env:AI_HARNESS_PROCESS_TEST\r\n");
+            }
+            else
+            {
+                await File.WriteAllTextAsync(
+                    command,
+                    "#!/bin/sh\nprintf '%s\\n' \"$AI_HARNESS_PROCESS_TEST\"\n");
+                File.SetUnixFileMode(
+                    command,
+                    File.GetUnixFileMode(command) |
+                    UnixFileMode.UserExecute);
+            }
+
+            var result = await new ProcessRunner().RunAsync(
+                command,
+                [],
+                directory,
+                TimeSpan.FromSeconds(20),
+                environmentVariables: new Dictionary<string, string>
+                {
+                    ["AI_HARNESS_PROCESS_TEST"] = "isolated"
+                });
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.Equal("isolated", result.StandardOutput.Trim());
         }
         finally
         {

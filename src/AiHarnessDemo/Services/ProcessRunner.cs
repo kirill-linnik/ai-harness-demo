@@ -24,7 +24,8 @@ public sealed class ProcessRunner
         TimeSpan timeout,
         CancellationToken cancellationToken = default,
         Action<string>? standardOutputLineReceived = null,
-        TimeSpan? stallTimeout = null)
+        TimeSpan? stallTimeout = null,
+        IReadOnlyDictionary<string, string>? environmentVariables = null)
     {
         if (string.IsNullOrWhiteSpace(executable))
         {
@@ -64,6 +65,13 @@ public sealed class ProcessRunner
             resolvedExecutable,
             arguments.ToArray(),
             resolvedWorkingDirectory);
+        if (environmentVariables is not null)
+        {
+            foreach (var (name, value) in environmentVariables)
+            {
+                startInfo.Environment[name] = value;
+            }
+        }
 
         using var process = new Process { StartInfo = startInfo };
         if (!process.Start())

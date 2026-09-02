@@ -28,7 +28,7 @@ public sealed partial class IntakeCoordinator(
     private static partial Regex CustomerReplyPattern();
 
     [GeneratedRegex(
-        @"(?im)^\s*(?:\*\*)?TASK_BRIEF(?:\*\*)?\s*:\s*(.+?)\s*$")]
+        @"(?ims)^\s*(?:\*\*)?TASK_BRIEF(?:\*\*)?\s*:\s*(.+?)\s*\z")]
     private static partial Regex TaskBriefPattern();
 
     public async Task<IntakeResponse> ContinueAsync(
@@ -143,11 +143,11 @@ public sealed partial class IntakeCoordinator(
                     accountManager.Role,
                     model.Model,
                     intakeStep.Attempt,
-                    BuildDialogueTask(flow.Messages),
+                    BuildDialogueTask(flow.Messages, flow.Outcome),
                     flow.RepositoryKnowledge,
                     workspace.Path,
                     flow.Outcome,
-                    "Determine whether the customer request is implementation-ready.",
+                    $"Create a task-ready brief with sensible defaults. Delivery is already configured as {flow.Outcome}.",
                     priorReplies,
                     learnings,
                     Progress: progress =>
@@ -312,16 +312,32 @@ public sealed partial class IntakeCoordinator(
             Environment.NewLine,
             customerMessages.Select((item, index) => $"Customer input {index + 1}: {item}"));
 
-    private static string BuildDialogueTask(IEnumerable<FlowMessage> messages)
+    internal static string BuildDialogueTask(
+        IEnumerable<FlowMessage> messages,
+        OutcomeType outcome)
     {
+        var orderedMessages = messages
+            .OrderBy(item => item.CreatedAt)
+            .ToList();
         var dialogue = string.Join(
             Environment.NewLine,
-            messages
-                .OrderBy(item => item.CreatedAt)
-                .Select(item => $"{item.Role}: {item.Content}"));
+            orderedMessages.Select(item => $"{item.Role}: {item.Content}"));
+        var clarificationPolicy = orderedMessages.Any(
+            item => item.Role == ConversationRole.AccountManager && item.IsQuestion)
+            ? "The Account Manager has already asked a clarification question, so this turn must " +
+              "return READY using reasonable assumptions."
+            : "Clarification is exceptional: ask only if no safe interpretation identifies the " +
+              "target product or visible outcome.";
+
         return
-            "Review this customer dialogue against the repository knowledge. Decide whether the " +
-            "request is implementation-ready; otherwise ask exactly one material clarification." +
+            "Turn this complete customer dialogue into a brief the delivery team can act on. " +
+            "Default to READY once meaningful work can begin; downstream details do not need to be " +
+            "settled during intake. Treat all prior answers as final and do not reconfirm them. " +
+            "A request for a design the customer can click is actionable and requires an interactive " +
+            "result, not another prototype, implementation, or deployment choice. " +
+            $"The configured delivery outcome is {outcome}; do not ask the customer how the work " +
+            "should be packaged, released, or deployed. " +
+            clarificationPolicy +
             Environment.NewLine +
             Environment.NewLine +
             dialogue;

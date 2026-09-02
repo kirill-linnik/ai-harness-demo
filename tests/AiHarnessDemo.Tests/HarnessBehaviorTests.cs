@@ -97,11 +97,17 @@ public sealed class IntakeCoordinatorTests
         var result = IntakeCoordinator.ParseResponse("""
             INTAKE_STATUS: READY
             CUSTOMER_REPLY: The implementation brief is ready for Team Lead.
-            TASK_BRIEF: Add a persistent onboarding checklist with keyboard support and automated tests.
+            TASK_BRIEF:
+            Outcome: Add a persistent onboarding checklist.
+            Acceptance:
+            - Supports keyboard navigation.
+            - Includes automated tests.
             """);
 
         Assert.True(result.Ready);
         Assert.Contains("persistent onboarding", result.TaskBrief);
+        Assert.Contains("keyboard navigation", result.TaskBrief);
+        Assert.Contains("automated tests", result.TaskBrief);
     }
 
     [Fact]
@@ -112,12 +118,56 @@ public sealed class IntakeCoordinatorTests
 
         Assert.Contains("invalid intake contract", exception.Message);
     }
+
+    [Fact]
+    public void AccountManagerContract_DefaultsToActionInsteadOfAnInterview()
+    {
+        var contract = CopilotReasoningHost.ResponseContract("account-manager");
+
+        Assert.Contains("Default to READY", contract);
+        Assert.Contains("every earlier answer as settled", contract);
+        Assert.Contains("something the customer can click is actionable", contract);
+        Assert.Contains("Never ask about technologies", contract);
+        Assert.Contains("deployment, hosting, credentials", contract);
+        Assert.Contains("you must return READY using reasonable assumptions", contract);
+    }
+
+    [Fact]
+    public void DialogueTask_CapsClarificationAndKeepsDeliveryChoicesOutOfIntake()
+    {
+        var messages = new[]
+        {
+            new FlowMessage
+            {
+                Role = ConversationRole.Customer,
+                Content = "Give me a new design I can click."
+            },
+            new FlowMessage
+            {
+                Role = ConversationRole.AccountManager,
+                Content = "Which site should the redesign cover?",
+                IsQuestion = true
+            },
+            new FlowMessage
+            {
+                Role = ConversationRole.Customer,
+                Content = "Both."
+            }
+        };
+
+        var task = IntakeCoordinator.BuildDialogueTask(messages, OutcomeType.PullRequest);
+
+        Assert.Contains("this turn must return READY", task);
+        Assert.Contains("design the customer can click is actionable", task);
+        Assert.Contains("configured delivery outcome is PullRequest", task);
+        Assert.Contains("do not ask the customer", task);
+    }
 }
 
 public sealed class ModelSelectorTests
 {
     [Theory]
-    [InlineData("account-manager", 1, "gpt-5-mini")]
+    [InlineData("account-manager", 1, "claude-haiku-4.5")]
     [InlineData("software-engineer", 2, "gpt-5.4-mini")]
     [InlineData("software-engineer", 5, "gpt-5.4")]
     [InlineData("architect", 4, "claude-sonnet-5")]
@@ -169,6 +219,54 @@ public sealed class AgentCatalogTests
         Assert.Equal("software-engineer", manifest.Role);
         Assert.Equal(60, manifest.SortOrder);
         Assert.Contains("Produce working code", manifest.Instructions);
+    }
+}
+
+public sealed class CopilotReasoningHostTests
+{
+    [Fact]
+    public void AccountManagerInvocation_IsToolFreeAndUsesAnIsolatedCopilotHome()
+    {
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            "account-manager",
+            "account-manager",
+            "claude-haiku-4.5",
+            "Prompt");
+        var environment = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
+            CopilotReasoningHost.BuildProcessEnvironment(
+                "account-manager",
+                Path.Combine(Path.GetTempPath(), "harness", "ai-harness.db")));
+
+        Assert.Contains("--available-tools", arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.Contains("--no-custom-instructions", arguments);
+        Assert.Contains("--no-eager-powershell-resolution", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+        Assert.EndsWith(
+            Path.Combine("copilot-home", "account-manager"),
+            environment["COPILOT_HOME"]);
+    }
+
+    [Fact]
+    public void DeliveryAgentInvocation_PreservesCliToolsAndUserConfiguration()
+    {
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            "software-engineer",
+            "software-engineer",
+            "gpt-5.4-mini",
+            "Prompt");
+
+        Assert.Contains("--allow-all-tools", arguments);
+        Assert.DoesNotContain("--available-tools", arguments);
+        Assert.DoesNotContain("--disable-builtin-mcps", arguments);
+        Assert.Null(
+            CopilotReasoningHost.BuildProcessEnvironment(
+                "software-engineer",
+                Path.Combine(Path.GetTempPath(), "harness", "ai-harness.db")));
     }
 }
 

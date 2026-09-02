@@ -25,8 +25,12 @@ public sealed partial class CopilotCliRuntime(
     [
         "--agent",
         "--allow-all-tools",
+        "--available-tools",
+        "--disable-builtin-mcps",
         "--model",
         "--no-ask-user",
+        "--no-custom-instructions",
+        "--no-eager-powershell-resolution",
         "--output-format"
     ];
 

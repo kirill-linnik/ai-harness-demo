@@ -41,7 +41,7 @@ flowchart LR
 | --- | --- |
 | `AgentCatalog` | Discovers valid Copilot agent definitions from `.github\agents`, synchronizes display metadata, and preserves enabled state in SQLite. |
 | `RepositoryAnalyzer` | Runs `copilot init`, discovers repository boundaries inside the selected project, performs a bounded static study, and persists editable shared knowledge. |
-| `IntakeCoordinator` | Persists customer dialogue and asks one material clarification at a time before creating a task-ready handoff. |
+| `IntakeCoordinator` | Persists customer dialogue, defaults workable requests into a task-ready handoff, and permits at most one blocking clarification. |
 | `FlowPlanner` | Uses task complexity and domain signals to select only enabled specialists in dependency order. |
 | `ModelSelector` | Routes each role to a model using task complexity and prior retry rate. |
 | `FlowQueue` / `FlowWorker` | Recover queued work after restart and execute multiple independent flows concurrently. |
