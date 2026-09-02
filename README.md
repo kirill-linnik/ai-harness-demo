@@ -11,9 +11,31 @@ Prerequisites:
 - Windows, macOS, or Linux
 - .NET 10 SDK
 - Node.js 20.19+ (or 22.12+) and npm (needed to build the browser client; `dotnet build`/`dotnet run` do this automatically)
-- GitHub Copilot CLI
+- GitHub Copilot CLI, installed and authenticated
 - Git
 - Edge or Chrome for browser speech recognition
+
+Install Copilot CLI using one of the supported methods:
+
+```powershell
+# Windows (recommended)
+winget install GitHub.Copilot
+
+# Any platform with Node.js 22+
+npm install -g @github/copilot
+```
+
+Then verify and authenticate it before starting the harness:
+
+```powershell
+copilot --version
+copilot login
+```
+
+At startup, the harness resolves the configured `copilot.command`, rejects interactive editor
+bootstrap shims, and validates the CLI version and required programmatic options. The detected
+version and executable status appear in the sidebar and on **Settings**. The factory remains locked
+when this check fails.
 
 On Windows:
 

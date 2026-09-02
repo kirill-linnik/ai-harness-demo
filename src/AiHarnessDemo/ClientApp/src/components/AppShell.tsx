@@ -64,8 +64,12 @@ export function AppShell({
         <div className="sidebar-spacer"></div>
         <div className="runtime-card">
           <div className="runtime-line">
-            <span className={`status-light ${data?.copilotCliAvailable ? "" : "offline"}`}></span>
-            <strong>{data?.copilotCliAvailable ? "Copilot CLI ready" : "Copilot CLI unavailable"}</strong>
+            <span className={`status-light ${data?.copilotCli.ready ? "" : "offline"}`}></span>
+            <strong title={data?.copilotCli.detail}>
+              {data?.copilotCli.ready
+                ? `Copilot CLI ${data.copilotCli.version || "ready"}`
+                : "Copilot CLI unavailable"}
+            </strong>
           </div>
           <div className="runtime-line">
             <small>Repository</small>

@@ -10,6 +10,7 @@ public sealed class CopilotReasoningHost(
     ProcessRunner processRunner,
     HarnessPaths paths,
     WorkflowDefinitionProvider workflowProvider,
+    CopilotCliRuntime copilotCliRuntime,
     WorkflowPromptRenderer promptRenderer,
     WorkspaceHookRunner hookRunner)
     : ReasoningHost(new ReasoningHostConfig("copilot-cli"))
@@ -17,11 +18,18 @@ public sealed class CopilotReasoningHost(
     private const int MaximumPromptCharacters = 24_000;
 
     public override ReasoningHostReadiness CheckReadiness(
-        CancellationToken cancellationToken = default) =>
-        ExecutableLocator.Exists(
-            workflowProvider.GetValidated().Config.Copilot.Command)
-            ? ReasoningHostReadiness.CreateAvailable("Copilot CLI is available.")
-            : ReasoningHostReadiness.CreateUnavailable("Copilot CLI is not available on PATH.");
+        CancellationToken cancellationToken = default)
+    {
+        var command = workflowProvider.GetValidated().Config.Copilot.Command;
+        var status = copilotCliRuntime.Current;
+        return status.Ready &&
+               string.Equals(status.Command, command, StringComparison.Ordinal)
+            ? ReasoningHostReadiness.CreateAvailable(status.Detail)
+            : ReasoningHostReadiness.CreateUnavailable(
+                string.Equals(status.Command, command, StringComparison.Ordinal)
+                    ? status.Detail
+                    : $"Copilot CLI command '{command}' has not passed startup validation.");
+    }
 
     public override async Task<AgentRunResult> RunAgentAsync(
         AgentRunRequest request,
@@ -30,6 +38,17 @@ public sealed class CopilotReasoningHost(
         var context = RequireContext(request);
         var manifest = await agentCatalog.GetManifestAsync(context.AgentId, cancellationToken);
         var workflow = workflowProvider.GetValidated();
+        var copilotCli = await copilotCliRuntime.GetAsync(
+            workflow.Config.Copilot.Command,
+            cancellationToken);
+        if (!copilotCli.Ready)
+        {
+            return Failure(
+                "Copilot CLI is not ready.",
+                copilotCli.Detail,
+                AgentRunFailureKind.DependencyUnavailable,
+                "copilot-cli");
+        }
         request.Progress?.Invoke(new AgentRunProgress(
             AgentRunPhase.BuildingPrompt,
             "Rendering WORKFLOW.md with role and repository context."));
@@ -69,9 +88,9 @@ public sealed class CopilotReasoningHost(
                 cancellationToken);
             request.Progress?.Invoke(new AgentRunProgress(
                 AgentRunPhase.LaunchingAgentProcess,
-                $"Launching {workflow.Config.Copilot.Command} with {request.Model}."));
+                $"Launching Copilot CLI {copilotCli.Version} with {request.Model}."));
             result = await processRunner.RunAsync(
-                workflow.Config.Copilot.Command,
+                copilotCli.ResolvedPath,
                 [
                     "-C", request.WorkingDirectory,
                     "--add-dir", paths.Root,
@@ -134,7 +153,9 @@ public sealed class CopilotReasoningHost(
                 AgentRunFailureKind.Transient);
         }
 
-        return CopilotJsonlParser.Parse(result.StandardOutput);
+        return CopilotJsonlParser.Parse(
+            result.StandardOutput,
+            result.StandardError);
     }
 
     private static AgentExecutionContext RequireContext(AgentRunRequest request) =>

@@ -23,6 +23,7 @@ builder.Services.AddDbContextFactory<HarnessDbContext>(options =>
 
 builder.Services.AddSingleton<ProcessRunner>();
 builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<CopilotCliRuntime>();
 builder.Services.AddSingleton<RuntimeCircuitBreaker>();
 builder.Services.AddSingleton<RepositoryContextGate>();
 builder.Services.AddSingleton<WorkflowLoader>();
@@ -55,6 +56,12 @@ builder.Services.AddHostedService<FlowWorker>();
 var app = builder.Build();
 
 await DatabaseInitializer.InitializeAsync(app.Services);
+var startupWorkflow = app.Services
+    .GetRequiredService<WorkflowDefinitionProvider>()
+    .GetValidated();
+await app.Services
+    .GetRequiredService<CopilotCliRuntime>()
+    .RefreshAsync(startupWorkflow.Config.Copilot.Command);
 
 app.UseExceptionHandler();
 app.Use(LocalRequestGuard.ApplyAsync);

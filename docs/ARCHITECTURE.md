@@ -66,7 +66,8 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 ## Copilot CLI execution
 
 - Requires Git and a selected project folder containing at least one Git work tree.
-- Resolves native Copilot executables on macOS and Linux, plus native and npm command shims on Windows.
+- Resolves native and npm-installed Copilot CLI commands, skipping interactive Windows bootstrap
+  shims and falling back to the latest app-managed native CLI when available.
 - Creates the same `ai-harness/<task>-<flow-id>` branch in an isolated worktree for each project repository.
 - Loads the generic agents from this project with `--add-dir`.
 - Selects a model per role and launches non-interactive Copilot CLI execution.

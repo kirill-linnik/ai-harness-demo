@@ -14,6 +14,10 @@
     <ProjectReference Include="..\AiHarnessDemo.Core\AiHarnessDemo.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="AiHarnessDemo.Tests" />
+  </ItemGroup>
+
   <!--
     ClientApp (Vite + React + TypeScript) integration.
 

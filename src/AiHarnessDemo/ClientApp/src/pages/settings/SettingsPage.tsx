@@ -23,7 +23,7 @@ export function SettingsPage() {
 
   if (!data || !settings) return null;
 
-  const { agents, workflow } = data;
+  const { agents, copilotCli, workflow } = data;
   const enabledCount = agents.filter(agent => agent.enabled).length;
 
   async function onSave() {
@@ -71,6 +71,36 @@ export function SettingsPage() {
       </div>
       <section className="settings-grid">
         <div className="settings-stack">
+          <div className="card">
+            <div className="card-header">
+              <div>
+                <h3>Copilot CLI runtime</h3>
+                <p>Required for repository initialization and every agent execution.</p>
+              </div>
+              <span className={`status-pill ${copilotCli.ready ? "approved" : "failed"}`}>
+                {copilotCli.ready ? "Ready" : "Unavailable"}
+              </span>
+            </div>
+            <div className="card-body">
+              <div className="runtime-line">
+                <small>Command</small>
+                <strong className="mono">{copilotCli.command}</strong>
+              </div>
+              <div className="runtime-line">
+                <small>Version</small>
+                <strong>{copilotCli.version || "Not detected"}</strong>
+              </div>
+              <div className="runtime-line">
+                <small>Executable</small>
+                <strong title={copilotCli.resolvedPath}>
+                  {copilotCli.resolvedPath ? lastPathPart(copilotCli.resolvedPath) : "Not resolved"}
+                </strong>
+              </div>
+              <div className={copilotCli.ready ? "callout" : "pushback-callout"} style={{ marginTop: 14 }}>
+                {copilotCli.detail}
+              </div>
+            </div>
+          </div>
           <div className="card">
             <div className="card-header">
               <div>

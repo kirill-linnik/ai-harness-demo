@@ -44,6 +44,178 @@ public sealed class CopilotJsonlParserTests
         Assert.False(result.Success);
         Assert.Equal(AgentRunFailureKind.InvalidOutput, result.FailureKind);
     }
+
+    [Fact]
+    public void Parse_UsesCompletedRootDeltasWhenFinalMessageEventIsMissing()
+    {
+        const string jsonl = """
+            {"type":"assistant.message_start","data":{"messageId":"root"}}
+            {"type":"assistant.message_delta","data":{"messageId":"root","deltaContent":"INTAKE_STATUS: READY\n"}}
+            {"type":"assistant.message_delta","data":{"messageId":"root","deltaContent":"CUSTOMER_REPLY: Ready.\nTASK_BRIEF: Refresh the site."}}
+            {"type":"assistant.message","agentId":"child","data":{"messageId":"child","content":"Ignore child response."}}
+            {"type":"assistant.turn_end","data":{"turnId":"0"}}
+            {"type":"result"}
+            """;
+
+        var result = CopilotJsonlParser.Parse(jsonl);
+
+        Assert.True(result.Success);
+        Assert.Equal(
+            "INTAKE_STATUS: READY\nCUSTOMER_REPLY: Ready.\nTASK_BRIEF: Refresh the site.",
+            result.OutputSummary);
+    }
+
+    [Fact]
+    public void Parse_ReportsSessionErrorsAndMarksRateLimitsTransient()
+    {
+        const string jsonl = """
+            {"type":"session.error","data":{"errorType":"rate_limit","message":"Please retry shortly.","statusCode":429}}
+            """;
+
+        var result = CopilotJsonlParser.Parse(jsonl);
+
+        Assert.False(result.Success);
+        Assert.Equal(AgentRunFailureKind.Transient, result.FailureKind);
+        Assert.Contains("rate_limit", result.Error);
+        Assert.Contains("Please retry shortly.", result.Error);
+    }
+
+    [Fact]
+    public void Parse_TreatsAnEarlyExitWithStandardErrorAsAmbiguous()
+    {
+        var result = CopilotJsonlParser.Parse(
+            string.Empty,
+            "\u001b[31;1mThe transport closed unexpectedly.\u001b[0m");
+
+        Assert.False(result.Success);
+        Assert.Equal(AgentRunFailureKind.AmbiguousCrash, result.FailureKind);
+        Assert.Equal(
+            "Copilot CLI ended without a complete assistant response. " +
+            "The transport closed unexpectedly.",
+            result.Error);
+    }
+}
+
+public sealed class CopilotCliRuntimeTests
+{
+    [Fact]
+    public async Task RefreshAsync_ValidatesTheProgrammaticCliContract()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-copilot-probe-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var command = CreateCliShim(
+                root,
+                "--agent --allow-all-tools --model --no-ask-user --output-format");
+            var status = await CreateRuntime(root).RefreshAsync(command);
+
+            Assert.True(status.Ready);
+            Assert.Equal("9.8.7", status.Version);
+            Assert.True(
+                string.Equals(
+                    command,
+                    status.ResolvedPath,
+                    StringComparison.OrdinalIgnoreCase),
+                $"Expected '{command}', resolved '{status.ResolvedPath}'.");
+            Assert.Contains("non-interactive JSON execution", status.Detail);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RefreshAsync_RejectsACliWithoutJsonOutputSupport()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-copilot-capabilities-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var command = CreateCliShim(
+                root,
+                "--agent --allow-all-tools --model --no-ask-user");
+            var status = await CreateRuntime(root).RefreshAsync(command);
+
+            Assert.False(status.Ready);
+            Assert.Contains("--output-format", status.Detail);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RefreshAsync_ReportsInstallationGuidanceWhenCliIsMissing()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-copilot-missing-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var status = await CreateRuntime(root).RefreshAsync(
+                Path.Combine(root, "missing-copilot"));
+
+            Assert.False(status.Ready);
+            Assert.Empty(status.ResolvedPath);
+            Assert.Contains("winget install GitHub.Copilot", status.Detail);
+            Assert.Contains("npm install -g @github/copilot", status.Detail);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static CopilotCliRuntime CreateRuntime(string root) =>
+        new(
+            new ProcessRunner(),
+            new HarnessPaths(
+                root,
+                Path.Combine(root, ".github", "agents"),
+                Path.Combine(root, "harness.db")),
+            TimeProvider.System,
+            NullLogger<CopilotCliRuntime>.Instance);
+
+    private static string CreateCliShim(string root, string helpOutput)
+    {
+        var command = Path.Combine(root, "copilot.cmd");
+        File.WriteAllText(command, "@echo off\r\nexit /b 1\r\n");
+        File.WriteAllText(
+            Path.Combine(root, "copilot.ps1"),
+            $$"""
+              if ($args[0] -eq '--version') {
+                  Write-Output 'GitHub Copilot CLI 9.8.7'
+                  exit 0
+              }
+              if ($args[0] -eq 'help') {
+                  Write-Output '{{helpOutput}}'
+                  exit 0
+              }
+              exit 7
+              """);
+        return command;
+    }
 }
 
 public sealed class LocalRequestGuardTests
@@ -87,6 +259,86 @@ public sealed class RepositoryContextGateTests
 
 public sealed class ProcessRunnerTests
 {
+    [Fact]
+    public void Resolve_SkipsInteractiveCopilotBootstrapperForLatestManagedCli()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-copilot-locator-{Guid.NewGuid():N}");
+        var shimDirectory = Path.Combine(root, "interactive-shim");
+        var managedRoot = Path.Combine(root, "managed-cli");
+        var olderExecutable = Path.Combine(managedRoot, "1.0.79-9", "copilot.exe");
+        var latestExecutable = Path.Combine(managedRoot, "1.0.80", "copilot.exe");
+        Directory.CreateDirectory(shimDirectory);
+        Directory.CreateDirectory(Path.GetDirectoryName(olderExecutable)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(latestExecutable)!);
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(shimDirectory, "copilot.bat"),
+                "@echo off\r\npwsh -File copilot.ps1 %*\r\n");
+            File.WriteAllText(
+                Path.Combine(shimDirectory, "copilot.ps1"),
+                "$answer = Read-Host \"Install GitHub Copilot CLI? (y/N)\"");
+            File.WriteAllText(olderExecutable, string.Empty);
+            File.WriteAllText(latestExecutable, string.Empty);
+
+            var resolved = ExecutableLocator.Resolve(
+                "copilot",
+                root,
+                shimDirectory,
+                managedRoot);
+
+            Assert.Equal(latestExecutable, resolved);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Resolve_PreservesNonInteractiveNpmCopilotShim()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-copilot-shim-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var command = Path.Combine(root, "copilot.cmd");
+        var powerShellShim = Path.Combine(root, "copilot.ps1");
+
+        try
+        {
+            File.WriteAllText(command, "@echo off\r\nnode copilot.js %*\r\n");
+            File.WriteAllText(powerShellShim, "& node copilot.js @args\r\n");
+
+            var resolved = ExecutableLocator.Resolve(
+                "copilot",
+                root,
+                root,
+                managedCopilotRoot: null);
+
+            Assert.True(
+                string.Equals(command, resolved, StringComparison.OrdinalIgnoreCase),
+                $"Expected '{command}', resolved '{resolved}'.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task RunAsync_LaunchesThePlatformCommandWithoutLosingArguments()
     {

@@ -13,13 +13,7 @@ public static class DemoApi
     {
         var api = endpoints.MapGroup("/api");
 
-        api.MapGet("/health", (WorkflowDefinitionProvider workflowProvider) => Results.Ok(new
-        {
-            status = "ready",
-            utc = DateTimeOffset.UtcNow,
-            copilotCliAvailable = ExecutableLocator.Exists(
-                workflowProvider.GetValidated().Config.Copilot.Command)
-        }));
+        api.MapGet("/health", GetHealthAsync);
 
         api.MapGet("/bootstrap", GetBootstrapAsync);
         api.MapGet("/settings", GetSettingsAsync);
@@ -46,10 +40,29 @@ public static class DemoApi
         return endpoints;
     }
 
+    private static async Task<IResult> GetHealthAsync(
+        WorkflowDefinitionProvider workflowProvider,
+        CopilotCliRuntime copilotCliRuntime,
+        CancellationToken cancellationToken)
+    {
+        var workflow = workflowProvider.GetValidated();
+        var copilotCli = await copilotCliRuntime.GetAsync(
+            workflow.Config.Copilot.Command,
+            cancellationToken);
+        return Results.Ok(new
+        {
+            status = copilotCli.Ready ? "ready" : "degraded",
+            utc = DateTimeOffset.UtcNow,
+            copilotCliAvailable = copilotCli.Ready,
+            copilotCli = ToDto(copilotCli)
+        });
+    }
+
     private static async Task<IResult> GetBootstrapAsync(
         IDbContextFactory<HarnessDbContext> databaseFactory,
         AgentCatalog catalog,
         WorkflowDefinitionProvider workflowProvider,
+        CopilotCliRuntime copilotCliRuntime,
         CancellationToken cancellationToken)
     {
         var agents = await catalog.SyncAsync(cancellationToken);
@@ -72,11 +85,13 @@ public static class DemoApi
             learningCount,
             totalMilliseconds / 60_000);
         var workflow = workflowProvider.GetValidated();
-        var copilotAvailable = ExecutableLocator.Exists(workflow.Config.Copilot.Command);
+        var copilotCli = await copilotCliRuntime.GetAsync(
+            workflow.Config.Copilot.Command,
+            cancellationToken);
         var workflowStatus = workflowProvider.Status();
         var factoryDisabledReason = FactoryDisabledReason(
             settings,
-            copilotAvailable,
+            copilotCli,
             workflowStatus);
 
         return Results.Ok(new BootstrapDto(
@@ -84,7 +99,8 @@ public static class DemoApi
             agents.Select(item => item.ToDto()).ToList(),
             flows.Select(item => item.ToSummaryDto()).ToList(),
             stats,
-            copilotAvailable,
+            copilotCli.Ready,
+            ToDto(copilotCli),
             ToDto(workflowStatus),
             string.IsNullOrEmpty(factoryDisabledReason),
             factoryDisabledReason));
@@ -336,12 +352,16 @@ public static class DemoApi
     private static async Task<IResult> RefreshRuntimeAsync(
         WorkflowDefinitionProvider workflowProvider,
         AgentCatalog catalog,
+        CopilotCliRuntime copilotCliRuntime,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         FlowQueue queue,
         CancellationToken cancellationToken)
     {
         var requestedAt = DateTimeOffset.UtcNow;
-        _ = workflowProvider.GetValidated();
+        var workflow = workflowProvider.GetValidated();
+        await copilotCliRuntime.RefreshAsync(
+            workflow.Config.Copilot.Command,
+            cancellationToken);
         await catalog.SyncAsync(cancellationToken);
 
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
@@ -361,7 +381,13 @@ public static class DemoApi
             queued = true,
             coalesced = false,
             requestedAt,
-            operations = new[] { "workflow-reload", "agent-catalog-reconcile", "flow-recovery" }
+            operations = new[]
+            {
+                "workflow-reload",
+                "copilot-cli-readiness",
+                "agent-catalog-reconcile",
+                "flow-recovery"
+            }
         });
     }
 
@@ -393,11 +419,28 @@ public static class DemoApi
             status.MaxAttempts,
             status.WorkspaceRoot);
 
+    private static CopilotCliStatusDto ToDto(CopilotCliRuntimeStatus status) =>
+        new(
+            status.Ready,
+            status.Command,
+            status.ResolvedPath,
+            status.Version,
+            status.Detail,
+            status.CheckedAt);
+
     private static string FactoryDisabledReason(
         HarnessSettings settings,
-        bool copilotAvailable,
+        CopilotCliRuntimeStatus copilotCli,
         WorkflowRuntimeStatus workflow)
     {
+        if (!copilotCli.Ready)
+        {
+            return copilotCli.Detail;
+        }
+        if (!workflow.Ready)
+        {
+            return workflow.LastError ?? "WORKFLOW.md is not ready.";
+        }
         if (string.IsNullOrWhiteSpace(settings.RepositoryPath) ||
             string.IsNullOrWhiteSpace(settings.RepositoryKnowledge))
         {
@@ -411,15 +454,6 @@ public static class DemoApi
         {
             return "The selected project folder contains no Git repositories. Choose a project with source control in Settings.";
         }
-        if (!copilotAvailable)
-        {
-            return "The configured Copilot CLI command is unavailable. Install or repair it before starting the factory.";
-        }
-        if (!workflow.Ready)
-        {
-            return workflow.LastError ?? "WORKFLOW.md is not ready.";
-        }
-
         return string.Empty;
     }
 }

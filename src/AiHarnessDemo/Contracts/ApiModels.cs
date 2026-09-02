@@ -151,12 +151,21 @@ public sealed record WorkflowStatusDto(
     int? MaxAttempts,
     string? WorkspaceRoot);
 
+public sealed record CopilotCliStatusDto(
+    bool Ready,
+    string Command,
+    string ResolvedPath,
+    string Version,
+    string Detail,
+    DateTimeOffset CheckedAt);
+
 public sealed record BootstrapDto(
     SettingsDto Settings,
     IReadOnlyList<AgentDto> Agents,
     IReadOnlyList<FlowSummaryDto> Flows,
     HarnessStatsDto Stats,
     bool CopilotCliAvailable,
+    CopilotCliStatusDto CopilotCli,
     WorkflowStatusDto Workflow,
     bool FactoryEnabled,
     string FactoryDisabledReason);

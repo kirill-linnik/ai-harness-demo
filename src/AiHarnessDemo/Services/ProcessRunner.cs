@@ -274,7 +274,18 @@ public static class ExecutableLocator
 
     public static string? Resolve(
         string executable,
-        string? workingDirectory = null)
+        string? workingDirectory = null) =>
+        Resolve(
+            executable,
+            workingDirectory,
+            Environment.GetEnvironmentVariable("PATH"),
+            ManagedCopilotRoot());
+
+    internal static string? Resolve(
+        string executable,
+        string? workingDirectory,
+        string? searchPath,
+        string? managedCopilotRoot)
     {
         if (string.IsNullOrWhiteSpace(executable))
         {
@@ -291,7 +302,11 @@ public static class ExecutableLocator
             return ResolveCandidate(path);
         }
 
-        foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
+        var isBareWindowsCopilot =
+            OperatingSystem.IsWindows() &&
+            (string.Equals(executable, "copilot", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(executable, "copilot.exe", StringComparison.OrdinalIgnoreCase));
+        foreach (var directory in (searchPath ?? string.Empty)
                      .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
             var normalizedDirectory = directory.Trim().Trim('"');
@@ -303,8 +318,18 @@ public static class ExecutableLocator
             var resolved = ResolveCandidate(Path.Combine(normalizedDirectory, executable));
             if (resolved is not null)
             {
+                if (isBareWindowsCopilot &&
+                    IsInteractiveCopilotBootstrapper(resolved))
+                {
+                    continue;
+                }
                 return resolved;
             }
+        }
+
+        if (isBareWindowsCopilot)
+        {
+            return ResolveManagedCopilot(managedCopilotRoot);
         }
 
         return null;
@@ -331,6 +356,108 @@ public static class ExecutableLocator
         }
 
         return null;
+    }
+
+    private static bool IsInteractiveCopilotBootstrapper(string executable)
+    {
+        var extension = Path.GetExtension(executable);
+        if (!extension.Equals(".cmd", StringComparison.OrdinalIgnoreCase) &&
+            !extension.Equals(".bat", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var powerShellShim = Path.ChangeExtension(executable, ".ps1");
+        if (!File.Exists(powerShellShim))
+        {
+            return true;
+        }
+
+        try
+        {
+            return File.ReadLines(powerShellShim).Any(line =>
+                line.Contains("Read-Host", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("PromptForChoice", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    private static string? ManagedCopilotRoot()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        var localApplicationData = Environment.GetFolderPath(
+            Environment.SpecialFolder.LocalApplicationData);
+        return string.IsNullOrWhiteSpace(localApplicationData)
+            ? null
+            : Path.Combine(
+                localApplicationData,
+                "github-copilot-sdk",
+                "cli");
+    }
+
+    private static string? ResolveManagedCopilot(string? root)
+    {
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Directory.EnumerateDirectories(root)
+                .Select(directory =>
+                {
+                    var executable = Path.Combine(directory, "copilot.exe");
+                    return new
+                    {
+                        Path = executable,
+                        SortKey = ManagedCopilotSortKey(directory, executable)
+                    };
+                })
+                .Where(candidate => IsExecutableFile(candidate.Path))
+                .OrderByDescending(candidate => candidate.SortKey)
+                .Select(candidate => candidate.Path)
+                .FirstOrDefault();
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static (Version Version, bool Stable, int Revision, DateTime ModifiedAt)
+        ManagedCopilotSortKey(string directory, string executable)
+    {
+        var directoryName = Path.GetFileName(directory);
+        var separator = directoryName.IndexOf('-');
+        var versionText = separator < 0
+            ? directoryName
+            : directoryName[..separator];
+        var revisionText = separator < 0
+            ? string.Empty
+            : directoryName[(separator + 1)..];
+        _ = Version.TryParse(versionText, out var version);
+        _ = int.TryParse(revisionText, out var revision);
+        return (
+            version ?? new Version(0, 0),
+            separator < 0,
+            revision,
+            File.GetLastWriteTimeUtc(executable));
     }
 
     private static IEnumerable<string> WindowsExecutableExtensions() =>

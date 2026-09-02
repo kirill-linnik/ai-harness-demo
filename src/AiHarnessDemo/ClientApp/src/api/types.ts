@@ -209,12 +209,22 @@ export interface WorkflowStatusDto {
   workspaceRoot: string | null;
 }
 
+export interface CopilotCliStatusDto {
+  ready: boolean;
+  command: string;
+  resolvedPath: string;
+  version: string;
+  detail: string;
+  checkedAt: string;
+}
+
 export interface BootstrapDto {
   settings: SettingsDto;
   agents: AgentDto[];
   flows: FlowSummaryDto[];
   stats: HarnessStatsDto;
   copilotCliAvailable: boolean;
+  copilotCli: CopilotCliStatusDto;
   workflow: WorkflowStatusDto;
   factoryEnabled: boolean;
   factoryDisabledReason: string;
