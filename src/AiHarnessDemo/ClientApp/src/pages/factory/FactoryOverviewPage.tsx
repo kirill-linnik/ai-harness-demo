@@ -68,8 +68,8 @@ export function FactoryOverviewPage() {
             The factory assembles the team.
           </h2>
           <p>
-            Account Manager clarifies the brief. Team Lead selects enabled specialists. The harness
-            observes every handoff, model choice, pushback, and correction.
+            Account Manager clarifies and confirms the brief with you. Team Lead then selects enabled
+            specialists. The harness observes every handoff, model choice, pushback, and correction.
           </p>
           <div className="hero-actions">
             <button className="button primary" onClick={startSpeaking}>

@@ -17,10 +17,11 @@ public sealed partial class IntakeCoordinator(
     AgentRunner agentRunner,
     IWorkspaceManager workspaceManager,
     HandoffGateEngine handoffGate,
-    RepositoryContextGate contextGate)
+    RepositoryContextGate contextGate,
+    FlowQueue flowQueue)
 {
     [GeneratedRegex(
-        @"(?im)^\s*(?:\*\*)?INTAKE_STATUS(?:\*\*)?\s*:\s*(READY|NEEDS_CLARIFICATION)\s*$")]
+        @"(?im)^\s*(?:\*\*)?INTAKE_STATUS(?:\*\*)?\s*:\s*(NEEDS_CLARIFICATION|AWAITING_CONFIRMATION|CONFIRMED)\s*$")]
     private static partial Regex IntakeStatusPattern();
 
     [GeneratedRegex(
@@ -71,6 +72,7 @@ public sealed partial class IntakeCoordinator(
         {
             throw new InvalidOperationException("This factory flow has already left intake.");
         }
+        var pendingConfirmationBrief = GetPendingConfirmationBrief(flow);
 
         var customerMessage = new FlowMessage
         {
@@ -84,7 +86,10 @@ public sealed partial class IntakeCoordinator(
             .Where(item => item.Role == ConversationRole.Customer)
             .Select(item => item.Content)
             .ToList();
-        flow.ConsolidatedRequest = FormatCustomerInputs(customerMessages);
+        if (string.IsNullOrWhiteSpace(pendingConfirmationBrief))
+        {
+            flow.ConsolidatedRequest = FormatCustomerInputs(customerMessages);
+        }
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);
 
@@ -107,7 +112,7 @@ public sealed partial class IntakeCoordinator(
             AgentId = accountManager.Id,
             AgentName = accountManager.Name,
             AgentRole = accountManager.Role,
-            Label = "Clarify customer request",
+            Label = "Review customer intake",
             Model = model.Model,
             ModelReason = model.Reason,
             Status = StepStatus.Running,
@@ -143,7 +148,10 @@ public sealed partial class IntakeCoordinator(
                     accountManager.Role,
                     model.Model,
                     intakeStep.Attempt,
-                    BuildDialogueTask(flow.Messages, flow.Outcome),
+                    BuildDialogueTask(
+                        flow.Messages,
+                        flow.Outcome,
+                        pendingConfirmationBrief),
                     flow.RepositoryKnowledge,
                     workspace.Path,
                     flow.Outcome,
@@ -182,21 +190,30 @@ public sealed partial class IntakeCoordinator(
         }
 
         stopwatch.Stop();
-        var response = ParseResponse(result.Output);
-        flow.ConsolidatedRequest = response.Ready
-            ? response.TaskBrief
-            : FormatCustomerInputs(customerMessages);
+        var response = ApplyConfirmationGate(
+            ParseResponse(result.Output),
+            pendingConfirmationBrief);
+        flow.ConsolidatedRequest =
+            response.Status == AccountManagerIntakeStatus.NeedsClarification
+                ? FormatCustomerInputs(customerMessages)
+                : response.TaskBrief;
         var accountManagerMessage = new FlowMessage
         {
             FlowRunId = flow.Id,
             Role = ConversationRole.AccountManager,
             Content = response.Reply,
-            IsQuestion = !response.Ready
+            IsQuestion = response.Status != AccountManagerIntakeStatus.Confirmed
         };
         flow.Messages.Add(accountManagerMessage);
         database.Entry(accountManagerMessage).State = EntityState.Added;
 
-        intakeStep.Label = response.Ready ? "Request aligned" : "Clarification requested";
+        intakeStep.Label = response.Status switch
+        {
+            AccountManagerIntakeStatus.NeedsClarification => "Clarification requested",
+            AccountManagerIntakeStatus.AwaitingConfirmation => "Customer confirmation requested",
+            AccountManagerIntakeStatus.Confirmed => "Customer confirmed brief",
+            _ => throw new InvalidOperationException("Unsupported Account Manager intake status.")
+        };
         intakeStep.Status = StepStatus.Completed;
         intakeStep.Phase = AgentRunPhase.Succeeded;
         intakeStep.ExecutionAttempts = result.ExecutionAttempts;
@@ -223,25 +240,47 @@ public sealed partial class IntakeCoordinator(
             ActionType = response.Ready
                 ? HandoffActionType.Advance
                 : HandoffActionType.RequestRevision,
-            Summary = result.Output,
+            Summary = string.IsNullOrWhiteSpace(response.TaskBrief)
+                ? result.Output
+                : response.TaskBrief,
             Evidence = $"Copilot Account Manager reviewed {customerMessages.Count} customer turn(s).",
             BlastRadius = HandoffBlastRadius.Low
         });
         flow.GateRecords.Add(intakeGate);
         database.Entry(intakeGate).State = EntityState.Added;
+        var (intakeEventType, intakeEventMessage) = response.Status switch
+        {
+            AccountManagerIntakeStatus.NeedsClarification => (
+                "intake.clarification",
+                "Copilot Account Manager requested one material clarification."),
+            AccountManagerIntakeStatus.AwaitingConfirmation => (
+                "intake.confirmation_requested",
+                "Copilot Account Manager presented its understanding for customer confirmation."),
+            AccountManagerIntakeStatus.Confirmed => (
+                "intake.confirmed",
+                "Customer explicitly confirmed the Account Manager brief."),
+            _ => throw new InvalidOperationException("Unsupported Account Manager intake status.")
+        };
         var intakeEvent = new FlowEvent
         {
             FlowRunId = flow.Id,
             FlowStepId = intakeStep.Id,
-            Type = response.Ready ? "intake.ready" : "intake.clarification",
-            Message = response.Ready
-                ? "Copilot Account Manager confirmed a task-ready brief."
-                : "Copilot Account Manager requested one material clarification."
+            Type = intakeEventType,
+            Message = intakeEventMessage
         };
         flow.Events.Add(intakeEvent);
         database.Entry(intakeEvent).State = EntityState.Added;
+        var queuedEvent = PrepareConfirmedHandoff(flow, response);
+        if (queuedEvent is not null)
+        {
+            database.Entry(queuedEvent).State = EntityState.Added;
+        }
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);
+        if (queuedEvent is not null && !flowQueue.Queue(flow.Id))
+        {
+            throw new InvalidOperationException("Unable to queue the customer-confirmed flow.");
+        }
 
         return new IntakeResponse(
             flow.ToDetailDto(),
@@ -262,23 +301,67 @@ public sealed partial class IntakeCoordinator(
                 "Expected INTAKE_STATUS, CUSTOMER_REPLY, and TASK_BRIEF markers.");
         }
 
-        var ready = string.Equals(
-            status.Groups[1].Value,
-            "READY",
-            StringComparison.OrdinalIgnoreCase);
+        var intakeStatus = status.Groups[1].Value.ToUpperInvariant() switch
+        {
+            "NEEDS_CLARIFICATION" => AccountManagerIntakeStatus.NeedsClarification,
+            "AWAITING_CONFIRMATION" => AccountManagerIntakeStatus.AwaitingConfirmation,
+            "CONFIRMED" => AccountManagerIntakeStatus.Confirmed,
+            _ => throw new InvalidOperationException(
+                "Copilot Account Manager returned an unsupported intake status.")
+        };
         var taskBrief = brief.Groups[1].Value.Trim();
-        if (ready &&
+        var requiresBrief = intakeStatus is
+            AccountManagerIntakeStatus.AwaitingConfirmation or
+            AccountManagerIntakeStatus.Confirmed;
+        if (requiresBrief &&
             (string.IsNullOrWhiteSpace(taskBrief) ||
              string.Equals(taskBrief, "NONE", StringComparison.OrdinalIgnoreCase)))
         {
             throw new InvalidOperationException(
-                "Copilot Account Manager marked the request ready without a TASK_BRIEF.");
+                "Copilot Account Manager requested or recorded confirmation without a TASK_BRIEF.");
         }
 
         return new AccountManagerResponse(
-            ready,
+            intakeStatus,
             reply.Groups[1].Value.Trim(),
-            ready ? taskBrief : string.Empty);
+            requiresBrief ? taskBrief : string.Empty);
+    }
+
+    internal static AccountManagerResponse ApplyConfirmationGate(
+        AccountManagerResponse response,
+        string? pendingConfirmationBrief)
+    {
+        if (!response.Ready)
+        {
+            return response;
+        }
+        if (string.IsNullOrWhiteSpace(pendingConfirmationBrief))
+        {
+            throw new InvalidOperationException(
+                "Copilot Account Manager cannot confirm a brief that the customer has not reviewed.");
+        }
+
+        return response with { TaskBrief = pendingConfirmationBrief.Trim() };
+    }
+
+    internal static FlowEvent? PrepareConfirmedHandoff(
+        FlowRun flow,
+        AccountManagerResponse response)
+    {
+        if (!response.Ready)
+        {
+            return null;
+        }
+
+        flow.Status = FlowStatus.Queued;
+        var queuedEvent = new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = "flow.queued",
+            Message = "Customer-confirmed brief entered the AI factory queue."
+        };
+        flow.Events.Add(queuedEvent);
+        return queuedEvent;
     }
 
     private static FlowRun CreateFlow(string message, HarnessSettings settings) =>
@@ -312,9 +395,21 @@ public sealed partial class IntakeCoordinator(
             Environment.NewLine,
             customerMessages.Select((item, index) => $"Customer input {index + 1}: {item}"));
 
+    private static string GetPendingConfirmationBrief(FlowRun flow)
+    {
+        var latestIntakeEvent = flow.Events
+            .Where(item => item.Type.StartsWith("intake.", StringComparison.Ordinal))
+            .OrderByDescending(item => item.CreatedAt)
+            .FirstOrDefault();
+        return latestIntakeEvent?.Type is "intake.confirmation_requested" or "intake.ready"
+            ? flow.ConsolidatedRequest.Trim()
+            : string.Empty;
+    }
+
     internal static string BuildDialogueTask(
         IEnumerable<FlowMessage> messages,
-        OutcomeType outcome)
+        OutcomeType outcome,
+        string? pendingConfirmationBrief = null)
     {
         var orderedMessages = messages
             .OrderBy(item => item.CreatedAt)
@@ -322,22 +417,33 @@ public sealed partial class IntakeCoordinator(
         var dialogue = string.Join(
             Environment.NewLine,
             orderedMessages.Select(item => $"{item.Role}: {item.Content}"));
-        var clarificationPolicy = orderedMessages.Any(
-            item => item.Role == ConversationRole.AccountManager && item.IsQuestion)
-            ? "The Account Manager has already asked a clarification question, so this turn must " +
-              "return READY using reasonable assumptions."
-            : "Clarification is exceptional: ask only if no safe interpretation identifies the " +
-              "target product or visible outcome.";
+        var confirmationPolicy = string.IsNullOrWhiteSpace(pendingConfirmationBrief)
+            ? "No proposed brief is awaiting customer approval, so this turn must not return " +
+              "CONFIRMED. If the request is actionable, return AWAITING_CONFIRMATION with a complete " +
+              "brief and ask the customer to validate your concise understanding. "
+            : "The customer is replying to the unconfirmed brief below. Return CONFIRMED only if " +
+              "their latest message clearly approves that brief without a correction. If they " +
+              "correct it, incorporate the correction and request confirmation of the revised brief; " +
+              "if they only reject it, ask one focused clarification question. ";
+        var pendingBriefContext = string.IsNullOrWhiteSpace(pendingConfirmationBrief)
+            ? string.Empty
+            : Environment.NewLine +
+              Environment.NewLine +
+              "UNCONFIRMED_TASK_BRIEF:" +
+              Environment.NewLine +
+              pendingConfirmationBrief.Trim();
 
         return
             "Turn this complete customer dialogue into a brief the delivery team can act on. " +
-            "Default to READY once meaningful work can begin; downstream details do not need to be " +
-            "settled during intake. Treat all prior answers as final and do not reconfirm them. " +
+            "Default to AWAITING_CONFIRMATION once meaningful work can begin; downstream details do " +
+            "not need to be settled during intake. Treat all prior answers as settled and do not ask " +
+            "for the same detail twice. Ask at most one focused clarification question in this turn. " +
             "A request for a design the customer can click is actionable and requires an interactive " +
             "result, not another prototype, implementation, or deployment choice. " +
             $"The configured delivery outcome is {outcome}; do not ask the customer how the work " +
             "should be packaged, released, or deployed. " +
-            clarificationPolicy +
+            confirmationPolicy +
+            pendingBriefContext +
             Environment.NewLine +
             Environment.NewLine +
             dialogue;
@@ -374,4 +480,20 @@ public sealed partial class IntakeCoordinator(
     }
 }
 
-public sealed record AccountManagerResponse(bool Ready, string Reply, string TaskBrief);
+public enum AccountManagerIntakeStatus
+{
+    NeedsClarification,
+    AwaitingConfirmation,
+    Confirmed
+}
+
+public sealed record AccountManagerResponse(
+    AccountManagerIntakeStatus Status,
+    string Reply,
+    string TaskBrief)
+{
+    public bool Ready => Status == AccountManagerIntakeStatus.Confirmed;
+
+    public bool AwaitingConfirmation =>
+        Status == AccountManagerIntakeStatus.AwaitingConfirmation;
+}

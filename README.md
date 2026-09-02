@@ -66,7 +66,7 @@ Open `http://localhost:5283`.
 1. Open **Settings**, enable the agents you want Team Lead to consider, and choose a local project folder.
 2. Leave **Run Copilot init** selected, then choose **Initialize and study repository**. Review and edit the generated shared knowledge.
 3. Open **AI Factory**, click **Listen to the next task**, and speak the idea.
-4. Answer Account Manager's clarification, send the brief to Team Lead, and watch the execution graph.
+4. Correct or confirm Account Manager's understanding. Confirmation sends the brief straight to Team Lead so you can watch the execution graph.
 5. Open the customer preview, speak feedback, then approve the result or start another iteration.
 6. Show **Execution history** and **Harness memory** to explain model routing and cross-flow learning.
 

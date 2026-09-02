@@ -87,16 +87,17 @@ public sealed class IntakeCoordinatorTests
             """);
 
         Assert.False(result.Ready);
+        Assert.Equal(AccountManagerIntakeStatus.NeedsClarification, result.Status);
         Assert.Contains("observable result", result.Reply);
         Assert.Empty(result.TaskBrief);
     }
 
     [Fact]
-    public void ParseResponse_LoadsTaskReadyBrief()
+    public void ParseResponse_LoadsBriefAwaitingCustomerConfirmation()
     {
         var result = IntakeCoordinator.ParseResponse("""
-            INTAKE_STATUS: READY
-            CUSTOMER_REPLY: The implementation brief is ready for Team Lead.
+            INTAKE_STATUS: AWAITING_CONFIRMATION
+            CUSTOMER_REPLY: Do I understand correctly that you want a persistent onboarding checklist? If yes, I'll ask the team to implement it.
             TASK_BRIEF:
             Outcome: Add a persistent onboarding checklist.
             Acceptance:
@@ -104,10 +105,25 @@ public sealed class IntakeCoordinatorTests
             - Includes automated tests.
             """);
 
-        Assert.True(result.Ready);
+        Assert.False(result.Ready);
+        Assert.True(result.AwaitingConfirmation);
         Assert.Contains("persistent onboarding", result.TaskBrief);
         Assert.Contains("keyboard navigation", result.TaskBrief);
         Assert.Contains("automated tests", result.TaskBrief);
+    }
+
+    [Fact]
+    public void ParseResponse_LoadsCustomerConfirmedBrief()
+    {
+        var result = IntakeCoordinator.ParseResponse("""
+            INTAKE_STATUS: CONFIRMED
+            CUSTOMER_REPLY: Thanks - I'll ask the team to implement it now.
+            TASK_BRIEF:
+            Outcome: Add a persistent onboarding checklist.
+            """);
+
+        Assert.True(result.Ready);
+        Assert.Equal(AccountManagerIntakeStatus.Confirmed, result.Status);
     }
 
     [Fact]
@@ -120,20 +136,20 @@ public sealed class IntakeCoordinatorTests
     }
 
     [Fact]
-    public void AccountManagerContract_DefaultsToActionInsteadOfAnInterview()
+    public void AccountManagerContract_RequiresExplicitConfirmationWithoutAnInterview()
     {
         var contract = CopilotReasoningHost.ResponseContract("account-manager");
 
-        Assert.Contains("Default to READY", contract);
-        Assert.Contains("every earlier answer as settled", contract);
+        Assert.Contains("Default to AWAITING_CONFIRMATION", contract);
+        Assert.Contains("explicitly and unambiguously approves", contract);
+        Assert.Contains("most recent AWAITING_CONFIRMATION brief", contract);
         Assert.Contains("something the customer can click is actionable", contract);
         Assert.Contains("Never ask about technologies", contract);
         Assert.Contains("deployment, hosting, credentials", contract);
-        Assert.Contains("you must return READY using reasonable assumptions", contract);
     }
 
     [Fact]
-    public void DialogueTask_CapsClarificationAndKeepsDeliveryChoicesOutOfIntake()
+    public void DialogueTask_RequiresConfirmationAndKeepsDeliveryChoicesOutOfIntake()
     {
         var messages = new[]
         {
@@ -157,10 +173,90 @@ public sealed class IntakeCoordinatorTests
 
         var task = IntakeCoordinator.BuildDialogueTask(messages, OutcomeType.PullRequest);
 
-        Assert.Contains("this turn must return READY", task);
+        Assert.Contains("must not return CONFIRMED", task);
+        Assert.Contains("return AWAITING_CONFIRMATION", task);
+        Assert.Contains("Ask at most one focused clarification question in this turn", task);
         Assert.Contains("design the customer can click is actionable", task);
         Assert.Contains("configured delivery outcome is PullRequest", task);
         Assert.Contains("do not ask the customer", task);
+    }
+
+    [Fact]
+    public void DialogueTask_PassesTheProposedBriefIntoTheApprovalTurn()
+    {
+        const string proposedBrief = "Outcome: Refresh the public pages with an interactive design.";
+        var messages = new[]
+        {
+            new FlowMessage
+            {
+                Role = ConversationRole.AccountManager,
+                Content = "Do I understand correctly that you want a fresh public-site design?",
+                IsQuestion = true
+            },
+            new FlowMessage
+            {
+                Role = ConversationRole.Customer,
+                Content = "Yes."
+            }
+        };
+
+        var task = IntakeCoordinator.BuildDialogueTask(
+            messages,
+            OutcomeType.PullRequest,
+            proposedBrief);
+
+        Assert.Contains("Return CONFIRMED only if", task);
+        Assert.Contains("UNCONFIRMED_TASK_BRIEF", task);
+        Assert.Contains(proposedBrief, task);
+    }
+
+    [Fact]
+    public void ConfirmationGate_RejectsConfirmationWithoutAProposedBrief()
+    {
+        var response = new AccountManagerResponse(
+            AccountManagerIntakeStatus.Confirmed,
+            "I'll ask the team to implement it now.",
+            "Unreviewed brief");
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => IntakeCoordinator.ApplyConfirmationGate(response, pendingConfirmationBrief: null));
+
+        Assert.Contains("has not reviewed", exception.Message);
+    }
+
+    [Fact]
+    public void ConfirmationGate_PreservesTheBriefTheCustomerReviewed()
+    {
+        const string approvedBrief = "Outcome: Refresh the public pages.";
+        var response = new AccountManagerResponse(
+            AccountManagerIntakeStatus.Confirmed,
+            "I'll ask the team to implement it now.",
+            "A changed brief");
+
+        var confirmed = IntakeCoordinator.ApplyConfirmationGate(response, approvedBrief);
+
+        Assert.Equal(approvedBrief, confirmed.TaskBrief);
+    }
+
+    [Fact]
+    public void ConfirmedBrief_QueuesTheFlowAndRecordsTheTransition()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Refresh the public pages",
+            OriginalRequest = "Give the public pages a fresh design."
+        };
+        var response = new AccountManagerResponse(
+            AccountManagerIntakeStatus.Confirmed,
+            "I'll ask the team to implement it now.",
+            "Outcome: Refresh the public pages.");
+
+        var queuedEvent = IntakeCoordinator.PrepareConfirmedHandoff(flow, response);
+
+        Assert.NotNull(queuedEvent);
+        Assert.Equal(FlowStatus.Queued, flow.Status);
+        Assert.Equal("flow.queued", queuedEvent.Type);
+        Assert.Contains(queuedEvent, flow.Events);
     }
 }
 

@@ -238,14 +238,19 @@ public static class DemoApi
             .Where(item => item.Role == ConversationRole.AccountManager)
             .OrderByDescending(item => item.CreatedAt)
             .FirstOrDefault();
+        var latestIntakeEvent = flow.Events
+            .Where(item => item.Type.StartsWith("intake.", StringComparison.Ordinal))
+            .OrderByDescending(item => item.CreatedAt)
+            .FirstOrDefault();
         if (latestAccountManagerMessage is null ||
             latestAccountManagerMessage.IsQuestion ||
+            latestIntakeEvent?.Type != "intake.confirmed" ||
             !flow.Steps.Any(item =>
                 item.AgentRole == "account-manager" &&
                 item.Status == StepStatus.Completed))
         {
             throw new InvalidOperationException(
-                "The Account Manager must confirm a task-ready brief before the flow starts.");
+                "The customer must explicitly confirm the Account Manager brief before the flow starts.");
         }
 
         flow.Status = FlowStatus.Queued;

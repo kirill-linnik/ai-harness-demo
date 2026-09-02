@@ -4,7 +4,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../api/endpoints";
 import { queryKeys } from "../../api/queries";
-import type { BootstrapDto, IntakeResponse } from "../../api/types";
+import type { BootstrapDto, FlowDetailDto, IntakeResponse } from "../../api/types";
 import { ToastProvider } from "../../lib/toast";
 import { IntakePage } from "./IntakePage";
 
@@ -45,6 +45,59 @@ const bootstrap: BootstrapDto = {
   factoryEnabled: true,
   factoryDisabledReason: ""
 };
+
+const flowId = "11111111-1111-1111-1111-111111111111";
+const timestamp = "2026-09-02T12:00:00Z";
+
+function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetailDto {
+  return {
+    id: flowId,
+    title: "Refresh the public site",
+    originalRequest: "Give the public site a fresh design.",
+    consolidatedRequest: "Outcome: Refresh the public site with an interactive design.",
+    status,
+    iteration: 1,
+    repositoryPath: "E:\\projects\\demo",
+    repositoryKnowledge: "Demo repository",
+    outcome: "Commit",
+    workspacePath: "E:\\projects\\demo\\.workspaces\\flow",
+    branchName: "ai-harness\\refresh-site",
+    outcomeUrl: "",
+    outcomeLabel: "",
+    failureReason: "",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    completedAt: null,
+    steps: [],
+    messages: [
+      {
+        id: "22222222-2222-2222-2222-222222222222",
+        role: "Customer",
+        content: "Give the public site a fresh design.",
+        isQuestion: false,
+        createdAt: timestamp
+      },
+      {
+        id: "33333333-3333-3333-3333-333333333333",
+        role: "AccountManager",
+        content:
+          "Do I understand correctly that you want a fresh interactive design for the public site? If yes, I'll ask the team to implement it.",
+        isQuestion: true,
+        createdAt: timestamp
+      }
+    ],
+    events: [
+      {
+        id: "44444444-4444-4444-4444-444444444444",
+        flowStepId: null,
+        type: "intake.confirmation_requested",
+        message: "Account Manager presented its understanding.",
+        createdAt: timestamp
+      }
+    ],
+    gateRecords: []
+  };
+}
 
 afterEach(() => {
   cleanup();
@@ -98,5 +151,80 @@ describe("IntakePage", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
     expect(composer).toHaveValue(request);
+  });
+
+  it("sends a confirmed brief directly to Team Lead without a second button", async () => {
+    const pendingFlow = confirmationFlow();
+    const queuedFlow = {
+      ...pendingFlow,
+      status: "Queued" as const,
+      messages: [
+        ...pendingFlow.messages,
+        {
+          id: "55555555-5555-5555-5555-555555555555",
+          role: "Customer" as const,
+          content: "Yes.",
+          isQuestion: false,
+          createdAt: timestamp
+        },
+        {
+          id: "66666666-6666-6666-6666-666666666666",
+          role: "AccountManager" as const,
+          content: "Thanks - I'll ask the team to implement it now.",
+          isQuestion: false,
+          createdAt: timestamp
+        }
+      ],
+      events: [
+        {
+          id: "77777777-7777-7777-7777-777777777777",
+          flowStepId: null,
+          type: "intake.confirmed",
+          message: "Customer explicitly confirmed the brief.",
+          createdAt: timestamp
+        },
+        ...pendingFlow.events
+      ]
+    } satisfies FlowDetailDto;
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(pendingFlow);
+    const continueIntake = vi.spyOn(api, "continueIntake").mockResolvedValue({
+      flow: queuedFlow,
+      reply: "Thanks - I'll ask the team to implement it now.",
+      readyToStart: true,
+      shouldSpeak: false
+    });
+    const startFlow = vi.spyOn(api, "startFlow").mockResolvedValue(queuedFlow);
+
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false }
+      }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    queryClient.setQueryData(queryKeys.flow(flowId), pendingFlow);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/intake/${flowId}`]}>
+            <Routes>
+              <Route path="/intake/:id" element={<IntakePage />} />
+              <Route path="/factory/:id" element={<div>Team Lead started</div>} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByText("Confirm brief")).toBeInTheDocument();
+    const composer = screen.getByPlaceholderText("Reply yes, or tell me what to change...");
+    fireEvent.change(composer, { target: { value: "Yes." } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(screen.getByText("Team Lead started")).toBeInTheDocument());
+    expect(continueIntake).toHaveBeenCalledWith({ flowId, message: "Yes." });
+    expect(startFlow).not.toHaveBeenCalled();
   });
 });

@@ -254,15 +254,18 @@ public sealed class CopilotReasoningHost(
     internal static string ResponseContract(string agentRole) =>
         agentRole == "account-manager"
             ? """
-              Move a workable customer request into delivery; do not exhaustively specify it.
+              Move a workable customer request toward delivery without treating clarity as customer approval.
               Return exactly these plain-text markers with no text before INTAKE_STATUS:
-              INTAKE_STATUS: READY or NEEDS_CLARIFICATION
-              CUSTOMER_REPLY: when READY, one brief confirmation of what the team will make; when clarification is essential, one short question; always use plain everyday customer language on one line
-              TASK_BRIEF: the complete implementation brief when ready, otherwise NONE; a ready brief may continue on following lines
-              Default to READY as soon as the delivery team can take a meaningful first action.
+              INTAKE_STATUS: NEEDS_CLARIFICATION, AWAITING_CONFIRMATION, or CONFIRMED
+              CUSTOMER_REPLY: one short plain-language line; ask one focused question when clarification is essential, ask the customer to validate your concise understanding when awaiting confirmation, or state that the confirmed brief is going to the team
+              TASK_BRIEF: the complete proposed brief when awaiting confirmation or confirmed, otherwise NONE; the brief may continue on following lines
+              Default to AWAITING_CONFIRMATION as soon as the delivery team can take a meaningful first action.
               Use NEEDS_CLARIFICATION only when the target product or visible outcome cannot be identified and no safe reversible assumption lets work start.
-              Treat every earlier answer as settled. Never repeat, reconfirm, or reframe it as another choice.
-              If the dialogue already contains an Account Manager question, or the customer tells you to proceed or shows frustration, you must return READY using reasonable assumptions.
+              Treat every earlier answer as settled and never ask for the same detail twice. The one allowed recap is the complete understanding presented for final confirmation.
+              Use AWAITING_CONFIRMATION to ask "Do I understand correctly that you want ...? If yes, I'll ask the team to implement it."
+              Return CONFIRMED only when the latest customer turn explicitly and unambiguously approves the most recent AWAITING_CONFIRMATION brief without changing it.
+              When CONFIRMED, copy the approved TASK_BRIEF exactly and tell the customer you are asking the team to implement it now.
+              If the customer rejects or corrects the proposed understanding, do not return CONFIRMED. Incorporate the correction, then clarify only a material gap or present a revised AWAITING_CONFIRMATION brief.
               A request for something the customer can click is actionable and requires an interactive result; do not ask whether it means pictures, a prototype, implementation, or deployment.
               Never ask about technologies, tools, file formats, implementation approaches, deployment, hosting, credentials, live release, pull requests, builds, or who deploys.
               Put reversible assumptions and decisions owned by designers, engineers, or release staff in TASK_BRIEF instead of asking the customer.

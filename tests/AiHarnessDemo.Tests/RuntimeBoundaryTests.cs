@@ -50,8 +50,8 @@ public sealed class CopilotJsonlParserTests
     {
         const string jsonl = """
             {"type":"assistant.message_start","data":{"messageId":"root"}}
-            {"type":"assistant.message_delta","data":{"messageId":"root","deltaContent":"INTAKE_STATUS: READY\n"}}
-            {"type":"assistant.message_delta","data":{"messageId":"root","deltaContent":"CUSTOMER_REPLY: Ready.\nTASK_BRIEF: Refresh the site."}}
+            {"type":"assistant.message_delta","data":{"messageId":"root","deltaContent":"INTAKE_STATUS: AWAITING_CONFIRMATION\n"}}
+            {"type":"assistant.message_delta","data":{"messageId":"root","deltaContent":"CUSTOMER_REPLY: Is this the refresh you want? If yes, I'll send it to the team.\nTASK_BRIEF: Refresh the site."}}
             {"type":"assistant.message","agentId":"child","data":{"messageId":"child","content":"Ignore child response."}}
             {"type":"assistant.turn_end","data":{"turnId":"0"}}
             {"type":"result"}
@@ -61,7 +61,7 @@ public sealed class CopilotJsonlParserTests
 
         Assert.True(result.Success);
         Assert.Equal(
-            "INTAKE_STATUS: READY\nCUSTOMER_REPLY: Ready.\nTASK_BRIEF: Refresh the site.",
+            "INTAKE_STATUS: AWAITING_CONFIRMATION\nCUSTOMER_REPLY: Is this the refresh you want? If yes, I'll send it to the team.\nTASK_BRIEF: Refresh the site.",
             result.OutputSummary);
     }
 

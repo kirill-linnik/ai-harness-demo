@@ -8,11 +8,10 @@ import {
   queryKeys,
   useBootstrapQuery,
   useContinueIntakeMutation,
-  useFlowQuery,
-  useStartFlowMutation
+  useFlowQuery
 } from "../../api/queries";
 import type { FlowMessageDto } from "../../api/types";
-import { ArrowIcon, MicIcon, SendIcon, waveMarkup } from "../../lib/icons";
+import { MicIcon, SendIcon, waveMarkup } from "../../lib/icons";
 import { consumeDraftPrompt, consumeStartVoiceHint } from "../../lib/session";
 import { speak, toggleVoice } from "../../lib/voice";
 import { useToast } from "../../lib/toast";
@@ -29,7 +28,6 @@ export function IntakePage() {
   const flowQuery = useFlowQuery(params.id);
   const flow = flowQuery.data ?? null;
   const continueIntake = useContinueIntakeMutation();
-  const startFlow = useStartFlowMutation();
 
   const [message, setMessage] = useState("");
   const [pendingMessage, setPendingMessage] = useState<FlowMessageDto | null>(null);
@@ -54,6 +52,12 @@ export function IntakePage() {
     if (log) log.scrollTop = log.scrollHeight;
   }, [visibleMessages.length]);
 
+  useEffect(() => {
+    if (flow && flow.status !== "Intake") {
+      navigate(`/factory/${flow.id}`, { replace: true });
+    }
+  }, [flow?.id, flow?.status, navigate]);
+
   // Existing flows (already queued/running/etc.) remain reachable even if the factory has since
   // been disabled; only a brand-new intake conversation is gated, mirroring the original
   // `route.page === "intake" && !state.bootstrap.factoryEnabled` check in renderRoute().
@@ -72,8 +76,11 @@ export function IntakePage() {
     );
   }
 
-  const latestAccountManagerMessage = [...messages].reverse().find(item => item.role === "AccountManager");
-  const ready = Boolean(latestAccountManagerMessage) && !latestAccountManagerMessage!.isQuestion;
+  const latestIntakeEvent = flow?.events.find(item => item.type.startsWith("intake."));
+  const confirmed = latestIntakeEvent?.type === "intake.confirmed";
+  const awaitingConfirmation =
+    latestIntakeEvent?.type === "intake.confirmation_requested" ||
+    latestIntakeEvent?.type === "intake.ready";
 
   async function submitIntake() {
     if (submitting.current) return;
@@ -99,6 +106,10 @@ export function IntakePage() {
       queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
       setPendingMessage(null);
       if (response.shouldSpeak) speak(response.reply);
+      if (response.readyToStart || response.flow.status !== "Intake") {
+        navigate(`/factory/${response.flow.id}`, { replace: true });
+        return;
+      }
       if (!params.id || params.id !== response.flow.id) {
         navigate(`/intake/${response.flow.id}`, { replace: true });
       }
@@ -111,32 +122,13 @@ export function IntakePage() {
     }
   }
 
-  async function startCurrentFlow() {
-    if (!flow) return;
-    try {
-      const startedFlow = await startFlow.mutateAsync(flow.id);
-      queryClient.setQueryData(queryKeys.flow(flow.id), startedFlow);
-      navigate(`/factory/${flow.id}`);
-    } catch (error) {
-      toast(error instanceof Error ? error.message : String(error), "error");
-    }
-  }
-
   const sending = continueIntake.isPending || pendingMessage !== null;
-  const starting = startFlow.isPending;
 
   return (
     <AppShell
       active="factory"
       title="Customer intake"
-      subtitle="Voice dialogue · project-grounded clarification · durable brief"
-      actions={
-        ready ? (
-          <button className="button primary" disabled={starting} onClick={startCurrentFlow}>
-            <ArrowIcon /> {starting ? "Queuing..." : "Send to Team Lead"}
-          </button>
-        ) : undefined
-      }
+      subtitle="Voice dialogue · explicit customer confirmation · durable brief"
     >
       <div className="page-head">
         <div>
@@ -156,8 +148,10 @@ export function IntakePage() {
                   : "A new flow starts with your first message."}
               </p>
             </div>
-            {ready ? (
-              <span className="status-pill approved">Brief ready</span>
+            {confirmed ? (
+              <span className="status-pill approved">Brief confirmed</span>
+            ) : awaitingConfirmation ? (
+              <span className="status-pill intake">Confirm brief</span>
             ) : (
               <span className="status-pill intake">Clarifying</span>
             )}
@@ -187,7 +181,11 @@ export function IntakePage() {
               </button>
               <textarea
                 id="intake-message"
-                placeholder="Describe the customer outcome..."
+                placeholder={
+                  awaitingConfirmation
+                    ? "Reply yes, or tell me what to change..."
+                    : "Describe the customer outcome..."
+                }
                 aria-label="Customer request"
                 value={message}
                 onChange={event => setMessage(event.target.value)}
@@ -219,11 +217,19 @@ export function IntakePage() {
           </button>
           {waveMarkup()}
           <div className="intake-signal-copy">
-            <strong>{ready ? "The task is ready for orchestration" : "Listening for product intent"}</strong>
+            <strong>
+              {confirmed
+                ? "The confirmed brief is entering the factory"
+                : awaitingConfirmation
+                  ? "Confirm the Account Manager's understanding"
+                  : "Listening for product intent"}
+            </strong>
             <span>
-              {ready
+              {confirmed
                 ? "Team Lead will select the smallest capable team."
-                : "Account Manager will ask only for material missing context."}
+                : awaitingConfirmation
+                  ? "Reply yes to start immediately, or explain what should change."
+                  : "Account Manager will ask only for material missing context."}
             </span>
           </div>
         </div>
