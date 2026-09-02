@@ -10,6 +10,7 @@ Prerequisites:
 
 - Windows, macOS, or Linux
 - .NET 10 SDK
+- Node.js 20.19+ (or 22.12+) and npm (needed to build the browser client; `dotnet build`/`dotnet run` do this automatically)
 - GitHub Copilot CLI
 - Git
 - Edge or Chrome for browser speech recognition
@@ -60,3 +61,21 @@ The AI Factory and every new-assignment control remain locked until Settings con
 
 See [`docs\ARCHITECTURE.md`](docs\ARCHITECTURE.md) for the flow and component model.
 See [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for Symphony attribution.
+
+## Browser client
+
+The browser dashboard is a React + TypeScript + Vite app in `src\AiHarnessDemo\ClientApp`. Vite builds
+directly into `src\AiHarnessDemo\wwwroot`, so `dotnet build`/`dotnet run`/`dotnet publish` keep producing
+a single deployable ASP.NET Core host — there is no separately deployed frontend. To iterate on the
+client with hot reload against a running API:
+
+```powershell
+cd src\AiHarnessDemo
+dotnet run
+# in a second terminal
+cd src\AiHarnessDemo\ClientApp
+npm ci
+npm run dev
+```
+
+`npm run typecheck`, `npm test`, and `npm run build` validate the client in isolation.

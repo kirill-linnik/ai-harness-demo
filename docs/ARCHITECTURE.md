@@ -83,3 +83,16 @@ The browser uses a same-origin minimal API:
 - `/api/history`, `/api/learnings`, `/api/previews/{id}`
 
 The UI polls only active flows. Completed flows remain static and independently addressable through `#/factory/{id}`.
+
+## Browser client
+
+`src\AiHarnessDemo\ClientApp` is a React + TypeScript + Vite single-page app organized by feature page
+(`factory`, `intake`, `flow`, `settings`, `history`, `memory`, `preview`) under `src\pages`, with a typed
+API client/contracts layer in `src\api` and shared shell/utility code in `src\components`/`src\lib`.
+[TanStack Query](https://tanstack.com/query) owns all server state, including the active-flow poll
+(`useFlowQuery`'s `refetchInterval`, gated on flow status exactly like the original `scheduleFlowPoll`).
+Routing uses React Router's `HashRouter` so that server-issued links such as `flow.outcomeUrl`
+(`#/preview/{id}`) and every other shareable `#/...` URL keep working unchanged. Vite builds directly
+into `wwwroot` (`vite.config.ts`: `build.outDir = "../wwwroot"`), and `AiHarnessDemo.csproj` runs
+`npm ci`/`npm run build` before `Build`/`Publish` so `wwwroot` is always regenerated from
+`ClientApp\src` — it is not hand-edited.

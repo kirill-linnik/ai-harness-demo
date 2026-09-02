@@ -22,3 +22,11 @@ Thumbs.db
 *.pem
 *.key
 **/appsettings.Local.json
+
+# ClientApp (Vite + React + TypeScript) dependencies and build cache.
+# package-lock.json and the generated wwwroot bundle remain tracked. Run `dotnet build`
+# (or `npm run build` in ClientApp) after changing ClientApp\src to refresh the bundle.
+src/AiHarnessDemo/ClientApp/node_modules/
+src/AiHarnessDemo/ClientApp/dist/
+src/AiHarnessDemo/ClientApp/.vite/
+src/AiHarnessDemo/ClientApp/node_modules/.tmp/

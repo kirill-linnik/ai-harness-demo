@@ -14,4 +14,46 @@
     <ProjectReference Include="..\AiHarnessDemo.Core\AiHarnessDemo.Core.csproj" />
   </ItemGroup>
 
+  <!--
+    ClientApp (Vite + React + TypeScript) integration.
+
+    The SPA source of truth lives in ClientApp\src and builds directly into wwwroot, so a plain
+    `dotnet build`/`dotnet publish` of this project always produces an up-to-date, single-host
+    deployable app (see ClientApp\vite.config.ts: build.outDir = "../wwwroot", emptyOutDir = true).
+    wwwroot itself is therefore purely generated output and is not treated as authored source.
+
+    Set -p:SkipClientAppBuild=true to skip this (e.g. when wwwroot was already built out-of-band,
+    or Node.js is unavailable in the current environment).
+  -->
+  <PropertyGroup>
+    <SkipClientAppBuild Condition="'$(SkipClientAppBuild)' == ''">false</SkipClientAppBuild>
+    <ClientAppDirectory>$(MSBuildProjectDirectory)\ClientApp</ClientAppDirectory>
+    <ClientAppDependencyLock>$(ClientAppDirectory)\node_modules\.package-lock.json</ClientAppDependencyLock>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ClientAppSourceFiles Include="$(ClientAppDirectory)\src\**\*.*" />
+    <ClientAppSourceFiles Include="$(ClientAppDirectory)\index.html" />
+    <ClientAppSourceFiles Include="$(ClientAppDirectory)\vite.config.ts" />
+    <ClientAppSourceFiles Include="$(ClientAppDirectory)\tsconfig*.json" />
+    <ClientAppSourceFiles Include="$(ClientAppDirectory)\package.json" />
+    <ClientAppSourceFiles Include="$(ClientAppDirectory)\package-lock.json" />
+  </ItemGroup>
+
+  <Target Name="RestoreClientAppDependencies"
+          Condition="'$(SkipClientAppBuild)' != 'true'"
+          Inputs="$(ClientAppDirectory)\package.json;$(ClientAppDirectory)\package-lock.json"
+          Outputs="$(ClientAppDependencyLock)">
+    <Exec Command="npm ci" WorkingDirectory="$(ClientAppDirectory)" />
+  </Target>
+
+  <!-- Inputs/Outputs keep .NET builds fast when neither dependencies nor client sources changed. -->
+  <Target Name="BuildClientApp" BeforeTargets="Build;Publish"
+          Condition="'$(SkipClientAppBuild)' != 'true'"
+          DependsOnTargets="RestoreClientAppDependencies"
+          Inputs="@(ClientAppSourceFiles)"
+          Outputs="$(MSBuildProjectDirectory)\wwwroot\index.html">
+    <Exec Command="npm run build" WorkingDirectory="$(ClientAppDirectory)" />
+  </Target>
+
 </Project>

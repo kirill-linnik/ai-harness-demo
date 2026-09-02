@@ -1,0 +1,212 @@
+import { useEffect, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
+import { AppShell } from "../../components/AppShell";
+import { BootScreen } from "../../components/BootScreen";
+import { FatalScreen } from "../../components/FatalScreen";
+import {
+  queryKeys,
+  useBootstrapQuery,
+  useContinueIntakeMutation,
+  useFlowQuery,
+  useStartFlowMutation
+} from "../../api/queries";
+import { ArrowIcon, MicIcon, SendIcon, waveMarkup } from "../../lib/icons";
+import { consumeDraftPrompt, consumeStartVoiceHint } from "../../lib/session";
+import { speak, toggleVoice } from "../../lib/voice";
+import { useToast } from "../../lib/toast";
+import { MessageBubble } from "./MessageBubble";
+import { FactoryLockedPage } from "../factory/FactoryLockedPage";
+
+export function IntakePage() {
+  const params = useParams<{ id?: string }>();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const toast = useToast();
+
+  const bootstrapQuery = useBootstrapQuery();
+  const flowQuery = useFlowQuery(params.id);
+  const flow = flowQuery.data ?? null;
+  const continueIntake = useContinueIntakeMutation();
+  const startFlow = useStartFlowMutation();
+
+  const [message, setMessage] = useState("");
+  const logRef = useRef<HTMLDivElement | null>(null);
+  const initialized = useRef(false);
+
+  useEffect(() => {
+    if (initialized.current) return;
+    initialized.current = true;
+    const draft = consumeDraftPrompt();
+    if (draft) setMessage(draft);
+    if (consumeStartVoiceHint()) {
+      setTimeout(() => toggleVoice("intake-message", "intake-mic", setMessage), 250);
+    }
+  }, []);
+
+  useEffect(() => {
+    const log = logRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [flow?.messages.length]);
+
+  // Existing flows (already queued/running/etc.) remain reachable even if the factory has since
+  // been disabled; only a brand-new intake conversation is gated, mirroring the original
+  // `route.page === "intake" && !state.bootstrap.factoryEnabled` check in renderRoute().
+  if (!params.id && bootstrapQuery.data && !bootstrapQuery.data.factoryEnabled) {
+    return <FactoryLockedPage />;
+  }
+  if (params.id && flowQuery.isLoading) return <BootScreen />;
+  if (params.id && flowQuery.isError) {
+    const error = flowQuery.error;
+    return (
+      <FatalScreen
+        title="The intake could not load"
+        message={error instanceof Error ? error.message : String(error)}
+        onRetry={() => void flowQuery.refetch()}
+      />
+    );
+  }
+
+  const messages = flow?.messages ?? [];
+  const latestAccountManagerMessage = [...messages].reverse().find(item => item.role === "AccountManager");
+  const ready = Boolean(latestAccountManagerMessage) && !latestAccountManagerMessage!.isQuestion;
+
+  async function submitIntake() {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      toast("Describe the change before sending.", "error");
+      return;
+    }
+    try {
+      const response = await continueIntake.mutateAsync({ flowId: flow?.id ?? null, message: trimmed });
+      queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
+      setMessage("");
+      if (response.shouldSpeak) speak(response.reply);
+      if (!params.id || params.id !== response.flow.id) {
+        navigate(`/intake/${response.flow.id}`, { replace: true });
+      }
+    } catch (error) {
+      toast(error instanceof Error ? error.message : String(error), "error");
+    }
+  }
+
+  async function startCurrentFlow() {
+    if (!flow) return;
+    try {
+      const startedFlow = await startFlow.mutateAsync(flow.id);
+      queryClient.setQueryData(queryKeys.flow(flow.id), startedFlow);
+      navigate(`/factory/${flow.id}`);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : String(error), "error");
+    }
+  }
+
+  const sending = continueIntake.isPending;
+  const starting = startFlow.isPending;
+
+  return (
+    <AppShell
+      active="factory"
+      title="Customer intake"
+      subtitle="Voice dialogue · project-grounded clarification · durable brief"
+      actions={
+        ready ? (
+          <button className="button primary" disabled={starting} onClick={startCurrentFlow}>
+            <ArrowIcon /> {starting ? "Queuing..." : "Send to Team Lead"}
+          </button>
+        ) : undefined
+      }
+    >
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Customer intake</div>
+          <h2>Talk to your Account Manager</h2>
+          <p>Your voice becomes a durable brief. Clarifications stay attached to the flow and follow every specialist.</p>
+        </div>
+      </div>
+      <section className="intake-layout">
+        <div className="card conversation">
+          <div className="card-header">
+            <div>
+              <h3>Live brief</h3>
+              <p>
+                {flow
+                  ? `Flow ${flow.id.slice(0, 8)} · ${messages.length} dialogue turns`
+                  : "A new flow starts with your first message."}
+              </p>
+            </div>
+            {ready ? (
+              <span className="status-pill approved">Brief ready</span>
+            ) : (
+              <span className="status-pill intake">Clarifying</span>
+            )}
+          </div>
+          <div className="conversation-log" id="conversation-log" ref={logRef}>
+            {messages.length ? (
+              messages.map(item => <MessageBubble key={item.id} message={item} />)
+            ) : (
+              <div className="message accountmanager">
+                <div className="message-avatar">AM</div>
+                <div className="message-bubble">
+                  <strong>Account Manager</strong>
+                  Tell me what you want the team to change. I already have the selected repository context.
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="composer">
+            <div className="composer-row">
+              <button
+                id="intake-mic"
+                className="icon-button"
+                aria-label="Record task"
+                onClick={() => toggleVoice("intake-message", "intake-mic", setMessage)}
+              >
+                <MicIcon />
+              </button>
+              <textarea
+                id="intake-message"
+                placeholder="Describe the customer outcome..."
+                aria-label="Customer request"
+                value={message}
+                onChange={event => setMessage(event.target.value)}
+                onKeyDown={event => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void submitIntake();
+                  }
+                }}
+              />
+              <button className="button primary" disabled={sending} onClick={() => void submitIntake()}>
+                <SendIcon /> {sending ? "Thinking..." : "Send"}
+              </button>
+            </div>
+            <div className="composer-hint">Use voice in Edge or Chrome on localhost, or type when the room is noisy.</div>
+          </div>
+        </div>
+        <div className="intake-signal" id="intake-signal">
+          <div className="orbit one"></div>
+          <div className="orbit two"></div>
+          <div className="orbit three"></div>
+          <button
+            id="intake-mic-large"
+            className="mic-button"
+            aria-label="Start voice recording"
+            onClick={() => toggleVoice("intake-message", "intake-mic-large", setMessage)}
+          >
+            <MicIcon />
+          </button>
+          {waveMarkup()}
+          <div className="intake-signal-copy">
+            <strong>{ready ? "The task is ready for orchestration" : "Listening for product intent"}</strong>
+            <span>
+              {ready
+                ? "Team Lead will select the smallest capable team."
+                : "Account Manager will ask only for material missing context."}
+            </span>
+          </div>
+        </div>
+      </section>
+    </AppShell>
+  );
+}
