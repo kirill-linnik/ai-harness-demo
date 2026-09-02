@@ -1,0 +1,24 @@
+# Build output
+**/bin/
+**/obj/
+.vs/
+
+# Runtime state
+/data/
+
+# IDE and OS files
+.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Local credentials and overrides
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+**/appsettings.Local.json

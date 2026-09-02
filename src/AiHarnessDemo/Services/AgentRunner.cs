@@ -1,0 +1,142 @@
+using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Reasoning;
+using Polly;
+using Polly.Retry;
+using DeliveryOutcomeType = AiHarnessDemo.Core.Domain.OutcomeType;
+
+namespace AiHarnessDemo.Services;
+
+public sealed record AgentExecutionContext(
+    Guid FlowId,
+    int Iteration,
+    string AgentId,
+    string AgentName,
+    string AgentRole,
+    string Model,
+    int Attempt,
+    string Task,
+    string RepositoryKnowledge,
+    string RepositoryPath,
+    DeliveryOutcomeType Outcome,
+    string PlanSummary,
+    IReadOnlyList<string> PreviousOutputs,
+    IReadOnlyList<HarnessLearning> Learnings,
+    string CustomerFeedback = "",
+    Action<AgentRunProgress>? Progress = null);
+
+public sealed record AgentExecutionResult(
+    string Output,
+    string Evidence,
+    int ExecutionAttempts,
+    IReadOnlyList<ToolCallRecord> ToolCalls);
+
+/// <summary>
+/// Routes one role through Copilot CLI. Retry options are read immediately before each dispatch so
+/// changes to WORKFLOW.md affect the next execution.
+/// </summary>
+public sealed class AgentRunner(
+    CopilotReasoningHost copilotHost,
+    RuntimeCircuitBreaker circuitBreaker,
+    WorkflowDefinitionProvider workflowProvider,
+    ILogger<AgentRunner> logger)
+{
+    public async Task<AgentExecutionResult> ExecuteAsync(
+        AgentExecutionContext context,
+        CancellationToken cancellationToken = default)
+    {
+        ReasoningHost host = copilotHost;
+        if (!circuitBreaker.Allows(
+                host,
+                context.AgentId,
+                cancellationToken,
+                out var unavailableReason))
+        {
+            throw new AgentRunException(
+                unavailableReason ?? "Reasoning host is unavailable.",
+                AgentRunFailureKind.DependencyUnavailable,
+                host.Config.RuntimeName);
+        }
+
+        var options = workflowProvider.GetValidated().Config.Agent;
+        var attempts = 0;
+        var pipelineBuilder = new ResiliencePipelineBuilder<AgentRunResult>();
+        if (options.MaxAttempts > 1)
+        {
+            pipelineBuilder.AddRetry(new RetryStrategyOptions<AgentRunResult>
+            {
+                MaxRetryAttempts = options.MaxAttempts - 1,
+                BackoffType = DelayBackoffType.Exponential,
+                Delay = TimeSpan.FromMilliseconds(options.RetryBaseDelayMs),
+                MaxDelay = TimeSpan.FromMilliseconds(options.MaxRetryBackoffMs),
+                UseJitter = true,
+                ShouldHandle = new PredicateBuilder<AgentRunResult>()
+                    .Handle<AgentRunException>(exception =>
+                        exception.FailureKind is
+                            AgentRunFailureKind.Transient or
+                            AgentRunFailureKind.TimedOut or
+                            AgentRunFailureKind.Stalled or
+                            AgentRunFailureKind.AmbiguousCrash),
+                OnRetry = arguments =>
+                {
+                    logger.LogWarning(
+                        arguments.Outcome.Exception,
+                        "{AgentId} failed on execution attempt {Attempt}; retrying.",
+                        context.AgentId,
+                        arguments.AttemptNumber + 1);
+                    return default;
+                }
+            });
+        }
+
+        var pipeline = pipelineBuilder.Build();
+        AgentRunResult result;
+        try
+        {
+            result = await pipeline.ExecuteAsync(
+                async token =>
+                {
+                    attempts++;
+                    var runResult = await host.RunAgentAsync(
+                        new AgentRunRequest
+                        {
+                            AgentId = context.AgentId,
+                            Model = context.Model,
+                            CorrelationId = $"{context.FlowId:N}:{context.Iteration}:{context.AgentId}:{context.Attempt}",
+                            WorkingDirectory = context.RepositoryPath,
+                            InputContext = new Dictionary<string, object?>
+                            {
+                                ["execution"] = context
+                            },
+                            Progress = context.Progress
+                        },
+                        token);
+
+                    if (!runResult.Success)
+                    {
+                        throw new AgentRunException(
+                            runResult.Error ?? "Agent run reported failure without an error.",
+                            runResult.FailureKind ?? AgentRunFailureKind.InvalidOutput,
+                            runResult.FailedDependency);
+                    }
+
+                    return runResult;
+                },
+                cancellationToken);
+            circuitBreaker.RecordSuccess(host.Config.RuntimeName, context.AgentId);
+        }
+        catch (AgentRunException exception)
+            when (exception.FailureKind == AgentRunFailureKind.DependencyUnavailable)
+        {
+            circuitBreaker.RecordAvailabilityFailure(
+                exception.FailedDependency ?? host.Config.RuntimeName,
+                exception.Message);
+            throw;
+        }
+
+        return new AgentExecutionResult(
+            result.OutputSummary,
+            $"{host.Config.RuntimeName}: {result.ToolCalls.Count} observable tool call(s).",
+            attempts,
+            result.ToolCalls);
+    }
+}
