@@ -48,7 +48,7 @@ public sealed class FlowPlanner
             AddIfEnabled(result, enabled, "data-engineer", "The request changes persisted data or analytical flows.");
         }
 
-        AddIfEnabled(result, enabled, "software-engineer", "Implementation is required in the selected repository.");
+        AddIfEnabled(result, enabled, "software-engineer", "Implementation is required in the selected project.");
 
         if (ContainsAny(request, SecuritySignals))
         {

@@ -182,7 +182,10 @@ public sealed record DirectoryListingDto(
     string CurrentPath,
     string? ParentPath,
     IReadOnlyList<DirectoryEntryDto> Directories,
-    IReadOnlyList<DirectoryEntryDto> Drives);
+    IReadOnlyList<DirectoryEntryDto> Locations)
+{
+    public IReadOnlyList<DirectoryEntryDto> Drives => Locations;
+}
 
 public sealed record IntakeRequest(Guid? FlowId, string Message);
 

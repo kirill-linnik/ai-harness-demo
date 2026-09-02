@@ -8,6 +8,7 @@ description: Selects the smallest capable agent team and defines the delivery se
 You orchestrate delivery while keeping ownership centralized and handoffs explicit.
 
 - Select only enabled agents whose specialties are justified by the task.
+- Treat the selected project folder as one product even when it contains multiple Git repositories; identify which repositories each delivery slice owns.
 - Order work around dependencies; identify safe parallel work.
 - Define a concrete handoff contract for every transition.
 - Require decisions, artifacts, evidence, risks, and the next owner's inputs.

@@ -13,11 +13,12 @@ public static class DemoApi
     {
         var api = endpoints.MapGroup("/api");
 
-        api.MapGet("/health", () => Results.Ok(new
+        api.MapGet("/health", (WorkflowDefinitionProvider workflowProvider) => Results.Ok(new
         {
             status = "ready",
             utc = DateTimeOffset.UtcNow,
-            copilotCliAvailable = ExecutableLocator.Exists("copilot")
+            copilotCliAvailable = ExecutableLocator.Exists(
+                workflowProvider.GetValidated().Config.Copilot.Command)
         }));
 
         api.MapGet("/bootstrap", GetBootstrapAsync);
@@ -70,7 +71,8 @@ public static class DemoApi
             flows.Count(item => item.Status == FlowStatus.Approved),
             learningCount,
             totalMilliseconds / 60_000);
-        var copilotAvailable = ExecutableLocator.Exists("copilot");
+        var workflow = workflowProvider.GetValidated();
+        var copilotAvailable = ExecutableLocator.Exists(workflow.Config.Copilot.Command);
         var workflowStatus = workflowProvider.Status();
         var factoryDisabledReason = FactoryDisabledReason(
             settings,
@@ -399,19 +401,19 @@ public static class DemoApi
         if (string.IsNullOrWhiteSpace(settings.RepositoryPath) ||
             string.IsNullOrWhiteSpace(settings.RepositoryKnowledge))
         {
-            return "Add and study a source repository in Settings before starting the factory.";
+            return "Add and study a source project in Settings before starting the factory.";
         }
         if (!Directory.Exists(settings.RepositoryPath))
         {
-            return "The selected source repository no longer exists. Choose it again in Settings.";
+            return "The selected source project no longer exists. Choose it again in Settings.";
         }
-        if (!RepositoryAnalyzer.IsGitRepository(settings.RepositoryPath))
+        if (!RepositoryAnalyzer.IsProjectDirectory(settings.RepositoryPath))
         {
-            return "The selected project is not a Git repository root. Choose a Git repository in Settings.";
+            return "The selected project folder contains no Git repositories. Choose a project with source control in Settings.";
         }
         if (!copilotAvailable)
         {
-            return "Copilot CLI is unavailable. Install or repair it before starting the factory.";
+            return "The configured Copilot CLI command is unavailable. Install or repair it before starting the factory.";
         }
         if (!workflow.Ready)
         {

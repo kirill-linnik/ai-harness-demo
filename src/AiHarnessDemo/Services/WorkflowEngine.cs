@@ -751,8 +751,8 @@ public sealed class WorkflowEngine(
         flow.Status = FlowStatus.WaitingForFeedback;
         flow.OutcomeUrl = $"#/preview/{flow.Id}";
         flow.OutcomeLabel = flow.Outcome == OutcomeType.PullRequest
-            ? $"Pull request candidate · {flow.BranchName}"
-            : $"Commit candidate · {flow.BranchName}";
+            ? $"Pull request candidate(s) · {flow.BranchName}"
+            : $"Commit candidate(s) · {flow.BranchName}";
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         database.FlowEvents.Add(new FlowEvent
         {

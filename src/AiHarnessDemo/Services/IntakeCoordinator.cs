@@ -54,10 +54,10 @@ public sealed partial class IntakeCoordinator(
         var settings = await database.Settings.AsNoTracking().SingleAsync(cancellationToken);
         if (string.IsNullOrWhiteSpace(settings.RepositoryPath) ||
             string.IsNullOrWhiteSpace(settings.RepositoryKnowledge) ||
-            !RepositoryAnalyzer.IsGitRepository(settings.RepositoryPath))
+            !RepositoryAnalyzer.IsProjectDirectory(settings.RepositoryPath))
         {
             throw new InvalidOperationException(
-                "Add and study a valid source repository in Settings before starting a factory flow.");
+                "Add and study a project folder containing at least one Git repository before starting a factory flow.");
         }
 
         var flow = request.FlowId is null

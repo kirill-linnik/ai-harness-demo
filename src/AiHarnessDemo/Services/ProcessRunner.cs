@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
 
@@ -25,10 +26,31 @@ public sealed class ProcessRunner
         Action<string>? standardOutputLineReceived = null,
         TimeSpan? stallTimeout = null)
     {
+        if (string.IsNullOrWhiteSpace(executable))
+        {
+            throw new ArgumentException("An executable is required.", nameof(executable));
+        }
+
+        var resolvedWorkingDirectory = Path.GetFullPath(workingDirectory);
+        if (!Directory.Exists(resolvedWorkingDirectory))
+        {
+            throw new DirectoryNotFoundException(
+                $"Process working directory does not exist: {resolvedWorkingDirectory}");
+        }
+
+        var resolvedExecutable = ExecutableLocator.Resolve(
+            executable,
+            resolvedWorkingDirectory);
+        if (resolvedExecutable is null)
+        {
+            throw new Win32Exception(
+                2,
+                $"Executable '{executable}' was not found on PATH.");
+        }
+
         var startInfo = new ProcessStartInfo
         {
-            FileName = executable,
-            WorkingDirectory = workingDirectory,
+            WorkingDirectory = resolvedWorkingDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -37,10 +59,11 @@ public sealed class ProcessRunner
             StandardErrorEncoding = Encoding.UTF8
         };
 
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
+        ConfigureInvocation(
+            startInfo,
+            resolvedExecutable,
+            arguments.ToArray(),
+            resolvedWorkingDirectory);
 
         using var process = new Process { StartInfo = startInfo };
         if (!process.Start())
@@ -151,35 +174,206 @@ public sealed class ProcessRunner
 
         process.Kill(entireProcessTree: true);
     }
+
+    private static void ConfigureInvocation(
+        ProcessStartInfo startInfo,
+        string executable,
+        IReadOnlyList<string> arguments,
+        string workingDirectory)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var extension = Path.GetExtension(executable);
+            if (extension.Equals(".ps1", StringComparison.OrdinalIgnoreCase))
+            {
+                ConfigurePowerShell(startInfo, executable, arguments, workingDirectory);
+                return;
+            }
+
+            if (extension.Equals(".cmd", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".bat", StringComparison.OrdinalIgnoreCase))
+            {
+                var powerShellShim = Path.ChangeExtension(executable, ".ps1");
+                if (File.Exists(powerShellShim) &&
+                    TryResolvePowerShell(workingDirectory) is { } powerShell)
+                {
+                    ConfigurePowerShellWithHost(
+                        startInfo,
+                        powerShellShim,
+                        arguments,
+                        powerShell);
+                    return;
+                }
+
+                throw new Win32Exception(
+                    193,
+                    $"Windows batch launcher '{executable}' has no runnable PowerShell companion. " +
+                    "Use a native executable or install the complete npm command shim.");
+            }
+        }
+
+        startInfo.FileName = executable;
+        AddArguments(startInfo, arguments);
+    }
+
+    private static void ConfigurePowerShell(
+        ProcessStartInfo startInfo,
+        string script,
+        IReadOnlyList<string> arguments,
+        string workingDirectory)
+    {
+        var powerShell = TryResolvePowerShell(workingDirectory)
+            ?? throw new Win32Exception(
+                2,
+                $"PowerShell is required to launch '{script}'.");
+        ConfigurePowerShellWithHost(startInfo, script, arguments, powerShell);
+    }
+
+    private static void ConfigurePowerShellWithHost(
+        ProcessStartInfo startInfo,
+        string script,
+        IReadOnlyList<string> arguments,
+        string powerShell)
+    {
+        startInfo.FileName = powerShell;
+        AddArguments(
+            startInfo,
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script,
+                .. arguments
+            ]);
+    }
+
+    private static string? TryResolvePowerShell(string workingDirectory) =>
+        ExecutableLocator.Resolve("pwsh", workingDirectory) ??
+        ExecutableLocator.Resolve("powershell", workingDirectory);
+
+    private static void AddArguments(
+        ProcessStartInfo startInfo,
+        IEnumerable<string> arguments)
+    {
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+    }
 }
 
 public static class ExecutableLocator
 {
-    public static bool Exists(string executable)
+    public static bool Exists(
+        string executable,
+        string? workingDirectory = null) =>
+        Resolve(executable, workingDirectory) is not null;
+
+    public static string? Resolve(
+        string executable,
+        string? workingDirectory = null)
     {
-        if (Path.IsPathRooted(executable))
+        if (string.IsNullOrWhiteSpace(executable))
         {
-            return File.Exists(executable);
+            return null;
         }
 
-        var extensions = OperatingSystem.IsWindows()
-            ? (Environment.GetEnvironmentVariable("PATHEXT") ?? ".EXE;.CMD;.BAT")
-                .Split(';', StringSplitOptions.RemoveEmptyEntries)
-            : [string.Empty];
+        if (Path.IsPathRooted(executable) || HasDirectorySeparator(executable))
+        {
+            var path = Path.IsPathRooted(executable)
+                ? executable
+                : Path.Combine(
+                    workingDirectory ?? Environment.CurrentDirectory,
+                    executable);
+            return ResolveCandidate(path);
+        }
 
         foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
                      .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
-            foreach (var extension in extensions.Prepend(string.Empty))
+            var normalizedDirectory = directory.Trim().Trim('"');
+            if (string.IsNullOrWhiteSpace(normalizedDirectory))
             {
-                var candidate = Path.Combine(directory.Trim('"'), executable + extension);
-                if (File.Exists(candidate))
+                continue;
+            }
+
+            var resolved = ResolveCandidate(Path.Combine(normalizedDirectory, executable));
+            if (resolved is not null)
+            {
+                return resolved;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ResolveCandidate(string path)
+    {
+        if (OperatingSystem.IsWindows() &&
+            string.IsNullOrEmpty(Path.GetExtension(path)))
+        {
+            foreach (var extension in WindowsExecutableExtensions())
+            {
+                var candidate = path + extension;
+                if (IsExecutableFile(candidate))
                 {
-                    return true;
+                    return Path.GetFullPath(candidate);
                 }
             }
         }
 
-        return false;
+        if (IsExecutableFile(path))
+        {
+            return Path.GetFullPath(path);
+        }
+
+        return null;
     }
+
+    private static IEnumerable<string> WindowsExecutableExtensions() =>
+        (Environment.GetEnvironmentVariable("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+        .Split(
+            ';',
+            StringSplitOptions.RemoveEmptyEntries |
+            StringSplitOptions.TrimEntries)
+        .Select(extension =>
+            extension.StartsWith('.') ? extension : $".{extension}")
+        .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsExecutableFile(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            return true;
+        }
+
+        try
+        {
+            const UnixFileMode execute =
+                UnixFileMode.UserExecute |
+                UnixFileMode.GroupExecute |
+                UnixFileMode.OtherExecute;
+            return (File.GetUnixFileMode(path) & execute) != 0;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool HasDirectorySeparator(string value) =>
+        value.Contains(Path.DirectorySeparatorChar) ||
+        value.Contains(Path.AltDirectorySeparatorChar);
 }

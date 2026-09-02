@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Text;
 using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Data;
@@ -33,6 +34,64 @@ public sealed class RepositoryAnalyzer(
             File.Exists(Path.Combine(path, ".git"))
         );
 
+    public static bool IsProjectDirectory(string path) =>
+        FindGitRepositories(path).Count > 0;
+
+    public static IReadOnlyList<string> FindGitRepositories(string projectPath)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath) ||
+            !Directory.Exists(projectPath))
+        {
+            return [];
+        }
+
+        var root = Path.GetFullPath(projectPath);
+        var repositories = new List<string>();
+        var pending = new Stack<string>();
+        pending.Push(root);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (IsGitRepository(current))
+            {
+                repositories.Add(current);
+                continue;
+            }
+
+            IReadOnlyList<string> directories;
+            try
+            {
+                directories = Directory.EnumerateDirectories(current).ToList();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                continue;
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            foreach (var directory in directories)
+            {
+                if (!ShouldIgnoreDirectory(directory) &&
+                    CanTraverse(directory))
+                {
+                    pending.Push(directory);
+                }
+            }
+        }
+
+        return repositories
+            .OrderBy(
+                path => Path.GetRelativePath(root, path),
+                OperatingSystem.IsWindows()
+                    ? StringComparer.OrdinalIgnoreCase
+                    : StringComparer.Ordinal)
+            .ToList();
+    }
+
     public async Task<RepositoryAnalysis> AnalyzeAsync(
         string requestedPath,
         bool runCopilotInit,
@@ -49,7 +108,13 @@ public sealed class RepositoryAnalyzer(
         if (!Directory.Exists(repositoryPath))
         {
             throw new DirectoryNotFoundException(
-                $"The selected repository does not exist: {repositoryPath}");
+                $"The selected project folder does not exist: {repositoryPath}");
+        }
+        var gitRepositories = FindGitRepositories(repositoryPath);
+        if (gitRepositories.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "The selected project folder must contain at least one Git repository.");
         }
 
         var initSucceeded = false;
@@ -57,37 +122,54 @@ public sealed class RepositoryAnalyzer(
 
         if (runCopilotInit)
         {
-            if (!ExecutableLocator.Exists("copilot"))
+            var workflow = workflowProvider.GetValidated();
+            var copilotCommand = workflow.Config.Copilot.Command;
+            if (!ExecutableLocator.Exists(copilotCommand, repositoryPath))
             {
-                initMessage = "Copilot CLI is not available on PATH. Static repository study completed.";
+                initMessage =
+                    $"Copilot CLI command '{copilotCommand}' is not available. " +
+                    "Static repository study completed.";
             }
             else
             {
-                var result = await processRunner.RunAsync(
-                    "copilot",
-                    ["init"],
-                    repositoryPath,
-                    TimeSpan.FromMilliseconds(
-                        workflowProvider.GetValidated().Config.Copilot.TurnTimeoutMs),
-                    cancellationToken);
-
-                initSucceeded = result.ExitCode == 0;
-                initMessage = initSucceeded
-                    ? "Copilot CLI initialized repository instructions successfully."
-                    : $"Copilot init failed (exit {result.ExitCode}): {Tail(result.CombinedOutput, 700)}";
-
-                if (!initSucceeded)
+                try
                 {
-                    logger.LogWarning(
-                        "Copilot init failed for {RepositoryPath}: {Message}",
+                    var result = await processRunner.RunAsync(
+                        copilotCommand,
+                        ["init"],
                         repositoryPath,
-                        initMessage);
+                        TimeSpan.FromMilliseconds(workflow.Config.Copilot.TurnTimeoutMs),
+                        cancellationToken);
+
+                    initSucceeded = result.ExitCode == 0;
+                    initMessage = initSucceeded
+                        ? "Copilot CLI initialized repository instructions successfully."
+                        : $"Copilot init failed (exit {result.ExitCode}): {Tail(result.CombinedOutput, 700)}";
+
+                    if (!initSucceeded)
+                    {
+                        logger.LogWarning(
+                            "Copilot init failed for {RepositoryPath}: {Message}",
+                            repositoryPath,
+                            initMessage);
+                    }
+                }
+                catch (Win32Exception exception)
+                {
+                    initMessage =
+                        $"Copilot init could not be launched: {exception.Message} " +
+                        "Static repository study completed.";
+                    logger.LogWarning(
+                        exception,
+                        "Copilot init could not be launched for {RepositoryPath}.",
+                        repositoryPath);
                 }
             }
         }
 
         var knowledge = await BuildKnowledgeAsync(
             repositoryPath,
+            gitRepositories,
             initMessage,
             cancellationToken);
 
@@ -103,18 +185,11 @@ public sealed class RepositoryAnalyzer(
 
     public DirectoryListingDto ListDirectories(string? requestedPath)
     {
-        var drives = DriveInfo.GetDrives()
-            .Where(drive => drive.IsReady)
-            .Select(drive => new DirectoryEntryDto(
-                string.IsNullOrWhiteSpace(drive.VolumeLabel)
-                    ? drive.Name
-                    : $"{drive.Name}  {drive.VolumeLabel}",
-                drive.RootDirectory.FullName))
-            .ToList();
+        var locations = ListLocations();
 
         if (string.IsNullOrWhiteSpace(requestedPath))
         {
-            return new DirectoryListingDto(string.Empty, null, [], drives);
+            return new DirectoryListingDto(string.Empty, null, [], locations);
         }
 
         var path = Path.GetFullPath(requestedPath);
@@ -135,11 +210,52 @@ public sealed class RepositoryAnalyzer(
             path,
             Directory.GetParent(path)?.FullName,
             directories,
-            drives);
+            locations);
+    }
+
+    public static IReadOnlyList<DirectoryEntryDto> ListLocations()
+    {
+        var locations = new List<DirectoryEntryDto>();
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        void AddLocation(string name, string path)
+        {
+            if (Directory.Exists(path) &&
+                !locations.Any(item =>
+                    string.Equals(item.Path, path, comparison)))
+            {
+                locations.Add(new DirectoryEntryDto(name, path));
+            }
+        }
+
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrWhiteSpace(home))
+        {
+            AddLocation("Home", home);
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            foreach (var drive in DriveInfo.GetDrives().Where(item => item.IsReady))
+            {
+                AddLocation(DriveLabel(drive), drive.RootDirectory.FullName);
+            }
+        }
+        else
+        {
+            var root = Path.GetPathRoot(Environment.CurrentDirectory) ??
+                       Path.DirectorySeparatorChar.ToString();
+            AddLocation("File system", root);
+        }
+
+        return locations;
     }
 
     private static async Task<string> BuildKnowledgeAsync(
         string repositoryPath,
+        IReadOnlyList<string> gitRepositories,
         string initMessage,
         CancellationToken cancellationToken)
     {
@@ -176,6 +292,8 @@ public sealed class RepositoryAnalyzer(
         builder.AppendLine();
         builder.AppendLine("## Repository profile");
         builder.AppendLine($"- **Location:** `{repositoryPath}`");
+        builder.AppendLine(
+            $"- **Git repositories:** {string.Join(", ", gitRepositories.Select(path => RepositoryLabel(repositoryPath, path)))}");
         builder.AppendLine($"- **Source files studied:** {files.Count:N0}");
         builder.AppendLine($"- **Primary file types:** {string.Join(", ", extensions.DefaultIfEmpty("No source files detected"))}");
         builder.AppendLine($"- **Top-level areas:** {string.Join(", ", topDirectories.DefaultIfEmpty("No child directories"))}");
@@ -376,4 +494,49 @@ public sealed class RepositoryAnalyzer(
 
     private static string Tail(string text, int maxCharacters) =>
         text.Length <= maxCharacters ? text : text[^maxCharacters..];
+
+    internal static bool ShouldIgnoreDirectory(string directory) =>
+        IgnoredDirectories.Contains(Path.GetFileName(directory));
+
+    internal static bool CanTraverse(string directory)
+    {
+        try
+        {
+            return (File.GetAttributes(directory) & FileAttributes.ReparsePoint) == 0;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static string RepositoryLabel(string projectPath, string repositoryPath)
+    {
+        var relativePath = Path.GetRelativePath(projectPath, repositoryPath);
+        return relativePath == "."
+            ? Path.GetFileName(repositoryPath)
+            : relativePath;
+    }
+
+    private static string DriveLabel(DriveInfo drive)
+    {
+        try
+        {
+            return string.IsNullOrWhiteSpace(drive.VolumeLabel)
+                ? drive.Name
+                : $"{drive.Name}  {drive.VolumeLabel}";
+        }
+        catch (IOException)
+        {
+            return drive.Name;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return drive.Name;
+        }
+    }
 }

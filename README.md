@@ -8,10 +8,13 @@ It is intentionally generic and suitable for an external audience. Its core is a
 
 Prerequisites:
 
+- Windows, macOS, or Linux
 - .NET 10 SDK
 - GitHub Copilot CLI
 - Git
 - Edge or Chrome for browser speech recognition
+
+On Windows:
 
 ```powershell
 cd <clone-directory>
@@ -24,26 +27,35 @@ Or:
 .\Start-Demo.ps1
 ```
 
+On macOS or Linux:
+
+```shell
+cd <clone-directory>
+cd src
+cd AiHarnessDemo
+dotnet run
+```
+
 Open `http://localhost:5283`.
 
 ## Rehearsal path
 
-1. Open **Settings**, enable the agents you want Team Lead to consider, and choose a local source repository.
+1. Open **Settings**, enable the agents you want Team Lead to consider, and choose a local project folder.
 2. Leave **Run Copilot init** selected, then choose **Initialize and study repository**. Review and edit the generated shared knowledge.
 3. Open **AI Factory**, click **Listen to the next task**, and speak the idea.
 4. Answer Account Manager's clarification, send the brief to Team Lead, and watch the execution graph.
 5. Open the customer preview, speak feedback, then approve the result or start another iteration.
 6. Show **Execution history** and **Harness memory** to explain model routing and cross-flow learning.
 
-The AI Factory and every new-assignment control remain locked until Settings contains a studied Git repository.
+The AI Factory and every new-assignment control remain locked until Settings contains a studied project folder with at least one Git repository.
 
 ## Safety and persistence
 
 - All application state is stored in `data\ai-harness.db`.
 - `WORKFLOW.md` is the hot-reloadable, version-controlled Symphony policy and prompt contract.
 - Agent definitions are loaded from `.github\agents\*.agent.md`.
-- Copilot CLI receives tool access only inside `data\worktrees\<flow-id>`; the selected source must be a Git repository.
-- Multiple flows can run in parallel; every flow receives an independent worktree and branch.
+- Copilot CLI receives tool access only inside `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree.
+- Multiple flows can run in parallel; every flow receives an independent project workspace and a matching branch in each discovered repository.
 - No cloud credentials, private endpoints, or provider-specific work-item integrations are included.
 
 See [`docs\ARCHITECTURE.md`](docs\ARCHITECTURE.md) for the flow and component model.
