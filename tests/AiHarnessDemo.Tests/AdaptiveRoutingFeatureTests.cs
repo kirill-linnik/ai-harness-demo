@@ -1,4 +1,5 @@
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Data;
 using AiHarnessDemo.Services;
@@ -380,5 +381,183 @@ public sealed class RoutingObservationTests
         public Task<HarnessDbContext> CreateDbContextAsync(
             CancellationToken cancellationToken = default) =>
             Task.FromResult(CreateDbContext());
+    }
+}
+
+public sealed class ApprovalGatedReleaseTests
+{
+    [Fact]
+    public async Task Approval_QueuesPublicationInsteadOfClosingTheFlow()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var databaseFactory = new ApprovalDbContextFactory(options);
+        var flow = await SeedWaitingFlowAsync(databaseFactory);
+        var queue = new FlowQueue();
+        using var gate = new HandoffGateEngine();
+        gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
+        await RestoreGateAsync(databaseFactory, gate);
+        var coordinator = CreateCoordinator(databaseFactory, gate, queue);
+
+        var updated = await coordinator.DecideAsync(
+            flow.Id,
+            approve: true,
+            CancellationToken.None);
+
+        Assert.Equal(FlowStatus.Queued, updated.Status);
+        Assert.Null(updated.CompletedAt);
+        Assert.Equal($"#/preview/{flow.Id}", updated.OutcomeUrl);
+        var publication = Assert.Single(
+            updated.Steps,
+            step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
+        Assert.Equal(StepStatus.Pending, publication.Status);
+        Assert.Contains(
+            WorkflowEngine.ApprovedPublicationAssignment,
+            publication.InputSummary);
+        Assert.True(queue.Reader.TryRead(out var queuedFlowId));
+        Assert.Equal(flow.Id, queuedFlowId);
+        await using var database = await databaseFactory.CreateDbContextAsync();
+        var resolvedGate = await database.GateRecords.SingleAsync();
+        Assert.True(resolvedGate.Resolved);
+        Assert.True(resolvedGate.Approved);
+    }
+
+    [Fact]
+    public async Task Rejection_QueuesReworkWithoutPublication()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var databaseFactory = new ApprovalDbContextFactory(options);
+        var flow = await SeedWaitingFlowAsync(databaseFactory);
+        await using (var database = await databaseFactory.CreateDbContextAsync())
+        {
+            database.FlowMessages.Add(new FlowMessage
+            {
+                FlowRunId = flow.Id,
+                Role = ConversationRole.Customer,
+                Content = "Increase text contrast."
+            });
+            await database.SaveChangesAsync();
+        }
+        var queue = new FlowQueue();
+        using var gate = new HandoffGateEngine();
+        gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
+        await RestoreGateAsync(databaseFactory, gate);
+        var coordinator = CreateCoordinator(databaseFactory, gate, queue);
+
+        var updated = await coordinator.DecideAsync(
+            flow.Id,
+            approve: false,
+            CancellationToken.None);
+
+        Assert.Equal(FlowStatus.Queued, updated.Status);
+        Assert.Equal(2, updated.Iteration);
+        Assert.DoesNotContain(
+            updated.Steps,
+            step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
+        Assert.True(queue.Reader.TryRead(out var queuedFlowId));
+        Assert.Equal(flow.Id, queuedFlowId);
+    }
+
+    [Fact]
+    public void PullRequestUrl_IsAcceptedOnlyFromPublishedReleaseOutput()
+    {
+        Assert.Equal(
+            "https://github.com/devclub/site/pull/38",
+            WorkflowEngine.ExtractPullRequestUrl(
+                "Published https://github.com/devclub/site/pull/38 after approval."));
+        Assert.Null(WorkflowEngine.ExtractPullRequestUrl("Local candidate only."));
+    }
+
+    private static FeedbackCoordinator CreateCoordinator(
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        HandoffGateEngine gate,
+        FlowQueue queue) =>
+        new(
+            databaseFactory,
+            new FixedModelRouter(),
+            new BootstrapTaskProfileFactory(),
+            TestRoutingSupport.Recorder(databaseFactory),
+            new NeverApprovalAgentRunner(),
+            gate,
+            queue);
+
+    private static async Task<FlowRun> SeedWaitingFlowAsync(
+        IDbContextFactory<HarnessDbContext> databaseFactory)
+    {
+        await using var database = await databaseFactory.CreateDbContextAsync();
+        await database.Database.EnsureCreatedAsync();
+        var flow = new FlowRun
+        {
+            Title = "Approval gated release",
+            OriginalRequest = "Prepare a release.",
+            ConsolidatedRequest = "Prepare a release.",
+            Status = FlowStatus.WaitingForFeedback,
+            Outcome = OutcomeType.PullRequest,
+            RepositoryPath = @"C:\code\demo"
+        };
+        flow.OutcomeUrl = $"#/preview/{flow.Id}";
+        var release = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 70,
+            AgentId = "release-engineer",
+            AgentName = "Release Engineer",
+            AgentRole = "release-engineer",
+            Label = WorkflowEngine.ReleaseCandidateLabel,
+            Status = StepStatus.Completed,
+            Attempt = 1,
+            OutputSummary = "Local candidate prepared."
+        };
+        flow.Steps.Add(release);
+        database.Flows.Add(flow);
+        database.GateRecords.Add(new HandoffGateRecord
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = release.Id,
+            ActionType = HandoffActionType.Release,
+            Decision = HandoffGateDecision.AwaitingHumanApproval,
+            TrustLevelAtDecision = HandoffTrustLevel.Gated,
+            Summary = "Candidate ready.",
+            Evidence = "Validated.",
+            Reason = "Customer approval required."
+        });
+        await database.SaveChangesAsync();
+        return flow;
+    }
+
+    private static async Task RestoreGateAsync(
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        HandoffGateEngine gate)
+    {
+        await using var database = await databaseFactory.CreateDbContextAsync();
+        gate.RestoreHistory(await database.GateRecords.AsNoTracking().ToListAsync());
+    }
+
+    private sealed class ApprovalDbContextFactory(
+        DbContextOptions<HarnessDbContext> options)
+        : IDbContextFactory<HarnessDbContext>
+    {
+        public HarnessDbContext CreateDbContext() => new(options);
+
+        public Task<HarnessDbContext> CreateDbContextAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(CreateDbContext());
+    }
+
+    private sealed class NeverApprovalAgentRunner : IAgentRunner
+    {
+        public Task<AgentExecutionResult> ExecuteAsync(
+            AgentExecutionContext context,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException(
+                "Approval scheduling must not execute an agent inline.");
     }
 }

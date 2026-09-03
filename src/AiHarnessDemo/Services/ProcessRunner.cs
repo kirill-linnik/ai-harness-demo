@@ -118,18 +118,18 @@ public sealed class ProcessRunner
         }
         catch (ProcessStalledException)
         {
-            Terminate(process);
+            await TerminateAsync(process);
             throw;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            Terminate(process);
+            await TerminateAsync(process);
             throw new TimeoutException(
                 $"'{executable}' did not finish within {timeout.TotalMinutes:0.#} minutes.");
         }
         catch (OperationCanceledException)
         {
-            Terminate(process);
+            await TerminateAsync(process);
             throw;
         }
 
@@ -173,7 +173,7 @@ public sealed class ProcessRunner
         }
     }
 
-    private static void Terminate(Process process)
+    private static async Task TerminateAsync(Process process)
     {
         if (process.HasExited)
         {
@@ -181,6 +181,8 @@ public sealed class ProcessRunner
         }
 
         process.Kill(entireProcessTree: true);
+        await process.WaitForExitAsync(CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     private static void ConfigureInvocation(

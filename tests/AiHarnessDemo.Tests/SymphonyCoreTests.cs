@@ -122,6 +122,7 @@ public sealed class WorkflowDefinitionTests
         Assert.Equal("voice", workflow.Config.Tracker.Kind);
         Assert.Equal(7, workflow.Config.Agent.MaxConcurrentAgents);
         Assert.Equal(2, workflow.Config.Agent.MaxAttempts);
+        Assert.Equal(900_000, workflow.Config.Copilot.MaximumQualityStallTimeoutMs);
         Assert.Equal(
             Path.Combine(artifact.Directory, ".worktrees"),
             workflow.Config.Workspace.ResolvedRoot);
@@ -136,6 +137,30 @@ public sealed class WorkflowDefinitionTests
             renderer.Render("Build {{ missing.value }}", new Dictionary<string, string>()));
 
         Assert.Contains("missing.value", exception.Message);
+    }
+
+    [Fact]
+    public void Render_PreservesTemplateSyntaxInsideRuntimeValues()
+    {
+        var rendered = new WorkflowPromptRenderer().Render(
+            "Prior handoff:\n{{ handoffs }}",
+            new Dictionary<string, string>
+            {
+                ["handoffs"] = "Angular binding: {{ meeting.title }}"
+            });
+
+        Assert.Contains("{{ meeting.title }}", rendered);
+    }
+
+    [Fact]
+    public void Render_RejectsUnsupportedExpressionsInTheTemplateItself()
+    {
+        var exception = Assert.Throws<WorkflowConfigurationException>(() =>
+            new WorkflowPromptRenderer().Render(
+                "{{ task | upper }}",
+                new Dictionary<string, string> { ["task"] = "Build it." }));
+
+        Assert.Contains("invalid or unsupported", exception.Message);
     }
 
     [Fact]

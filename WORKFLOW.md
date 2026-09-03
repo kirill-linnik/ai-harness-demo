@@ -23,6 +23,7 @@ copilot:
   command: copilot
   turn_timeout_ms: 1200000
   stall_timeout_ms: 300000
+  maximum_quality_stall_timeout_ms: 900000
 ---
 
 You are {{ agent.name }}. Execute only the current assignment for this role.

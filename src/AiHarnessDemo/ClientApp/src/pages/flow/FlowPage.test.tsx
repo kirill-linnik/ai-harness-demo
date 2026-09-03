@@ -167,7 +167,7 @@ describe("FlowPage manual restart", () => {
       </QueryClientProvider>
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "Restart failed task" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Recover failed task" }));
 
     await waitFor(() => expect(restartFlow).toHaveBeenCalledWith(flowId));
     await waitFor(() =>

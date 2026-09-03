@@ -34,6 +34,23 @@ public sealed class CopilotSessionJournalTests
     }
 
     [Fact]
+    public async Task InspectAsync_RecoversACompletedHandoffWhenCliNeverShutsDownCleanly()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: true,
+            includeShutdown: false);
+
+        var snapshot = await CopilotSessionJournal.InspectDirectoryAsync(
+            fixture.CopilotHome,
+            fixture.SessionDirectory,
+            fixture.SessionId);
+
+        Assert.Equal(CopilotSessionJournalState.Completed, snapshot.State);
+        Assert.Contains("HANDOFF_STATUS: COMPLETE", snapshot.Result!.OutputSummary);
+    }
+
+    [Fact]
     public async Task InspectAsync_TreatsAnOpenTurnAndMalformedTailAsInterrupted()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
@@ -60,7 +77,7 @@ public sealed class CopilotSessionJournalTests
             Path.Combine(fixture.SessionDirectory, "events.jsonl"),
             [
                 RecoveryFixture.Serialize(
-                    "session.start",
+                    "session.resume",
                     resumedAt,
                     new
                     {
@@ -208,6 +225,59 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     [Fact]
+    public async Task RecoveryAutomaticallyContinuesAFailedStallWithCompletedOutput()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: false,
+            includeShutdown: false);
+        await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var failedStep = Assert.Single(flow.Steps);
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Agent process produced no output for 300 seconds.";
+            failedStep.Status = StepStatus.Failed;
+            failedStep.Phase = AgentRunPhase.Stalled;
+            failedStep.CompletedAt = DateTimeOffset.UtcNow;
+            flow.Steps.Add(new FlowStep
+            {
+                FlowRunId = flow.Id,
+                Iteration = flow.Iteration,
+                Sequence = 50,
+                AgentId = "quality-engineer",
+                AgentName = "Quality Engineer",
+                AgentRole = "quality-engineer",
+                Status = StepStatus.Skipped,
+                Phase = AgentRunPhase.Failed,
+                CompletedAt = DateTimeOffset.UtcNow
+            });
+            await database.SaveChangesAsync();
+        }
+
+        var recoveredFlows = await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+
+        await using var verification =
+            await fixture.DatabaseFactory.CreateDbContextAsync();
+        var recovered = await verification.Flows
+            .Include(item => item.Steps)
+            .Include(item => item.Events)
+            .SingleAsync();
+        Assert.Contains(fixture.FlowId, recoveredFlows);
+        Assert.Equal(FlowStatus.Queued, recovered.Status);
+        Assert.Equal(
+            StepStatus.Completed,
+            recovered.Steps.Single(step => step.Sequence == 40).Status);
+        Assert.Equal(
+            StepStatus.Pending,
+            recovered.Steps.Single(step => step.AgentRole == "quality-engineer").Status);
+        Assert.Contains(
+            recovered.Events,
+            item => item.Type == "flow.completed-output-auto-recovered");
+    }
+
+    [Fact]
     public async Task ManualRestartPreservesFailureAndQueuesAResumableRetry()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
@@ -272,6 +342,89 @@ public sealed class WorkflowRestartRecoveryTests
                 CancellationToken.None));
         Assert.Contains("Only a failed flow", exception.Message);
     }
+
+    [Fact]
+    public async Task ManualRestartSkipsJournalDiscoveryForPreLaunchFailure()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: false);
+        await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var failedStep = Assert.Single(flow.Steps);
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Workflow template failed.";
+            failedStep.Status = StepStatus.Failed;
+            failedStep.Phase = AgentRunPhase.Failed;
+            failedStep.CopilotSessionId = Guid.NewGuid();
+            failedStep.CopilotSessionHome = fixture.CopilotHome;
+            failedStep.CompletedAt = DateTimeOffset.UtcNow;
+            await database.SaveChangesAsync();
+        }
+
+        var restarted = await fixture.Engine.RestartFailedFlowAsync(
+            fixture.FlowId,
+            CancellationToken.None);
+
+        var retry = restarted.Steps.Single(step =>
+            step.Label == "Manual restart of Software Engineer");
+        Assert.Equal(StepStatus.Pending, retry.Status);
+        Assert.Null(retry.CopilotSessionId);
+        Assert.DoesNotContain(
+            restarted.Events,
+            item => item.Type == "agent.session-discovered");
+    }
+
+    [Fact]
+    public async Task ManualRestartRecoversCompletedOutputInsteadOfRerunningTheAgent()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: false,
+            includeShutdown: false);
+        await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var failedStep = Assert.Single(flow.Steps);
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Agent process produced no output for 300 seconds.";
+            failedStep.Status = StepStatus.Failed;
+            failedStep.Phase = AgentRunPhase.Stalled;
+            failedStep.CompletedAt = DateTimeOffset.UtcNow;
+            flow.Steps.Add(new FlowStep
+            {
+                FlowRunId = flow.Id,
+                Iteration = flow.Iteration,
+                Sequence = 50,
+                AgentId = "quality-engineer",
+                AgentName = "Quality Engineer",
+                AgentRole = "quality-engineer",
+                Status = StepStatus.Skipped,
+                Phase = AgentRunPhase.Failed,
+                CompletedAt = DateTimeOffset.UtcNow
+            });
+            await database.SaveChangesAsync();
+        }
+
+        var restarted = await fixture.Engine.RestartFailedFlowAsync(
+            fixture.FlowId,
+            CancellationToken.None);
+
+        Assert.Equal(FlowStatus.Queued, restarted.Status);
+        Assert.Equal(
+            StepStatus.Completed,
+            restarted.Steps.Single(step => step.Sequence == 40).Status);
+        Assert.Equal(
+            StepStatus.Pending,
+            restarted.Steps.Single(step => step.AgentRole == "quality-engineer").Status);
+        Assert.DoesNotContain(
+            restarted.Steps,
+            step => step.Label.StartsWith("Manual restart of", StringComparison.Ordinal));
+        Assert.Contains(
+            restarted.Events,
+            item => item.Type == "flow.completed-output-recovered");
+    }
 }
 
 internal sealed class RecoveryFixture : IAsyncDisposable
@@ -320,7 +473,8 @@ internal sealed class RecoveryFixture : IAsyncDisposable
 
     public static async Task<RecoveryFixture> CreateAsync(
         bool completed,
-        bool persistSessionId)
+        bool persistSessionId,
+        bool includeShutdown = true)
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -339,7 +493,7 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         Directory.CreateDirectory(sessionDirectory);
         await File.WriteAllTextAsync(
             Path.Combine(sessionDirectory, "events.jsonl"),
-            BuildJournal(sessionId, workspacePath, completed));
+            BuildJournal(sessionId, workspacePath, completed, includeShutdown));
 
         var options = new DbContextOptionsBuilder<HarnessDbContext>()
             .UseSqlite($"Data Source={databasePath};Pooling=False")
@@ -384,7 +538,7 @@ internal sealed class RecoveryFixture : IAsyncDisposable
             NullLogger<WorkflowDefinitionProvider>.Instance);
         var gate = new HandoffGateEngine();
         gate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
-        var journal = new CopilotSessionJournal(paths);
+        var journal = new CopilotSessionJournal();
         var engine = new WorkflowEngine(
             databaseFactory,
             new AgentCatalog(paths, databaseFactory),
@@ -421,7 +575,8 @@ internal sealed class RecoveryFixture : IAsyncDisposable
     private static string BuildJournal(
         Guid sessionId,
         string workspacePath,
-        bool completed)
+        bool completed,
+        bool includeShutdown)
     {
         var startedAt = DateTimeOffset.UtcNow.AddMinutes(-4);
         var events = new List<string>
@@ -472,13 +627,16 @@ internal sealed class RecoveryFixture : IAsyncDisposable
                 {
                     turnId = "0"
                 }));
-            events.Add(Serialize(
-                "session.shutdown",
-                startedAt.AddSeconds(5),
-                new
-                {
-                    shutdownType = "routine"
-                }));
+            if (includeShutdown)
+            {
+                events.Add(Serialize(
+                    "session.shutdown",
+                    startedAt.AddSeconds(5),
+                    new
+                    {
+                        shutdownType = "routine"
+                    }));
+            }
         }
         else
         {

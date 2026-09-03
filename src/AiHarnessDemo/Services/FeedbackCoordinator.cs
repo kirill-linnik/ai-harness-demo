@@ -35,6 +35,7 @@ public sealed partial class FeedbackCoordinator(
         FlowRun flow;
         AgentRecord? productManager;
         FlowStep? step = null;
+        var expectedAcceptedTimeSeconds = 0.0;
         await using (var database = await databaseFactory.CreateDbContextAsync(cancellationToken))
         {
             flow = await database.Flows
@@ -100,11 +101,15 @@ public sealed partial class FeedbackCoordinator(
                 var decision = await modelRouter.SelectAsync(
                     new RoutingRequest(step.Id, flow.ModelSelectionStrategy),
                     cancellationToken);
+                expectedAcceptedTimeSeconds = decision.PredictedAcceptedTimeSeconds;
                 step.Model = decision.SelectedModel;
                 step.ModelEffort = decision.SelectedEffort;
                 step.ModelReason = decision.Reason;
                 step.Status = StepStatus.Running;
                 step.StartedAt = DateTimeOffset.UtcNow;
+                step.CopilotSessionId =
+                    AgentSessionIdentity.Create(flow.Id, flow.Iteration, productManager.Id);
+                step.CopilotSessionHome = CopilotReasoningHost.ResolveCopilotSessionHome();
                 await database.SaveChangesAsync(cancellationToken);
             }
         }
@@ -147,12 +152,14 @@ public sealed partial class FeedbackCoordinator(
                         string.IsNullOrWhiteSpace(flow.WorkspacePath)
                             ? flow.RepositoryPath
                             : flow.WorkspacePath,
-                        AgentSessionIdentity.Create(flow.Id, flow.Iteration, productManager.Id),
+                        step.CopilotSessionId!.Value,
                         flow.Outcome,
                         "Review the execution ledger and help the customer decide.",
                         previousOutputs,
                         [],
                         message,
+                        ModelSelectionStrategy: flow.ModelSelectionStrategy,
+                        ExpectedAcceptedTimeSeconds: expectedAcceptedTimeSeconds,
                         Progress: progress =>
                             RecordProgressAsync(
                                     flow.Id,
@@ -327,13 +334,47 @@ public sealed partial class FeedbackCoordinator(
 
         if (approve)
         {
-            flow.Status = FlowStatus.Approved;
-            flow.CompletedAt = DateTimeOffset.UtcNow;
+            var releaseStep = flow.Steps
+                .Where(item => item.AgentRole == "release-engineer")
+                .OrderByDescending(item => item.Sequence)
+                .FirstOrDefault()
+                ?? throw new InvalidOperationException(
+                    "The flow has no prepared Release Engineer handoff to publish.");
+            var publicationStep = new FlowStep
+            {
+                FlowRunId = flow.Id,
+                Iteration = flow.Iteration,
+                Sequence = flow.Steps
+                    .Where(item => item.Iteration == flow.Iteration)
+                    .Select(item => item.Sequence)
+                    .DefaultIfEmpty()
+                    .Max() + 10,
+                AgentId = releaseStep.AgentId,
+                AgentName = releaseStep.AgentName,
+                AgentRole = releaseStep.AgentRole,
+                Label = WorkflowEngine.ApprovedPublicationLabel,
+                Status = StepStatus.Pending,
+                Phase = AgentRunPhase.PreparingWorkspace,
+                Attempt = flow.Steps
+                    .Where(item =>
+                        item.Iteration == flow.Iteration &&
+                        item.AgentRole == "release-engineer")
+                    .Select(item => item.Attempt)
+                    .DefaultIfEmpty()
+                    .Max() + 1,
+                InputSummary = WorkflowEngine.ApprovedPublicationAssignment
+            };
+            flow.Steps.Add(publicationStep);
+            database.Entry(publicationStep).State = EntityState.Added;
+            flow.Status = FlowStatus.Queued;
+            flow.CompletedAt = null;
             var approvedEvent = new FlowEvent
             {
                 FlowRunId = flow.Id,
-                Type = "flow.approved",
-                Message = "Customer approved the delivered outcome. Factory flow closed."
+                FlowStepId = publicationStep.Id,
+                Type = "flow.approved-publication-queued",
+                Message =
+                    "Customer approved the reviewed candidate. Release publication is queued."
             };
             flow.Events.Add(approvedEvent);
             database.Entry(approvedEvent).State = EntityState.Added;
@@ -376,9 +417,12 @@ public sealed partial class FeedbackCoordinator(
                 cancellationToken);
         }
 
-        if (!approve && !flowQueue.Queue(flow.Id))
+        if (!flowQueue.Queue(flow.Id))
         {
-            throw new InvalidOperationException("Unable to queue the revised factory flow.");
+            throw new InvalidOperationException(
+                approve
+                    ? "Unable to queue the customer-approved release publication."
+                    : "Unable to queue the revised factory flow.");
         }
 
         return flow.ToDetailDto();
@@ -419,6 +463,9 @@ public sealed partial class FeedbackCoordinator(
 
     internal static string StripReworkTargetMarker(string output) =>
         ReworkTargetRolesPattern().Replace(output, string.Empty).Trim();
+
+    internal static bool HasReworkTargetMarker(string output) =>
+        ReworkTargetRolesPattern().Matches(output).Count == 1;
 
     private async Task RecordProgressAsync(
         Guid flowId,
@@ -473,6 +520,12 @@ public sealed partial class FeedbackCoordinator(
             ? AgentRunPhase.Stalled
             : AgentRunPhase.Failed;
         storedStep.CompletedAt = DateTimeOffset.UtcNow;
+        if (exception is AgentRunException failedRun)
+        {
+            storedStep.ExecutionAttempts = Math.Max(
+                storedStep.ExecutionAttempts,
+                failedRun.ExecutionAttempts);
+        }
         storedStep.DurationMilliseconds = Math.Max(
             1,
             (long)(storedStep.CompletedAt.Value - storedStep.StartedAt!.Value).TotalMilliseconds);
@@ -490,6 +543,7 @@ public sealed partial class FeedbackCoordinator(
                 ? runException.FailureKind
                 : AgentRunFailureKind.InvalidOutput,
             storedStep.DurationMilliseconds,
+            Math.Max(1, storedStep.ExecutionAttempts),
             cancellationToken);
     }
 }

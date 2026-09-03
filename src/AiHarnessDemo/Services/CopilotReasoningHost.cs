@@ -1,3 +1,4 @@
+using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Core.Workflow;
 using AiHarnessDemo.Infrastructure;
@@ -13,7 +14,8 @@ public sealed partial class CopilotReasoningHost(
     WorkflowDefinitionProvider workflowProvider,
     CopilotCliRuntime copilotCliRuntime,
     WorkflowPromptRenderer promptRenderer,
-    WorkspaceHookRunner hookRunner)
+    WorkspaceHookRunner hookRunner,
+    CopilotSessionJournal sessionJournal)
     : ReasoningHost(new ReasoningHostConfig("copilot-cli"))
 {
     private const int MaximumPromptCharacters = 16_000;
@@ -110,10 +112,7 @@ public sealed partial class CopilotReasoningHost(
             AgentRunPhase.BuildingPrompt,
             "Rendered the exact prompt for the Copilot CLI turn.",
             prompt));
-        var environmentVariables = BuildProcessEnvironment(
-            context.AgentRole,
-            paths.DatabasePath);
-        var copilotSessionHome = ResolveCopilotSessionHome(environmentVariables);
+        var copilotSessionHome = ResolveCopilotSessionHome();
         var arguments = BuildCliArguments(
             request.WorkingDirectory,
             paths.Root,
@@ -124,11 +123,11 @@ public sealed partial class CopilotReasoningHost(
             request.CopilotSessionId,
             prompt,
             context.ResumeSession || context.RecoverInterruptedSession);
-        if (environmentVariables?.TryGetValue("COPILOT_HOME", out var copilotHome) == true)
-        {
-            Directory.CreateDirectory(copilotHome);
-        }
         ProcessResult result;
+        var timeouts = ResolveExecutionTimeouts(
+            workflow.Config.Copilot,
+            context.ModelSelectionStrategy,
+            context.ExpectedAcceptedTimeSeconds);
 
         try
         {
@@ -138,29 +137,36 @@ public sealed partial class CopilotReasoningHost(
                 cancellationToken);
             request.Progress?.Invoke(new AgentRunProgress(
                 AgentRunPhase.LaunchingAgentProcess,
-                $"Launching Copilot CLI {copilotCli.Version} with {request.Model}/{request.Effort}."));
+                $"Launching Copilot CLI {copilotCli.Version} with {request.Model}/{request.Effort}; " +
+                $"{timeouts.StallTimeout.TotalMinutes:0.#}-minute quiet watchdog and " +
+                $"{timeouts.TurnTimeout.TotalMinutes:0.#}-minute hard limit."));
             result = await processRunner.RunAsync(
                 copilotCli.ResolvedPath,
                 arguments,
                 request.WorkingDirectory,
-                TimeSpan.FromMilliseconds(workflow.Config.Copilot.TurnTimeoutMs),
+                timeouts.TurnTimeout,
                 cancellationToken,
                 CopilotJsonlParser.CreateProgressReporter(
                     request.Progress,
                     copilotSessionHome),
-                TimeSpan.FromMilliseconds(workflow.Config.Copilot.StallTimeoutMs),
-                environmentVariables);
+                timeouts.StallTimeout);
         }
         catch (ProcessStalledException exception)
         {
-            return Failure(
+            return await RecoverInterruptedProcessAsync(
+                context,
+                request,
+                copilotSessionHome,
                 "Copilot CLI stalled.",
                 exception.Message,
                 AgentRunFailureKind.Stalled);
         }
         catch (TimeoutException exception)
         {
-            return Failure(
+            return await RecoverInterruptedProcessAsync(
+                context,
+                request,
+                copilotSessionHome,
                 "Copilot CLI timed out.",
                 exception.Message,
                 AgentRunFailureKind.TimedOut);
@@ -280,6 +286,111 @@ public sealed partial class CopilotReasoningHost(
                 MaximumPromptCharacters -
                 recoveryInstruction.Length -
                 (Environment.NewLine.Length * 2));
+    }
+
+    internal static CopilotExecutionTimeouts ResolveExecutionTimeouts(
+        CopilotConfig config,
+        ModelSelectionStrategy strategy,
+        double expectedAcceptedTimeSeconds = 0)
+    {
+        var stallTimeoutMs = config.StallTimeoutMs;
+        if (strategy == ModelSelectionStrategy.MaximumQuality)
+        {
+            var predictedQuietWindowMs = double.IsFinite(expectedAcceptedTimeSeconds) &&
+                                         expectedAcceptedTimeSeconds > 0
+                ? expectedAcceptedTimeSeconds * 1_500
+                : config.MaximumQualityStallTimeoutMs;
+            stallTimeoutMs = (int)Math.Clamp(
+                predictedQuietWindowMs,
+                config.StallTimeoutMs,
+                config.MaximumQualityStallTimeoutMs);
+        }
+
+        return new CopilotExecutionTimeouts(
+            TimeSpan.FromMilliseconds(config.TurnTimeoutMs),
+            TimeSpan.FromMilliseconds(stallTimeoutMs));
+    }
+
+    private async Task<AgentRunResult> RecoverInterruptedProcessAsync(
+        AgentExecutionContext context,
+        AgentRunRequest request,
+        string copilotSessionHome,
+        string summary,
+        string error,
+        AgentRunFailureKind failureKind)
+    {
+        CopilotSessionSnapshot snapshot;
+        try
+        {
+            snapshot = await sessionJournal.InspectAsync(
+                copilotSessionHome,
+                request.CopilotSessionId,
+                CancellationToken.None);
+            for (var retry = 0;
+                 retry < 4 && snapshot.State == CopilotSessionJournalState.Active;
+                 retry++)
+            {
+                await Task.Delay(250, CancellationToken.None);
+                snapshot = await sessionJournal.InspectAsync(
+                    copilotSessionHome,
+                    request.CopilotSessionId,
+                    CancellationToken.None);
+            }
+        }
+        catch (IOException exception)
+        {
+            return Failure(
+                summary,
+                $"{error} Session recovery inspection failed: {exception.Message}",
+                failureKind);
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            return Failure(
+                summary,
+                $"{error} Session recovery inspection failed: {exception.Message}",
+                failureKind);
+        }
+
+        if (snapshot.State == CopilotSessionJournalState.Completed &&
+            snapshot.Result is { Success: true } recovered &&
+            IsRecoverableCompletedOutput(context.AgentRole, recovered.OutputSummary))
+        {
+            request.Progress?.Invoke(new AgentRunProgress(
+                AgentRunPhase.Finishing,
+                "Recovered the completed handoff from the Copilot session journal after the CLI stopped responding."));
+            return recovered;
+        }
+
+        return Failure(
+            summary,
+            error,
+            failureKind,
+            canResumeSession:
+                snapshot.State is
+                    CopilotSessionJournalState.Interrupted or
+                    CopilotSessionJournalState.Completed);
+    }
+
+    internal static bool IsRecoverableCompletedOutput(string agentRole, string output) =>
+        agentRole switch
+        {
+            "account-manager" => HasValidIntakeContract(output),
+            "product-manager" => FeedbackCoordinator.HasReworkTargetMarker(output),
+            _ => AgentHandoffInspector.HasTerminalStatus(output)
+        };
+
+    private static bool HasValidIntakeContract(string output)
+    {
+        try
+        {
+            _ = IntakeCoordinator.ParseResponse(output);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
     }
 
     internal static IReadOnlyDictionary<string, string> BuildPromptValues(
@@ -514,16 +625,9 @@ public sealed partial class CopilotReasoningHost(
         return Clip(string.Join(' ', summaryLines), 500);
     }
 
-    internal static string ResolveCopilotSessionHome(
-        IReadOnlyDictionary<string, string>? environmentVariables)
+    internal static string ResolveCopilotSessionHome(string? inheritedHome = null)
     {
-        if (environmentVariables?.TryGetValue("COPILOT_HOME", out var configuredHome) == true &&
-            !string.IsNullOrWhiteSpace(configuredHome))
-        {
-            return Path.GetFullPath(configuredHome);
-        }
-
-        var inheritedHome = Environment.GetEnvironmentVariable("COPILOT_HOME");
+        inheritedHome ??= Environment.GetEnvironmentVariable("COPILOT_HOME");
         return string.IsNullOrWhiteSpace(inheritedHome)
             ? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -561,27 +665,6 @@ public sealed partial class CopilotReasoningHost(
             comparison);
     }
 
-    internal static IReadOnlyDictionary<string, string>? BuildProcessEnvironment(
-        string agentRole,
-        string databasePath)
-    {
-        if (!IsAccountManager(agentRole))
-        {
-            return null;
-        }
-
-        var dataDirectory = Path.GetDirectoryName(Path.GetFullPath(databasePath))
-            ?? throw new InvalidOperationException(
-                $"Harness database path has no parent directory: {databasePath}");
-        return new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["COPILOT_HOME"] = Path.Combine(
-                dataDirectory,
-                "copilot-home",
-                "account-manager")
-        };
-    }
-
     private static AgentExecutionContext RequireContext(AgentRunRequest request) =>
         request.InputContext.TryGetValue("execution", out var value) &&
         value is AgentExecutionContext context
@@ -594,15 +677,21 @@ public sealed partial class CopilotReasoningHost(
         string summary,
         string error,
         AgentRunFailureKind failureKind,
-        string? dependency = null) =>
+        string? dependency = null,
+        bool canResumeSession = false) =>
         new()
         {
             Success = false,
             OutputSummary = summary,
             Error = error,
             FailureKind = failureKind,
-            FailedDependency = dependency
+            FailedDependency = dependency,
+            CanResumeSession = canResumeSession
         };
+
+    internal sealed record CopilotExecutionTimeouts(
+        TimeSpan TurnTimeout,
+        TimeSpan StallTimeout);
 
     internal static string ResponseContract(string agentRole) =>
         agentRole switch

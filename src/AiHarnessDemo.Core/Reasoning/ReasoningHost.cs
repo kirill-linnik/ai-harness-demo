@@ -28,6 +28,7 @@ public enum AgentRunPhase
     InitializingSession,
     StreamingTurn,
     Finishing,
+    Retrying,
     Succeeded,
     Failed,
     TimedOut,
@@ -57,6 +58,8 @@ public sealed class AgentRunResult
     public string? FailedDependency { get; init; }
 
     public bool ProcessTerminationUnconfirmed { get; init; }
+
+    public bool CanResumeSession { get; init; }
 }
 
 /// <summary>A scrubbed tool invocation. Raw tool arguments and results are not part of the audit record.</summary>
@@ -112,10 +115,15 @@ public sealed class AgentRunException(
     string message,
     AgentRunFailureKind failureKind,
     string? failedDependency = null,
+    bool canResumeSession = false,
     Exception? innerException = null)
     : Exception(message, innerException)
 {
     public AgentRunFailureKind FailureKind { get; } = failureKind;
 
     public string? FailedDependency { get; } = failedDependency;
+
+    public bool CanResumeSession { get; } = canResumeSession;
+
+    public int ExecutionAttempts { get; set; } = 1;
 }

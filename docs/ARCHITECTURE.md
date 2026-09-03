@@ -50,9 +50,10 @@ flowchart LR
 | `BootstrapTaskProfileFactory` / Team Lead profiles | Create strictly validated, normalized `task-profile-v1` routing inputs. Team Lead gets one visible correction turn for an invalid downstream profile contract. |
 | `AdaptiveModelRouter` | Applies router-v1 recency-weighted Bayesian evidence, risk quality floors, lexicographic strategy objectives, and bounded deterministic exploration immediately before execution. |
 | `RoutingObservationRecorder` | Records normalized handoff quality, duration/retry, estimated premium use, availability failures, downstream pushback and targeted customer-rework attribution, and weak final approval evidence. |
+| `PreviewArtifactCatalog` | Resolves validated per-variant static builds from the isolated flow workspace and exposes them only after the customer release gate is ready. |
 | `FlowQueue` / `FlowWorker` | Reconcile persisted Copilot sessions before re-queuing work after restart, then execute multiple independent flows concurrently. |
 | `WorkflowEngine` | Drives the durable state machine, pre-creates visible pending stages, records every transition, enforces handoff gates, and learns from pushbacks. |
-| `AgentRunner` | Runs every selected role through Copilot CLI with model routing, retries, progress events, and scrubbed tool-call audit. |
+| `AgentRunner` | Runs every selected role through Copilot CLI with model routing, bounded session-aware retries, progress events, and scrubbed tool-call audit. |
 | `CopilotSessionJournal` | Reads Copilot CLI session journals, discovers legacy in-flight sessions by workspace and agent, and distinguishes completed, active, and interrupted turns. |
 | `WorkspaceManager` | Creates one project workspace per flow, with an isolated worktree on the flow branch for every discovered repository. |
 | `FeedbackCoordinator` | Grounds Product Manager in the original request and full ledger, then closes or requeues the same flow with retained context. |
@@ -84,6 +85,9 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 - Gives delivery agents only the two most recent completed handoffs in the current iteration; Product Manager receives the execution ledger required by its role.
 - Gives each agent project access inside the isolated workspace; use only with repositories you trust.
 - Classifies an explicit `PUSHBACK` before advance gating, records a revision request and reusable prompt refinement, resumes the responsible upstream Copilot session, then resumes the blocked agent with the corrected handoff.
+- Applies the hot-reloadable five-minute quiet watchdog to Fastest response and Lowest cost. Maximum quality scales that window up to the configured fifteen-minute cap using predicted accepted time while retaining the hard per-turn timeout.
+- Recovers a contract-valid final handoff from the Copilot session journal when the CLI does not shut down cleanly; otherwise only a confirmed interrupted journal is resumed on the next bounded runtime attempt.
+- Keeps release preparation local until the customer resolves the release gate. Approval queues a distinct Release Engineer publication step; only that post-approval step may push and create the configured pull request.
 - Bounds every agent-to-agent correction loop with the persisted Settings retry limit (`0-10`, default `2`); only exhaustion or a missing upstream owner makes the flow terminal and skips downstream steps.
 
 ## API shape
@@ -95,6 +99,7 @@ The browser uses a same-origin minimal API:
 - `/api/intake`
 - `/api/flows`, `/api/flows/{id}`, `/start`, `/restart`, `/feedback`, `/decision`
 - `/api/history`, `/api/learnings`, `/api/previews/{id}`
+- `/api/previews/{id}/artifacts/{variant}/{path}` serves the real isolated browser build used by the customer acceptance page.
 
 The UI polls only active flows. Completed flows remain static and independently addressable through `#/factory/{id}`.
 

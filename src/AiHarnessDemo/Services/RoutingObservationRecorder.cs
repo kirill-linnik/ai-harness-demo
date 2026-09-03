@@ -29,21 +29,28 @@ public sealed class RoutingObservationRecorder(
         Guid stepId,
         AgentRunFailureKind failureKind,
         long durationMilliseconds,
+        int executionAttempts,
         CancellationToken cancellationToken = default)
     {
-        var unavailable = failureKind is
+        var operationalFailure = failureKind is
             AgentRunFailureKind.DependencyUnavailable or
-            AgentRunFailureKind.ModelUnavailable;
+            AgentRunFailureKind.ModelUnavailable or
+            AgentRunFailureKind.TimedOut or
+            AgentRunFailureKind.Stalled or
+            AgentRunFailureKind.AmbiguousCrash;
         return RecordAsync(
             stepId,
-            unavailable ? null : false,
-            unavailable,
+            operationalFailure ? null : false,
+            operationalFailure,
             durationMilliseconds,
-            1,
+            executionAttempts,
             failureKind switch
             {
                 AgentRunFailureKind.ModelUnavailable => "model-unavailable",
                 AgentRunFailureKind.DependencyUnavailable => "dependency-unavailable",
+                AgentRunFailureKind.TimedOut => "runtime-timeout",
+                AgentRunFailureKind.Stalled => "runtime-stalled",
+                AgentRunFailureKind.AmbiguousCrash => "runtime-ambiguous-crash",
                 _ => "execution-failure"
             },
             cancellationToken);

@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using AiHarnessDemo.Core.Reasoning;
-using AiHarnessDemo.Infrastructure;
 
 namespace AiHarnessDemo.Services;
 
@@ -27,17 +26,12 @@ internal sealed record CopilotSessionSnapshot(
     IReadOnlyList<int> ActiveProcessIds,
     string Detail);
 
-public sealed class CopilotSessionJournal(HarnessPaths paths)
+public sealed class CopilotSessionJournal
 {
     private const int ProcessExitWaitMilliseconds = 5_000;
 
-    internal string ExpectedHome(string agentRole)
-    {
-        var environment = CopilotReasoningHost.BuildProcessEnvironment(
-            agentRole,
-            paths.DatabasePath);
-        return CopilotReasoningHost.ResolveCopilotSessionHome(environment);
-    }
+    internal string ExpectedHome() =>
+        CopilotReasoningHost.ResolveCopilotSessionHome();
 
     internal Task<CopilotSessionSnapshot> InspectAsync(
         string copilotHome,
@@ -199,9 +193,10 @@ public sealed class CopilotSessionJournal(HarnessPaths paths)
             using (document)
             {
                 var timestamp = ReadTimestamp(document.RootElement);
-                if (eventType == "session.start")
+                if (eventType is "session.start" or "session.resume")
                 {
                     validJournal.Clear();
+                    startedAt = timestamp ?? startedAt;
                     completedAt = null;
                     turnOpen = false;
                     currentTurnHasFinalMessage = false;
@@ -226,6 +221,15 @@ public sealed class CopilotSessionJournal(HarnessPaths paths)
                             workspacePath =
                                 CopilotJsonlParser.ReadString(context, "cwd") ??
                                 workspacePath;
+                        }
+                        break;
+
+                    case "session.resume":
+                        if (Guid.TryParse(
+                                CopilotJsonlParser.ReadString(payload, "sessionId"),
+                                out var resumedSessionId))
+                        {
+                            observedSessionId = resumedSessionId;
                         }
                         break;
 

@@ -39,7 +39,12 @@ export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
     try {
       const updated = await decideFlow.mutateAsync({ flowId: flow.id, approve });
       queryClient.setQueryData(queryKeys.flow(flow.id), updated);
-      toast(approve ? "Outcome approved. Flow closed." : "Feedback retained. New iteration started.", "success");
+      toast(
+        approve
+          ? "Approval recorded. Publishing the pull request now."
+          : "Feedback retained. New iteration started.",
+        "success"
+      );
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error), "error");
     }
@@ -99,7 +104,7 @@ export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
             <RefreshIcon /> {decideFlow.isPending ? "Queuing..." : "Re-do with feedback"}
           </button>
           <button className="button success" disabled={decideFlow.isPending} onClick={() => void decide(true)}>
-            <CheckIcon /> {decideFlow.isPending ? "Approving..." : "Approve outcome"}
+            <CheckIcon /> {decideFlow.isPending ? "Queuing publication..." : "Approve and publish"}
           </button>
         </div>
       </div>

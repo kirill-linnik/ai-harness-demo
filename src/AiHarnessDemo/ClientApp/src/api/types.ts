@@ -35,6 +35,7 @@ export type AgentRunPhase =
   | "InitializingSession"
   | "StreamingTurn"
   | "Finishing"
+  | "Retrying"
   | "Succeeded"
   | "Failed"
   | "TimedOut"
@@ -359,7 +360,15 @@ export interface PreviewDto {
   request: string;
   repositoryName: string;
   iteration: number;
+  status: FlowStatus;
   outcomeLabel: string;
+  artifacts: PreviewArtifactDto[];
   deliveredBy: FlowStepDto[];
   generatedAt: string;
+}
+
+export interface PreviewArtifactDto {
+  id: string;
+  label: string;
+  url: string;
 }

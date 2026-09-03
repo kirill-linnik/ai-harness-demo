@@ -399,10 +399,91 @@ public sealed class AgentCatalogTests
     }
 }
 
+public sealed class PreviewArtifactCatalogTests
+{
+    [Fact]
+    public void DiscoverAndResolve_StayInsideGeneratedCustomerPreview()
+    {
+        var workspace = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-preview-{Guid.NewGuid():N}");
+        var browserRoot = Path.Combine(workspace, ".customer-preview", "eu", "browser");
+        Directory.CreateDirectory(Path.Combine(browserRoot, "assets"));
+        File.WriteAllText(Path.Combine(browserRoot, "index.html"), "<h1>Devclub</h1>");
+        File.WriteAllText(Path.Combine(browserRoot, "assets", "app.js"), "console.log('ok')");
+        File.WriteAllText(Path.Combine(workspace, "secret.txt"), "not public");
+        var flow = new FlowRun
+        {
+            Title = "Preview",
+            OriginalRequest = "Preview",
+            WorkspacePath = workspace
+        };
+
+        try
+        {
+            var catalog = new PreviewArtifactCatalog();
+            var artifact = Assert.Single(catalog.Discover(flow));
+
+            Assert.Equal("devclub.eu", artifact.Label);
+            Assert.Equal(
+                Path.Combine(browserRoot, "assets", "app.js"),
+                catalog.ResolveFile(flow, "eu", "assets/app.js"));
+            Assert.Throws<UnauthorizedAccessException>(() =>
+                catalog.ResolveFile(flow, "eu", "../../secret.txt"));
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+}
+
 public sealed class CopilotReasoningHostTests
 {
     [Fact]
-    public void AccountManagerInvocation_IsToolFreeAndUsesAnIsolatedCopilotHome()
+    public void ExecutionTimeouts_GiveMaximumQualityALongerQuietWindow()
+    {
+        var config = new CopilotConfig
+        {
+            TurnTimeoutMs = 1_200_000,
+            StallTimeoutMs = 300_000,
+            MaximumQualityStallTimeoutMs = 900_000
+        };
+
+        var quality = CopilotReasoningHost.ResolveExecutionTimeouts(
+            config,
+            ModelSelectionStrategy.MaximumQuality,
+            expectedAcceptedTimeSeconds: 400);
+        var fastest = CopilotReasoningHost.ResolveExecutionTimeouts(
+            config,
+            ModelSelectionStrategy.FastestResponse);
+
+        Assert.Equal(TimeSpan.FromMinutes(10), quality.StallTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(5), fastest.StallTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(20), quality.TurnTimeout);
+    }
+
+    [Theory]
+    [InlineData("software-engineer", "HANDOFF_STATUS: COMPLETE", true)]
+    [InlineData("software-engineer", "Still working.", false)]
+    [InlineData(
+        "account-manager",
+        "INTAKE_STATUS: CONFIRMED\nTASK_TITLE: Refresh site\nCUSTOMER_REPLY: Confirmed.\nTASK_BRIEF: Refresh the site.",
+        true)]
+    [InlineData("account-manager", "INTAKE_STATUS: INVALID", false)]
+    [InlineData("product-manager", "REWORK_TARGET_ROLES: NONE", true)]
+    public void RecoverableOutput_RequiresTheRolesTerminalContract(
+        string role,
+        string output,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CopilotReasoningHost.IsRecoverableCompletedOutput(role, output));
+    }
+
+    [Fact]
+    public void AccountManagerInvocation_IsToolFreeAndPreservesUserConfiguration()
     {
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\worktree",
@@ -413,10 +494,6 @@ public sealed class CopilotReasoningHostTests
             "low",
             Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             "Prompt");
-        var environment = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
-            CopilotReasoningHost.BuildProcessEnvironment(
-                "account-manager",
-                Path.Combine(Path.GetTempPath(), "harness", "ai-harness.db")));
 
         Assert.Contains("--available-tools", arguments);
         Assert.Contains("--disable-builtin-mcps", arguments);
@@ -433,9 +510,15 @@ public sealed class CopilotReasoningHostTests
             index =>
                 arguments[index] == "--add-dir" &&
                 arguments[index + 1] == @"C:\worktree");
-        Assert.EndsWith(
-            Path.Combine("copilot-home", "account-manager"),
-            environment["COPILOT_HOME"]);
+    }
+
+    [Fact]
+    public void SessionHome_UsesTheInheritedAuthenticatedCopilotHome()
+    {
+        Assert.Equal(
+            Path.GetFullPath(@"C:\authenticated-copilot-home"),
+            CopilotReasoningHost.ResolveCopilotSessionHome(
+                @"C:\authenticated-copilot-home"));
     }
 
     [Fact]
@@ -466,10 +549,6 @@ public sealed class CopilotReasoningHostTests
                 arguments[index + 1] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
         Assert.DoesNotContain("--available-tools", arguments);
         Assert.DoesNotContain("--disable-builtin-mcps", arguments);
-        Assert.Null(
-            CopilotReasoningHost.BuildProcessEnvironment(
-                "software-engineer",
-                Path.Combine(Path.GetTempPath(), "harness", "ai-harness.db")));
     }
 
     [Fact]
@@ -672,6 +751,29 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("HANDOFF_STATUS: PUSHBACK", contract);
         Assert.Contains("PUSHBACK_REASON", contract);
         Assert.DoesNotContain("harness will resume", contract, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+public sealed class AgentRunnerRecoveryTests
+{
+    [Theory]
+    [InlineData(AgentRunFailureKind.Stalled, true, true)]
+    [InlineData(AgentRunFailureKind.TimedOut, true, true)]
+    [InlineData(AgentRunFailureKind.Stalled, false, false)]
+    [InlineData(AgentRunFailureKind.Transient, true, false)]
+    public void ResumeRequiresAnInterruptedMaterializedSession(
+        AgentRunFailureKind failureKind,
+        bool canResume,
+        bool expected)
+    {
+        var exception = new AgentRunException(
+            "test",
+            failureKind,
+            canResumeSession: canResume);
+
+        Assert.Equal(
+            expected,
+            AgentRunner.ShouldResumeInterruptedSession(exception));
     }
 }
 
@@ -902,7 +1004,7 @@ public sealed class WorkflowPushbackLoopTests
             new FixedWorkspaceManager(workspacePath),
             runner,
             handoffGate,
-            new CopilotSessionJournal(paths),
+            new CopilotSessionJournal(),
             workflowProvider,
             NullLogger<WorkflowEngine>.Instance);
 
@@ -928,6 +1030,8 @@ public sealed class WorkflowPushbackLoopTests
             var qualityRuns = runner.Contexts
                 .Where(item => item.AgentRole == "quality-engineer")
                 .ToList();
+            var releaseRun = runner.Contexts.Single(item =>
+                item.AgentRole == "release-engineer");
 
             Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
             Assert.Equal(4, profiles.Count);
@@ -937,6 +1041,10 @@ public sealed class WorkflowPushbackLoopTests
             Assert.All(
                 runner.Contexts,
                 context => Assert.Equal("fixture-effort", context.ModelEffort));
+            Assert.Contains(
+                "do not push a branch or create a pull request",
+                releaseRun.Task,
+                StringComparison.OrdinalIgnoreCase);
             Assert.Equal(
                 [StepStatus.Completed, StepStatus.Completed, StepStatus.Completed],
                 stored.Steps

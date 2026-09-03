@@ -42,6 +42,7 @@ builder.Services.AddSingleton<AdaptiveModelRouter>();
 builder.Services.AddSingleton<IModelRouter>(
     services => services.GetRequiredService<AdaptiveModelRouter>());
 builder.Services.AddSingleton<RoutingObservationRecorder>();
+builder.Services.AddSingleton<PreviewArtifactCatalog>();
 builder.Services.AddSingleton<CopilotReasoningHost>();
 builder.Services.AddSingleton(_ =>
 {

@@ -3,6 +3,7 @@ using AiHarnessDemo.Data;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
 
 namespace AiHarnessDemo.Api;
@@ -32,6 +33,9 @@ public static class DemoApi
         api.MapGet("/history", GetHistoryAsync);
         api.MapGet("/learnings", GetLearningsAsync);
         api.MapGet("/previews/{flowId:guid}", GetPreviewAsync);
+        api.MapGet(
+            "/previews/{flowId:guid}/artifacts/{artifactId}/{**path}",
+            GetPreviewArtifactAsync);
 
         var symphony = endpoints.MapGroup("/api/v1");
         symphony.MapGet("/state", GetBootstrapAsync);
@@ -370,6 +374,7 @@ public static class DemoApi
     private static async Task<IResult> GetPreviewAsync(
         Guid flowId,
         IDbContextFactory<HarnessDbContext> databaseFactory,
+        PreviewArtifactCatalog artifactCatalog,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
@@ -390,9 +395,43 @@ public static class DemoApi
             flow.ConsolidatedRequest,
             Path.GetFileName(flow.RepositoryPath),
             flow.Iteration,
+            flow.Status,
             flow.OutcomeLabel,
+            artifactCatalog.Discover(flow)
+                .Select(item => new PreviewArtifactDto(
+                    item.Id,
+                    item.Label,
+                    item.Url))
+                .ToList(),
             deliveredBy,
             flow.UpdatedAt));
+    }
+
+    private static async Task<IResult> GetPreviewArtifactAsync(
+        Guid flowId,
+        string artifactId,
+        string? path,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        PreviewArtifactCatalog artifactCatalog,
+        CancellationToken cancellationToken)
+    {
+        var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
+        if (flow.Status is not (FlowStatus.WaitingForFeedback or FlowStatus.Approved))
+        {
+            throw new InvalidOperationException(
+                "This flow does not have a customer preview yet.");
+        }
+
+        var filePath = artifactCatalog.ResolveFile(flow, artifactId, path);
+        var contentTypes = new FileExtensionContentTypeProvider();
+        if (!contentTypes.TryGetContentType(filePath, out var contentType))
+        {
+            contentType = "application/octet-stream";
+        }
+        return Results.File(
+            filePath,
+            contentType,
+            enableRangeProcessing: true);
     }
 
     private static async Task<IResult> RefreshRuntimeAsync(

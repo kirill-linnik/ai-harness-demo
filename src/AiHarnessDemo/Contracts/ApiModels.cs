@@ -273,9 +273,16 @@ public sealed record PreviewDto(
     string Request,
     string RepositoryName,
     int Iteration,
+    FlowStatus Status,
     string OutcomeLabel,
+    IReadOnlyList<PreviewArtifactDto> Artifacts,
     IReadOnlyList<FlowStepDto> DeliveredBy,
     DateTimeOffset GeneratedAt);
+
+public sealed record PreviewArtifactDto(
+    string Id,
+    string Label,
+    string Url);
 
 public static class ApiMappings
 {

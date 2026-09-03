@@ -25,6 +25,8 @@ public sealed record AgentExecutionContext(
     IReadOnlyList<string> PreviousOutputs,
     IReadOnlyList<HarnessLearning> Learnings,
     string CustomerFeedback = "",
+    ModelSelectionStrategy ModelSelectionStrategy = ModelSelectionStrategy.MaximumQuality,
+    double ExpectedAcceptedTimeSeconds = 0,
     bool ResumeSession = false,
     bool RecoverInterruptedSession = false,
     Action<AgentRunProgress>? Progress = null);
@@ -72,6 +74,7 @@ public sealed class AgentRunner(
 
         var options = workflowProvider.GetValidated().Config.Agent;
         var attempts = 0;
+        var resumeInterruptedSession = false;
         var pipelineBuilder = new ResiliencePipelineBuilder<AgentRunResult>();
         if (options.MaxAttempts > 1)
         {
@@ -91,8 +94,16 @@ public sealed class AgentRunner(
                             AgentRunFailureKind.AmbiguousCrash),
                 OnRetry = arguments =>
                 {
+                    var exception = arguments.Outcome.Exception as AgentRunException;
+                    resumeInterruptedSession =
+                        ShouldResumeInterruptedSession(exception);
+                    context.Progress?.Invoke(new AgentRunProgress(
+                        AgentRunPhase.Retrying,
+                        resumeInterruptedSession
+                            ? $"Runtime attempt {arguments.AttemptNumber + 1} ended without a clean shutdown; resuming the confirmed Copilot session."
+                            : $"Runtime attempt {arguments.AttemptNumber + 1} failed transiently; retrying."));
                     logger.LogWarning(
-                        arguments.Outcome.Exception,
+                        exception,
                         "{AgentId} failed on execution attempt {Attempt}; retrying.",
                         context.AgentId,
                         arguments.AttemptNumber + 1);
@@ -109,6 +120,13 @@ public sealed class AgentRunner(
                 async token =>
                 {
                     attempts++;
+                    var attemptContext = resumeInterruptedSession
+                        ? context with
+                        {
+                            ResumeSession = true,
+                            RecoverInterruptedSession = true
+                        }
+                        : context;
                     var runResult = await host.RunAgentAsync(
                         new AgentRunRequest
                         {
@@ -120,7 +138,7 @@ public sealed class AgentRunner(
                             WorkingDirectory = context.WorkspacePath,
                             InputContext = new Dictionary<string, object?>
                             {
-                                ["execution"] = context
+                                ["execution"] = attemptContext
                             },
                             Progress = context.Progress
                         },
@@ -131,7 +149,8 @@ public sealed class AgentRunner(
                         throw new AgentRunException(
                             runResult.Error ?? "Agent run reported failure without an error.",
                             runResult.FailureKind ?? AgentRunFailureKind.InvalidOutput,
-                            runResult.FailedDependency);
+                            runResult.FailedDependency,
+                            runResult.CanResumeSession);
                     }
 
                     return runResult;
@@ -140,11 +159,14 @@ public sealed class AgentRunner(
             circuitBreaker.RecordSuccess(host.Config.RuntimeName, context.AgentId);
         }
         catch (AgentRunException exception)
-            when (exception.FailureKind == AgentRunFailureKind.DependencyUnavailable)
         {
-            circuitBreaker.RecordAvailabilityFailure(
-                exception.FailedDependency ?? host.Config.RuntimeName,
-                exception.Message);
+            exception.ExecutionAttempts = Math.Max(1, attempts);
+            if (exception.FailureKind == AgentRunFailureKind.DependencyUnavailable)
+            {
+                circuitBreaker.RecordAvailabilityFailure(
+                    exception.FailedDependency ?? host.Config.RuntimeName,
+                    exception.Message);
+            }
             throw;
         }
 
@@ -154,4 +176,11 @@ public sealed class AgentRunner(
             attempts,
             result.ToolCalls);
     }
+
+    internal static bool ShouldResumeInterruptedSession(
+        AgentRunException? exception) =>
+        exception?.CanResumeSession == true &&
+        exception.FailureKind is
+            AgentRunFailureKind.Stalled or
+            AgentRunFailureKind.TimedOut;
 }

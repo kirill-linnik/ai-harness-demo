@@ -124,6 +124,10 @@ The AI Factory and every new-assignment control remain locked until Settings con
 - Copilot CLI receives explicit project access to `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree, and source-folder paths remain intentionally inaccessible.
 - An explicit agent `PUSHBACK` is persisted as a rejected handoff, resumes the responsible upstream agent's Copilot session, then retries the blocked agent in its existing session.
 - Copilot session IDs are persisted per step. After a host restart, completed CLI turns are recovered from the session journal; interrupted turns resume the same session and preserved workspace instead of starting over.
+- The quiet-process watchdog is strategy-aware: Maximum quality scales its quiet window from 5 to 15 minutes using the router's predicted accepted time, while other strategies retain the five-minute bound. The 20-minute hard turn limit and configured retry count still cap each attempt.
+- If Copilot writes a valid final handoff but hangs before clean shutdown, the harness recovers that handoff from the session journal instead of failing the flow. Confirmed interrupted sessions resume on bounded runtime retries, and each recovery transition remains visible in the event ledger.
+- Browser-clickable deliveries publish validated per-variant builds from `.customer-preview\<variant>` into the customer acceptance page, where the customer can inspect the real result and approve it or request another iteration with feedback.
+- Release preparation before the customer gate is local-only: commits and preview artifacts may be created, but branches are not pushed and pull requests are not opened. Explicit customer approval queues a separate Release turn that publishes the PR; rejection queues rework instead.
 - Each step is routed immediately before execution across the currently discovered model + reasoning
   effort candidates. The step detail explains predictions, confidence, exploration, and rejected
   alternatives. A model-unavailable error is classified separately; automatic rerouting fails closed

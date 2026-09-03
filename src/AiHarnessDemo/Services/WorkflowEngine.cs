@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 using AiHarnessDemo.Data;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
@@ -23,6 +24,17 @@ public sealed class WorkflowEngine(
     WorkflowDefinitionProvider workflowProvider,
     ILogger<WorkflowEngine> logger)
 {
+    internal const string ReleaseCandidateLabel = "Prepare customer release candidate";
+    internal const string ApprovedPublicationLabel = "Publish customer-approved outcome";
+    internal const string ReleaseCandidateAssignment =
+        "Prepare the verified outcome for customer review. Commit intended changes locally and " +
+        "generate every browser artifact under .customer-preview, but do not push a branch or " +
+        "create a pull request before explicit customer approval.";
+    internal const string ApprovedPublicationAssignment =
+        "Customer approval is recorded. Publish the already-verified outcome now: push the " +
+        "prepared branch and create or reopen the configured pull request. Do not change product " +
+        "behavior unless publication itself requires a narrowly scoped correction.";
+
     private readonly Lock _concurrencyLock = new();
     private readonly SemaphoreSlim _learningGate = new(1, 1);
     private readonly SemaphoreSlim _manualRestartGate = new(1, 1);
@@ -180,12 +192,28 @@ public sealed class WorkflowEngine(
         var sequence = 20;
         foreach (var planned in deliveryPlan)
         {
+            var preparesReleaseCandidate =
+                planned.Agent.Role == "release-engineer";
+            if (preparesReleaseCandidate &&
+                await HasCompletedReleaseCandidateAsync(
+                    flow.Id,
+                    flow.Iteration,
+                    cancellationToken))
+            {
+                sequence += 10;
+                continue;
+            }
             await AddStepAsync(
                 flow,
                 planned,
                 sequence,
-                $"Execute {planned.Agent.Name} contract",
-                cancellationToken);
+                preparesReleaseCandidate
+                    ? ReleaseCandidateLabel
+                    : $"Execute {planned.Agent.Name} contract",
+                cancellationToken,
+                inputSummary: preparesReleaseCandidate
+                    ? ReleaseCandidateAssignment
+                    : null);
             sequence += 10;
         }
 
@@ -227,6 +255,23 @@ public sealed class WorkflowEngine(
         }
 
         await MarkWaitingForFeedbackAsync(flowId, cancellationToken);
+    }
+
+    private async Task<bool> HasCompletedReleaseCandidateAsync(
+        Guid flowId,
+        int iteration,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        return await database.FlowSteps.AnyAsync(
+            item =>
+                item.FlowRunId == flowId &&
+                item.Iteration == iteration &&
+                item.AgentRole == "release-engineer" &&
+                item.Label != ApprovedPublicationLabel &&
+                item.Status == StepStatus.Completed,
+            cancellationToken);
     }
 
     private async Task<Guid> AddStepAsync(
@@ -492,11 +537,14 @@ public sealed class WorkflowEngine(
                         item.Iteration == flow.Iteration &&
                         item.AgentId == step.AgentId &&
                         item.Id != step.Id &&
-                        item.CopilotSessionId != null)
+                        item.CopilotSessionId != null &&
+                        (item.Status == StepStatus.Completed ||
+                         item.Status == StepStatus.Pushback))
                     .OrderByDescending(item => item.StartedAt)
                     .Select(item => new
                     {
-                        item.CopilotSessionId
+                        item.CopilotSessionId,
+                        item.CopilotSessionHome
                     })
                     .FirstOrDefaultAsync(cancellationToken)
                 : null;
@@ -511,12 +559,19 @@ public sealed class WorkflowEngine(
                 step.Phase == AgentRunPhase.CanceledByReconciliation &&
                 persistedSessionId is not null;
             var resumesSession = recoversInterruptedSession || priorSession is not null;
+            var copilotSessionHome = !string.IsNullOrWhiteSpace(step.CopilotSessionHome)
+                ? step.CopilotSessionHome
+                : !string.IsNullOrWhiteSpace(priorSession?.CopilotSessionHome)
+                    ? priorSession.CopilotSessionHome
+                    : sessionJournal.ExpectedHome();
             step.Model = decision.SelectedModel;
             step.ModelEffort = decision.SelectedEffort;
             step.ModelReason = decision.Reason;
             step.Status = StepStatus.Running;
             step.Phase = AgentRunPhase.BuildingPrompt;
             step.StartedAt ??= DateTimeOffset.UtcNow;
+            step.CopilotSessionId = copilotSessionId;
+            step.CopilotSessionHome = copilotSessionHome;
             flow.UpdatedAt = DateTimeOffset.UtcNow;
             database.FlowEvents.Add(new FlowEvent
             {
@@ -596,6 +651,8 @@ public sealed class WorkflowEngine(
                 planSummary,
                 previousOutputs,
                 learnings,
+                ModelSelectionStrategy: flow.ModelSelectionStrategy,
+                ExpectedAcceptedTimeSeconds: decision.PredictedAcceptedTimeSeconds,
                 ResumeSession: resumesSession,
                 RecoverInterruptedSession: recoversInterruptedSession,
                 Progress: progress =>
@@ -724,14 +781,45 @@ public sealed class WorkflowEngine(
         CancellationToken cancellationToken)
     {
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var completion = await StageCompletedStepAsync(
+            database,
+            flowId,
+            stepId,
+            result,
+            completedAt,
+            durationMilliseconds,
+            recoveredSessionId,
+            cancellationToken);
+        await database.SaveChangesAsync(cancellationToken);
+        await RecordCompletionObservationAsync(completion, cancellationToken);
+        ThrowIfCompletionBlocked(completion.GateRecord);
+        return completion.Step;
+    }
+
+    private async Task<StagedStepCompletion> StageCompletedStepAsync(
+        HarnessDbContext database,
+        Guid flowId,
+        Guid stepId,
+        AgentExecutionResult result,
+        DateTimeOffset completedAt,
+        long? durationMilliseconds,
+        Guid? recoveredSessionId,
+        CancellationToken cancellationToken)
+    {
         var step = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
         var pushbackReason = AgentHandoffInspector.GetPushbackReason(result.Output);
         var pushedBack = pushbackReason is not null;
+        var publishesApprovedOutcome =
+            step.AgentRole == "release-engineer" &&
+            string.Equals(
+                step.Label,
+                ApprovedPublicationLabel,
+                StringComparison.Ordinal);
         var actionType = pushedBack
             ? HandoffActionType.RequestRevision
-            : step.AgentRole == "release-engineer"
+            : step.AgentRole == "release-engineer" && !publishesApprovedOutcome
             ? HandoffActionType.Release
             : HandoffActionType.Advance;
         var gateRecord = handoffGate.SubmitProposal(new HandoffProposal
@@ -811,34 +899,47 @@ public sealed class WorkflowEngine(
                     $"{step.AgentName} recovered after {result.ExecutionAttempts} runtime attempts."
             });
         }
-        await database.SaveChangesAsync(cancellationToken);
-        if (pushedBack)
+
+        return new StagedStepCompletion(
+            step,
+            gateRecord,
+            pushedBack,
+            elapsedMilliseconds,
+            step.ExecutionAttempts);
+    }
+
+    private async Task RecordCompletionObservationAsync(
+        StagedStepCompletion completion,
+        CancellationToken cancellationToken)
+    {
+        if (completion.PushedBack)
         {
             await observationRecorder.RecordPushbackDetectionAsync(
-                stepId,
-                elapsedMilliseconds,
-                result.ExecutionAttempts,
-                cancellationToken);
+            completion.Step.Id,
+            completion.ElapsedMilliseconds,
+            completion.ExecutionAttempts,
+            cancellationToken);
         }
         else
         {
             await observationRecorder.RecordCompletionAsync(
-                stepId,
-                accepted: true,
-                elapsedMilliseconds,
-                result.ExecutionAttempts,
-                "accepted-handoff",
-                cancellationToken);
+            completion.Step.Id,
+            accepted: true,
+            completion.ElapsedMilliseconds,
+            completion.ExecutionAttempts,
+            "accepted-handoff",
+            cancellationToken);
         }
+    }
 
+    private static void ThrowIfCompletionBlocked(HandoffGateRecord gateRecord)
+    {
         if (gateRecord.Decision is
             HandoffGateDecision.BlockedKillSwitch or
             HandoffGateDecision.LoggedShadow)
         {
             throw new InvalidOperationException(gateRecord.Reason);
         }
-
-        return step;
     }
 
     private async Task MarkStepInterruptedAsync(
@@ -889,6 +990,12 @@ public sealed class WorkflowEngine(
             ? AgentRunPhase.Stalled
             : AgentRunPhase.Failed;
         step.CompletedAt = completedAt;
+        if (exception is AgentRunException failedRun)
+        {
+            step.ExecutionAttempts = Math.Max(
+                step.ExecutionAttempts,
+                failedRun.ExecutionAttempts);
+        }
         step.DurationMilliseconds = durationMilliseconds ?? Math.Max(
             1,
             (long)(completedAt - (step.StartedAt ?? completedAt)).TotalMilliseconds);
@@ -911,6 +1018,7 @@ public sealed class WorkflowEngine(
             stepId,
             failureKind,
             step.DurationMilliseconds,
+            Math.Max(1, step.ExecutionAttempts),
             cancellationToken);
     }
 
@@ -918,6 +1026,7 @@ public sealed class WorkflowEngine(
         CancellationToken cancellationToken)
     {
         List<InterruptedStepCandidate> interruptedSteps;
+        List<InterruptedStepCandidate> failedStalledSteps;
         await using (var database = await databaseFactory.CreateDbContextAsync(cancellationToken))
         {
             interruptedSteps = await (
@@ -928,6 +1037,24 @@ public sealed class WorkflowEngine(
                           (flow.Status == FlowStatus.Queued ||
                            flow.Status == FlowStatus.Running ||
                            flow.Status == FlowStatus.Reworking)
+                    select new InterruptedStepCandidate(
+                        step.Id,
+                        step.FlowRunId,
+                        step.AgentName,
+                        step.AgentRole,
+                        flow.WorkspacePath,
+                        step.StartedAt,
+                        step.CopilotSessionId,
+                        step.CopilotSessionHome))
+                .ToListAsync(cancellationToken);
+            failedStalledSteps = await (
+                    from step in database.FlowSteps.AsNoTracking()
+                    join flow in database.Flows.AsNoTracking()
+                        on step.FlowRunId equals flow.Id
+                    where step.Status == StepStatus.Failed &&
+                          (step.Phase == AgentRunPhase.Stalled ||
+                           step.Phase == AgentRunPhase.TimedOut) &&
+                          flow.Status == FlowStatus.Failed
                     select new InterruptedStepCandidate(
                         step.Id,
                         step.FlowRunId,
@@ -975,6 +1102,36 @@ public sealed class WorkflowEngine(
             }
         }
 
+        foreach (var candidate in failedStalledSteps
+                     .GroupBy(item => item.FlowId)
+                     .Select(group => group
+                         .OrderByDescending(item => item.StartedAt)
+                         .First()))
+        {
+            try
+            {
+                await TryRecoverCompletedFailedStepAsync(candidate, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                logger.LogError(
+                    exception,
+                    "Could not recover completed output for failed step {StepId} in flow {FlowId}.",
+                    candidate.StepId,
+                    candidate.FlowId);
+                await AddEventAsync(
+                    candidate.FlowId,
+                    candidate.StepId,
+                    "step.completed-output-recovery-failed",
+                    $"Completed-output recovery failed: {exception.Message}",
+                    CancellationToken.None);
+            }
+        }
+
         await using var flowDatabase = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var interruptedFlows = await flowDatabase.Flows
             .Where(flow =>
@@ -991,9 +1148,100 @@ public sealed class WorkflowEngine(
 
         logger.LogInformation(
             "Reconciled {StepCount} interrupted step(s) across {FlowCount} flow(s).",
-            interruptedSteps.Count,
+            interruptedSteps.Count + failedStalledSteps.Count,
             interruptedFlows.Count);
         return interruptedFlows.Select(flow => flow.Id).ToList();
+    }
+
+    private async Task<bool> TryRecoverCompletedFailedStepAsync(
+        InterruptedStepCandidate candidate,
+        CancellationToken cancellationToken)
+    {
+        var copilotHome = string.IsNullOrWhiteSpace(candidate.CopilotSessionHome)
+            ? sessionJournal.ExpectedHome()
+            : candidate.CopilotSessionHome;
+        var snapshot = candidate.CopilotSessionId is { } sessionId
+            ? await sessionJournal.InspectAsync(
+                copilotHome,
+                sessionId,
+                cancellationToken)
+            : null;
+        if (snapshot is null || snapshot.State == CopilotSessionJournalState.Missing)
+        {
+            snapshot = await sessionJournal.DiscoverLatestAsync(
+                copilotHome,
+                candidate.WorkspacePath,
+                candidate.AgentName,
+                candidate.StartedAt,
+                cancellationToken);
+        }
+        if (snapshot is not
+            {
+                State: CopilotSessionJournalState.Completed,
+                Result: { Success: true } recoveredResult
+            } ||
+            !CopilotReasoningHost.IsRecoverableCompletedOutput(
+                candidate.AgentRole,
+                recoveredResult.OutputSummary))
+        {
+            return false;
+        }
+
+        StagedStepCompletion completion;
+        await using (var database =
+                     await databaseFactory.CreateDbContextAsync(cancellationToken))
+        {
+            await using var transaction =
+                await database.Database.BeginTransactionAsync(cancellationToken);
+            var flow = await database.Flows
+                .Include(item => item.Steps)
+                .SingleAsync(item => item.Id == candidate.FlowId, cancellationToken);
+            var failedStep = flow.Steps.Single(item => item.Id == candidate.StepId);
+            if (flow.Status != FlowStatus.Failed ||
+                failedStep.Status != StepStatus.Failed)
+            {
+                return false;
+            }
+
+            completion = await StageCompletedStepAsync(
+                database,
+                flow.Id,
+                failedStep.Id,
+                ToRecoveredExecutionResult(recoveredResult, snapshot.SessionId),
+                snapshot.CompletedAt ?? DateTimeOffset.UtcNow,
+                durationMilliseconds: null,
+                snapshot.SessionId,
+                cancellationToken);
+            ThrowIfCompletionBlocked(completion.GateRecord);
+            foreach (var laterStep in flow.Steps.Where(
+                         step =>
+                             step.Iteration == flow.Iteration &&
+                             step.Sequence > failedStep.Sequence &&
+                             step.Status == StepStatus.Skipped))
+            {
+                ResetSkippedStep(laterStep);
+            }
+            failedStep.CopilotSessionId = snapshot.SessionId;
+            failedStep.CopilotSessionHome = snapshot.CopilotHome;
+            flow.Status = FlowStatus.Queued;
+            flow.FailureReason = string.Empty;
+            flow.CompletedAt = null;
+            flow.UpdatedAt = DateTimeOffset.UtcNow;
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = failedStep.Id,
+                Type = "flow.completed-output-auto-recovered",
+                Message =
+                    $"Recovered {failedStep.AgentName}'s completed handoff from Copilot session " +
+                    $"{snapshot.SessionId:D}; downstream execution will continue automatically."
+            });
+            await database.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+
+        await RecordCompletionObservationAsync(completion, cancellationToken);
+        return true;
     }
 
     internal async Task<FlowRun> RestartFailedFlowAsync(
@@ -1005,6 +1253,7 @@ public sealed class WorkflowEngine(
         {
             await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
             var flow = await database.Flows
+                           .AsSplitQuery()
                            .Include(item => item.Steps)
                            .ThenInclude(step => step.ToolCalls)
                            .Include(item => item.Messages)
@@ -1027,7 +1276,7 @@ public sealed class WorkflowEngine(
                              ?? throw new InvalidOperationException(
                                  "The failed flow has no failed agent step to restart.");
             var copilotHome = string.IsNullOrWhiteSpace(failedStep.CopilotSessionHome)
-                ? sessionJournal.ExpectedHome(failedStep.AgentRole)
+                ? sessionJournal.ExpectedHome()
                 : failedStep.CopilotSessionHome;
             var snapshot = failedStep.CopilotSessionId is { } sessionId
                 ? await sessionJournal.InspectAsync(
@@ -1036,7 +1285,13 @@ public sealed class WorkflowEngine(
                     cancellationToken)
                 : null;
             var discovered = false;
-            if (snapshot is null || snapshot.State == CopilotSessionJournalState.Missing)
+            var canHaveRecoverableJournal =
+                failedStep.Phase is
+                    AgentRunPhase.Stalled or
+                    AgentRunPhase.TimedOut or
+                    AgentRunPhase.CanceledByReconciliation;
+            if ((snapshot is null || snapshot.State == CopilotSessionJournalState.Missing) &&
+                canHaveRecoverableJournal)
             {
                 snapshot = await sessionJournal.DiscoverLatestAsync(
                     copilotHome,
@@ -1056,6 +1311,60 @@ public sealed class WorkflowEngine(
                     throw new InvalidOperationException(
                         $"Copilot session {snapshot.SessionId:D} is still active and could not be stopped safely.");
                 }
+            }
+
+            if (snapshot is
+                {
+                    State: CopilotSessionJournalState.Completed,
+                    Result: { Success: true } recoveredResult
+                } &&
+                failedStep.Status == StepStatus.Failed &&
+                failedStep.Phase is AgentRunPhase.Stalled or AgentRunPhase.TimedOut &&
+                CopilotReasoningHost.IsRecoverableCompletedOutput(
+                    failedStep.AgentRole,
+                    recoveredResult.OutputSummary))
+            {
+                await using var transaction =
+                    await database.Database.BeginTransactionAsync(cancellationToken);
+                var completion = await StageCompletedStepAsync(
+                    database,
+                    flow.Id,
+                    failedStep.Id,
+                    ToRecoveredExecutionResult(recoveredResult, snapshot.SessionId),
+                    snapshot.CompletedAt ?? DateTimeOffset.UtcNow,
+                    durationMilliseconds: null,
+                    snapshot.SessionId,
+                    cancellationToken);
+                ThrowIfCompletionBlocked(completion.GateRecord);
+                foreach (var laterStep in flow.Steps.Where(
+                             step =>
+                                 step.Iteration == flow.Iteration &&
+                                 step.Sequence > failedStep.Sequence &&
+                                 step.Status == StepStatus.Skipped))
+                {
+                    ResetSkippedStep(laterStep);
+                }
+
+                var recoveredFailureReason = flow.FailureReason;
+                failedStep.CopilotSessionId = snapshot.SessionId;
+                failedStep.CopilotSessionHome = snapshot.CopilotHome;
+                flow.Status = FlowStatus.Queued;
+                flow.FailureReason = string.Empty;
+                flow.CompletedAt = null;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = failedStep.Id,
+                    Type = "flow.completed-output-recovered",
+                    Message =
+                        $"Recovered {failedStep.AgentName}'s completed handoff from Copilot session " +
+                        $"{snapshot.SessionId:D} after the runtime stopped: {recoveredFailureReason}"
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                await RecordCompletionObservationAsync(completion, cancellationToken);
+                return flow;
             }
 
             foreach (var laterStep in flow.Steps.Where(
@@ -1191,7 +1500,7 @@ public sealed class WorkflowEngine(
         CancellationToken cancellationToken)
     {
         var copilotHome = string.IsNullOrWhiteSpace(candidate.CopilotSessionHome)
-            ? sessionJournal.ExpectedHome(candidate.AgentRole)
+            ? sessionJournal.ExpectedHome()
             : candidate.CopilotSessionHome;
         var snapshot = candidate.CopilotSessionId is { } sessionId
             ? await sessionJournal.InspectAsync(
@@ -1212,7 +1521,10 @@ public sealed class WorkflowEngine(
         }
 
         if (snapshot?.State == CopilotSessionJournalState.Completed &&
-            snapshot.Result is { Success: true } recoveredResult)
+            snapshot.Result is { Success: true } recoveredResult &&
+            CopilotReasoningHost.IsRecoverableCompletedOutput(
+                candidate.AgentRole,
+                recoveredResult.OutputSummary))
         {
             await PersistRecoveredSessionIdentityAsync(
                 candidate.StepId,
@@ -1852,12 +2164,71 @@ public sealed class WorkflowEngine(
     {
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var flow = await database.Flows.SingleAsync(item => item.Id == flowId, cancellationToken);
-        var hasReleaseGate = await database.GateRecords.AnyAsync(
+        var latestReleaseGate = await database.GateRecords
+            .Where(item =>
+                item.FlowRunId == flowId &&
+                item.ActionType == HandoffActionType.Release)
+            .OrderByDescending(item => item.DecidedAt)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (latestReleaseGate is
+            {
+                Resolved: true,
+                Approved: true
+            })
+        {
+            var publicationStep = await database.FlowSteps
+                .Where(item =>
+                    item.FlowRunId == flowId &&
+                    item.Iteration == flow.Iteration &&
+                    item.AgentRole == "release-engineer" &&
+                    item.Label == ApprovedPublicationLabel &&
+                    item.Status == StepStatus.Completed)
+                .OrderByDescending(item => item.Sequence)
+                .FirstOrDefaultAsync(cancellationToken)
+                ?? throw new InvalidOperationException(
+                    "Customer approval was recorded, but the approved release publication did not complete.");
+            if (flow.Outcome == OutcomeType.PullRequest)
+            {
+                var pullRequestUrl = ExtractPullRequestUrl(publicationStep.OutputSummary)
+                    ?? throw new InvalidOperationException(
+                        "The approved Release handoff did not report a pull request URL.");
+                flow.OutcomeUrl = pullRequestUrl;
+                flow.OutcomeLabel =
+                    $"Published pull request #{new Uri(pullRequestUrl).Segments[^1]}";
+            }
+            else
+            {
+                flow.OutcomeUrl = $"#/preview/{flow.Id}";
+                flow.OutcomeLabel = $"Approved commit · {flow.BranchName}";
+            }
+            flow.Status = FlowStatus.Approved;
+            flow.CompletedAt = DateTimeOffset.UtcNow;
+            flow.UpdatedAt = DateTimeOffset.UtcNow;
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flowId,
+                FlowStepId = publicationStep.Id,
+                Type = "flow.approved",
+                Message =
+                    $"Customer-approved outcome was published: {flow.OutcomeLabel}."
+            });
+            await database.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        var hasReleaseGate = latestReleaseGate is
+        {
+            Resolved: false
+        };
+        if (!hasReleaseGate)
+        {
+            hasReleaseGate = await database.GateRecords.AnyAsync(
             item =>
                 item.FlowRunId == flowId &&
                 item.ActionType == HandoffActionType.Release &&
                 !item.Resolved,
             cancellationToken);
+        }
         if (!hasReleaseGate)
         {
             var lastCompletedStep = await database.FlowSteps
@@ -1902,6 +2273,15 @@ public sealed class WorkflowEngine(
             Message = "Customer preview is ready; Product Manager is waiting for feedback."
         });
         await database.SaveChangesAsync(cancellationToken);
+    }
+
+    internal static string? ExtractPullRequestUrl(string output)
+    {
+        var match = Regex.Match(
+            output,
+            @"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+",
+            RegexOptions.CultureInvariant);
+        return match.Success ? match.Value : null;
     }
 
     private async Task MarkFailedAsync(
@@ -1960,6 +2340,15 @@ public sealed class WorkflowEngine(
         return events;
     }
 
+    private static AgentExecutionResult ToRecoveredExecutionResult(
+        AgentRunResult result,
+        Guid sessionId) =>
+        new(
+            result.OutputSummary,
+            $"Recovered from completed Copilot session {sessionId:D}.",
+            1,
+            result.ToolCalls);
+
     private static string FormatDuration(TimeSpan duration) =>
         duration.TotalMinutes >= 1
             ? $"{duration.TotalMinutes:0.0} min"
@@ -1974,6 +2363,13 @@ public sealed class WorkflowEngine(
         DateTimeOffset? StartedAt,
         Guid? CopilotSessionId,
         string CopilotSessionHome);
+
+    private sealed record StagedStepCompletion(
+        FlowStep Step,
+        HandoffGateRecord GateRecord,
+        bool PushedBack,
+        long ElapsedMilliseconds,
+        int ExecutionAttempts);
 }
 
 public sealed class FlowWorker(

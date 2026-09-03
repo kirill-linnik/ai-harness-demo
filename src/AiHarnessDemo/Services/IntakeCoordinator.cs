@@ -141,6 +141,10 @@ public sealed partial class IntakeCoordinator(
         intakeStep.ModelEffort = routing.SelectedEffort;
         intakeStep.ModelReason = routing.Reason;
         intakeStep.Status = StepStatus.Running;
+        var intakeSessionId =
+            AgentSessionIdentity.Create(flow.Id, flow.Iteration, accountManager.Id);
+        intakeStep.CopilotSessionId = intakeSessionId;
+        intakeStep.CopilotSessionHome = CopilotReasoningHost.ResolveCopilotSessionHome();
         await database.SaveChangesAsync(cancellationToken);
 
         var stopwatch = Stopwatch.StartNew();
@@ -174,11 +178,13 @@ public sealed partial class IntakeCoordinator(
                     flow.RepositoryKnowledge,
                     flow.RepositoryPath,
                     workspace.Path,
-                    AgentSessionIdentity.Create(flow.Id, flow.Iteration, accountManager.Id),
+                    intakeSessionId,
                     flow.Outcome,
                     $"Create a task-ready brief with sensible defaults. Delivery is already configured as {flow.Outcome}.",
                     priorReplies,
                     learnings,
+                    ModelSelectionStrategy: settings.ModelSelectionStrategy,
+                    ExpectedAcceptedTimeSeconds: routing.PredictedAcceptedTimeSeconds,
                     Progress: progress =>
                     {
                         if (progress.ExecutionPrompt is not null)
@@ -217,6 +223,12 @@ public sealed partial class IntakeCoordinator(
                 ? AgentRunPhase.Stalled
                 : AgentRunPhase.Failed;
             intakeStep.CompletedAt = DateTimeOffset.UtcNow;
+            if (exception is AgentRunException failedRun)
+            {
+                intakeStep.ExecutionAttempts = Math.Max(
+                    intakeStep.ExecutionAttempts,
+                    failedRun.ExecutionAttempts);
+            }
             intakeStep.DurationMilliseconds = stopwatch.ElapsedMilliseconds;
             await database.SaveChangesAsync(cancellationToken);
             await observationRecorder.RecordFailureAsync(
@@ -225,6 +237,7 @@ public sealed partial class IntakeCoordinator(
                     ? runException.FailureKind
                     : AgentRunFailureKind.InvalidOutput,
                 intakeStep.DurationMilliseconds,
+                Math.Max(1, intakeStep.ExecutionAttempts),
                 cancellationToken);
             throw;
         }

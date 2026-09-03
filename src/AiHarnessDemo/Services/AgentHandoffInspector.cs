@@ -66,6 +66,9 @@ internal static partial class AgentHandoffInspector
         return "The agent explicitly rejected the upstream handoff.";
     }
 
+    public static bool HasTerminalStatus(string output) =>
+        HandoffStatusPattern().IsMatch(output);
+
     private static string CleanLine(string value)
     {
         var cleaned = value

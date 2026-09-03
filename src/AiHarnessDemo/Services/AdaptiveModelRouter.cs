@@ -158,7 +158,8 @@ public sealed class AdaptiveModelRouter(
                     on observation.RoutingDecisionId equals observedDecision.Id
                 join observedStep in database.FlowSteps.AsNoTracking()
                     on observation.FlowStepId equals observedStep.Id
-                where !observation.AvailabilityFailure
+                where observation.OutcomeKind != "model-unavailable" &&
+                      observation.OutcomeKind != "dependency-unavailable"
                 select new Evidence(
                     observedDecision.SelectedModel,
                     observedDecision.SelectedEffort,

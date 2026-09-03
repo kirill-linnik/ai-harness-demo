@@ -74,6 +74,8 @@ public sealed class CopilotConfig
     public int TurnTimeoutMs { get; set; } = 1_200_000;
 
     public int StallTimeoutMs { get; set; } = 300_000;
+
+    public int MaximumQualityStallTimeoutMs { get; set; } = 900_000;
 }
 
 public sealed class WorkflowConfigurationException(string message, Exception? innerException = null)
@@ -221,6 +223,19 @@ public sealed class WorkflowLoader
         {
             throw new WorkflowConfigurationException("copilot.turn_timeout_ms must be positive.");
         }
+        if (config.Copilot.StallTimeoutMs <= 0 ||
+            config.Copilot.StallTimeoutMs > config.Copilot.TurnTimeoutMs)
+        {
+            throw new WorkflowConfigurationException(
+                "copilot.stall_timeout_ms must be positive and cannot exceed turn_timeout_ms.");
+        }
+        if (config.Copilot.MaximumQualityStallTimeoutMs <= 0 ||
+            config.Copilot.MaximumQualityStallTimeoutMs < config.Copilot.StallTimeoutMs ||
+            config.Copilot.MaximumQualityStallTimeoutMs > config.Copilot.TurnTimeoutMs)
+        {
+            throw new WorkflowConfigurationException(
+                "copilot.maximum_quality_stall_timeout_ms cannot be smaller than stall_timeout_ms or exceed turn_timeout_ms.");
+        }
         if (string.IsNullOrWhiteSpace(prompt))
         {
             throw new WorkflowConfigurationException(
@@ -238,6 +253,14 @@ public sealed partial class WorkflowPromptRenderer
         string template,
         IReadOnlyDictionary<string, string> values)
     {
+        var templateWithoutVariables = VariablePattern().Replace(template, string.Empty);
+        if (templateWithoutVariables.Contains("{{", StringComparison.Ordinal) ||
+            templateWithoutVariables.Contains("}}", StringComparison.Ordinal))
+        {
+            throw new WorkflowConfigurationException(
+                "Workflow template contains an invalid or unsupported expression.");
+        }
+
         var rendered = VariablePattern().Replace(
             template,
             match =>
@@ -248,13 +271,6 @@ public sealed partial class WorkflowPromptRenderer
                     : throw new WorkflowConfigurationException(
                         $"Unknown workflow template variable '{{{{ {key} }}}}'.");
             });
-
-        if (rendered.Contains("{{", StringComparison.Ordinal) ||
-            rendered.Contains("}}", StringComparison.Ordinal))
-        {
-            throw new WorkflowConfigurationException(
-                "Workflow template contains an invalid or unsupported expression.");
-        }
 
         return rendered.Trim();
     }

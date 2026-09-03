@@ -73,7 +73,7 @@ export function FlowPage() {
         .reverse()
         .find(step => step.label.startsWith("Manual restart of "));
       setSelectedStepId(retryStep?.id ?? null);
-      toast("Failed task queued from its preserved workspace.", "success");
+      toast("Failed task recovery queued from its preserved session and workspace.", "success");
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error), "error");
     }
@@ -110,7 +110,7 @@ export function FlowPage() {
           </button>
           {flow.outcomeUrl && (
             <a className="button primary small" href={flow.outcomeUrl}>
-              <ExternalIcon /> Customer preview
+              <ExternalIcon /> {flow.status === "Approved" ? "Published outcome" : "Customer preview"}
             </a>
           )}
         </div>
@@ -183,9 +183,14 @@ export function FlowPage() {
             <strong>Customer approved this outcome</strong>
             <span>The factory flow is complete and remains available in execution history.</span>
           </div>
-          <a className="button success" href={flow.outcomeUrl}>
-            <ExternalIcon /> Open accepted preview
-          </a>
+          <div className="flow-heading-actions">
+            <a className="button" href={`#/preview/${flow.id}`}>
+              <ExternalIcon /> Accepted preview
+            </a>
+            <a className="button success" href={flow.outcomeUrl}>
+              <ExternalIcon /> Published outcome
+            </a>
+          </div>
         </section>
       )}
       {flow.status === "Failed" && (
@@ -202,7 +207,7 @@ export function FlowPage() {
             disabled={restartFlow.isPending}
             onClick={() => void restartFailedFlow()}
           >
-            <RefreshIcon /> {restartFlow.isPending ? "Restarting..." : "Restart failed task"}
+            <RefreshIcon /> {restartFlow.isPending ? "Recovering..." : "Recover failed task"}
           </button>
         </section>
       )}
