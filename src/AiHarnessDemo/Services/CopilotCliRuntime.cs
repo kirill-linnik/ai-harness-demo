@@ -24,6 +24,7 @@ public sealed partial class CopilotCliRuntime(
     private static readonly string[] RequiredOptions =
     [
         "--add-dir",
+        "--acp",
         "--agent",
         "--allow-all-tools",
         "--available-tools",

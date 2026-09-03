@@ -13,7 +13,9 @@ namespace AiHarnessDemo.Services;
 public sealed partial class IntakeCoordinator(
     IDbContextFactory<HarnessDbContext> databaseFactory,
     AgentCatalog agentCatalog,
-    ModelSelector modelSelector,
+    IModelRouter modelRouter,
+    BootstrapTaskProfileFactory profileFactory,
+    RoutingObservationRecorder observationRecorder,
     IAgentRunner agentRunner,
     IWorkspaceManager workspaceManager,
     HandoffGateEngine handoffGate,
@@ -107,7 +109,6 @@ public sealed partial class IntakeCoordinator(
             await database.SaveChangesAsync(cancellationToken);
         }
 
-        var model = modelSelector.Select("account-manager", complexity: 1);
         var intakeStep = new FlowStep
         {
             FlowRunId = flow.Id,
@@ -117,9 +118,7 @@ public sealed partial class IntakeCoordinator(
             AgentName = accountManager.Name,
             AgentRole = accountManager.Role,
             Label = "Review customer intake",
-            Model = model.Model,
-            ModelReason = model.Reason,
-            Status = StepStatus.Running,
+            Status = StepStatus.Pending,
             Phase = AgentRunPhase.BuildingPrompt,
             Attempt = customerMessages.Count,
             StartedAt = DateTimeOffset.UtcNow,
@@ -127,6 +126,21 @@ public sealed partial class IntakeCoordinator(
         };
         flow.Steps.Add(intakeStep);
         database.Entry(intakeStep).State = EntityState.Added;
+        await database.SaveChangesAsync(cancellationToken);
+        database.TaskProfiles.Add(profileFactory.Create(
+            accountManager.Role,
+            FormatCustomerInputs(customerMessages),
+            flow.Id,
+            flow.Iteration,
+            intakeStep.Id));
+        await database.SaveChangesAsync(cancellationToken);
+        var routing = await modelRouter.SelectAsync(
+            new RoutingRequest(intakeStep.Id, settings.ModelSelectionStrategy),
+            cancellationToken);
+        intakeStep.Model = routing.SelectedModel;
+        intakeStep.ModelEffort = routing.SelectedEffort;
+        intakeStep.ModelReason = routing.Reason;
+        intakeStep.Status = StepStatus.Running;
         await database.SaveChangesAsync(cancellationToken);
 
         var stopwatch = Stopwatch.StartNew();
@@ -150,7 +164,8 @@ public sealed partial class IntakeCoordinator(
                     accountManager.Id,
                     accountManager.Name,
                     accountManager.Role,
-                    model.Model,
+                    intakeStep.Model,
+                    intakeStep.ModelEffort,
                     intakeStep.Attempt,
                     BuildDialogueTask(
                         flow.Messages,
@@ -204,6 +219,13 @@ public sealed partial class IntakeCoordinator(
             intakeStep.CompletedAt = DateTimeOffset.UtcNow;
             intakeStep.DurationMilliseconds = stopwatch.ElapsedMilliseconds;
             await database.SaveChangesAsync(cancellationToken);
+            await observationRecorder.RecordFailureAsync(
+                intakeStep.Id,
+                exception is AgentRunException runException
+                    ? runException.FailureKind
+                    : AgentRunFailureKind.InvalidOutput,
+                intakeStep.DurationMilliseconds,
+                cancellationToken);
             throw;
         }
 
@@ -238,6 +260,13 @@ public sealed partial class IntakeCoordinator(
         intakeStep.OutputSummary = result.Output;
         intakeStep.CompletedAt = DateTimeOffset.UtcNow;
         intakeStep.DurationMilliseconds = stopwatch.ElapsedMilliseconds;
+        await observationRecorder.RecordCompletionAsync(
+            intakeStep.Id,
+            accepted: response.Status != AccountManagerIntakeStatus.NeedsClarification,
+            intakeStep.DurationMilliseconds,
+            result.ExecutionAttempts,
+            response.Ready ? "confirmed-intake" : "intake-turn",
+            cancellationToken);
         foreach (var toolCall in result.ToolCalls)
         {
             var storedCall = new AgentToolCall
@@ -288,6 +317,10 @@ public sealed partial class IntakeCoordinator(
         };
         flow.Events.Add(intakeEvent);
         database.Entry(intakeEvent).State = EntityState.Added;
+        if (response.Ready)
+        {
+            flow.ModelSelectionStrategy = settings.ModelSelectionStrategy;
+        }
         var queuedEvent = ApplyIntakeOutcome(flow, response);
         if (queuedEvent is not null)
         {
@@ -300,8 +333,23 @@ public sealed partial class IntakeCoordinator(
             throw new InvalidOperationException("Unable to queue the customer-confirmed flow.");
         }
 
+        var detailFlow = await database.Flows
+            .AsNoTracking()
+            .AsSplitQuery()
+            .Include(item => item.Steps)
+            .ThenInclude(step => step.ToolCalls)
+            .Include(item => item.Steps)
+            .ThenInclude(step => step.RoutingDecisions)
+            .ThenInclude(decision => decision.TaskProfile)
+            .Include(item => item.Steps)
+            .ThenInclude(step => step.RoutingDecisions)
+            .ThenInclude(decision => decision.Alternatives)
+            .Include(item => item.Messages)
+            .Include(item => item.Events)
+            .Include(item => item.GateRecords)
+            .SingleAsync(item => item.Id == flow.Id, cancellationToken);
         return new IntakeResponse(
-            flow.ToDetailDto(),
+            detailFlow.ToDetailDto(),
             response.Reply,
             response.Ready,
             ShouldSpeak: true);
@@ -401,6 +449,7 @@ public sealed partial class IntakeCoordinator(
             RepositoryPath = settings.RepositoryPath,
             RepositoryKnowledge = settings.RepositoryKnowledge,
             Outcome = settings.Outcome,
+            ModelSelectionStrategy = settings.ModelSelectionStrategy,
             RuntimeMarker = "LiveCopilot"
         };
 

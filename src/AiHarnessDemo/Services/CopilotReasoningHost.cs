@@ -123,7 +123,7 @@ public sealed partial class CopilotReasoningHost(
             request.Effort,
             request.CopilotSessionId,
             prompt,
-            context.RecoverInterruptedSession);
+            context.ResumeSession || context.RecoverInterruptedSession);
         if (environmentVariables?.TryGetValue("COPILOT_HOME", out var copilotHome) == true)
         {
             Directory.CreateDirectory(copilotHome);
@@ -225,11 +225,14 @@ public sealed partial class CopilotReasoningHost(
             "--add-dir", harnessRoot,
             "--agent", agentId,
             "--model", model,
-            "--effort", effort,
             "--output-format", "json",
             "--no-color",
             "--no-ask-user"
         };
+        if (!string.Equals(effort, "default", StringComparison.OrdinalIgnoreCase))
+        {
+            arguments.AddRange(["--effort", effort]);
+        }
         arguments.AddRange(
             resumeSession
                 ? [$"--resume={copilotSessionId:D}"]
@@ -633,6 +636,12 @@ public sealed partial class CopilotReasoningHost(
               Property names and enum casing are exact. Integers are 1-10, confidence is 0-1, risk is Low/Medium/High/Critical, reasons are nonempty, and rationales contain 1-5 bounded entries.
               Allowed task tags are CustomerDialogue, Planning, Architecture, Design, Data, Implementation, Security, Quality, Documentation, Release, Feedback, and CrossCutting.
               Include exactly one profile for every already-planned downstream role in the supplied plan, excluding team-lead. Do not add, remove, or select roles; FlowPlanner remains role-selection authority.
+              """,
+            "product-manager" => """
+              Respond directly to the customer in concise plain language after reviewing the original brief and execution ledger.
+              End with exactly one standalone marker:
+              REWORK_TARGET_ROLES: NONE
+              Replace NONE with a comma-separated list of exact delivery role IDs from the ledger only when the customer's requested rework can be attributed to those roles. Do not guess or blame every role.
               """,
             _ => """
               Complete the assigned role in the isolated workspace; do not merely advise.

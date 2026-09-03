@@ -9,6 +9,7 @@ public sealed record SettingsDto(
     string RepositoryKnowledge,
     OutcomeType Outcome,
     int MaxHandoffRetries,
+    ModelSelectionStrategy ModelSelectionStrategy,
     DateTimeOffset UpdatedAt);
 
 public sealed record AgentDto(
@@ -46,7 +47,10 @@ public sealed record FlowStepDto(
     string AgentRole,
     string Label,
     string Model,
+    string ModelEffort,
     string ModelReason,
+    TaskProfileDto? TaskProfile,
+    RoutingDecisionDto? Routing,
     StepStatus Status,
     AgentRunPhase Phase,
     int Attempt,
@@ -101,6 +105,7 @@ public sealed record FlowDetailDto(
     string RepositoryPath,
     string RepositoryKnowledge,
     OutcomeType Outcome,
+    ModelSelectionStrategy ModelSelectionStrategy,
     string WorkspacePath,
     string BranchName,
     string OutcomeUrl,
@@ -162,6 +167,52 @@ public sealed record CopilotCliStatusDto(
     string Detail,
     DateTimeOffset CheckedAt);
 
+public sealed record ModelCatalogStatusDto(
+    bool Ready,
+    string CatalogVersion,
+    int CandidateCount,
+    string Detail,
+    DateTimeOffset CheckedAt);
+
+public sealed record TaskProfileDto(
+    string Version,
+    string Role,
+    int Complexity,
+    int ReasoningDepth,
+    int ContextDemand,
+    int ToolIntensity,
+    IReadOnlyList<string> TaskTypeTags,
+    TaskRisk Risk,
+    string RiskReason,
+    double Confidence,
+    IReadOnlyList<string> Rationales);
+
+public sealed record RoutingAlternativeDto(
+    string Model,
+    string Effort,
+    int Rank,
+    double PredictedQuality,
+    double PredictedAcceptedTimeSeconds,
+    double PredictedPremiumRequests,
+    double Confidence,
+    string Reason);
+
+public sealed record RoutingDecisionDto(
+    ModelSelectionStrategy Strategy,
+    string SelectedModel,
+    string SelectedEffort,
+    double PredictedQuality,
+    double PredictedAcceptedTimeSeconds,
+    double PredictedPremiumRequests,
+    bool PremiumUseEstimated,
+    double Confidence,
+    double Uncertainty,
+    bool Exploration,
+    string Reason,
+    string AlgorithmVersion,
+    int RerouteCount,
+    IReadOnlyList<RoutingAlternativeDto> Alternatives);
+
 public sealed record BootstrapDto(
     SettingsDto Settings,
     IReadOnlyList<AgentDto> Agents,
@@ -169,6 +220,7 @@ public sealed record BootstrapDto(
     HarnessStatsDto Stats,
     bool CopilotCliAvailable,
     CopilotCliStatusDto CopilotCli,
+    ModelCatalogStatusDto ModelCatalog,
     WorkflowStatusDto Workflow,
     bool FactoryEnabled,
     string FactoryDisabledReason);
@@ -177,7 +229,8 @@ public sealed record SaveSettingsRequest(
     string? RepositoryPath,
     string? RepositoryKnowledge,
     OutcomeType Outcome,
-    int? MaxHandoffRetries);
+    int? MaxHandoffRetries,
+    ModelSelectionStrategy ModelSelectionStrategy);
 
 public sealed record ToggleAgentRequest(bool Enabled);
 
@@ -232,6 +285,7 @@ public static class ApiMappings
             settings.RepositoryKnowledge,
             settings.Outcome,
             settings.MaxHandoffRetries,
+            settings.ModelSelectionStrategy,
             settings.UpdatedAt);
 
     public static AgentDto ToDto(this AgentRecord agent) =>
@@ -267,6 +321,7 @@ public static class ApiMappings
             flow.RepositoryPath,
             flow.RepositoryKnowledge,
             flow.Outcome,
+            flow.ModelSelectionStrategy,
             flow.WorkspacePath,
             flow.BranchName,
             flow.OutcomeUrl,
@@ -327,7 +382,18 @@ public static class ApiMappings
             step.AgentRole,
             step.Label,
             step.Model,
+            step.ModelEffort,
             step.ModelReason,
+            step.RoutingDecisions
+                .Where(item => !item.Superseded)
+                .OrderByDescending(item => item.CreatedAt)
+                .Select(item => item.TaskProfile?.ToDto())
+                .FirstOrDefault(),
+            step.RoutingDecisions
+                .Where(item => !item.Superseded)
+                .OrderByDescending(item => item.CreatedAt)
+                .Select(item => item.ToDto())
+                .FirstOrDefault(),
             step.Status,
             step.Phase,
             step.Attempt,
@@ -346,6 +412,48 @@ public static class ApiMappings
                     item.ToolName,
                     item.ArgumentsSummary,
                     item.Succeeded))
+                .ToList());
+
+    public static TaskProfileDto ToDto(this TaskProfile profile) =>
+        new(
+            profile.Version,
+            profile.Role,
+            profile.Complexity,
+            profile.ReasoningDepth,
+            profile.ContextDemand,
+            profile.ToolIntensity,
+            TaskProfileRules.ReadTags(profile).Select(item => item.ToString()).ToList(),
+            profile.Risk,
+            profile.RiskReason,
+            profile.Confidence,
+            TaskProfileRules.ReadRationales(profile));
+
+    public static RoutingDecisionDto ToDto(this RoutingDecision decision) =>
+        new(
+            decision.Strategy,
+            decision.SelectedModel,
+            decision.SelectedEffort,
+            decision.PredictedQuality,
+            decision.PredictedAcceptedTimeSeconds,
+            decision.PredictedPremiumRequests,
+            decision.PremiumUseEstimated,
+            decision.Confidence,
+            decision.Uncertainty,
+            decision.Exploration,
+            decision.Reason,
+            decision.AlgorithmVersion,
+            decision.RerouteCount,
+            decision.Alternatives
+                .OrderBy(item => item.Rank)
+                .Select(item => new RoutingAlternativeDto(
+                    item.Model,
+                    item.Effort,
+                    item.Rank,
+                    item.PredictedQuality,
+                    item.PredictedAcceptedTimeSeconds,
+                    item.PredictedPremiumRequests,
+                    item.Confidence,
+                    item.Reason))
                 .ToList());
 
     public static LearningDto ToDto(this HarnessLearning learning) =>

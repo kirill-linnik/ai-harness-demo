@@ -9,6 +9,37 @@ public enum OutcomeType
     PullRequest
 }
 
+public enum ModelSelectionStrategy
+{
+    MaximumQuality,
+    FastestResponse,
+    LowestCost
+}
+
+public enum TaskRisk
+{
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+public enum TaskTypeTag
+{
+    CustomerDialogue,
+    Planning,
+    Architecture,
+    Design,
+    Data,
+    Implementation,
+    Security,
+    Quality,
+    Documentation,
+    Release,
+    Feedback,
+    CrossCutting
+}
+
 public enum FlowStatus
 {
     Intake,
@@ -49,6 +80,9 @@ public sealed class HarnessSettings
     public OutcomeType Outcome { get; set; } = OutcomeType.PullRequest;
 
     public int MaxHandoffRetries { get; set; } = 2;
+
+    public ModelSelectionStrategy ModelSelectionStrategy { get; set; } =
+        ModelSelectionStrategy.MaximumQuality;
 
     // Retains compatibility with databases created before Copilot CLI became the only host.
     public string RuntimeMarker { get; set; } = "LiveCopilot";
@@ -97,6 +131,9 @@ public sealed class FlowRun
 
     public OutcomeType Outcome { get; set; } = OutcomeType.PullRequest;
 
+    public ModelSelectionStrategy ModelSelectionStrategy { get; set; } =
+        ModelSelectionStrategy.MaximumQuality;
+
     // Retains compatibility with databases created before Copilot CLI became the only host.
     public string RuntimeMarker { get; set; } = "LiveCopilot";
 
@@ -123,6 +160,8 @@ public sealed class FlowRun
     public List<FlowEvent> Events { get; set; } = [];
 
     public List<HandoffGateRecord> GateRecords { get; set; } = [];
+
+    public List<TaskProfile> TaskProfiles { get; set; } = [];
 }
 
 public sealed class FlowStep
@@ -146,6 +185,8 @@ public sealed class FlowStep
     public string Label { get; set; } = string.Empty;
 
     public string Model { get; set; } = string.Empty;
+
+    public string ModelEffort { get; set; } = string.Empty;
 
     public string ModelReason { get; set; } = string.Empty;
 
@@ -176,6 +217,206 @@ public sealed class FlowStep
     public long DurationMilliseconds { get; set; }
 
     public List<AgentToolCall> ToolCalls { get; set; } = [];
+
+    public List<RoutingDecision> RoutingDecisions { get; set; } = [];
+}
+
+/// <summary>
+/// Versioned normalized routing input. Task text and repository content are deliberately excluded.
+/// </summary>
+public sealed class TaskProfile
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid FlowRunId { get; set; }
+
+    public int Iteration { get; set; }
+
+    public Guid? FlowStepId { get; set; }
+
+    public string Version { get; set; } = "task-profile-v1";
+
+    public required string Role { get; set; }
+
+    public int Complexity { get; set; }
+
+    public int ReasoningDepth { get; set; }
+
+    public int ContextDemand { get; set; }
+
+    public int ToolIntensity { get; set; }
+
+    /// <summary>JSON array of <see cref="TaskTypeTag"/> names.</summary>
+    public string TaskTypeTagsJson { get; set; } = "[]";
+
+    public TaskRisk Risk { get; set; }
+
+    public required string RiskReason { get; set; }
+
+    public double Confidence { get; set; }
+
+    /// <summary>JSON array of bounded rationale strings.</summary>
+    public string RationalesJson { get; set; } = "[]";
+
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class ModelCatalogSnapshot
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public required string CatalogVersion { get; set; }
+
+    public string CliVersion { get; set; } = string.Empty;
+
+    public DateTimeOffset DiscoveredAt { get; set; } = DateTimeOffset.UtcNow;
+
+    public bool IsCurrent { get; set; }
+
+    public List<ModelCatalogCandidate> Candidates { get; set; } = [];
+}
+
+public sealed class ModelCatalogCandidate
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid ModelCatalogSnapshotId { get; set; }
+
+    public ModelCatalogSnapshot? Snapshot { get; set; }
+
+    public required string Model { get; set; }
+
+    public required string Effort { get; set; }
+
+    public int ModelOrder { get; set; }
+
+    public int EffortOrder { get; set; }
+
+    public bool IsDefaultModel { get; set; }
+
+    public bool IsDefaultEffort { get; set; }
+
+    public double? PremiumMultiplier { get; set; }
+
+    public string Description { get; set; } = string.Empty;
+
+    public string MetadataConfidence { get; set; } = "low";
+
+    public bool Enabled { get; set; } = true;
+}
+
+public sealed class RoutingDecision
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid FlowStepId { get; set; }
+
+    public Guid TaskProfileId { get; set; }
+
+    public TaskProfile? TaskProfile { get; set; }
+
+    public Guid ModelCatalogSnapshotId { get; set; }
+
+    public Guid? SupersedesRoutingDecisionId { get; set; }
+
+    public bool Superseded { get; set; }
+
+    public int RerouteCount { get; set; }
+
+    public required string SelectedModel { get; set; }
+
+    public required string SelectedEffort { get; set; }
+
+    public ModelSelectionStrategy Strategy { get; set; }
+
+    public double PredictedQuality { get; set; }
+
+    public double PredictedAcceptedTimeSeconds { get; set; }
+
+    public double PredictedPremiumRequests { get; set; }
+
+    public bool PremiumUseEstimated { get; set; } = true;
+
+    public double Confidence { get; set; }
+
+    public double Uncertainty { get; set; }
+
+    public bool Exploration { get; set; }
+
+    public required string Reason { get; set; }
+
+    public string AlgorithmVersion { get; set; } = "router-v1";
+
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    public List<RoutingAlternative> Alternatives { get; set; } = [];
+
+    public FlowStep? FlowStep { get; set; }
+}
+
+public sealed class RoutingAlternative
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid RoutingDecisionId { get; set; }
+
+    public RoutingDecision? RoutingDecision { get; set; }
+
+    public required string Model { get; set; }
+
+    public required string Effort { get; set; }
+
+    public int Rank { get; set; }
+
+    public double PredictedQuality { get; set; }
+
+    public double PredictedAcceptedTimeSeconds { get; set; }
+
+    public double PredictedPremiumRequests { get; set; }
+
+    public double Confidence { get; set; }
+
+    public required string Reason { get; set; }
+}
+
+/// <summary>Normalized outcome evidence. It intentionally contains no prompt, task, or repository text.</summary>
+public sealed class RoutingObservation
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid RoutingDecisionId { get; set; }
+
+    public Guid FlowStepId { get; set; }
+
+    public required string Role { get; set; }
+
+    public string TaskTypeTagsJson { get; set; } = "[]";
+
+    public int Complexity { get; set; }
+
+    public int ReasoningDepth { get; set; }
+
+    public int ContextDemand { get; set; }
+
+    public int ToolIntensity { get; set; }
+
+    public TaskRisk Risk { get; set; }
+
+    public bool? Accepted { get; set; }
+
+    public bool AvailabilityFailure { get; set; }
+
+    public double EvidenceWeight { get; set; } = 1;
+
+    public long DurationMilliseconds { get; set; }
+
+    public int ExecutionAttempts { get; set; } = 1;
+
+    public double EstimatedPremiumRequests { get; set; }
+
+    public string OutcomeKind { get; set; } = string.Empty;
+
+    public DateTimeOffset ObservedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 /// <summary>Scrubbed tool trace. Raw tool arguments and results are deliberately not persisted.</summary>

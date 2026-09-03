@@ -12,7 +12,48 @@ const step: FlowStepDto = {
   agentRole: "team-lead",
   label: "Plan the delivery system",
   model: "claude-sonnet-5",
+  modelEffort: "high",
   modelReason: "Selected for cross-cutting planning.",
+  taskProfile: {
+    version: "task-profile-v1",
+    role: "team-lead",
+    complexity: 8,
+    reasoningDepth: 9,
+    contextDemand: 7,
+    toolIntensity: 2,
+    taskTypeTags: ["Planning"],
+    risk: "High",
+    riskReason: "Cross-cutting delivery risk.",
+    confidence: 0.8,
+    rationales: ["Multiple boundaries."]
+  },
+  routing: {
+    strategy: "MaximumQuality",
+    selectedModel: "claude-sonnet-5",
+    selectedEffort: "high",
+    predictedQuality: 0.95,
+    predictedAcceptedTimeSeconds: 70,
+    predictedPremiumRequests: 1.2,
+    premiumUseEstimated: true,
+    confidence: 0.8,
+    uncertainty: 0.2,
+    exploration: false,
+    reason: "Highest conservative quality.",
+    algorithmVersion: "router-v1",
+    rerouteCount: 0,
+    alternatives: [
+      {
+        model: "gpt-fast",
+        effort: "medium",
+        rank: 1,
+        predictedQuality: 0.9,
+        predictedAcceptedTimeSeconds: 40,
+        predictedPremiumRequests: 0.5,
+        confidence: 0.6,
+        reason: "Ranked behind the selected candidate."
+      }
+    ]
+  },
   status: "Completed",
   phase: "Succeeded",
   attempt: 1,
@@ -44,6 +85,13 @@ describe("StepDetail", () => {
     expect(screen.getByRole("heading", { name: "Next owner", level: 2 })).toBeInTheDocument();
     expect(screen.getByText("Architect")).toHaveProperty("tagName", "STRONG");
     expect(screen.getByRole("list")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Routing decision" })).toHaveTextContent(
+      "95.0% conservative quality"
+    );
+    expect(screen.getByRole("region", { name: "Task profile" })).toHaveTextContent("High risk");
+    expect(screen.getByRole("region", { name: "Task profile" })).toHaveTextContent("Multiple boundaries.");
+    expect(screen.getByText("router-v1")).toBeInTheDocument();
+    expect(screen.getByText(/0.50 premium requests/)).toBeInTheDocument();
   });
 
   it("keeps an explicit placeholder while a running step has no output yet", () => {

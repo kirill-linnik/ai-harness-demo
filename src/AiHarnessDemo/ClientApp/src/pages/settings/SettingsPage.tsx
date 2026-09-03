@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useBootstrapQuery, useAnalyzeRepositoryMutation, useSaveSettingsMutation } from "../../api/queries";
-import type { OutcomeType } from "../../api/types";
+import type { ModelSelectionStrategy, OutcomeType } from "../../api/types";
 import { AppShell } from "../../components/AppShell";
 import { CheckIcon, FolderIcon, RefreshIcon } from "../../lib/icons";
 import { lastPathPart } from "../../lib/format";
@@ -19,12 +19,26 @@ export function SettingsPage() {
   const [knowledge, setKnowledge] = useState(settings?.repositoryKnowledge ?? "");
   const [outcome, setOutcome] = useState<OutcomeType>(settings?.outcome ?? "PullRequest");
   const [maxHandoffRetries, setMaxHandoffRetries] = useState(settings?.maxHandoffRetries ?? 2);
+  const [modelSelectionStrategy, setModelSelectionStrategy] = useState<ModelSelectionStrategy>(
+    settings?.modelSelectionStrategy ?? "MaximumQuality"
+  );
   const [runCopilotInit, setRunCopilotInit] = useState(true);
   const [browserOpen, setBrowserOpen] = useState(false);
+  const hydratedSettingsVersion = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!settings || hydratedSettingsVersion.current === settings.updatedAt) return;
+    setRepositoryPath(settings.repositoryPath);
+    setKnowledge(settings.repositoryKnowledge);
+    setOutcome(settings.outcome);
+    setMaxHandoffRetries(settings.maxHandoffRetries);
+    setModelSelectionStrategy(settings.modelSelectionStrategy);
+    hydratedSettingsVersion.current = settings.updatedAt;
+  }, [settings]);
 
   if (!data || !settings) return null;
 
-  const { agents, copilotCli, workflow } = data;
+  const { agents, copilotCli, modelCatalog, workflow } = data;
   const enabledCount = agents.filter(agent => agent.enabled).length;
 
   async function onSave() {
@@ -38,12 +52,14 @@ export function SettingsPage() {
         repositoryPath,
         repositoryKnowledge: knowledge,
         outcome,
-        maxHandoffRetries
+        maxHandoffRetries,
+        modelSelectionStrategy
       });
       setRepositoryPath(saved.repositoryPath);
       setKnowledge(saved.repositoryKnowledge);
       setOutcome(saved.outcome);
       setMaxHandoffRetries(saved.maxHandoffRetries);
+      setModelSelectionStrategy(saved.modelSelectionStrategy);
       toast("Harness settings saved.", "success");
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error), "error");
@@ -110,6 +126,9 @@ export function SettingsPage() {
               </div>
               <div className={copilotCli.ready ? "callout" : "pushback-callout"} style={{ marginTop: 14 }}>
                 {copilotCli.detail}
+              </div>
+              <div className={modelCatalog.ready ? "callout" : "pushback-callout"} style={{ marginTop: 10 }}>
+                <strong>ACP model catalog:</strong> {modelCatalog.detail}
               </div>
             </div>
           </div>
@@ -241,6 +260,23 @@ export function SettingsPage() {
             </div>
             <div className="card-body">
               <div className="field">
+                <label htmlFor="model-selection-strategy">Adaptive model strategy</label>
+                <select
+                  id="model-selection-strategy"
+                  value={modelSelectionStrategy}
+                  onChange={event => setModelSelectionStrategy(event.target.value as ModelSelectionStrategy)}
+                >
+                  <option value="MaximumQuality">Maximum quality</option>
+                  <option value="FastestResponse">Fastest response</option>
+                  <option value="LowestCost">Lowest cost</option>
+                </select>
+                <small>
+                  Maximum quality ranks conservative success first. Fastest response minimizes expected time to an
+                  accepted handoff, including rework. Lowest cost minimizes expected Copilot premium requests. Every
+                  strategy enforces a risk-adjusted quality floor and is snapshotted when the confirmed flow is queued.
+                </small>
+              </div>
+              <div className="field" style={{ marginTop: 16 }}>
                 <label>Delivery artifact</label>
                 <div className="segmented">
                   <button

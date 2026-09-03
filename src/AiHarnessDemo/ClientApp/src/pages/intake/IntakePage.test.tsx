@@ -14,6 +14,7 @@ const bootstrap: BootstrapDto = {
     repositoryKnowledge: "Demo repository",
     outcome: "Commit",
     maxHandoffRetries: 2,
+    modelSelectionStrategy: "MaximumQuality",
     updatedAt: "2026-09-02T12:00:00Z"
   },
   agents: [],
@@ -31,6 +32,13 @@ const bootstrap: BootstrapDto = {
     command: "copilot",
     resolvedPath: "copilot",
     version: "1.0.0",
+    detail: "Ready",
+    checkedAt: "2026-09-02T12:00:00Z"
+  },
+  modelCatalog: {
+    ready: true,
+    catalogVersion: "acp-test",
+    candidateCount: 4,
     detail: "Ready",
     checkedAt: "2026-09-02T12:00:00Z"
   },
@@ -61,6 +69,7 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
     repositoryPath: "E:\\projects\\demo",
     repositoryKnowledge: "Demo repository",
     outcome: "Commit",
+    modelSelectionStrategy: "MaximumQuality",
     workspacePath: "E:\\projects\\demo\\.workspaces\\flow",
     branchName: "ai-harness\\refresh-site",
     outcomeUrl: "",

@@ -9,7 +9,7 @@ function eventClass(type: string): string {
 }
 
 export function Timeline({ events }: { events: FlowEventDto[] }) {
-  const visible = events.slice(0, 18);
+  const visible = events;
   if (!visible.length) return <p className="muted">Waiting for the first event.</p>;
 
   return (

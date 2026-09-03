@@ -44,6 +44,7 @@ public static class DemoApi
     private static async Task<IResult> GetHealthAsync(
         WorkflowDefinitionProvider workflowProvider,
         CopilotCliRuntime copilotCliRuntime,
+        ModelCatalogDiscovery modelCatalog,
         CancellationToken cancellationToken)
     {
         var workflow = workflowProvider.GetValidated();
@@ -52,10 +53,11 @@ public static class DemoApi
             cancellationToken);
         return Results.Ok(new
         {
-            status = copilotCli.Ready ? "ready" : "degraded",
+            status = copilotCli.Ready && modelCatalog.Current.Ready ? "ready" : "degraded",
             utc = DateTimeOffset.UtcNow,
             copilotCliAvailable = copilotCli.Ready,
-            copilotCli = ToDto(copilotCli)
+            copilotCli = ToDto(copilotCli),
+            modelCatalog = ToDto(modelCatalog.Current)
         });
     }
 
@@ -64,6 +66,7 @@ public static class DemoApi
         AgentCatalog catalog,
         WorkflowDefinitionProvider workflowProvider,
         CopilotCliRuntime copilotCliRuntime,
+        ModelCatalogDiscovery modelCatalog,
         CancellationToken cancellationToken)
     {
         var agents = await catalog.SyncAsync(cancellationToken);
@@ -93,6 +96,7 @@ public static class DemoApi
         var factoryDisabledReason = FactoryDisabledReason(
             settings,
             copilotCli,
+            modelCatalog.Current,
             workflowStatus);
 
         return Results.Ok(new BootstrapDto(
@@ -102,6 +106,7 @@ public static class DemoApi
             stats,
             copilotCli.Ready,
             ToDto(copilotCli),
+            ToDto(modelCatalog.Current),
             ToDto(workflowStatus),
             string.IsNullOrEmpty(factoryDisabledReason),
             factoryDisabledReason));
@@ -140,6 +145,7 @@ public static class DemoApi
         }
 
         settings.Outcome = request.Outcome;
+        settings.ModelSelectionStrategy = request.ModelSelectionStrategy;
         if (request.MaxHandoffRetries is { } maxHandoffRetries)
         {
             settings.MaxHandoffRetries = maxHandoffRetries;
@@ -236,6 +242,12 @@ public static class DemoApi
         var flow = await database.Flows
                        .Include(item => item.Steps)
                        .ThenInclude(step => step.ToolCalls)
+                       .Include(item => item.Steps)
+                       .ThenInclude(step => step.RoutingDecisions)
+                       .ThenInclude(decision => decision.TaskProfile)
+                       .Include(item => item.Steps)
+                       .ThenInclude(step => step.RoutingDecisions)
+                       .ThenInclude(decision => decision.Alternatives)
                        .Include(item => item.Messages)
                        .Include(item => item.Events)
                        .Include(item => item.GateRecords)
@@ -265,6 +277,8 @@ public static class DemoApi
                 "The customer must explicitly confirm the Account Manager brief before the flow starts.");
         }
 
+        var settings = await database.Settings.AsNoTracking().SingleAsync(cancellationToken);
+        flow.ModelSelectionStrategy = settings.ModelSelectionStrategy;
         flow.Status = FlowStatus.Queued;
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         var queuedEvent = new FlowEvent
@@ -385,6 +399,7 @@ public static class DemoApi
         WorkflowDefinitionProvider workflowProvider,
         AgentCatalog catalog,
         CopilotCliRuntime copilotCliRuntime,
+        ModelCatalogDiscovery modelCatalog,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         FlowQueue queue,
         CancellationToken cancellationToken)
@@ -393,6 +408,9 @@ public static class DemoApi
         var workflow = workflowProvider.GetValidated();
         await copilotCliRuntime.RefreshAsync(
             workflow.Config.Copilot.Command,
+            cancellationToken);
+        await modelCatalog.RefreshAsync(
+            Directory.GetCurrentDirectory(),
             cancellationToken);
         await catalog.SyncAsync(cancellationToken);
 
@@ -417,6 +435,7 @@ public static class DemoApi
             {
                 "workflow-reload",
                 "copilot-cli-readiness",
+                "acp-model-catalog",
                 "agent-catalog-reconcile",
                 "flow-recovery"
             }
@@ -434,6 +453,12 @@ public static class DemoApi
                    .AsSplitQuery()
                    .Include(item => item.Steps)
                    .ThenInclude(step => step.ToolCalls)
+                   .Include(item => item.Steps)
+                   .ThenInclude(step => step.RoutingDecisions)
+                   .ThenInclude(decision => decision.TaskProfile)
+                   .Include(item => item.Steps)
+                   .ThenInclude(step => step.RoutingDecisions)
+                   .ThenInclude(decision => decision.Alternatives)
                    .Include(item => item.Messages)
                    .Include(item => item.Events)
                    .Include(item => item.GateRecords)
@@ -460,9 +485,18 @@ public static class DemoApi
             status.Detail,
             status.CheckedAt);
 
+    private static ModelCatalogStatusDto ToDto(ModelCatalogRuntimeStatus status) =>
+        new(
+            status.Ready,
+            status.CatalogVersion,
+            status.CandidateCount,
+            status.Detail,
+            status.CheckedAt);
+
     private static string FactoryDisabledReason(
         HarnessSettings settings,
         CopilotCliRuntimeStatus copilotCli,
+        ModelCatalogRuntimeStatus modelCatalog,
         WorkflowRuntimeStatus workflow)
     {
         if (!copilotCli.Ready)
@@ -472,6 +506,10 @@ public static class DemoApi
         if (!workflow.Ready)
         {
             return workflow.LastError ?? "WORKFLOW.md is not ready.";
+        }
+        if (!modelCatalog.Ready)
+        {
+            return modelCatalog.Detail;
         }
         if (string.IsNullOrWhiteSpace(settings.RepositoryPath) ||
             string.IsNullOrWhiteSpace(settings.RepositoryKnowledge))

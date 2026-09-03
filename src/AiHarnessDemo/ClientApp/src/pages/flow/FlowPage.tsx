@@ -6,7 +6,7 @@ import { BootScreen } from "../../components/BootScreen";
 import { FatalScreen } from "../../components/FatalScreen";
 import { StatusPill } from "../../components/StatusPill";
 import { BackIcon, CopyIcon, ExternalIcon, FactoryIcon, RefreshIcon } from "../../lib/icons";
-import { groupBy, lastPathPart, timeAgo } from "../../lib/format";
+import { groupBy, lastPathPart, statusLabel, timeAgo } from "../../lib/format";
 import { useToast } from "../../lib/toast";
 import { IterationLane } from "./IterationLane";
 import { StepDetail } from "./StepDetail";
@@ -94,7 +94,8 @@ export function FlowPage() {
           <h2>{flow.title}</h2>
           <p>
             {repositoryName} · iteration {flow.iteration} ·{" "}
-            {flow.outcome === "PullRequest" ? "pull request outcome" : "commit outcome"}
+            {flow.outcome === "PullRequest" ? "pull request outcome" : "commit outcome"} ·{" "}
+            {statusLabel(flow.modelSelectionStrategy)}
           </p>
           <div className="flow-meta">
             <StatusPill status={flow.status} />

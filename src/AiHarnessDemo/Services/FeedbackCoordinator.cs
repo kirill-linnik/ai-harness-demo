@@ -4,10 +4,11 @@ using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Reasoning;
 using Microsoft.EntityFrameworkCore;
+using System.Text.RegularExpressions;
 
 namespace AiHarnessDemo.Services;
 
-public sealed class FeedbackCoordinator(
+public sealed partial class FeedbackCoordinator(
     IDbContextFactory<HarnessDbContext> databaseFactory,
     IModelRouter modelRouter,
     BootstrapTaskProfileFactory profileFactory,
@@ -16,6 +17,10 @@ public sealed class FeedbackCoordinator(
     HandoffGateEngine gateEngine,
     FlowQueue flowQueue)
 {
+    [GeneratedRegex(
+        @"(?im)^\s*REWORK_TARGET_ROLES\s*:\s*(?<roles>NONE|[a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)\s*$")]
+    private static partial Regex ReworkTargetRolesPattern();
+
     public async Task<FeedbackResponse> RespondAsync(
         Guid flowId,
         string feedback,
@@ -85,22 +90,13 @@ public sealed class FeedbackCoordinator(
             await database.SaveChangesAsync(cancellationToken);
             if (step is not null)
             {
-                var profile = await database.TaskProfiles.SingleOrDefaultAsync(
-                    item =>
-                        item.FlowRunId == flow.Id &&
-                        item.Iteration == flow.Iteration &&
-                        item.Role == productManager!.Role,
-                    cancellationToken);
-                if (profile is null)
-                {
-                    database.TaskProfiles.Add(profileFactory.Create(
-                        productManager!.Role,
-                        flow.ConsolidatedRequest,
-                        flow.Id,
-                        flow.Iteration,
-                        step.Id));
-                    await database.SaveChangesAsync(cancellationToken);
-                }
+                database.TaskProfiles.Add(profileFactory.Create(
+                    productManager!.Role,
+                    $"{flow.ConsolidatedRequest}{Environment.NewLine}Customer feedback: {message}",
+                    flow.Id,
+                    flow.Iteration,
+                    step.Id));
+                await database.SaveChangesAsync(cancellationToken);
                 var decision = await modelRouter.SelectAsync(
                     new RoutingRequest(step.Id, flow.ModelSelectionStrategy),
                     cancellationToken);
@@ -176,7 +172,7 @@ public sealed class FeedbackCoordinator(
                     CancellationToken.None);
                 throw;
             }
-            reply = result.Output;
+            reply = StripReworkTargetMarker(result.Output);
 
             await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
             var storedStep = await database.FlowSteps.SingleAsync(
@@ -203,7 +199,7 @@ public sealed class FeedbackCoordinator(
                 });
             }
             storedStep.Status = StepStatus.Completed;
-            storedStep.OutputSummary = reply;
+            storedStep.OutputSummary = result.Output;
             storedStep.ExecutionAttempts = result.ExecutionAttempts;
             storedStep.CompletedAt = DateTimeOffset.UtcNow;
             storedStep.DurationMilliseconds = Math.Max(
@@ -267,6 +263,12 @@ public sealed class FeedbackCoordinator(
         var flow = await database.Flows
                        .Include(item => item.Steps)
                        .ThenInclude(step => step.ToolCalls)
+                       .Include(item => item.Steps)
+                       .ThenInclude(step => step.RoutingDecisions)
+                       .ThenInclude(decision => decision.TaskProfile)
+                       .Include(item => item.Steps)
+                       .ThenInclude(step => step.RoutingDecisions)
+                       .ThenInclude(decision => decision.Alternatives)
                        .Include(item => item.Messages)
                        .Include(item => item.Events)
                        .Include(item => item.GateRecords)
@@ -296,6 +298,32 @@ public sealed class FeedbackCoordinator(
         pendingReleaseGate.ResolvedBy = resolvedGate.ResolvedBy;
         pendingReleaseGate.ResolutionNote = resolvedGate.ResolutionNote;
         pendingReleaseGate.ResolvedAt = resolvedGate.ResolvedAt;
+
+        var rejectedIteration = flow.Iteration;
+        IReadOnlyList<string> targetedReworkRoles = [];
+        if (!approve)
+        {
+            var eligibleRoles = flow.Steps
+                .Where(item => item.Iteration == rejectedIteration)
+                .Select(item => item.AgentRole)
+                .Where(role => role is not "account-manager" and not "product-manager")
+                .ToHashSet(StringComparer.Ordinal);
+            var productManagerReview = flow.Steps
+                .Where(item =>
+                    item.Iteration == rejectedIteration &&
+                    item.AgentRole == "product-manager" &&
+                    item.Status == StepStatus.Completed)
+                .OrderByDescending(item => item.Sequence)
+                .ThenByDescending(item => item.Attempt)
+                .FirstOrDefault();
+            if (productManagerReview is not null)
+            {
+                _ = TryParseReworkTargets(
+                    productManagerReview.OutputSummary,
+                    eligibleRoles,
+                    out targetedReworkRoles);
+            }
+        }
 
         if (approve)
         {
@@ -339,6 +367,14 @@ public sealed class FeedbackCoordinator(
         {
             await observationRecorder.RecordFinalApprovalAsync(flow.Id, cancellationToken);
         }
+        else if (targetedReworkRoles.Count > 0)
+        {
+            await observationRecorder.RecordTargetedReworkAsync(
+                flow.Id,
+                rejectedIteration,
+                targetedReworkRoles,
+                cancellationToken);
+        }
 
         if (!approve && !flowQueue.Queue(flow.Id))
         {
@@ -347,6 +383,42 @@ public sealed class FeedbackCoordinator(
 
         return flow.ToDetailDto();
     }
+
+    internal static bool TryParseReworkTargets(
+        string output,
+        IReadOnlySet<string> eligibleRoles,
+        out IReadOnlyList<string> targetRoles)
+    {
+        var matches = ReworkTargetRolesPattern().Matches(output);
+        if (matches.Count != 1)
+        {
+            targetRoles = [];
+            return false;
+        }
+
+        var value = matches[0].Groups["roles"].Value;
+        if (string.Equals(value, "NONE", StringComparison.Ordinal))
+        {
+            targetRoles = [];
+            return true;
+        }
+
+        var parsed = value
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (parsed.Length == 0 || parsed.Any(role => !eligibleRoles.Contains(role)))
+        {
+            targetRoles = [];
+            return false;
+        }
+
+        targetRoles = parsed;
+        return true;
+    }
+
+    internal static string StripReworkTargetMarker(string output) =>
+        ReworkTargetRolesPattern().Replace(output, string.Empty).Trim();
 
     private async Task RecordProgressAsync(
         Guid flowId,

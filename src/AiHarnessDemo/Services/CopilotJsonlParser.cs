@@ -188,7 +188,8 @@ public static partial class CopilotJsonlParser
             {
                 var failureKind = ClassifySessionError(
                     sessionErrorType,
-                    sessionStatusCode);
+                    sessionStatusCode,
+                    sessionErrorMessage);
                 var errorType = string.IsNullOrWhiteSpace(sessionErrorType)
                     ? "unknown"
                     : sessionErrorType;
@@ -204,9 +205,12 @@ public static partial class CopilotJsonlParser
                     OutputSummary = "Copilot CLI session failed.",
                     Error = $"Copilot CLI session failed ({errorType}{status}): {message}",
                     FailureKind = failureKind,
-                    FailedDependency = failureKind == AgentRunFailureKind.DependencyUnavailable
-                        ? "copilot-cli"
-                        : null,
+                    FailedDependency = failureKind switch
+                    {
+                        AgentRunFailureKind.DependencyUnavailable => "copilot-cli",
+                        AgentRunFailureKind.ModelUnavailable => "model-candidate",
+                        _ => null
+                    },
                     ToolCalls = toolCalls
                 };
             }
@@ -411,7 +415,8 @@ public static partial class CopilotJsonlParser
 
     private static AgentRunFailureKind ClassifySessionError(
         string? errorType,
-        int? statusCode)
+        int? statusCode,
+        string? errorMessage)
     {
         if (statusCode is 401 or 403)
         {
@@ -427,6 +432,15 @@ public static partial class CopilotJsonlParser
             .Trim()
             .Replace('-', '_')
             .ToLowerInvariant();
+        var normalizedMessage = (errorMessage ?? string.Empty).ToLowerInvariant();
+        if (normalized.Contains("model_unavailable", StringComparison.Ordinal) ||
+            normalized.Contains("unsupported_model", StringComparison.Ordinal) ||
+            normalizedMessage.Contains("model is not available", StringComparison.Ordinal) ||
+            normalizedMessage.Contains("unsupported model", StringComparison.Ordinal) ||
+            normalizedMessage.Contains("unknown model", StringComparison.Ordinal))
+        {
+            return AgentRunFailureKind.ModelUnavailable;
+        }
         if (normalized.Contains("auth", StringComparison.Ordinal) ||
             normalized.Contains("forbidden", StringComparison.Ordinal) ||
             normalized.Contains("permission", StringComparison.Ordinal) ||

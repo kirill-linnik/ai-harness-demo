@@ -2,6 +2,8 @@
 // Enum members are serialized as their C# name strings by JsonStringEnumConverter.
 
 export type OutcomeType = "Commit" | "PullRequest";
+export type ModelSelectionStrategy = "MaximumQuality" | "FastestResponse" | "LowestCost";
+export type TaskRisk = "Low" | "Medium" | "High" | "Critical";
 
 export type FlowStatus =
   | "Intake"
@@ -54,6 +56,7 @@ export interface SettingsDto {
   repositoryKnowledge: string;
   outcome: OutcomeType;
   maxHandoffRetries: number;
+  modelSelectionStrategy: ModelSelectionStrategy;
   updatedAt: string;
 }
 
@@ -95,7 +98,10 @@ export interface FlowStepDto {
   agentRole: string;
   label: string;
   model: string;
+  modelEffort: string;
   modelReason: string;
+  taskProfile: TaskProfileDto | null;
+  routing: RoutingDecisionDto | null;
   status: StepStatus;
   phase: AgentRunPhase;
   attempt: number;
@@ -154,6 +160,7 @@ export interface FlowDetailDto {
   repositoryPath: string;
   repositoryKnowledge: string;
   outcome: OutcomeType;
+  modelSelectionStrategy: ModelSelectionStrategy;
   workspacePath: string;
   branchName: string;
   outcomeUrl: string;
@@ -221,6 +228,56 @@ export interface CopilotCliStatusDto {
   checkedAt: string;
 }
 
+export interface ModelCatalogStatusDto {
+  ready: boolean;
+  catalogVersion: string;
+  candidateCount: number;
+  detail: string;
+  checkedAt: string;
+}
+
+export interface TaskProfileDto {
+  version: string;
+  role: string;
+  complexity: number;
+  reasoningDepth: number;
+  contextDemand: number;
+  toolIntensity: number;
+  taskTypeTags: string[];
+  risk: TaskRisk;
+  riskReason: string;
+  confidence: number;
+  rationales: string[];
+}
+
+export interface RoutingAlternativeDto {
+  model: string;
+  effort: string;
+  rank: number;
+  predictedQuality: number;
+  predictedAcceptedTimeSeconds: number;
+  predictedPremiumRequests: number;
+  confidence: number;
+  reason: string;
+}
+
+export interface RoutingDecisionDto {
+  strategy: ModelSelectionStrategy;
+  selectedModel: string;
+  selectedEffort: string;
+  predictedQuality: number;
+  predictedAcceptedTimeSeconds: number;
+  predictedPremiumRequests: number;
+  premiumUseEstimated: boolean;
+  confidence: number;
+  uncertainty: number;
+  exploration: boolean;
+  reason: string;
+  algorithmVersion: string;
+  rerouteCount: number;
+  alternatives: RoutingAlternativeDto[];
+}
+
 export interface BootstrapDto {
   settings: SettingsDto;
   agents: AgentDto[];
@@ -228,6 +285,7 @@ export interface BootstrapDto {
   stats: HarnessStatsDto;
   copilotCliAvailable: boolean;
   copilotCli: CopilotCliStatusDto;
+  modelCatalog: ModelCatalogStatusDto;
   workflow: WorkflowStatusDto;
   factoryEnabled: boolean;
   factoryDisabledReason: string;
@@ -238,6 +296,7 @@ export interface SaveSettingsRequest {
   repositoryKnowledge: string;
   outcome: OutcomeType;
   maxHandoffRetries: number;
+  modelSelectionStrategy: ModelSelectionStrategy;
 }
 
 export interface ToggleAgentRequest {

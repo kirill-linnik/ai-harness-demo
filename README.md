@@ -34,7 +34,7 @@ copilot login
 
 At startup, the harness resolves the configured `copilot.command`, rejects interactive editor
 bootstrap shims, validates the CLI version and required programmatic/ACP options, then opens a
-dedicated `--acp --stdio` process to discover enabled model + effort candidates. Discovery must
+dedicated `--acp` stdio process to discover enabled model + effort candidates. Discovery must
 succeed on every startup; persisted catalog snapshots are audit records, not a readiness fallback.
 Runtime and catalog status appear on **Settings**, and the factory remains locked when either check
 fails.

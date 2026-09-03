@@ -82,6 +82,19 @@ public sealed class CopilotJsonlParserTests
     }
 
     [Fact]
+    public void Parse_ClassifiesUnsupportedModelsSeparatelyFromQualityFailures()
+    {
+        var result = CopilotJsonlParser.Parse(
+            """
+            {"type":"session.error","data":{"errorType":"unsupported_model","message":"Unknown model."}}
+            """);
+
+        Assert.False(result.Success);
+        Assert.Equal(AgentRunFailureKind.ModelUnavailable, result.FailureKind);
+        Assert.Equal("model-candidate", result.FailedDependency);
+    }
+
+    [Fact]
     public void ProgressReporter_CapturesTheActualCopilotSession()
     {
         var progress = new List<AgentRunProgress>();
@@ -247,7 +260,7 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--add-dir --agent --allow-all-tools --available-tools --disable-builtin-mcps " +
+                "--add-dir --acp --agent --allow-all-tools --available-tools --disable-builtin-mcps " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --output-format --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);

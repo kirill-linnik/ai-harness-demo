@@ -17,6 +17,7 @@ const bootstrap: BootstrapDto = {
     repositoryKnowledge: "Demo repository",
     outcome: "PullRequest",
     maxHandoffRetries: 2,
+    modelSelectionStrategy: "MaximumQuality",
     updatedAt: timestamp
   },
   agents: [],
@@ -34,6 +35,13 @@ const bootstrap: BootstrapDto = {
     command: "copilot",
     resolvedPath: "copilot",
     version: "1.0.82",
+    detail: "Ready",
+    checkedAt: timestamp
+  },
+  modelCatalog: {
+    ready: true,
+    catalogVersion: "acp-test",
+    candidateCount: 4,
     detail: "Ready",
     checkedAt: timestamp
   },
@@ -60,7 +68,10 @@ function step(overrides: Partial<FlowStepDto> = {}): FlowStepDto {
     agentRole: "software-engineer",
     label: "Execute Software Engineer contract",
     model: "gpt-5.4",
+    modelEffort: "high",
     modelReason: "Selected for implementation.",
+    taskProfile: null,
+    routing: null,
     status: "Failed",
     phase: "Stalled",
     attempt: 1,
@@ -89,6 +100,7 @@ function failedFlow(): FlowDetailDto {
     repositoryPath: "E:\\projects\\demo",
     repositoryKnowledge: "Demo repository",
     outcome: "PullRequest",
+    modelSelectionStrategy: "MaximumQuality",
     workspacePath: "E:\\projects\\demo\\data\\worktrees\\flow",
     branchName: "ai-harness\\refresh-site",
     outcomeUrl: "",

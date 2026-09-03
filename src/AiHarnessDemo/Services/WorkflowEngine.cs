@@ -123,7 +123,14 @@ public sealed class WorkflowEngine(
                 lead,
                 sequence: 10,
                 label: "Plan the delivery system",
-                cancellationToken);
+                cancellationToken,
+                inputSummary:
+                    "Plan delivery for the fixed downstream role sequence and emit one validated " +
+                    "task profile for each role: " +
+                    string.Join(
+                        ", ",
+                        plan.Where(item => item.Agent.Role != "team-lead")
+                            .Select(item => item.Agent.Role)));
             await EnsureBootstrapProfileAsync(
                 flow,
                 lead.Agent.Role,
@@ -275,9 +282,7 @@ public sealed class WorkflowEngine(
             await databaseFactory.CreateDbContextAsync(cancellationToken);
         if (await database.TaskProfiles.AnyAsync(
                 item =>
-                    item.FlowRunId == flow.Id &&
-                    item.Iteration == flow.Iteration &&
-                    item.Role == role,
+                    item.FlowStepId == stepId,
                 cancellationToken))
         {
             return;
@@ -332,6 +337,13 @@ public sealed class WorkflowEngine(
         }
         catch (TaskProfileValidationException firstFailure)
         {
+            await observationRecorder.RecordCompletionAsync(
+                leadResult.Id,
+                accepted: false,
+                leadResult.DurationMilliseconds,
+                Math.Max(1, leadResult.ExecutionAttempts),
+                "invalid-task-profile",
+                cancellationToken);
             var validationErrors = string.Join(
                 Environment.NewLine,
                 firstFailure.Errors.Select(error => $"- {error}"));
@@ -385,6 +397,13 @@ public sealed class WorkflowEngine(
             }
             catch (TaskProfileValidationException secondFailure)
             {
+                await observationRecorder.RecordCompletionAsync(
+                    correction.Id,
+                    accepted: false,
+                    correction.DurationMilliseconds,
+                    Math.Max(1, correction.ExecutionAttempts),
+                    "invalid-task-profile",
+                    cancellationToken);
                 await AddEventAsync(
                     flow.Id,
                     correctionStepId,
@@ -577,6 +596,7 @@ public sealed class WorkflowEngine(
                 planSummary,
                 previousOutputs,
                 learnings,
+                ResumeSession: resumesSession,
                 RecoverInterruptedSession: recoversInterruptedSession,
                 Progress: progress =>
                     RecordProgressAsync(
@@ -792,13 +812,24 @@ public sealed class WorkflowEngine(
             });
         }
         await database.SaveChangesAsync(cancellationToken);
-        await observationRecorder.RecordCompletionAsync(
-            stepId,
-            accepted: !pushedBack,
-            elapsedMilliseconds,
-            result.ExecutionAttempts,
-            pushedBack ? "self-pushback" : "accepted-handoff",
-            cancellationToken);
+        if (pushedBack)
+        {
+            await observationRecorder.RecordPushbackDetectionAsync(
+                stepId,
+                elapsedMilliseconds,
+                result.ExecutionAttempts,
+                cancellationToken);
+        }
+        else
+        {
+            await observationRecorder.RecordCompletionAsync(
+                stepId,
+                accepted: true,
+                elapsedMilliseconds,
+                result.ExecutionAttempts,
+                "accepted-handoff",
+                cancellationToken);
+        }
 
         if (gateRecord.Decision is
             HandoffGateDecision.BlockedKillSwitch or

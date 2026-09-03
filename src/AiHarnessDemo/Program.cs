@@ -36,7 +36,12 @@ builder.Services.AddSingleton<AgentCatalog>();
 builder.Services.AddSingleton<RepositoryAnalyzer>();
 builder.Services.AddSingleton<IntakeCoordinator>();
 builder.Services.AddSingleton<FlowPlanner>();
-builder.Services.AddSingleton<ModelSelector>();
+builder.Services.AddSingleton<BootstrapTaskProfileFactory>();
+builder.Services.AddSingleton<ModelCatalogDiscovery>();
+builder.Services.AddSingleton<AdaptiveModelRouter>();
+builder.Services.AddSingleton<IModelRouter>(
+    services => services.GetRequiredService<AdaptiveModelRouter>());
+builder.Services.AddSingleton<RoutingObservationRecorder>();
 builder.Services.AddSingleton<CopilotReasoningHost>();
 builder.Services.AddSingleton(_ =>
 {
@@ -65,6 +70,9 @@ var startupWorkflow = app.Services
 await app.Services
     .GetRequiredService<CopilotCliRuntime>()
     .RefreshAsync(startupWorkflow.Config.Copilot.Command);
+await app.Services
+    .GetRequiredService<ModelCatalogDiscovery>()
+    .RefreshAsync(paths.Root);
 
 app.UseExceptionHandler();
 app.Use(LocalRequestGuard.ApplyAsync);

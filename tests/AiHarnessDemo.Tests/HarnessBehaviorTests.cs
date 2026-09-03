@@ -473,6 +473,22 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
+    public void ModelWithoutConfigurableEffort_OmitsTheEffortArgument()
+    {
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            "software-engineer",
+            "software-engineer",
+            "model-with-default-effort",
+            "default",
+            Guid.Parse("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            "Prompt");
+
+        Assert.DoesNotContain("--effort", arguments);
+    }
+
+    [Fact]
     public void InterruptedInvocation_ExplicitlyResumesTheExistingSession()
     {
         var sessionId = Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
@@ -903,6 +919,9 @@ public sealed class WorkflowPushbackLoopTests
             var profiles = await database.TaskProfiles
                 .OrderBy(item => item.Role)
                 .ToListAsync();
+            var leadRuns = runner.Contexts
+                .Where(item => item.AgentRole == "team-lead")
+                .ToList();
             var engineerRuns = runner.Contexts
                 .Where(item => item.AgentRole == "software-engineer")
                 .ToList();
@@ -912,6 +931,9 @@ public sealed class WorkflowPushbackLoopTests
 
             Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
             Assert.Equal(4, profiles.Count);
+            Assert.Equal(2, leadRuns.Count);
+            Assert.False(leadRuns[0].ResumeSession);
+            Assert.True(leadRuns[1].ResumeSession);
             Assert.All(
                 runner.Contexts,
                 context => Assert.Equal("fixture-effort", context.ModelEffort));
@@ -931,8 +953,12 @@ public sealed class WorkflowPushbackLoopTests
                     .ToArray());
             Assert.Equal(3, engineerRuns.Count);
             Assert.Single(engineerRuns.Select(item => item.CopilotSessionId).Distinct());
+            Assert.False(engineerRuns[0].ResumeSession);
+            Assert.All(engineerRuns.Skip(1), context => Assert.True(context.ResumeSession));
             Assert.Equal(3, qualityRuns.Count);
             Assert.Single(qualityRuns.Select(item => item.CopilotSessionId).Distinct());
+            Assert.False(qualityRuns[0].ResumeSession);
+            Assert.All(qualityRuns.Skip(1), context => Assert.True(context.ResumeSession));
             Assert.Contains(
                 "Quality Engineer cannot continue",
                 engineerRuns[^1].Task);
@@ -950,6 +976,9 @@ public sealed class WorkflowPushbackLoopTests
                 item =>
                     item.Type == "agent.session-resumed" &&
                     item.Message.StartsWith("Software Engineer", StringComparison.Ordinal));
+            Assert.Contains(
+                stored.Events,
+                item => item.Type == "profile.validation-correction");
             Assert.All(
                 stored.Steps,
                 step => Assert.Contains(
@@ -1019,6 +1048,16 @@ public sealed class WorkflowPushbackLoopTests
                       """;
             if (context.AgentRole == "team-lead")
             {
+                var teamLeadAttempt = Contexts.Count(item =>
+                    item.AgentRole == "team-lead");
+                if (teamLeadAttempt == 1)
+                {
+                    return Task.FromResult(new AgentExecutionResult(
+                        output,
+                        "Fake runner evidence.",
+                        1,
+                        []));
+                }
                 output += """
 
                     TEAM_TASK_PROFILES_V1_BEGIN

@@ -49,7 +49,7 @@ flowchart LR
 | `ModelCatalogDiscovery` | Uses a dedicated bidirectional Copilot ACP process at startup to discover enabled explicit model + effort candidates and persist an audit snapshot. Current discovery is mandatory for readiness. |
 | `BootstrapTaskProfileFactory` / Team Lead profiles | Create strictly validated, normalized `task-profile-v1` routing inputs. Team Lead gets one visible correction turn for an invalid downstream profile contract. |
 | `AdaptiveModelRouter` | Applies router-v1 recency-weighted Bayesian evidence, risk quality floors, lexicographic strategy objectives, and bounded deterministic exploration immediately before execution. |
-| `RoutingObservationRecorder` | Records normalized handoff quality, duration/retry, estimated premium use, availability failures, downstream pushback attribution, and weak final approval evidence. |
+| `RoutingObservationRecorder` | Records normalized handoff quality, duration/retry, estimated premium use, availability failures, downstream pushback and targeted customer-rework attribution, and weak final approval evidence. |
 | `FlowQueue` / `FlowWorker` | Reconcile persisted Copilot sessions before re-queuing work after restart, then execute multiple independent flows concurrently. |
 | `WorkflowEngine` | Drives the durable state machine, pre-creates visible pending stages, records every transition, enforces handoff gates, and learns from pushbacks. |
 | `AgentRunner` | Runs every selected role through Copilot CLI with model routing, retries, progress events, and scrubbed tool-call audit. |
@@ -80,7 +80,7 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 - Creates the same `ai-harness/<task>-<flow-id>` branch in an isolated worktree for each project repository.
 - Grants the flow workspace explicitly with `--add-dir`, sets it as Copilot's working directory, and tells agents that original source-folder paths are metadata rather than work targets.
 - Loads the generic agents from this project with a separate `--add-dir`.
-- Selects a discovered model + effort per step and passes both `--model` and `--effort` to non-interactive Copilot CLI execution.
+- Selects a discovered model + effort per step, always passes `--model`, and passes `--effort` when that model advertises configurable reasoning levels.
 - Gives delivery agents only the two most recent completed handoffs in the current iteration; Product Manager receives the execution ledger required by its role.
 - Gives each agent project access inside the isolated workspace; use only with repositories you trust.
 - Classifies an explicit `PUSHBACK` before advance gating, records a revision request and reusable prompt refinement, resumes the responsible upstream Copilot session, then resumes the blocked agent with the corrected handoff.

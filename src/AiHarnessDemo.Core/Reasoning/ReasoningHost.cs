@@ -7,6 +7,8 @@ public sealed class AgentRunRequest
 
     public required string Model { get; init; }
 
+    public required string Effort { get; init; }
+
     public required string CorrelationId { get; init; }
 
     public required Guid CopilotSessionId { get; init; }
@@ -79,6 +81,7 @@ public enum AgentRunFailureKind
 {
     Transient,
     DependencyUnavailable,
+    ModelUnavailable,
     TimedOut,
     Stalled,
     InvalidOutput,
