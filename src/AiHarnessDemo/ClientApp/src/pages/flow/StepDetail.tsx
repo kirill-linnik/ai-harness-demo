@@ -1,7 +1,39 @@
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { FlowStepDto, HandoffGateRecordDto } from "../../api/types";
 import { formatDuration, statusLabel } from "../../lib/format";
 
+function HandoffContent({
+  title,
+  content,
+  emptyMessage
+}: {
+  title: string;
+  content: string;
+  emptyMessage: string;
+}) {
+  return (
+    <section className="detail-artifact" aria-label={title}>
+      <div className="detail-artifact-header">{title}</div>
+      <div className="detail-markdown">
+        {content ? (
+          <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>
+            {content}
+          </ReactMarkdown>
+        ) : (
+          <p className="detail-placeholder">{emptyMessage}</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGateRecordDto | undefined }) {
+  const outputPlaceholder =
+    step.status === "Running"
+      ? "Agent is reasoning, acting, and observing..."
+      : "This handoff has not started.";
+
   return (
     <>
       <div className="detail-kicker">{step.label || step.agentRole}</div>
@@ -11,6 +43,11 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
         <span>{step.durationMilliseconds ? formatDuration(step.durationMilliseconds) : "Not completed"}</span>
         {step.status === "Running" && <span>{statusLabel(step.phase)}</span>}
         {step.executionAttempts > 1 && <span>{step.executionAttempts} runtime attempts</span>}
+        {step.copilotSessionId && (
+          <span title={`Copilot session ${step.copilotSessionId}`}>
+            session {step.copilotSessionId.slice(0, 8)}
+          </span>
+        )}
       </div>
       <p className="muted">{step.modelReason || step.inputSummary || "Waiting for Team Lead selection."}</p>
       {gate && (
@@ -41,8 +78,17 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
           ))}
         </div>
       )}
-      <div className="detail-output">
-        {step.outputSummary || (step.status === "Running" ? "Agent is reasoning, acting, and observing..." : "This handoff has not started.")}
+      <div className="detail-artifacts">
+        <HandoffContent
+          title="Prompt sent to Copilot CLI"
+          content={step.executionPrompt}
+          emptyMessage="The exact prompt was not captured for this earlier handoff."
+        />
+        <HandoffContent
+          title="Current output"
+          content={step.outputSummary}
+          emptyMessage={outputPlaceholder}
+        />
       </div>
     </>
   );

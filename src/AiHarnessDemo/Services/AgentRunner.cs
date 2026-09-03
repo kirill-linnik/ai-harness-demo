@@ -24,6 +24,7 @@ public sealed record AgentExecutionContext(
     IReadOnlyList<string> PreviousOutputs,
     IReadOnlyList<HarnessLearning> Learnings,
     string CustomerFeedback = "",
+    bool RecoverInterruptedSession = false,
     Action<AgentRunProgress>? Progress = null);
 
 public sealed record AgentExecutionResult(

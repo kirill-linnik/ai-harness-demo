@@ -165,13 +165,25 @@ public sealed partial class IntakeCoordinator(
                     priorReplies,
                     learnings,
                     Progress: progress =>
+                    {
+                        if (progress.ExecutionPrompt is not null)
+                        {
+                            intakeStep.ExecutionPrompt = progress.ExecutionPrompt;
+                        }
+                        if (progress.CopilotSessionId is not null)
+                        {
+                            intakeStep.CopilotSessionId = progress.CopilotSessionId;
+                            intakeStep.CopilotSessionHome =
+                                progress.CopilotSessionHome ?? string.Empty;
+                        }
                         RecordProgressAsync(
                                 flow.Id,
                                 intakeStep.Id,
                                 progress,
                                 CancellationToken.None)
                             .GetAwaiter()
-                            .GetResult()),
+                            .GetResult();
+                    }),
                 cancellationToken);
         }
         catch (Exception exception)
@@ -179,9 +191,9 @@ public sealed partial class IntakeCoordinator(
             stopwatch.Stop();
             intakeStep.Status = StepStatus.Failed;
             intakeStep.Phase = exception is AgentRunException
-                {
-                    FailureKind: AgentRunFailureKind.TimedOut
-                }
+            {
+                FailureKind: AgentRunFailureKind.TimedOut
+            }
                 ? AgentRunPhase.TimedOut
                 : exception is AgentRunException
                 {
@@ -476,6 +488,15 @@ public sealed partial class IntakeCoordinator(
             item => item.Id == stepId,
             cancellationToken);
         step.Phase = progress.Phase;
+        if (progress.ExecutionPrompt is not null)
+        {
+            step.ExecutionPrompt = progress.ExecutionPrompt;
+        }
+        if (progress.CopilotSessionId is not null)
+        {
+            step.CopilotSessionId = progress.CopilotSessionId;
+            step.CopilotSessionHome = progress.CopilotSessionHome ?? string.Empty;
+        }
         database.FlowEvents.Add(new FlowEvent
         {
             FlowRunId = flowId,

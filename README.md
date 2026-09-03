@@ -79,6 +79,8 @@ The AI Factory and every new-assignment control remain locked until Settings con
 - Agent definitions are loaded from `.github\agents\*.agent.md`.
 - Copilot CLI receives explicit project access to `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree, and source-folder paths remain intentionally inaccessible.
 - An explicit agent `PUSHBACK` is persisted as a rejected handoff, resumes the responsible upstream agent's Copilot session, then retries the blocked agent in its existing session.
+- Copilot session IDs are persisted per step. After a host restart, completed CLI turns are recovered from the session journal; interrupted turns resume the same session and preserved workspace instead of starting over.
+- A failed flow can be manually restarted from its detail page. The failed attempt remains in history, while a new retry resumes its Copilot session when available and re-queues downstream work in the same workspace.
 - The handoff retry limit is persisted in Settings (`0-10`, default `2`); only an exhausted limit or an unroutable pushback stops the flow and skips downstream steps.
 - Multiple flows can run in parallel; every flow receives an independent project workspace and a matching branch in each discovered repository.
 - No cloud credentials, private endpoints, or provider-specific work-item integrations are included.

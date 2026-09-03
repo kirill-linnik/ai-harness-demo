@@ -159,6 +159,12 @@ public sealed class FlowStep
 
     public string InputSummary { get; set; } = string.Empty;
 
+    public string ExecutionPrompt { get; set; } = string.Empty;
+
+    public Guid? CopilotSessionId { get; set; }
+
+    public string CopilotSessionHome { get; set; } = string.Empty;
+
     public string OutputSummary { get; set; } = string.Empty;
 
     public string PushbackReason { get; set; } = string.Empty;
@@ -172,7 +178,7 @@ public sealed class FlowStep
     public List<AgentToolCall> ToolCalls { get; set; } = [];
 }
 
-/// <summary>Scrubbed tool trace. Raw prompts and tool results are deliberately not persisted.</summary>
+/// <summary>Scrubbed tool trace. Raw tool arguments and results are deliberately not persisted.</summary>
 public sealed class AgentToolCall
 {
     public Guid Id { get; set; } = Guid.NewGuid();

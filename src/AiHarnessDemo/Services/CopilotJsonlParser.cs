@@ -266,7 +266,8 @@ public static partial class CopilotJsonlParser
     }
 
     public static Action<string> CreateProgressReporter(
-        Action<AgentRunProgress>? report)
+        Action<AgentRunProgress>? report,
+        string copilotSessionHome = "")
     {
         var pendingToolNames = new Dictionary<string, string>(StringComparer.Ordinal);
         return line =>
@@ -279,6 +280,20 @@ public static partial class CopilotJsonlParser
 
             using (document)
             {
+                if (eventType == "session.start")
+                {
+                    var sessionId = ReadString(payload, "sessionId");
+                    var hasSessionId = Guid.TryParse(sessionId, out var parsedSessionId);
+                    report(new AgentRunProgress(
+                        AgentRunPhase.InitializingSession,
+                        hasSessionId
+                            ? $"Copilot session {parsedSessionId:D} initialized."
+                            : "Copilot session initialized without a usable session ID.",
+                        CopilotSessionId: hasSessionId ? parsedSessionId : null,
+                        CopilotSessionHome: copilotSessionHome));
+                    return;
+                }
+
                 if (eventType == "tool.execution_start")
                 {
                     var tool = ReadString(payload, "toolName") ?? "unknown";
@@ -338,7 +353,7 @@ public static partial class CopilotJsonlParser
         };
     }
 
-    private static bool TryPayload(
+    internal static bool TryPayload(
         string line,
         out string eventType,
         out JsonDocument document,
@@ -373,7 +388,7 @@ public static partial class CopilotJsonlParser
         return true;
     }
 
-    private static string? ReadString(JsonElement element, string propertyName) =>
+    internal static string? ReadString(JsonElement element, string propertyName) =>
         element.TryGetProperty(propertyName, out var value) &&
         value.ValueKind == JsonValueKind.String
             ? value.GetString()
@@ -389,7 +404,7 @@ public static partial class CopilotJsonlParser
         ReadString(element, "toolCallId") ??
         ReadString(element, "callId");
 
-    private static bool IsSubAgentEvent(JsonElement root) =>
+    internal static bool IsSubAgentEvent(JsonElement root) =>
         root.TryGetProperty("agentId", out var agentId) &&
         agentId.ValueKind == JsonValueKind.String &&
         !string.IsNullOrWhiteSpace(agentId.GetString());

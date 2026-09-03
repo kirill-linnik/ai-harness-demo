@@ -33,7 +33,12 @@ public enum AgentRunPhase
     CanceledByReconciliation
 }
 
-public sealed record AgentRunProgress(AgentRunPhase Phase, string Activity);
+public sealed record AgentRunProgress(
+    AgentRunPhase Phase,
+    string Activity,
+    string? ExecutionPrompt = null,
+    Guid? CopilotSessionId = null,
+    string? CopilotSessionHome = null);
 
 public sealed class AgentRunResult
 {
@@ -52,7 +57,7 @@ public sealed class AgentRunResult
     public bool ProcessTerminationUnconfirmed { get; init; }
 }
 
-/// <summary>A scrubbed tool invocation. Raw prompts are deliberately not part of the audit record.</summary>
+/// <summary>A scrubbed tool invocation. Raw tool arguments and results are not part of the audit record.</summary>
 public sealed record ToolCallRecord(
     string ToolName,
     string ArgumentsSummary,

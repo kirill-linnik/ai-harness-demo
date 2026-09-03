@@ -101,6 +101,8 @@ export interface FlowStepDto {
   attempt: number;
   executionAttempts: number;
   inputSummary: string;
+  executionPrompt: string;
+  copilotSessionId: string;
   outputSummary: string;
   pushbackReason: string;
   startedAt: string | null;

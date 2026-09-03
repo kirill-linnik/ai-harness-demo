@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Text.Json;
 using AiHarnessDemo.Api;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Reasoning;
@@ -78,6 +79,30 @@ public sealed class CopilotJsonlParserTests
         Assert.Equal(AgentRunFailureKind.Transient, result.FailureKind);
         Assert.Contains("rate_limit", result.Error);
         Assert.Contains("Please retry shortly.", result.Error);
+    }
+
+    [Fact]
+    public void ProgressReporter_CapturesTheActualCopilotSession()
+    {
+        var progress = new List<AgentRunProgress>();
+        var reporter = CopilotJsonlParser.CreateProgressReporter(
+            progress.Add,
+            @"C:\copilot-home");
+        var sessionId = Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+
+        reporter(JsonSerializer.Serialize(new
+        {
+            type = "session.start",
+            data = new
+            {
+                sessionId
+            }
+        }));
+
+        var observed = Assert.Single(progress);
+        Assert.Equal(AgentRunPhase.InitializingSession, observed.Phase);
+        Assert.Equal(sessionId, observed.CopilotSessionId);
+        Assert.Equal(@"C:\copilot-home", observed.CopilotSessionHome);
     }
 
     [Fact]

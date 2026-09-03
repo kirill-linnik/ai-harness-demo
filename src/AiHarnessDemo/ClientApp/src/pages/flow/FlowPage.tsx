@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useFlowQuery } from "../../api/queries";
+import { useFlowQuery, useRestartFlowMutation } from "../../api/queries";
 import { AppShell } from "../../components/AppShell";
 import { BootScreen } from "../../components/BootScreen";
 import { FatalScreen } from "../../components/FatalScreen";
 import { StatusPill } from "../../components/StatusPill";
-import { BackIcon, CopyIcon, ExternalIcon, FactoryIcon } from "../../lib/icons";
+import { BackIcon, CopyIcon, ExternalIcon, FactoryIcon, RefreshIcon } from "../../lib/icons";
 import { groupBy, lastPathPart, timeAgo } from "../../lib/format";
 import { useToast } from "../../lib/toast";
 import { IterationLane } from "./IterationLane";
@@ -17,6 +17,7 @@ export function FlowPage() {
   const { id } = useParams<{ id: string }>();
   const toast = useToast();
   const flowQuery = useFlowQuery(id);
+  const restartFlow = useRestartFlowMutation();
   const flow = flowQuery.data;
 
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
@@ -63,6 +64,19 @@ export function FlowPage() {
     const link = `${location.origin}${location.pathname}#/factory/${flow!.id}`;
     await navigator.clipboard.writeText(link);
     toast("Flow link copied.", "success");
+  }
+
+  async function restartFailedFlow() {
+    try {
+      const restarted = await restartFlow.mutateAsync(flow!.id);
+      const retryStep = [...restarted.steps]
+        .reverse()
+        .find(step => step.label.startsWith("Manual restart of "));
+      setSelectedStepId(retryStep?.id ?? null);
+      toast("Failed task queued from its preserved workspace.", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : String(error), "error");
+    }
   }
 
   return (
@@ -182,6 +196,13 @@ export function FlowPage() {
             <strong>Flow stopped</strong>
             <span>{flow.failureReason}</span>
           </div>
+          <button
+            className="button"
+            disabled={restartFlow.isPending}
+            onClick={() => void restartFailedFlow()}
+          >
+            <RefreshIcon /> {restartFlow.isPending ? "Restarting..." : "Restart failed task"}
+          </button>
         </section>
       )}
     </AppShell>

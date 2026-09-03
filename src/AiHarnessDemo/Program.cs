@@ -50,6 +50,7 @@ builder.Services.AddSingleton<IWorkspaceManager, WorkspaceManager>();
 builder.Services.AddSingleton<AgentRunner>();
 builder.Services.AddSingleton<IAgentRunner>(
     services => services.GetRequiredService<AgentRunner>());
+builder.Services.AddSingleton<CopilotSessionJournal>();
 builder.Services.AddSingleton<FlowQueue>();
 builder.Services.AddSingleton<WorkflowEngine>();
 builder.Services.AddSingleton<FeedbackCoordinator>();

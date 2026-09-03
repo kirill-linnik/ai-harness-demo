@@ -8,7 +8,7 @@
 | Policy / coordination / execution / integration / observability layers | `AiHarnessDemo.Core`, `WorkflowEngine`, reasoning hosts and workspaces, voice/Copilot adapters, API and browser dashboard. |
 | Single scheduling authority | `FlowQueue`, `FlowWorker`, and `WorkflowEngine`; duplicate dispatch is rejected by the active-run map. |
 | Bounded concurrency | Dynamic `agent.max_concurrent_agents` from `WORKFLOW.md`. |
-| Transient recovery | Fresh-per-dispatch Polly retry pipeline with exponential backoff and jitter; dependency circuit breaker; queued-flow restart reconciliation. |
+| Transient recovery | Fresh-per-dispatch Polly retry pipeline with exponential backoff and jitter; dependency circuit breaker; completed-session journal recovery and explicit interrupted-session resume after restart. |
 | Per-work-item workspace | One collision-resistant flow ID directory containing a matching branch and worktree for every project repository; preserved between turns and iterations. |
 | Workspace safety invariants | Absolute root containment check, sanitized key, and Copilot `cwd` equal to the flow workspace. |
 | Workspace lifecycle hooks | `after_create`, `before_run`, `after_run`, and `before_remove` contracts in `WORKFLOW.md`. |
@@ -46,9 +46,10 @@ flowchart LR
 | `IntakeCoordinator` | Persists customer dialogue, separates clarification from confirmation, and queues only a customer-confirmed brief. |
 | `FlowPlanner` | Uses task complexity and domain signals to select only enabled specialists in dependency order. |
 | `ModelSelector` | Routes each role to a model using task complexity and prior retry rate. |
-| `FlowQueue` / `FlowWorker` | Recover queued work after restart and execute multiple independent flows concurrently. |
+| `FlowQueue` / `FlowWorker` | Reconcile persisted Copilot sessions before re-queuing work after restart, then execute multiple independent flows concurrently. |
 | `WorkflowEngine` | Drives the durable state machine, pre-creates visible pending stages, records every transition, enforces handoff gates, and learns from pushbacks. |
 | `AgentRunner` | Runs every selected role through Copilot CLI with model routing, retries, progress events, and scrubbed tool-call audit. |
+| `CopilotSessionJournal` | Reads Copilot CLI session journals, discovers legacy in-flight sessions by workspace and agent, and distinguishes completed, active, and interrupted turns. |
 | `WorkspaceManager` | Creates one project workspace per flow, with an isolated worktree on the flow branch for every discovered repository. |
 | `FeedbackCoordinator` | Grounds Product Manager in the original request and full ledger, then closes or requeues the same flow with retained context. |
 | `HarnessDbContext` | Persists settings, agents, flows, dialogue, steps, events, model choices, durations, outcomes, and prompt refinements. |
@@ -85,7 +86,7 @@ The browser uses a same-origin minimal API:
 - `/api/bootstrap`, `/api/settings`, `/api/agents`
 - `/api/directories`, `/api/repositories/analyze`
 - `/api/intake`
-- `/api/flows`, `/api/flows/{id}`, `/start`, `/feedback`, `/decision`
+- `/api/flows`, `/api/flows/{id}`, `/start`, `/restart`, `/feedback`, `/decision`
 - `/api/history`, `/api/learnings`, `/api/previews/{id}`
 
 The UI polls only active flows. Completed flows remain static and independently addressable through `#/factory/{id}`.

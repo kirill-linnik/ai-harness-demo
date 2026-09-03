@@ -60,7 +60,7 @@ public sealed partial class CopilotReasoningHost(
             AgentRunPhase.BuildingPrompt,
             "Rendering WORKFLOW.md with role and repository context."));
         var isAccountManager = IsAccountManager(context.AgentRole);
-        var prompt = Clip(
+        var renderedPrompt = Clip(
             promptRenderer.Render(
             workflow.PromptTemplate,
             new Dictionary<string, string>(StringComparer.Ordinal)
@@ -94,6 +94,17 @@ public sealed partial class CopilotReasoningHost(
                 ["response.contract"] = ResponseContract(context.AgentRole)
             }),
             MaximumPromptCharacters);
+        var prompt = context.RecoverInterruptedSession
+            ? RestartContinuationPrompt(renderedPrompt)
+            : renderedPrompt;
+        request.Progress?.Invoke(new AgentRunProgress(
+            AgentRunPhase.BuildingPrompt,
+            "Rendered the exact prompt for the Copilot CLI turn.",
+            prompt));
+        var environmentVariables = BuildProcessEnvironment(
+            context.AgentRole,
+            paths.DatabasePath);
+        var copilotSessionHome = ResolveCopilotSessionHome(environmentVariables);
         var arguments = BuildCliArguments(
             request.WorkingDirectory,
             paths.Root,
@@ -101,10 +112,8 @@ public sealed partial class CopilotReasoningHost(
             context.AgentRole,
             request.Model,
             request.CopilotSessionId,
-            prompt);
-        var environmentVariables = BuildProcessEnvironment(
-            context.AgentRole,
-            paths.DatabasePath);
+            prompt,
+            context.RecoverInterruptedSession);
         if (environmentVariables?.TryGetValue("COPILOT_HOME", out var copilotHome) == true)
         {
             Directory.CreateDirectory(copilotHome);
@@ -126,7 +135,9 @@ public sealed partial class CopilotReasoningHost(
                 request.WorkingDirectory,
                 TimeSpan.FromMilliseconds(workflow.Config.Copilot.TurnTimeoutMs),
                 cancellationToken,
-                CopilotJsonlParser.CreateProgressReporter(request.Progress),
+                CopilotJsonlParser.CreateProgressReporter(
+                    request.Progress,
+                    copilotSessionHome),
                 TimeSpan.FromMilliseconds(workflow.Config.Copilot.StallTimeoutMs),
                 environmentVariables);
         }
@@ -187,7 +198,8 @@ public sealed partial class CopilotReasoningHost(
         string agentRole,
         string model,
         Guid copilotSessionId,
-        string prompt)
+        string prompt,
+        bool resumeSession = false)
     {
         var arguments = new List<string>
         {
@@ -196,11 +208,14 @@ public sealed partial class CopilotReasoningHost(
             "--add-dir", harnessRoot,
             "--agent", agentId,
             "--model", model,
-            "--session-id", copilotSessionId.ToString("D"),
             "--output-format", "json",
             "--no-color",
             "--no-ask-user"
         };
+        arguments.AddRange(
+            resumeSession
+                ? [$"--resume={copilotSessionId:D}"]
+                : ["--session-id", copilotSessionId.ToString("D")]);
 
         if (IsAccountManager(agentRole))
         {
@@ -220,6 +235,42 @@ public sealed partial class CopilotReasoningHost(
 
         arguments.AddRange(["-p", prompt]);
         return arguments;
+    }
+
+    internal static string RestartContinuationPrompt(string renderedPrompt)
+    {
+        const string recoveryInstruction =
+            """
+            The harness restarted while your previous Copilot CLI turn was in progress.
+            Resume from the existing session and current workspace state. Preserve completed work,
+            inspect what remains, and finish the handoff without starting the assignment over.
+            """;
+        return
+            recoveryInstruction +
+            Environment.NewLine +
+            Environment.NewLine +
+            Clip(
+                renderedPrompt,
+                MaximumPromptCharacters -
+                recoveryInstruction.Length -
+                (Environment.NewLine.Length * 2));
+    }
+
+    internal static string ResolveCopilotSessionHome(
+        IReadOnlyDictionary<string, string>? environmentVariables)
+    {
+        if (environmentVariables?.TryGetValue("COPILOT_HOME", out var configuredHome) == true &&
+            !string.IsNullOrWhiteSpace(configuredHome))
+        {
+            return Path.GetFullPath(configuredHome);
+        }
+
+        var inheritedHome = Environment.GetEnvironmentVariable("COPILOT_HOME");
+        return string.IsNullOrWhiteSpace(inheritedHome)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".copilot")
+            : Path.GetFullPath(inheritedHome);
     }
 
     internal static string PrepareRepositoryKnowledge(

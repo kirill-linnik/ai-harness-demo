@@ -40,6 +40,8 @@ export const api = {
   flow: (flowId: string) => request<FlowDetailDto>(`/api/flows/${flowId}`),
   startFlow: (flowId: string) =>
     request<FlowDetailDto>(`/api/flows/${flowId}/start`, { method: "POST", body: {} }),
+  restartFlow: (flowId: string) =>
+    request<FlowDetailDto>(`/api/flows/${flowId}/restart`, { method: "POST", body: {} }),
   sendFeedback: (flowId: string, body: FeedbackRequest) =>
     request<FeedbackResponse>(`/api/flows/${flowId}/feedback`, { method: "POST", body }),
   decideFlow: (flowId: string, approve: boolean) =>

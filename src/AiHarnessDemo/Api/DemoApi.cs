@@ -26,6 +26,7 @@ public static class DemoApi
         api.MapGet("/flows", GetFlowsAsync);
         api.MapGet("/flows/{flowId:guid}", GetFlowAsync);
         api.MapPost("/flows/{flowId:guid}/start", StartFlowAsync);
+        api.MapPost("/flows/{flowId:guid}/restart", RestartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/feedback", AddFeedbackAsync);
         api.MapPost("/flows/{flowId:guid}/decision", DecideFlowAsync);
         api.MapGet("/history", GetHistoryAsync);
@@ -290,6 +291,21 @@ public static class DemoApi
         FeedbackCoordinator coordinator,
         CancellationToken cancellationToken) =>
         Results.Ok(await coordinator.RespondAsync(flowId, request.Message, cancellationToken));
+
+    private static async Task<IResult> RestartFlowAsync(
+        Guid flowId,
+        WorkflowEngine engine,
+        FlowQueue queue,
+        CancellationToken cancellationToken)
+    {
+        var flow = await engine.RestartFailedFlowAsync(flowId, cancellationToken);
+        if (!queue.Queue(flowId))
+        {
+            throw new InvalidOperationException("Unable to queue the restarted factory flow.");
+        }
+
+        return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
+    }
 
     private static async Task<IResult> DecideFlowAsync(
         Guid flowId,

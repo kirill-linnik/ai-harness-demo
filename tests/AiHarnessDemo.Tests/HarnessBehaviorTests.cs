@@ -419,6 +419,28 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
+    public void InterruptedInvocation_ExplicitlyResumesTheExistingSession()
+    {
+        var sessionId = Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        var prompt = CopilotReasoningHost.RestartContinuationPrompt("Original prompt.");
+
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            "software-engineer",
+            "software-engineer",
+            "gpt-5.4-mini",
+            sessionId,
+            prompt,
+            resumeSession: true);
+
+        Assert.Contains($"--resume={sessionId:D}", arguments);
+        Assert.DoesNotContain("--session-id", arguments);
+        Assert.Contains("Original prompt.", prompt);
+        Assert.Contains("without starting the assignment over", prompt);
+    }
+
+    [Fact]
     public void RepositoryKnowledge_DoesNotRedirectAgentsToTheOriginalSourcePath()
     {
         var knowledge = """
@@ -691,6 +713,7 @@ public sealed class WorkflowPushbackLoopTests
             new FixedWorkspaceManager(workspacePath),
             runner,
             handoffGate,
+            new CopilotSessionJournal(paths),
             workflowProvider,
             NullLogger<WorkflowEngine>.Instance);
 
@@ -747,6 +770,11 @@ public sealed class WorkflowPushbackLoopTests
                 item =>
                     item.Type == "agent.session-resumed" &&
                     item.Message.StartsWith("Software Engineer", StringComparison.Ordinal));
+            Assert.All(
+                stored.Steps,
+                step => Assert.Contains(
+                    $"Exact prompt for {step.AgentRole}",
+                    step.ExecutionPrompt));
             Assert.DoesNotContain(
                 stored.Steps,
                 item => item.Status is StepStatus.Failed or StepStatus.Skipped);
@@ -767,6 +795,15 @@ public sealed class WorkflowPushbackLoopTests
             CancellationToken cancellationToken = default)
         {
             Contexts.Add(context);
+            context.Progress?.Invoke(new AgentRunProgress(
+                AgentRunPhase.InitializingSession,
+                $"Copilot session {context.CopilotSessionId:D} initialized.",
+                CopilotSessionId: context.CopilotSessionId,
+                CopilotSessionHome: Path.Combine(Path.GetTempPath(), "copilot-test-home")));
+            context.Progress?.Invoke(new AgentRunProgress(
+                AgentRunPhase.BuildingPrompt,
+                "Rendered the exact prompt for the Copilot CLI turn.",
+                $"# Exact prompt for {context.AgentRole}{Environment.NewLine}{Environment.NewLine}{context.Task}"));
             var output =
                 context.AgentRole == "quality-engineer" && context.Attempt <= 2
                     ? """
@@ -927,6 +964,44 @@ public sealed class PersistenceTests
         var settings = await database.Settings.SingleAsync();
 
         Assert.Equal(2, settings.MaxHandoffRetries);
+        Assert.Equal(System.Data.ConnectionState.Open, connection.State);
+    }
+
+    [Fact]
+    public async Task FlowStepSchema_AddsExecutionPromptToExistingDatabase()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                CREATE TABLE FlowSteps (
+                    Id TEXT NOT NULL CONSTRAINT PK_FlowSteps PRIMARY KEY
+                );
+                INSERT INTO FlowSteps (Id) VALUES ('legacy-step');
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var database = new HarnessDbContext(options);
+
+        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
+        await using var probe = connection.CreateCommand();
+        probe.CommandText = "SELECT name FROM pragma_table_info('FlowSteps');";
+        var columns = new List<string>();
+        await using (var reader = await probe.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                columns.Add(reader.GetString(0));
+            }
+        }
+
+        Assert.Contains("ExecutionPrompt", columns);
+        Assert.Contains("CopilotSessionId", columns);
+        Assert.Contains("CopilotSessionHome", columns);
         Assert.Equal(System.Data.ConnectionState.Open, connection.State);
     }
 }

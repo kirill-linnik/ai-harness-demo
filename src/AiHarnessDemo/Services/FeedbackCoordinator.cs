@@ -125,7 +125,15 @@ public sealed class FeedbackCoordinator(
                         "Review the execution ledger and help the customer decide.",
                         previousOutputs,
                         [],
-                        message),
+                        message,
+                        Progress: progress =>
+                            RecordProgressAsync(
+                                    flow.Id,
+                                    step.Id,
+                                    progress,
+                                    CancellationToken.None)
+                                .GetAwaiter()
+                                .GetResult()),
                     cancellationToken);
             }
             catch (Exception exception)
@@ -292,6 +300,36 @@ public sealed class FeedbackCoordinator(
         return flow.ToDetailDto();
     }
 
+    private async Task RecordProgressAsync(
+        Guid flowId,
+        Guid stepId,
+        AgentRunProgress progress,
+        CancellationToken cancellationToken)
+    {
+        await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var storedStep = await database.FlowSteps.SingleAsync(
+            item => item.Id == stepId,
+            cancellationToken);
+        storedStep.Phase = progress.Phase;
+        if (progress.ExecutionPrompt is not null)
+        {
+            storedStep.ExecutionPrompt = progress.ExecutionPrompt;
+        }
+        if (progress.CopilotSessionId is not null)
+        {
+            storedStep.CopilotSessionId = progress.CopilotSessionId;
+            storedStep.CopilotSessionHome = progress.CopilotSessionHome ?? string.Empty;
+        }
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flowId,
+            FlowStepId = stepId,
+            Type = $"agent.{progress.Phase}",
+            Message = progress.Activity
+        });
+        await database.SaveChangesAsync(cancellationToken);
+    }
+
     private async Task PersistFeedbackFailureAsync(
         Guid flowId,
         Guid stepId,
@@ -304,9 +342,9 @@ public sealed class FeedbackCoordinator(
             cancellationToken);
         storedStep.Status = StepStatus.Failed;
         storedStep.Phase = exception is AgentRunException
-            {
-                FailureKind: AgentRunFailureKind.TimedOut
-            }
+        {
+            FailureKind: AgentRunFailureKind.TimedOut
+        }
             ? AgentRunPhase.TimedOut
             : exception is AgentRunException
             {

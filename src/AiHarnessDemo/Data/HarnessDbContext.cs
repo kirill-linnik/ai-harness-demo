@@ -160,6 +160,7 @@ public static class DatabaseInitializer
 
         await database.Database.EnsureCreatedAsync();
         await EnsureSettingsSchemaAsync(database);
+        await EnsureFlowStepSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         var settings = await database.Settings.SingleOrDefaultAsync();
@@ -189,9 +190,48 @@ public static class DatabaseInitializer
         await catalog.SyncAsync();
     }
 
-    internal static async Task EnsureSettingsSchemaAsync(
+    internal static Task EnsureSettingsSchemaAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken = default) =>
+        EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Settings') " +
+            "WHERE name = 'MaxHandoffRetries';",
+            "ALTER TABLE Settings ADD COLUMN MaxHandoffRetries " +
+            "INTEGER NOT NULL DEFAULT 2;",
+            cancellationToken);
+
+    internal static async Task EnsureFlowStepSchemaAsync(
         HarnessDbContext database,
         CancellationToken cancellationToken = default)
+    {
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'ExecutionPrompt';",
+            "ALTER TABLE FlowSteps ADD COLUMN ExecutionPrompt " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'CopilotSessionId';",
+            "ALTER TABLE FlowSteps ADD COLUMN CopilotSessionId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'CopilotSessionHome';",
+            "ALTER TABLE FlowSteps ADD COLUMN CopilotSessionHome " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+    }
+
+    private static async Task EnsureColumnAsync(
+        HarnessDbContext database,
+        string probeSql,
+        string migrationSql,
+        CancellationToken cancellationToken)
     {
         var connection = database.Database.GetDbConnection();
         var shouldClose = connection.State != ConnectionState.Open;
@@ -202,9 +242,7 @@ public static class DatabaseInitializer
         try
         {
             await using var probe = connection.CreateCommand();
-            probe.CommandText =
-                "SELECT COUNT(*) FROM pragma_table_info('Settings') " +
-                "WHERE name = 'MaxHandoffRetries';";
+            probe.CommandText = probeSql;
             var exists = Convert.ToInt64(
                 await probe.ExecuteScalarAsync(cancellationToken));
             if (exists > 0)
@@ -213,9 +251,7 @@ public static class DatabaseInitializer
             }
 
             await using var migration = connection.CreateCommand();
-            migration.CommandText =
-                "ALTER TABLE Settings ADD COLUMN MaxHandoffRetries " +
-                "INTEGER NOT NULL DEFAULT 2;";
+            migration.CommandText = migrationSql;
             await migration.ExecuteNonQueryAsync(cancellationToken);
         }
         finally
