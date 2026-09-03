@@ -9,7 +9,9 @@ namespace AiHarnessDemo.Services;
 
 public sealed class FeedbackCoordinator(
     IDbContextFactory<HarnessDbContext> databaseFactory,
-    ModelSelector modelSelector,
+    IModelRouter modelRouter,
+    BootstrapTaskProfileFactory profileFactory,
+    RoutingObservationRecorder observationRecorder,
     IAgentRunner agentRunner,
     HandoffGateEngine gateEngine,
     FlowQueue flowQueue)
@@ -60,7 +62,6 @@ public sealed class FeedbackCoordinator(
 
             if (productManager is not null)
             {
-                var model = modelSelector.Select("product-manager", complexity: 2);
                 step = new FlowStep
                 {
                     FlowRunId = flow.Id,
@@ -74,10 +75,7 @@ public sealed class FeedbackCoordinator(
                     AgentName = productManager.Name,
                     AgentRole = productManager.Role,
                     Label = "Interpret customer feedback",
-                    Model = model.Model,
-                    ModelReason = model.Reason,
-                    Status = StepStatus.Running,
-                    StartedAt = DateTimeOffset.UtcNow,
+                    Status = StepStatus.Pending,
                     InputSummary = message
                 };
                 database.FlowSteps.Add(step);
@@ -85,6 +83,34 @@ public sealed class FeedbackCoordinator(
 
             flow.UpdatedAt = DateTimeOffset.UtcNow;
             await database.SaveChangesAsync(cancellationToken);
+            if (step is not null)
+            {
+                var profile = await database.TaskProfiles.SingleOrDefaultAsync(
+                    item =>
+                        item.FlowRunId == flow.Id &&
+                        item.Iteration == flow.Iteration &&
+                        item.Role == productManager!.Role,
+                    cancellationToken);
+                if (profile is null)
+                {
+                    database.TaskProfiles.Add(profileFactory.Create(
+                        productManager!.Role,
+                        flow.ConsolidatedRequest,
+                        flow.Id,
+                        flow.Iteration,
+                        step.Id));
+                    await database.SaveChangesAsync(cancellationToken);
+                }
+                var decision = await modelRouter.SelectAsync(
+                    new RoutingRequest(step.Id, flow.ModelSelectionStrategy),
+                    cancellationToken);
+                step.Model = decision.SelectedModel;
+                step.ModelEffort = decision.SelectedEffort;
+                step.ModelReason = decision.Reason;
+                step.Status = StepStatus.Running;
+                step.StartedAt = DateTimeOffset.UtcNow;
+                await database.SaveChangesAsync(cancellationToken);
+            }
         }
 
         string reply;
@@ -98,9 +124,13 @@ public sealed class FeedbackCoordinator(
         {
             var previousOutputs = flow.Steps
                 .Where(item => item.Status is StepStatus.Completed or StepStatus.Pushback)
-                .OrderBy(item => item.Sequence)
-                .Select(item => item.OutputSummary)
-                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .OrderBy(item => item.Iteration)
+                .ThenBy(item => item.Sequence)
+                .ThenBy(item => item.Attempt)
+                .Where(item => !string.IsNullOrWhiteSpace(item.OutputSummary))
+                .Select(item =>
+                    $"{item.AgentName} ({item.AgentRole}){Environment.NewLine}" +
+                    item.OutputSummary)
                 .ToList();
             AgentExecutionResult result;
             try
@@ -113,6 +143,7 @@ public sealed class FeedbackCoordinator(
                         productManager.Name,
                         productManager.Role,
                         step.Model,
+                        step.ModelEffort,
                         step.Attempt,
                         flow.ConsolidatedRequest,
                         flow.RepositoryKnowledge,
@@ -179,6 +210,13 @@ public sealed class FeedbackCoordinator(
                 1,
                 (long)(storedStep.CompletedAt.Value - storedStep.StartedAt!.Value).TotalMilliseconds);
             await database.SaveChangesAsync(cancellationToken);
+            await observationRecorder.RecordCompletionAsync(
+                storedStep.Id,
+                accepted: true,
+                storedStep.DurationMilliseconds,
+                result.ExecutionAttempts,
+                "accepted-feedback-handoff",
+                cancellationToken);
         }
 
         await using (var database = await databaseFactory.CreateDbContextAsync(cancellationToken))
@@ -186,6 +224,12 @@ public sealed class FeedbackCoordinator(
             var storedFlow = await database.Flows
                 .Include(item => item.Steps)
                 .ThenInclude(step => step.ToolCalls)
+                .Include(item => item.Steps)
+                .ThenInclude(step => step.RoutingDecisions)
+                .ThenInclude(decision => decision.TaskProfile)
+                .Include(item => item.Steps)
+                .ThenInclude(step => step.RoutingDecisions)
+                .ThenInclude(decision => decision.Alternatives)
                 .Include(item => item.Messages)
                 .Include(item => item.Events)
                 .Include(item => item.GateRecords)
@@ -291,6 +335,10 @@ public sealed class FeedbackCoordinator(
 
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);
+        if (approve)
+        {
+            await observationRecorder.RecordFinalApprovalAsync(flow.Id, cancellationToken);
+        }
 
         if (!approve && !flowQueue.Queue(flow.Id))
         {
@@ -364,5 +412,12 @@ public sealed class FeedbackCoordinator(
             Message = $"Product Manager could not process feedback: {exception.GetBaseException().Message}"
         });
         await database.SaveChangesAsync(cancellationToken);
+        await observationRecorder.RecordFailureAsync(
+            storedStep.Id,
+            exception is AgentRunException runException
+                ? runException.FailureKind
+                : AgentRunFailureKind.InvalidOutput,
+            storedStep.DurationMilliseconds,
+            cancellationToken);
     }
 }

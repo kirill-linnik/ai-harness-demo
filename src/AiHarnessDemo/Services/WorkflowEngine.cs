@@ -13,7 +13,9 @@ public sealed class WorkflowEngine(
     IDbContextFactory<HarnessDbContext> databaseFactory,
     AgentCatalog agentCatalog,
     FlowPlanner planner,
-    ModelSelector modelSelector,
+    IModelRouter modelRouter,
+    BootstrapTaskProfileFactory profileFactory,
+    RoutingObservationRecorder observationRecorder,
     IWorkspaceManager workspaceManager,
     IAgentRunner agentRunner,
     HandoffGateEngine handoffGate,
@@ -122,9 +124,15 @@ public sealed class WorkflowEngine(
                 sequence: 10,
                 label: "Plan the delivery system",
                 cancellationToken);
+            await EnsureBootstrapProfileAsync(
+                flow,
+                lead.Agent.Role,
+                leadStepId,
+                cancellationToken);
+            FlowStep leadResult;
             if (await ShouldExecuteStepAsync(leadStepId, cancellationToken))
             {
-                await ExecuteWithPushbackRecoveryAsync(
+                leadResult = await ExecuteWithPushbackRecoveryAsync(
                     flow,
                     flowId,
                     leadStepId,
@@ -134,15 +142,31 @@ public sealed class WorkflowEngine(
                     upstreamOwners,
                     cancellationToken);
             }
+            else
+            {
+                await using var leadDatabase =
+                    await databaseFactory.CreateDbContextAsync(cancellationToken);
+                leadResult = await leadDatabase.FlowSteps
+                    .AsNoTracking()
+                    .SingleAsync(item => item.Id == leadStepId, cancellationToken);
+            }
+            await EnsureDownstreamProfilesAsync(
+                flow,
+                lead,
+                leadResult,
+                plan.Where(item => item.Agent.Role != "team-lead")
+                    .Select(item => item.Agent.Role)
+                    .ToArray(),
+                workspace.Path,
+                planSummary,
+                complexity,
+                upstreamOwners,
+                cancellationToken);
         }
         else
         {
-            await AddEventAsync(
-                flow.Id,
-                null,
-                "plan.fallback",
-                "Team Lead is disabled; the harness applied its deterministic default sequence.",
-                cancellationToken);
+            throw new InvalidOperationException(
+                "Team Lead must be enabled because downstream task profiles cannot be silently synthesized.");
         }
 
         var deliveryPlan = plan.Where(item => item.Agent.Role != "team-lead").ToList();
@@ -241,6 +265,154 @@ public sealed class WorkflowEngine(
         return step.Id;
     }
 
+    private async Task EnsureBootstrapProfileAsync(
+        FlowRun flow,
+        string role,
+        Guid stepId,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        if (await database.TaskProfiles.AnyAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.Iteration == flow.Iteration &&
+                    item.Role == role,
+                cancellationToken))
+        {
+            return;
+        }
+        database.TaskProfiles.Add(profileFactory.Create(
+            role,
+            flow.ConsolidatedRequest,
+            flow.Id,
+            flow.Iteration,
+            stepId));
+        await database.SaveChangesAsync(cancellationToken);
+    }
+
+    private async Task EnsureDownstreamProfilesAsync(
+        FlowRun flow,
+        PlannedAgent lead,
+        FlowStep leadResult,
+        IReadOnlyCollection<string> expectedRoles,
+        string workspacePath,
+        string planSummary,
+        int complexity,
+        IReadOnlyDictionary<string, AgentRecord> upstreamOwners,
+        CancellationToken cancellationToken)
+    {
+        await using (var check =
+                     await databaseFactory.CreateDbContextAsync(cancellationToken))
+        {
+            var existingRoles = await check.TaskProfiles
+                .AsNoTracking()
+                .Where(item =>
+                    item.FlowRunId == flow.Id &&
+                    item.Iteration == flow.Iteration &&
+                    expectedRoles.Contains(item.Role))
+                .Select(item => item.Role)
+                .ToListAsync(cancellationToken);
+            if (existingRoles.Order(StringComparer.Ordinal).SequenceEqual(
+                    expectedRoles.Order(StringComparer.Ordinal),
+                    StringComparer.Ordinal))
+            {
+                return;
+            }
+        }
+
+        IReadOnlyList<TaskProfile> profiles;
+        try
+        {
+            profiles = TaskProfileRules.ParseTeamLeadOutput(
+                leadResult.OutputSummary,
+                expectedRoles,
+                flow.Id,
+                flow.Iteration);
+        }
+        catch (TaskProfileValidationException firstFailure)
+        {
+            var validationErrors = string.Join(
+                Environment.NewLine,
+                firstFailure.Errors.Select(error => $"- {error}"));
+            var correctionStepId = await AddStepAsync(
+                flow,
+                lead,
+                sequence: 15,
+                label: "Correct Team Lead task profiles",
+                cancellationToken,
+                attempt: 2,
+                inputSummary:
+                    "Your previous task-profile contract was invalid. Resume the same session and " +
+                    "return a corrected sentinel-delimited JSON document. Exact validation errors:" +
+                    Environment.NewLine +
+                    validationErrors);
+            await AddEventAsync(
+                flow.Id,
+                correctionStepId,
+                "profile.validation-correction",
+                "Team Lead task profiles were invalid. One correction turn was scheduled with the exact validation errors.",
+                cancellationToken);
+            FlowStep correction;
+            if (await ShouldExecuteStepAsync(correctionStepId, cancellationToken))
+            {
+                correction = await ExecuteWithPushbackRecoveryAsync(
+                    flow,
+                    flow.Id,
+                    correctionStepId,
+                    workspacePath,
+                    planSummary,
+                    complexity,
+                    upstreamOwners,
+                    cancellationToken);
+            }
+            else
+            {
+                await using var correctionDatabase =
+                    await databaseFactory.CreateDbContextAsync(cancellationToken);
+                correction = await correctionDatabase.FlowSteps
+                    .AsNoTracking()
+                    .SingleAsync(item => item.Id == correctionStepId, cancellationToken);
+            }
+
+            try
+            {
+                profiles = TaskProfileRules.ParseTeamLeadOutput(
+                    correction.OutputSummary,
+                    expectedRoles,
+                    flow.Id,
+                    flow.Iteration);
+            }
+            catch (TaskProfileValidationException secondFailure)
+            {
+                await AddEventAsync(
+                    flow.Id,
+                    correctionStepId,
+                    "profile.validation-failed",
+                    "Team Lead returned invalid task profiles on the correction turn: " +
+                    string.Join("; ", secondFailure.Errors),
+                    cancellationToken);
+                throw new InvalidOperationException(
+                    "Team Lead task profiles remained invalid after one correction: " +
+                    string.Join("; ", secondFailure.Errors),
+                    secondFailure);
+            }
+        }
+
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        database.TaskProfiles.AddRange(profiles);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = leadResult.Id,
+            Type = "profile.validated",
+            Message =
+                $"Validated router-v1 task profiles for {profiles.Count} downstream roles."
+        });
+        await database.SaveChangesAsync(cancellationToken);
+    }
+
     private async Task<bool> ShouldExecuteStepAsync(
         Guid stepId,
         CancellationToken cancellationToken)
@@ -289,20 +461,9 @@ public sealed class WorkflowEngine(
             var step = await database.FlowSteps.SingleAsync(
                 item => item.Id == stepId,
                 cancellationToken);
-            var history = await database.FlowSteps
-                .AsNoTracking()
-                .Where(item =>
-                    item.AgentRole == step.AgentRole &&
-                    item.Id != step.Id &&
-                    item.Status != StepStatus.Pending &&
-                    item.Status != StepStatus.Running)
-                .Select(item => item.Status)
-                .ToListAsync(cancellationToken);
-            var failureRate = history.Count == 0
-                ? 0
-                : history.Count(status => status is StepStatus.Failed or StepStatus.Pushback) /
-                  (double)history.Count;
-            var model = modelSelector.Select(step.AgentRole, complexity, failureRate);
+            var decision = await modelRouter.SelectAsync(
+                new RoutingRequest(step.Id, flow.ModelSelectionStrategy),
+                cancellationToken);
             var persistedSessionId = step.CopilotSessionId;
             var priorSession = persistedSessionId is null
                 ? await database.FlowSteps
@@ -331,8 +492,9 @@ public sealed class WorkflowEngine(
                 step.Phase == AgentRunPhase.CanceledByReconciliation &&
                 persistedSessionId is not null;
             var resumesSession = recoversInterruptedSession || priorSession is not null;
-            step.Model = model.Model;
-            step.ModelReason = model.Reason;
+            step.Model = decision.SelectedModel;
+            step.ModelEffort = decision.SelectedEffort;
+            step.ModelReason = decision.Reason;
             step.Status = StepStatus.Running;
             step.Phase = AgentRunPhase.BuildingPrompt;
             step.StartedAt ??= DateTimeOffset.UtcNow;
@@ -342,7 +504,9 @@ public sealed class WorkflowEngine(
                 FlowRunId = flowId,
                 FlowStepId = stepId,
                 Type = "step.started",
-                Message = $"{step.AgentName} started with {model.Model}."
+                Message =
+                    $"{step.AgentName} started with {decision.SelectedModel}/{decision.SelectedEffort} " +
+                    $"under {flow.ModelSelectionStrategy}."
             });
             database.FlowEvents.Add(new FlowEvent
             {
@@ -356,16 +520,30 @@ public sealed class WorkflowEngine(
                     $"Copilot session {copilotSessionId:D}."
             });
 
-            var previousOutputs = await database.FlowSteps
+            var previousSteps = await database.FlowSteps
                 .AsNoTracking()
                 .Where(item =>
                     item.FlowRunId == flowId &&
+                    item.Iteration == step.Iteration &&
+                    item.Sequence < step.Sequence &&
                     item.Status == StepStatus.Completed &&
                     item.OutputSummary != string.Empty)
-                .OrderBy(item => item.Iteration)
-                .ThenBy(item => item.Sequence)
-                .Select(item => item.OutputSummary)
+                .OrderByDescending(item => item.Sequence)
+                .ThenByDescending(item => item.Attempt)
+                .Select(item => new
+                {
+                    item.AgentName,
+                    item.AgentRole,
+                    item.OutputSummary
+                })
+                .Take(2)
                 .ToListAsync(cancellationToken);
+            previousSteps.Reverse();
+            var previousOutputs = previousSteps
+                .Select(item =>
+                    $"{item.AgentName} ({item.AgentRole}){Environment.NewLine}" +
+                    item.OutputSummary)
+                .ToList();
             var learnings = await database.Learnings
                 .Where(item =>
                     item.AgentId == string.Empty ||
@@ -388,6 +566,7 @@ public sealed class WorkflowEngine(
                 step.AgentName,
                 step.AgentRole,
                 step.Model,
+                step.ModelEffort,
                 step.Attempt,
                 BuildStepTask(flow.ConsolidatedRequest, step.InputSummary),
                 flow.RepositoryKnowledge,
@@ -613,6 +792,13 @@ public sealed class WorkflowEngine(
             });
         }
         await database.SaveChangesAsync(cancellationToken);
+        await observationRecorder.RecordCompletionAsync(
+            stepId,
+            accepted: !pushedBack,
+            elapsedMilliseconds,
+            result.ExecutionAttempts,
+            pushedBack ? "self-pushback" : "accepted-handoff",
+            cancellationToken);
 
         if (gateRecord.Decision is
             HandoffGateDecision.BlockedKillSwitch or
@@ -675,7 +861,26 @@ public sealed class WorkflowEngine(
         step.DurationMilliseconds = durationMilliseconds ?? Math.Max(
             1,
             (long)(completedAt - (step.StartedAt ?? completedAt)).TotalMilliseconds);
+        var failureKind = exception is AgentRunException agentException
+            ? agentException.FailureKind
+            : AgentRunFailureKind.InvalidOutput;
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = step.FlowRunId,
+            FlowStepId = step.Id,
+            Type = failureKind == AgentRunFailureKind.ModelUnavailable
+                ? "routing.model-unavailable"
+                : "step.failed",
+            Message = failureKind == AgentRunFailureKind.ModelUnavailable
+                ? "The selected model/effort was classified unavailable. The run failed closed because the CLI result does not prove that no session or tool activity occurred; unsafe automatic rerouting was not attempted."
+                : $"{step.AgentName} failed: {exception.GetBaseException().Message}"
+        });
         await database.SaveChangesAsync(cancellationToken);
+        await observationRecorder.RecordFailureAsync(
+            stepId,
+            failureKind,
+            step.DurationMilliseconds,
+            cancellationToken);
     }
 
     internal async Task<IReadOnlyList<Guid>> RecoverInterruptedFlowsAsync(
@@ -836,6 +1041,20 @@ public sealed class WorkflowEngine(
 
             var canResume = snapshot is not null &&
                             snapshot.State != CopilotSessionJournalState.Missing;
+            var priorAssignment = failedStep.InputSummary.Trim();
+            if (string.IsNullOrWhiteSpace(priorAssignment) ||
+                priorAssignment.StartsWith(
+                    "Manual restart after the prior attempt failed:",
+                    StringComparison.Ordinal))
+            {
+                priorAssignment =
+                    "Complete the role-specific assignment and produce the required handoff.";
+            }
+            if (!canResume)
+            {
+                priorAssignment +=
+                    $"{Environment.NewLine}Inspect existing workspace changes before editing.";
+            }
             var retryStep = new FlowStep
             {
                 FlowRunId = flow.Id,
@@ -856,10 +1075,7 @@ public sealed class WorkflowEngine(
                     .Select(step => step.Attempt)
                     .DefaultIfEmpty()
                     .Max() + 1,
-                InputSummary =
-                    $"Manual restart after the prior attempt failed: {flow.FailureReason}" +
-                    $"{Environment.NewLine}{Environment.NewLine}" +
-                    "Continue from the preserved workspace, verify existing progress, and complete the handoff.",
+                InputSummary = priorAssignment,
                 CopilotSessionId = canResume ? snapshot!.SessionId : null,
                 CopilotSessionHome = canResume ? snapshot!.CopilotHome : string.Empty
             };
@@ -1106,6 +1322,11 @@ public sealed class WorkflowEngine(
             step,
             upstreamOwner,
             cancellationToken);
+        await RecordAttributedPushbackAsync(
+            flow,
+            step,
+            upstreamOwner,
+            cancellationToken);
 
         int pushbackCount;
         int maxHandoffRetries;
@@ -1320,7 +1541,7 @@ public sealed class WorkflowEngine(
             Attempt = blockedStep.Attempt + 1,
             InputSummary =
                 $"{upstreamOwner.Name} is revising the rejected handoff. " +
-                "Resume this role after the corrected handoff appears in Prior handoffs."
+                "Resume this role after the corrected handoff is attached to the retry."
         };
         return (revisionStep, retryStep);
     }
@@ -1434,6 +1655,38 @@ public sealed class WorkflowEngine(
         }
     }
 
+    private async Task RecordAttributedPushbackAsync(
+        FlowRun flow,
+        FlowStep blockedStep,
+        AgentRecord upstreamOwner,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var producingStep = await database.FlowSteps
+            .AsNoTracking()
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration &&
+                item.AgentId == upstreamOwner.Id &&
+                item.Sequence < blockedStep.Sequence &&
+                item.Status == StepStatus.Completed)
+            .OrderByDescending(item => item.Sequence)
+            .ThenByDescending(item => item.Attempt)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (producingStep is null)
+        {
+            return;
+        }
+        await observationRecorder.RecordCompletionAsync(
+            producingStep.Id,
+            accepted: false,
+            producingStep.DurationMilliseconds,
+            Math.Max(1, producingStep.ExecutionAttempts),
+            "downstream-pushback",
+            cancellationToken);
+    }
+
     internal static HarnessLearning CreatePushbackLearning(
         FlowRun flow,
         FlowStep blockedStep,
@@ -1494,7 +1747,7 @@ public sealed class WorkflowEngine(
 
         return
             $"{customerTask}{Environment.NewLine}{Environment.NewLine}" +
-            $"## Assignment for this turn{Environment.NewLine}{inputSummary}";
+            $"## Role-specific assignment{Environment.NewLine}{inputSummary}";
     }
 
     internal static bool HasHandoffRetryAvailable(

@@ -33,9 +33,11 @@ copilot login
 ```
 
 At startup, the harness resolves the configured `copilot.command`, rejects interactive editor
-bootstrap shims, and validates the CLI version and required programmatic options. The detected
-version and executable status appear in the sidebar and on **Settings**. The factory remains locked
-when this check fails.
+bootstrap shims, validates the CLI version and required programmatic/ACP options, then opens a
+dedicated `--acp --stdio` process to discover enabled model + effort candidates. Discovery must
+succeed on every startup; persisted catalog snapshots are audit records, not a readiness fallback.
+Runtime and catalog status appear on **Settings**, and the factory remains locked when either check
+fails.
 
 On Windows:
 
@@ -64,6 +66,8 @@ Open `http://localhost:5283`.
 ## Rehearsal path
 
 1. Open **Settings**, enable the agents you want Team Lead to consider, and choose a local project folder.
+   Choose Maximum quality, Fastest response, or Lowest cost; the strategy is snapshotted when the
+   confirmed flow is queued.
 2. Leave **Run Copilot init** selected, then choose **Initialize and study repository**. Review and edit the generated shared knowledge.
 3. Open **AI Factory**, click **Listen to the next task**, and speak the idea.
 4. Correct or confirm Account Manager's understanding. Confirmation sends the brief straight to Team Lead so you can watch the execution graph.
@@ -75,11 +79,18 @@ The AI Factory and every new-assignment control remain locked until Settings con
 ## Safety and persistence
 
 - All application state is stored in `data\ai-harness.db`.
+- Model catalogs, normalized task profiles, routing decisions/alternatives, and normalized outcome
+  evidence are stored in SQLite. Prompts and repository content are not copied into routing evidence.
 - `WORKFLOW.md` is the hot-reloadable, version-controlled Symphony policy and prompt contract.
+- Agent prompts lead with the role-specific assignment and include only compact repository facts, relevant immediate handoffs, applicable learned constraints, and the completion contract; retry diagnostics remain in the execution ledger.
 - Agent definitions are loaded from `.github\agents\*.agent.md`.
 - Copilot CLI receives explicit project access to `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree, and source-folder paths remain intentionally inaccessible.
 - An explicit agent `PUSHBACK` is persisted as a rejected handoff, resumes the responsible upstream agent's Copilot session, then retries the blocked agent in its existing session.
 - Copilot session IDs are persisted per step. After a host restart, completed CLI turns are recovered from the session journal; interrupted turns resume the same session and preserved workspace instead of starting over.
+- Each step is routed immediately before execution across the currently discovered model + reasoning
+  effort candidates. The step detail explains predictions, confidence, exploration, and rejected
+  alternatives. A model-unavailable error is classified separately; automatic rerouting fails closed
+  when the CLI result cannot prove that neither session nor tool activity began.
 - A failed flow can be manually restarted from its detail page. The failed attempt remains in history, while a new retry resumes its Copilot session when available and re-queues downstream work in the same workspace.
 - The handoff retry limit is persisted in Settings (`0-10`, default `2`); only an exhausted limit or an unroutable pushback stops the flow and skips downstream steps.
 - Multiple flows can run in parallel; every flow receives an independent project workspace and a matching branch in each discovered repository.

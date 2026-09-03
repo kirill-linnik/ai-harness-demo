@@ -252,13 +252,19 @@ public sealed class WorkflowRestartRecoveryTests
         Assert.Equal(StepStatus.Pending, retry.Status);
         Assert.Equal(AgentRunPhase.CanceledByReconciliation, retry.Phase);
         Assert.Equal(fixture.SessionId, retry.CopilotSessionId);
-        Assert.Contains("300 seconds", retry.InputSummary);
+        Assert.DoesNotContain("300 seconds", retry.InputSummary);
+        Assert.Contains("role-specific assignment", retry.InputSummary);
         var downstream = restarted.Steps.Single(step => step.AgentRole == "quality-engineer");
         Assert.Equal(60, downstream.Sequence);
         Assert.Equal(StepStatus.Pending, downstream.Status);
         Assert.Contains(
             restarted.Events,
             item => item.Type == "step.manual-retry-scheduled");
+        Assert.Contains(
+            restarted.Events,
+            item =>
+                item.Type == "flow.manual-restart" &&
+                item.Message.Contains("300 seconds", StringComparison.Ordinal));
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
             () => fixture.Engine.RestartFailedFlowAsync(
@@ -383,7 +389,9 @@ internal sealed class RecoveryFixture : IAsyncDisposable
             databaseFactory,
             new AgentCatalog(paths, databaseFactory),
             new FlowPlanner(),
-            new ModelSelector(),
+            new FixedModelRouter(),
+            new BootstrapTaskProfileFactory(),
+            TestRoutingSupport.Recorder(databaseFactory),
             new NeverWorkspaceManager(),
             new NeverAgentRunner(),
             gate,

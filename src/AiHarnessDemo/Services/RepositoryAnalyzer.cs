@@ -170,7 +170,6 @@ public sealed class RepositoryAnalyzer(
         var knowledge = await BuildKnowledgeAsync(
             repositoryPath,
             gitRepositories,
-            initMessage,
             cancellationToken);
 
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
@@ -256,20 +255,10 @@ public sealed class RepositoryAnalyzer(
     private static async Task<string> BuildKnowledgeAsync(
         string repositoryPath,
         IReadOnlyList<string> gitRepositories,
-        string initMessage,
         CancellationToken cancellationToken)
     {
         var warnings = new List<string>();
         var files = EnumerateSourceFiles(repositoryPath, warnings).Take(6_000).ToList();
-        var extensions = files
-            .Select(Path.GetExtension)
-            .Where(extension => !string.IsNullOrWhiteSpace(extension))
-            .Select(extension => extension!)
-            .GroupBy(extension => extension.ToLowerInvariant())
-            .OrderByDescending(group => group.Count())
-            .Take(8)
-            .Select(group => $"{group.Key} ({group.Count():N0})")
-            .ToList();
 
         var topDirectories = Directory.EnumerateDirectories(repositoryPath)
             .Select(Path.GetFileName)
@@ -280,23 +269,15 @@ public sealed class RepositoryAnalyzer(
 
         var frameworks = await DetectFrameworksAsync(files, cancellationToken);
         var commands = DetectCommands(files);
-        var instructionsPath = Path.Combine(
-            repositoryPath,
-            ".github",
-            "copilot-instructions.md");
         var readmePath = files.FirstOrDefault(file =>
             string.Equals(Path.GetFileName(file), "README.md", StringComparison.OrdinalIgnoreCase));
 
         var builder = new StringBuilder();
         builder.AppendLine($"# {Path.GetFileName(repositoryPath)}");
         builder.AppendLine();
-        builder.AppendLine("## Repository profile");
-        builder.AppendLine(
-            "- **Project files:** Materialized into a per-flow isolated workspace before agent execution.");
+        builder.AppendLine("## Repository facts");
         builder.AppendLine(
             $"- **Git repositories:** {string.Join(", ", gitRepositories.Select(path => RepositoryLabel(repositoryPath, path)))}");
-        builder.AppendLine($"- **Source files studied:** {files.Count:N0}");
-        builder.AppendLine($"- **Primary file types:** {string.Join(", ", extensions.DefaultIfEmpty("No source files detected"))}");
         builder.AppendLine($"- **Top-level areas:** {string.Join(", ", topDirectories.DefaultIfEmpty("No child directories"))}");
         builder.AppendLine($"- **Detected stack:** {string.Join(", ", frameworks.DefaultIfEmpty("No framework manifest detected"))}");
         builder.AppendLine();
@@ -306,22 +287,11 @@ public sealed class RepositoryAnalyzer(
             builder.AppendLine($"- `{command}`");
         }
 
-        builder.AppendLine();
-        builder.AppendLine("## AI initialization");
-        builder.AppendLine(initMessage);
-
-        if (File.Exists(instructionsPath))
-        {
-            builder.AppendLine();
-            builder.AppendLine("## Copilot repository instructions");
-            builder.AppendLine(await ReadLimitedAsync(instructionsPath, 5_000, cancellationToken));
-        }
-
         if (readmePath is not null)
         {
             builder.AppendLine();
             builder.AppendLine("## README signal");
-            builder.AppendLine(await ReadLimitedAsync(readmePath, 2_500, cancellationToken));
+            builder.AppendLine(await ReadLimitedAsync(readmePath, 600, cancellationToken));
         }
 
         if (warnings.Count > 0)
@@ -333,12 +303,6 @@ public sealed class RepositoryAnalyzer(
                 builder.AppendLine($"- {warning}");
             }
         }
-
-        builder.AppendLine();
-        builder.AppendLine("## Editable harness notes");
-        builder.AppendLine(
-            "Add domain language, architectural constraints, release rules, and quality expectations here. " +
-            "Every agent receives this shared context.");
 
         return builder.ToString().Trim();
     }

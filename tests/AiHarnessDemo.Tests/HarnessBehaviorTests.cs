@@ -289,35 +289,87 @@ public sealed class IntakeCoordinatorTests
     }
 }
 
-public sealed class ModelSelectorTests
+public sealed class AdaptiveModelRouterTests
 {
     [Theory]
-    [InlineData("account-manager", 1, "claude-sonnet-5")]
-    [InlineData("software-engineer", 2, "gpt-5.4-mini")]
-    [InlineData("software-engineer", 5, "gpt-5.4")]
-    [InlineData("architect", 4, "claude-sonnet-5")]
-    public void Select_MatchesRoleAndComplexity(
-        string role,
-        int complexity,
+    [InlineData(ModelSelectionStrategy.MaximumQuality, "quality")]
+    [InlineData(ModelSelectionStrategy.FastestResponse, "fast")]
+    [InlineData(ModelSelectionStrategy.LowestCost, "cheap")]
+    public void Rank_UsesConfiguredLexicographicObjective(
+        ModelSelectionStrategy strategy,
         string expectedModel)
     {
-        var choice = new ModelSelector().Select(role, complexity);
+        var scores = new[]
+        {
+            Score("quality", quality: .95, time: 20, premium: 2),
+            Score("fast", quality: .91, time: 5, premium: 1.5),
+            Score("cheap", quality: .90, time: 15, premium: .5)
+        };
 
-        Assert.Equal(expectedModel, choice.Model);
-        Assert.False(string.IsNullOrWhiteSpace(choice.Reason));
+        var ranked = AdaptiveModelRouter.Rank(scores, strategy, TaskRisk.Medium);
+
+        Assert.Equal(expectedModel, ranked[0].Model);
     }
 
     [Fact]
-    public void Select_EscalatesWhenHistoryShowsRepeatedCorrections()
+    public void Rank_EnforcesCriticalQualityFloor()
     {
-        var choice = new ModelSelector().Select(
-            "quality-engineer",
-            complexity: 2,
-            historicalFailureRate: 0.4);
+        var ranked = AdaptiveModelRouter.Rank(
+            [
+                Score("best", quality: .95, time: 50, premium: 4),
+                Score("faster", quality: .949, time: 1, premium: .1)
+            ],
+            ModelSelectionStrategy.FastestResponse,
+            TaskRisk.Critical);
 
-        Assert.Equal("claude-sonnet-5", choice.Model);
-        Assert.Contains("prior", choice.Reason);
+        Assert.Single(ranked);
+        Assert.Equal("best", ranked[0].Model);
     }
+
+    [Fact]
+    public void Exploration_IsDeterministicAndNeverUsedForHighRisk()
+    {
+        var scores = new[]
+        {
+            Score("best", quality: .95, time: 10, premium: 1, uncertainty: .1),
+            Score("uncertain", quality: .94, time: 11, premium: 1.1, uncertainty: .9)
+        };
+        var exploringId = Enumerable.Range(1, 10_000)
+            .Select(value => new Guid(value, 0, 0, new byte[8]))
+            .First(id => AdaptiveModelRouter.SelectCandidate(
+                scores,
+                ModelSelectionStrategy.MaximumQuality,
+                TaskRisk.Low,
+                id).Exploration);
+
+        var first = AdaptiveModelRouter.SelectCandidate(
+            scores,
+            ModelSelectionStrategy.MaximumQuality,
+            TaskRisk.Low,
+            exploringId);
+        var second = AdaptiveModelRouter.SelectCandidate(
+            scores,
+            ModelSelectionStrategy.MaximumQuality,
+            TaskRisk.Low,
+            exploringId);
+        var highRisk = AdaptiveModelRouter.SelectCandidate(
+            scores,
+            ModelSelectionStrategy.MaximumQuality,
+            TaskRisk.High,
+            exploringId);
+
+        Assert.True(first.Exploration);
+        Assert.Equal(first, second);
+        Assert.False(highRisk.Exploration);
+    }
+
+    private static AdaptiveModelRouter.CandidateScore Score(
+        string model,
+        double quality,
+        double time,
+        double premium,
+        double uncertainty = .2) =>
+        new(model, "high", quality, time, premium, 1 - uncertainty, uncertainty);
 }
 
 public sealed class AgentCatalogTests
@@ -358,6 +410,7 @@ public sealed class CopilotReasoningHostTests
             "account-manager",
             "account-manager",
             "claude-sonnet-5",
+            "low",
             Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             "Prompt");
         var environment = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
@@ -394,6 +447,7 @@ public sealed class CopilotReasoningHostTests
             "software-engineer",
             "software-engineer",
             "gpt-5.4-mini",
+            "medium",
             Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
             "Prompt");
 
@@ -430,6 +484,7 @@ public sealed class CopilotReasoningHostTests
             "software-engineer",
             "software-engineer",
             "gpt-5.4-mini",
+            "high",
             sessionId,
             prompt,
             resumeSession: true);
@@ -437,7 +492,10 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains($"--resume={sessionId:D}", arguments);
         Assert.DoesNotContain("--session-id", arguments);
         Assert.Contains("Original prompt.", prompt);
-        Assert.Contains("without starting the assignment over", prompt);
+        Assert.StartsWith(
+            "Resume from the current workspace; inspect existing changes before continuing.",
+            prompt);
+        Assert.DoesNotContain("harness restarted", prompt, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -463,6 +521,119 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
+    public void PromptValues_KeepOnlyFocusedRoleContext()
+    {
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "software-engineer",
+            "Software Engineer",
+            "software-engineer",
+            "gpt-5.4-mini",
+            "medium",
+            1,
+            "Implement the approved visual refresh.",
+            """
+            # demo
+
+            ## Repository profile
+            - **Project files:** Materialized into a per-flow isolated workspace before agent execution.
+            - **Source files studied:** 1,018
+            - **Primary file types:** .jpg (515), .ts (83)
+            - **Detected stack:** Angular, Node.js
+
+            ## Likely developer commands
+            - `npm test`
+
+            ## AI initialization
+            Copilot CLI initialized repository instructions successfully.
+
+            ## README signal
+            Long README details that agents can inspect from the workspace.
+
+            ## Installation
+            This embedded README section must not leak into the prompt.
+
+            ## Operations
+            Neither should this one.
+
+            ## Editable harness notes
+            Add domain language, architectural constraints, release rules, and quality expectations here. Every agent receives this shared context.
+            """,
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Team Lead -> Architect -> Product Designer -> Software Engineer",
+            [
+                "Team Lead handoff",
+                "Architect handoff",
+                "Product Designer handoff"
+            ],
+            [],
+            Progress: null);
+
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Deliver working code.",
+            context.WorkspacePath);
+        var prompt = new WorkflowPromptRenderer().Render(
+            """
+            You are {{ agent.name }}.
+            ## Assignment
+            {{ task }}
+            ## Role contract
+            {{ agent.instructions }}
+            ## Workspace
+            {{ workspace }}
+            {{ role.context }}
+            ## Completion contract
+            {{ response.contract }}
+            """,
+            values);
+
+        Assert.Contains("Implement the approved visual refresh", prompt);
+        Assert.Contains(@"E:\worktrees\flow-123", prompt);
+        Assert.Contains("Angular, Node.js", prompt);
+        Assert.Contains("### Project summary", prompt);
+        Assert.Contains("Long README details", prompt);
+        Assert.Contains("Architect handoff", prompt);
+        Assert.Contains("Product Designer handoff", prompt);
+        Assert.DoesNotContain("Team Lead handoff", prompt);
+        Assert.DoesNotContain("Source files studied", prompt);
+        Assert.DoesNotContain("AI initialization", prompt);
+        Assert.DoesNotContain("README signal", prompt);
+        Assert.DoesNotContain("Installation", prompt);
+        Assert.DoesNotContain("Operations", prompt);
+        Assert.DoesNotContain("Editable harness notes", prompt);
+        Assert.DoesNotContain("Team plan", prompt);
+        Assert.DoesNotContain("No prior", prompt);
+        Assert.DoesNotContain(@"E:\source-project", prompt);
+    }
+
+    [Fact]
+    public void ProductManagerLedger_PreservesEveryStepWithinItsPromptBudget()
+    {
+        var outputs = Enumerable.Range(1, 9)
+            .Select(index =>
+                $"Agent {index} (role-{index}){Environment.NewLine}" +
+                $"Evidence {index}: {new string((char)('a' + index), 1_200)}")
+            .ToList();
+
+        var ledger = CopilotReasoningHost.CompactExecutionLedger(
+            outputs,
+            string.Empty,
+            6_000);
+
+        Assert.InRange(ledger.Length, 1, 6_000);
+        foreach (var index in Enumerable.Range(1, 9))
+        {
+            Assert.Contains($"Agent {index} (role-{index})", ledger);
+            Assert.Contains($"Evidence {index}", ledger);
+        }
+    }
+
+    [Fact]
     public void PriorHandoffs_CannotRedirectLaterAgentsToTheSourceFolder()
     {
         const string handoff =
@@ -484,7 +655,7 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("HANDOFF_STATUS: COMPLETE", contract);
         Assert.Contains("HANDOFF_STATUS: PUSHBACK", contract);
         Assert.Contains("PUSHBACK_REASON", contract);
-        Assert.Contains("resume", contract, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("harness will resume", contract, StringComparison.OrdinalIgnoreCase);
     }
 }
 
@@ -614,7 +785,7 @@ public sealed class PushbackRecoveryTests
             "Quality Engineer cannot continue; add exact validation evidence.");
 
         Assert.Contains("Implement the approved change", task);
-        Assert.Contains("Assignment for this turn", task);
+        Assert.Contains("Role-specific assignment", task);
         Assert.Contains("Quality Engineer cannot continue", task);
     }
 }
@@ -709,7 +880,9 @@ public sealed class WorkflowPushbackLoopTests
             databaseFactory,
             new AgentCatalog(paths, databaseFactory),
             new FlowPlanner(),
-            new ModelSelector(),
+            new FixedModelRouter(),
+            new BootstrapTaskProfileFactory(),
+            TestRoutingSupport.Recorder(databaseFactory),
             new FixedWorkspaceManager(workspacePath),
             runner,
             handoffGate,
@@ -727,6 +900,9 @@ public sealed class WorkflowPushbackLoopTests
                 .Include(item => item.Events)
                 .SingleAsync(item => item.Id == flow.Id);
             var learning = await database.Learnings.SingleAsync();
+            var profiles = await database.TaskProfiles
+                .OrderBy(item => item.Role)
+                .ToListAsync();
             var engineerRuns = runner.Contexts
                 .Where(item => item.AgentRole == "software-engineer")
                 .ToList();
@@ -735,6 +911,10 @@ public sealed class WorkflowPushbackLoopTests
                 .ToList();
 
             Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
+            Assert.Equal(4, profiles.Count);
+            Assert.All(
+                runner.Contexts,
+                context => Assert.Equal("fixture-effort", context.ModelEffort));
             Assert.Equal(
                 [StepStatus.Completed, StepStatus.Completed, StepStatus.Completed],
                 stored.Steps
@@ -837,6 +1017,15 @@ public sealed class WorkflowPushbackLoopTests
 
                       Continue the planned flow.
                       """;
+            if (context.AgentRole == "team-lead")
+            {
+                output += """
+
+                    TEAM_TASK_PROFILES_V1_BEGIN
+                    {"Version":"task-profile-v1","Profiles":[{"Role":"software-engineer","Complexity":5,"ReasoningDepth":6,"ContextDemand":5,"ToolIntensity":8,"TaskTypeTags":["Implementation"],"Risk":"Medium","RiskReason":"Implementation changes product behavior.","Confidence":0.8,"Rationales":["Code and tests are required."]},{"Role":"quality-engineer","Complexity":5,"ReasoningDepth":6,"ContextDemand":6,"ToolIntensity":7,"TaskTypeTags":["Quality"],"Risk":"Medium","RiskReason":"Independent validation is required.","Confidence":0.8,"Rationales":["Acceptance evidence must be checked."]},{"Role":"release-engineer","Complexity":4,"ReasoningDepth":4,"ContextDemand":6,"ToolIntensity":6,"TaskTypeTags":["Release"],"Risk":"High","RiskReason":"Packaging changes repository state.","Confidence":0.8,"Rationales":["Verified work must be packaged."]}]}
+                    TEAM_TASK_PROFILES_V1_END
+                    """;
+            }
             return Task.FromResult(new AgentExecutionResult(
                 output,
                 "Fake runner evidence.",

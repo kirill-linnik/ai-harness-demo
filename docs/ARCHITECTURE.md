@@ -13,6 +13,7 @@
 | Workspace safety invariants | Absolute root containment check, sanitized key, and Copilot `cwd` equal to the flow workspace. |
 | Workspace lifecycle hooks | `after_create`, `before_run`, `after_run`, and `before_remove` contracts in `WORKFLOW.md`. |
 | Coding-agent runtime | `CopilotReasoningHost` runs every selected role through GitHub Copilot CLI. |
+| Role-focused prompting | The hot-reloaded workflow renders the current assignment first, compact repository facts, at most two immediate upstream handoffs for delivery roles, applicable learned constraints, and the role's completion contract. Retry diagnostics remain in durable events rather than agent prompts. |
 | Observable run state | SQLite step attempts, events, gate history, models, durations, prompt refinements, `/api/v1/state`, and per-flow routes. |
 | Human handoff state | Release proposals stop at a customer gate; approval and execution state are intentionally separate. |
 
@@ -45,26 +46,31 @@ flowchart LR
 | `RepositoryAnalyzer` | Runs `copilot init`, discovers repository boundaries inside the selected project, performs a bounded static study, and persists editable shared knowledge. |
 | `IntakeCoordinator` | Persists customer dialogue, separates clarification from confirmation, and queues only a customer-confirmed brief. |
 | `FlowPlanner` | Uses task complexity and domain signals to select only enabled specialists in dependency order. |
-| `ModelSelector` | Routes each role to a model using task complexity and prior retry rate. |
+| `ModelCatalogDiscovery` | Uses a dedicated bidirectional Copilot ACP process at startup to discover enabled explicit model + effort candidates and persist an audit snapshot. Current discovery is mandatory for readiness. |
+| `BootstrapTaskProfileFactory` / Team Lead profiles | Create strictly validated, normalized `task-profile-v1` routing inputs. Team Lead gets one visible correction turn for an invalid downstream profile contract. |
+| `AdaptiveModelRouter` | Applies router-v1 recency-weighted Bayesian evidence, risk quality floors, lexicographic strategy objectives, and bounded deterministic exploration immediately before execution. |
+| `RoutingObservationRecorder` | Records normalized handoff quality, duration/retry, estimated premium use, availability failures, downstream pushback attribution, and weak final approval evidence. |
 | `FlowQueue` / `FlowWorker` | Reconcile persisted Copilot sessions before re-queuing work after restart, then execute multiple independent flows concurrently. |
 | `WorkflowEngine` | Drives the durable state machine, pre-creates visible pending stages, records every transition, enforces handoff gates, and learns from pushbacks. |
 | `AgentRunner` | Runs every selected role through Copilot CLI with model routing, retries, progress events, and scrubbed tool-call audit. |
 | `CopilotSessionJournal` | Reads Copilot CLI session journals, discovers legacy in-flight sessions by workspace and agent, and distinguishes completed, active, and interrupted turns. |
 | `WorkspaceManager` | Creates one project workspace per flow, with an isolated worktree on the flow branch for every discovered repository. |
 | `FeedbackCoordinator` | Grounds Product Manager in the original request and full ledger, then closes or requeues the same flow with retained context. |
-| `HarnessDbContext` | Persists settings, agents, flows, dialogue, steps, events, model choices, durations, outcomes, and prompt refinements. |
+| `HarnessDbContext` | Persists settings, agents, flows, dialogue, steps, events, catalogs, profiles, routing decisions, normalized evidence, durations, outcomes, and prompt refinements. |
 
 ## Durable state
 
 SQLite uses write-ahead logging for concurrent readers and short concurrent writes.
 
-- `Settings`: selected project folder, editable repository knowledge, and outcome.
+- `Settings`: selected project folder, editable repository knowledge, outcome, retry bound, and model-selection strategy.
 - `Agents`: discovered role metadata and enabled state.
-- `Flows`: one durable customer workflow per shareable URL.
-- `FlowSteps`: agent, model, attempt, state, duration, output, and pushback reason.
+- `Flows`: one durable customer workflow per shareable URL, including its queued strategy snapshot.
+- `FlowSteps`: agent, model + effort, attempt, state, duration, output, and pushback reason.
 - `FlowMessages`: voice/text dialogue with Account Manager and Product Manager.
 - `FlowEvents`: append-only observable execution ledger.
 - `Learnings`: cross-flow prompt refinements created from failed handoff contracts.
+- `ModelCatalogSnapshots` / `ModelCatalogCandidates`: ACP discovery audit history.
+- `TaskProfiles`, `RoutingDecisions`, `RoutingAlternatives`, `RoutingObservations`: normalized router-v1 state and evidence; no raw task or repository content.
 
 ## Copilot CLI execution
 
@@ -74,7 +80,8 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 - Creates the same `ai-harness/<task>-<flow-id>` branch in an isolated worktree for each project repository.
 - Grants the flow workspace explicitly with `--add-dir`, sets it as Copilot's working directory, and tells agents that original source-folder paths are metadata rather than work targets.
 - Loads the generic agents from this project with a separate `--add-dir`.
-- Selects a model per role and launches non-interactive Copilot CLI execution.
+- Selects a discovered model + effort per step and passes both `--model` and `--effort` to non-interactive Copilot CLI execution.
+- Gives delivery agents only the two most recent completed handoffs in the current iteration; Product Manager receives the execution ledger required by its role.
 - Gives each agent project access inside the isolated workspace; use only with repositories you trust.
 - Classifies an explicit `PUSHBACK` before advance gating, records a revision request and reusable prompt refinement, resumes the responsible upstream Copilot session, then resumes the blocked agent with the corrected handoff.
 - Bounds every agent-to-agent correction loop with the persisted Settings retry limit (`0-10`, default `2`); only exhaustion or a missing upstream owner makes the flow terminal and skips downstream steps.
