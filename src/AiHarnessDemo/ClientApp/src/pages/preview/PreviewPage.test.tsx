@@ -86,4 +86,25 @@ describe("PreviewPage", () => {
     );
     expect(decide).toHaveBeenCalledWith(flowId, false);
   });
+
+  it("confirms abandonment before removing customer artifacts", async () => {
+    const abandon = vi.spyOn(api, "abandonFlow").mockResolvedValue({
+      flowId,
+      status: "Abandoned",
+      processesStopped: 1,
+      listeningPortsReleased: [4173],
+      copilotSessionsDeleted: 2,
+      worktreesRemoved: 1,
+      localBranchesDeleted: 1,
+      remoteBranchesDeleted: 0
+    });
+    renderPage();
+
+    await screen.findByTitle("devclub.eu interactive customer preview");
+    fireEvent.click(screen.getByRole("button", { name: "Abandon" }));
+    expect(screen.getByRole("dialog", { name: "Abandon this flow?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Abandon and remove artifacts" }));
+
+    await waitFor(() => expect(abandon).toHaveBeenCalledWith(flowId));
+  });
 });

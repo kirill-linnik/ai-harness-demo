@@ -6,12 +6,14 @@ describe("flowPollIntervalMs", () => {
     expect(flowPollIntervalMs("Queued")).toBe(1000);
     expect(flowPollIntervalMs("Running")).toBe(1000);
     expect(flowPollIntervalMs("Reworking")).toBe(1000);
+    expect(flowPollIntervalMs("Abandoning")).toBe(1000);
   });
 
   it("stops polling for terminal or feedback-waiting statuses", () => {
     expect(flowPollIntervalMs("Intake")).toBe(false);
     expect(flowPollIntervalMs("WaitingForFeedback")).toBe(false);
     expect(flowPollIntervalMs("Approved")).toBe(false);
+    expect(flowPollIntervalMs("Abandoned")).toBe(false);
     expect(flowPollIntervalMs("Failed")).toBe(false);
   });
 

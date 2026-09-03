@@ -145,3 +145,15 @@ export function useDecideFlowMutation() {
     onSuccess: () => invalidateBootstrap()
   });
 }
+
+export function useAbandonFlowMutation() {
+  const queryClient = useQueryClient();
+  const invalidateBootstrap = useInvalidateBootstrap();
+  return useMutation({
+    mutationFn: (flowId: string) => api.abandonFlow(flowId),
+    onSuccess: result => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.flow(result.flowId) });
+      invalidateBootstrap();
+    }
+  });
+}

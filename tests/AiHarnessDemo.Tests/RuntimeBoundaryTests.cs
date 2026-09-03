@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Text.Json;
 using AiHarnessDemo.Api;
 using AiHarnessDemo.Core.Domain;
@@ -438,6 +439,108 @@ public sealed class RepositoryContextGateTests
 public sealed class ProcessRunnerTests
 {
     [Fact]
+    public async Task WorkspaceProcessCleaner_StopsAWorkspaceServerAndReportsItsPort()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var workspace = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-process-cleanup-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workspace);
+        var portFile = Path.Combine(workspace, "port.txt");
+        var scriptFile = Path.Combine(workspace, "server.ps1");
+        await File.WriteAllTextAsync(
+            scriptFile,
+            """
+            param([string]$PortFile)
+            Set-Location -LiteralPath $PSScriptRoot
+            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            [IO.File]::WriteAllText($PortFile, [string]$listener.LocalEndpoint.Port)
+            while ($true) { Start-Sleep -Seconds 1 }
+            """);
+        var executable = ExecutableLocator.Resolve("powershell", workspace)
+            ?? throw new InvalidOperationException("PowerShell is required for this test.");
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = executable,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }
+        };
+        process.StartInfo.ArgumentList.Add("-NoLogo");
+        process.StartInfo.ArgumentList.Add("-NoProfile");
+        process.StartInfo.ArgumentList.Add("-NonInteractive");
+        process.StartInfo.ArgumentList.Add("-File");
+        process.StartInfo.ArgumentList.Add(scriptFile);
+        process.StartInfo.ArgumentList.Add(portFile);
+
+        try
+        {
+            Assert.True(process.Start());
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (!File.Exists(portFile) && DateTimeOffset.UtcNow < deadline)
+            {
+                await Task.Delay(100);
+            }
+            Assert.True(File.Exists(portFile));
+            var port = int.Parse(await File.ReadAllTextAsync(portFile));
+            var cleaner = new WorkspaceProcessCleaner(
+                new ProcessRunner(),
+                NullLogger<WorkspaceProcessCleaner>.Instance);
+
+            var result = await cleaner.StopAsync(workspace);
+
+            Assert.Contains(process.Id, result.ProcessIds);
+            Assert.Contains(port, result.ListeningPorts);
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void WorkspaceOwnership_MatchesWorkingDirectoryOrCommandLine()
+    {
+        var workspace = Path.GetFullPath(
+            Path.Combine(Path.GetTempPath(), "flow-workspace"));
+
+        Assert.True(WorkspaceProcessCleaner.IsWorkspaceOwned(
+            workspace,
+            Path.Combine(workspace, "site"),
+            string.Empty,
+            OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal));
+        Assert.True(WorkspaceProcessCleaner.IsWorkspaceOwned(
+            workspace,
+            Path.GetTempPath(),
+            $"node {Path.Combine(workspace, "site", "server.js")}",
+            OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal));
+        Assert.False(WorkspaceProcessCleaner.IsWorkspaceOwned(
+            workspace,
+            Path.GetTempPath(),
+            "node unrelated.js",
+            OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Resolve_SkipsInteractiveCopilotBootstrapperForLatestManagedCli()
     {
         if (!OperatingSystem.IsWindows())
@@ -792,6 +895,24 @@ public sealed class WorkspaceManagerTests
             var recovered = await manager.PrepareAsync(flow);
             Assert.False(recovered.CreatedNow);
             Assert.Equal(workspace.Path, recovered.Path);
+
+            flow.WorkspacePath = workspace.Path;
+            flow.BranchName = workspace.BranchName;
+            var cleanup = await manager.RemoveAsync(flow);
+
+            Assert.Equal(2, cleanup.WorktreesRemoved);
+            Assert.Equal(2, cleanup.LocalBranchesDeleted);
+            Assert.Equal(0, cleanup.RemoteBranchesDeleted);
+            Assert.False(Directory.Exists(workspace.Path));
+            foreach (var repositoryName in new[] { "site", "data" })
+            {
+                var repositoryPath = Path.Combine(project, repositoryName);
+                var branch = await RunGitAsync(
+                    processRunner,
+                    repositoryPath,
+                    ["branch", "--list", workspace.BranchName]);
+                Assert.True(string.IsNullOrWhiteSpace(branch.StandardOutput));
+            }
         }
         finally
         {

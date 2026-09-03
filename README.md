@@ -128,6 +128,7 @@ The AI Factory and every new-assignment control remain locked until Settings con
 - If Copilot writes a valid final handoff but hangs before clean shutdown, the harness recovers that handoff from the session journal instead of failing the flow. Confirmed interrupted sessions resume on bounded runtime retries, and each recovery transition remains visible in the event ledger.
 - Browser-clickable deliveries publish validated per-variant builds from `.customer-preview\<variant>` into the customer acceptance page, where the customer can inspect the real result and approve it or request another iteration with feedback.
 - Release preparation before the customer gate is local-only: commits and preview artifacts may be created, but branches are not pushed and pull requests are not opened. Explicit customer approval queues a separate Release turn that publishes the PR; rejection queues rework instead.
+- **Abandon** is the third customer decision. It cancels active execution, stops workspace-owned applications and listening ports, removes Copilot sessions, preview artifacts, worktrees, and local/remote flow branches, then marks the flow abandoned. The durable execution ledger, harness learnings, and model-routing evidence remain available for future decisions.
 - Each step is routed immediately before execution across the currently discovered model + reasoning
   effort candidates. The step detail explains predictions, confidence, exploration, and rejected
   alternatives. A model-unavailable error is classified separately; automatic rerouting fails closed

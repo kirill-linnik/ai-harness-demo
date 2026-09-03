@@ -113,6 +113,9 @@ public sealed partial class CopilotReasoningHost(
             "Rendered the exact prompt for the Copilot CLI turn.",
             prompt));
         var copilotSessionHome = ResolveCopilotSessionHome();
+        var environmentVariables = BuildProcessEnvironment(
+            context.AgentRole,
+            context.AllowRemotePublication);
         var arguments = BuildCliArguments(
             request.WorkingDirectory,
             paths.Root,
@@ -149,7 +152,8 @@ public sealed partial class CopilotReasoningHost(
                 CopilotJsonlParser.CreateProgressReporter(
                     request.Progress,
                     copilotSessionHome),
-                timeouts.StallTimeout);
+                timeouts.StallTimeout,
+                environmentVariables);
         }
         catch (ProcessStalledException exception)
         {
@@ -633,6 +637,26 @@ public sealed partial class CopilotReasoningHost(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ".copilot")
             : Path.GetFullPath(inheritedHome);
+    }
+
+    internal static IReadOnlyDictionary<string, string>? BuildProcessEnvironment(
+        string agentRole,
+        bool allowRemotePublication)
+    {
+        if (agentRole != "release-engineer" ||
+            allowRemotePublication)
+        {
+            return null;
+        }
+
+        return new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GH_TOKEN"] = "customer-approval-required",
+            ["GITHUB_TOKEN"] = "customer-approval-required",
+            ["GIT_CONFIG_COUNT"] = "1",
+            ["GIT_CONFIG_KEY_0"] = "remote.origin.pushurl",
+            ["GIT_CONFIG_VALUE_0"] = "disabled://customer-approval-required"
+        };
     }
 
     internal static string PrepareRepositoryKnowledge(

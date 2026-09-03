@@ -15,7 +15,8 @@ public sealed partial class FeedbackCoordinator(
     RoutingObservationRecorder observationRecorder,
     IAgentRunner agentRunner,
     HandoffGateEngine gateEngine,
-    FlowQueue flowQueue)
+    FlowQueue flowQueue,
+    FlowLifecycleCoordinator lifecycle)
 {
     [GeneratedRegex(
         @"(?im)^\s*REWORK_TARGET_ROLES\s*:\s*(?<roles>NONE|[a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)\s*$")]
@@ -266,6 +267,8 @@ public sealed partial class FeedbackCoordinator(
         bool approve,
         CancellationToken cancellationToken = default)
     {
+        await using var lifecycleLease =
+            await lifecycle.EnterAsync(flowId, cancellationToken);
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var flow = await database.Flows
                        .Include(item => item.Steps)
@@ -353,6 +356,7 @@ public sealed partial class FeedbackCoordinator(
                 AgentName = releaseStep.AgentName,
                 AgentRole = releaseStep.AgentRole,
                 Label = WorkflowEngine.ApprovedPublicationLabel,
+                RemotePublicationAllowed = true,
                 Status = StepStatus.Pending,
                 Phase = AgentRunPhase.PreparingWorkspace,
                 Attempt = flow.Steps
@@ -362,7 +366,7 @@ public sealed partial class FeedbackCoordinator(
                     .Select(item => item.Attempt)
                     .DefaultIfEmpty()
                     .Max() + 1,
-                InputSummary = WorkflowEngine.ApprovedPublicationAssignment
+                InputSummary = WorkflowEngine.ApprovedPublicationAssignment(flow.Outcome)
             };
             flow.Steps.Add(publicationStep);
             database.Entry(publicationStep).State = EntityState.Added;

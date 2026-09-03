@@ -30,6 +30,7 @@ public static class DemoApi
         api.MapPost("/flows/{flowId:guid}/restart", RestartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/feedback", AddFeedbackAsync);
         api.MapPost("/flows/{flowId:guid}/decision", DecideFlowAsync);
+        api.MapPost("/flows/{flowId:guid}/abandon", AbandonFlowAsync);
         api.MapGet("/history", GetHistoryAsync);
         api.MapGet("/learnings", GetLearningsAsync);
         api.MapGet("/previews/{flowId:guid}", GetPreviewAsync);
@@ -88,7 +89,11 @@ public static class DemoApi
 
         var stats = new HarnessStatsDto(
             flows.Count,
-            flows.Count(item => item.Status is FlowStatus.Queued or FlowStatus.Running or FlowStatus.Reworking),
+            flows.Count(item => item.Status is
+                FlowStatus.Queued or
+                FlowStatus.Running or
+                FlowStatus.Reworking or
+                FlowStatus.Abandoning),
             flows.Count(item => item.Status == FlowStatus.Approved),
             learningCount,
             totalMilliseconds / 60_000);
@@ -324,6 +329,12 @@ public static class DemoApi
 
         return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
     }
+
+    private static async Task<IResult> AbandonFlowAsync(
+        Guid flowId,
+        FlowAbandonmentService abandonment,
+        CancellationToken cancellationToken) =>
+        Results.Ok(await abandonment.AbandonAsync(flowId, cancellationToken));
 
     private static async Task<IResult> DecideFlowAsync(
         Guid flowId,

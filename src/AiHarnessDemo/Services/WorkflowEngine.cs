@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Text.RegularExpressions;
 using AiHarnessDemo.Data;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
@@ -22,7 +21,8 @@ public sealed class WorkflowEngine(
     HandoffGateEngine handoffGate,
     CopilotSessionJournal sessionJournal,
     WorkflowDefinitionProvider workflowProvider,
-    ILogger<WorkflowEngine> logger)
+    ILogger<WorkflowEngine> logger,
+    IPublishedOutcomeVerifier? publicationVerifier = null)
 {
     internal const string ReleaseCandidateLabel = "Prepare customer release candidate";
     internal const string ApprovedPublicationLabel = "Publish customer-approved outcome";
@@ -30,10 +30,13 @@ public sealed class WorkflowEngine(
         "Prepare the verified outcome for customer review. Commit intended changes locally and " +
         "generate every browser artifact under .customer-preview, but do not push a branch or " +
         "create a pull request before explicit customer approval.";
-    internal const string ApprovedPublicationAssignment =
-        "Customer approval is recorded. Publish the already-verified outcome now: push the " +
-        "prepared branch and create or reopen the configured pull request. Do not change product " +
-        "behavior unless publication itself requires a narrowly scoped correction.";
+    internal static string ApprovedPublicationAssignment(OutcomeType outcome) =>
+        outcome == OutcomeType.PullRequest
+            ? "Customer approval is recorded. Publish the already-verified outcome now: push the " +
+              "prepared branch and create or reopen the configured pull request. Do not change " +
+              "product behavior unless publication itself requires a narrowly scoped correction."
+            : "Customer approval is recorded. Finalize the already-verified local commit outcome " +
+              "without pushing a branch or creating a pull request. Report the exact commit SHA.";
 
     private readonly Lock _concurrencyLock = new();
     private readonly SemaphoreSlim _learningGate = new(1, 1);
@@ -100,7 +103,11 @@ public sealed class WorkflowEngine(
                        cancellationToken)
                    ?? throw new KeyNotFoundException($"Factory flow '{flowId}' was not found.");
 
-            if (flow.Status is FlowStatus.Approved or FlowStatus.WaitingForFeedback)
+            if (flow.Status is
+                FlowStatus.Approved or
+                FlowStatus.Abandoned or
+                FlowStatus.Abandoning or
+                FlowStatus.WaitingForFeedback)
             {
                 return;
             }
@@ -653,6 +660,7 @@ public sealed class WorkflowEngine(
                 learnings,
                 ModelSelectionStrategy: flow.ModelSelectionStrategy,
                 ExpectedAcceptedTimeSeconds: decision.PredictedAcceptedTimeSeconds,
+                AllowRemotePublication: step.RemotePublicationAllowed,
                 ResumeSession: resumesSession,
                 RecoverInterruptedSession: recoversInterruptedSession,
                 Progress: progress =>
@@ -809,14 +817,23 @@ public sealed class WorkflowEngine(
         var step = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
+        if (step.RemotePublicationAllowed)
+        {
+            var flow = await database.Flows.SingleAsync(
+                item => item.Id == flowId,
+                cancellationToken);
+            var published = await (publicationVerifier
+                ?? throw new InvalidOperationException(
+                    "No published outcome verifier is configured."))
+                .VerifyAsync(flow, result.Output, cancellationToken);
+            flow.OutcomeUrl = published.Url;
+            flow.OutcomeLabel = published.Label;
+        }
         var pushbackReason = AgentHandoffInspector.GetPushbackReason(result.Output);
         var pushedBack = pushbackReason is not null;
         var publishesApprovedOutcome =
             step.AgentRole == "release-engineer" &&
-            string.Equals(
-                step.Label,
-                ApprovedPublicationLabel,
-                StringComparison.Ordinal);
+            step.RemotePublicationAllowed;
         var actionType = pushedBack
             ? HandoffActionType.RequestRevision
             : step.AgentRole == "release-engineer" && !publishesApprovedOutcome
@@ -1417,7 +1434,8 @@ public sealed class WorkflowEngine(
                     .Max() + 1,
                 InputSummary = priorAssignment,
                 CopilotSessionId = canResume ? snapshot!.SessionId : null,
-                CopilotSessionHome = canResume ? snapshot!.CopilotHome : string.Empty
+                CopilotSessionHome = canResume ? snapshot!.CopilotHome : string.Empty,
+                RemotePublicationAllowed = failedStep.RemotePublicationAllowed
             };
             flow.Steps.Add(retryStep);
             database.Entry(retryStep).State = EntityState.Added;
@@ -1880,6 +1898,7 @@ public sealed class WorkflowEngine(
             AgentName = blockedStep.AgentName,
             AgentRole = blockedStep.AgentRole,
             Label = $"Retry after {upstreamOwner.Name} revision",
+            RemotePublicationAllowed = blockedStep.RemotePublicationAllowed,
             Status = StepStatus.Pending,
             Attempt = blockedStep.Attempt + 1,
             InputSummary =
@@ -2181,7 +2200,7 @@ public sealed class WorkflowEngine(
                     item.FlowRunId == flowId &&
                     item.Iteration == flow.Iteration &&
                     item.AgentRole == "release-engineer" &&
-                    item.Label == ApprovedPublicationLabel &&
+                    item.RemotePublicationAllowed &&
                     item.Status == StepStatus.Completed)
                 .OrderByDescending(item => item.Sequence)
                 .FirstOrDefaultAsync(cancellationToken)
@@ -2189,17 +2208,25 @@ public sealed class WorkflowEngine(
                     "Customer approval was recorded, but the approved release publication did not complete.");
             if (flow.Outcome == OutcomeType.PullRequest)
             {
-                var pullRequestUrl = ExtractPullRequestUrl(publicationStep.OutputSummary)
-                    ?? throw new InvalidOperationException(
-                        "The approved Release handoff did not report a pull request URL.");
-                flow.OutcomeUrl = pullRequestUrl;
-                flow.OutcomeLabel =
-                    $"Published pull request #{new Uri(pullRequestUrl).Segments[^1]}";
+                if (string.IsNullOrWhiteSpace(flow.OutcomeUrl) ||
+                    !flow.OutcomeLabel.StartsWith(
+                        "Published pull request #",
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "The customer-approved pull request publication was not verified.");
+                }
             }
             else
             {
-                flow.OutcomeUrl = $"#/preview/{flow.Id}";
-                flow.OutcomeLabel = $"Approved commit · {flow.BranchName}";
+                if (string.IsNullOrWhiteSpace(flow.OutcomeLabel) ||
+                    !flow.OutcomeLabel.StartsWith(
+                        "Approved commit · ",
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "The customer-approved commit publication was not verified.");
+                }
             }
             flow.Status = FlowStatus.Approved;
             flow.CompletedAt = DateTimeOffset.UtcNow;
@@ -2275,14 +2302,6 @@ public sealed class WorkflowEngine(
         await database.SaveChangesAsync(cancellationToken);
     }
 
-    internal static string? ExtractPullRequestUrl(string output)
-    {
-        var match = Regex.Match(
-            output,
-            @"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+",
-            RegexOptions.CultureInvariant);
-        return match.Success ? match.Value : null;
-    }
 
     private async Task MarkFailedAsync(
         Guid flowId,
@@ -2372,13 +2391,22 @@ public sealed class WorkflowEngine(
         int ExecutionAttempts);
 }
 
+public interface IFlowExecutionController
+{
+    Task<bool> CancelAsync(
+        Guid flowId,
+        CancellationToken cancellationToken = default);
+}
+
 public sealed class FlowWorker(
     FlowQueue queue,
     WorkflowEngine engine,
     ILogger<FlowWorker> logger)
-    : BackgroundService
+    : BackgroundService, IFlowExecutionController
 {
     private readonly ConcurrentDictionary<Guid, Task> _running = new();
+    private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _cancellations = new();
+    private readonly ConcurrentDictionary<Guid, byte> _blocked = new();
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -2390,23 +2418,67 @@ public sealed class FlowWorker(
 
         await foreach (var flowId in queue.Reader.ReadAllAsync(stoppingToken))
         {
-            if (_running.ContainsKey(flowId))
+            if (_blocked.ContainsKey(flowId))
             {
                 continue;
             }
+            var flowSource =
+                CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            if (!_cancellations.TryAdd(flowId, flowSource))
+            {
+                flowSource.Dispose();
+                continue;
+            }
 
-            var task = engine.RunAsync(flowId, stoppingToken);
+            var task = engine.RunAsync(flowId, flowSource.Token);
             if (!_running.TryAdd(flowId, task))
             {
+                _cancellations.TryRemove(flowId, out _);
+                flowSource.Dispose();
                 continue;
             }
 
-            _ = ObserveAsync(flowId, task);
+            _ = ObserveAsync(flowId, task, flowSource);
         }
+    }
+
+    public async Task<bool> CancelAsync(
+        Guid flowId,
+        CancellationToken cancellationToken = default)
+    {
+        _blocked.TryAdd(flowId, 0);
+        if (!_cancellations.TryGetValue(flowId, out var source))
+        {
+            return false;
+        }
+
+        source.Cancel();
+        if (_running.TryGetValue(flowId, out var task))
+        {
+            try
+            {
+                await task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+            }
+            catch (OperationCanceledException) when (source.IsCancellationRequested)
+            {
+                // Expected when abandonment cancels a running flow.
+            }
+            catch (TimeoutException exception)
+            {
+                throw new InvalidOperationException(
+                    $"Flow {flowId} did not stop within the abandonment deadline.",
+                    exception);
+            }
+        }
+        return true;
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        foreach (var source in _cancellations.Values)
+        {
+            source.Cancel();
+        }
         await base.StopAsync(cancellationToken);
         try
         {
@@ -2424,7 +2496,10 @@ public sealed class FlowWorker(
         }
     }
 
-    private async Task ObserveAsync(Guid flowId, Task task)
+    private async Task ObserveAsync(
+        Guid flowId,
+        Task task,
+        CancellationTokenSource source)
     {
         try
         {
@@ -2437,6 +2512,8 @@ public sealed class FlowWorker(
         finally
         {
             _running.TryRemove(flowId, out _);
+            _cancellations.TryRemove(flowId, out _);
+            source.Dispose();
         }
     }
 }

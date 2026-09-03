@@ -6,6 +6,7 @@ import { hasFeedbackBeenSent, markFeedbackSent } from "../../lib/feedbackTracker
 import { CheckIcon, ExternalIcon, MicIcon, RefreshIcon, SendIcon } from "../../lib/icons";
 import { speak, toggleVoice } from "../../lib/voice";
 import { useToast } from "../../lib/toast";
+import { AbandonFlowButton } from "./AbandonFlowButton";
 
 export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
   const queryClient = useQueryClient();
@@ -93,6 +94,7 @@ export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
           </button>
         </div>
         <div className="feedback-actions">
+          <AbandonFlowButton flowId={flow.id} />
           <button className="button" disabled={sendFeedback.isPending} onClick={() => void submitFeedback()}>
             <SendIcon /> {sendFeedback.isPending ? "Product Manager..." : "Discuss feedback"}
           </button>

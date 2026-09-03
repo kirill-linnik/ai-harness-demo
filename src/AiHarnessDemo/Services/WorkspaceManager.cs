@@ -85,6 +85,177 @@ public sealed partial class WorkspaceManager(
         return new WorkspaceInfo(workspacePath, branchName, createdNow);
     }
 
+    public async Task<WorkspaceCleanupResult> RemoveAsync(
+        FlowRun flow,
+        CancellationToken cancellationToken = default)
+    {
+        var branchName = string.IsNullOrWhiteSpace(flow.BranchName)
+            ? $"ai-harness/{Slug(flow.Title)}-{flow.Id.ToString("N")[..16]}"
+            : flow.BranchName;
+
+        var expectedWorkspace = ResolveContained(flow.Id.ToString("N")[..16]);
+        if (!string.IsNullOrWhiteSpace(flow.WorkspacePath) &&
+            !PathsEqual(expectedWorkspace, flow.WorkspacePath))
+        {
+            throw new InvalidOperationException(
+                $"Flow workspace is outside its expected isolated location: {flow.WorkspacePath}");
+        }
+
+        var projectPath = Path.GetFullPath(flow.RepositoryPath);
+        if (!Directory.Exists(projectPath))
+        {
+            if (Directory.Exists(expectedWorkspace))
+            {
+                Directory.Delete(expectedWorkspace, recursive: true);
+            }
+            return WorkspaceCleanupResult.Empty;
+        }
+        var repositories = RepositoryAnalyzer.FindGitRepositories(projectPath);
+        if (repositories.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "No source Git repositories remain for flow cleanup.");
+        }
+        var branchValidation = await processRunner.RunAsync(
+            "git",
+            ["check-ref-format", "--branch", branchName],
+            projectPath,
+            TimeSpan.FromSeconds(20),
+            cancellationToken);
+        if (branchValidation.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Flow branch is not a valid Git branch name: {branchName}");
+        }
+
+        if (Directory.Exists(expectedWorkspace))
+        {
+            await hookRunner.RunAsync(
+                WorkspaceHookStage.BeforeRemove,
+                expectedWorkspace,
+                cancellationToken);
+        }
+
+        var worktreesRemoved = 0;
+        var localBranchesDeleted = 0;
+        var remoteBranchesDeleted = 0;
+        foreach (var repository in repositories)
+        {
+            var relativePath = Path.GetRelativePath(projectPath, repository);
+            var repositoryWorkspace =
+                repositories.Count == 1 && PathsEqual(projectPath, repository)
+                    ? expectedWorkspace
+                    : ResolveUnderWorkspace(expectedWorkspace, relativePath);
+            if (Directory.Exists(repositoryWorkspace))
+            {
+                var remove = await processRunner.RunAsync(
+                    "git",
+                    ["-C", repository, "worktree", "remove", "--force", repositoryWorkspace],
+                    repository,
+                    TimeSpan.FromMinutes(2),
+                    cancellationToken);
+                if (remove.ExitCode != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unable to remove flow worktree '{repositoryWorkspace}': {remove.CombinedOutput}");
+                }
+                worktreesRemoved++;
+            }
+
+            var prune = await processRunner.RunAsync(
+                "git",
+                ["-C", repository, "worktree", "prune"],
+                repository,
+                TimeSpan.FromSeconds(30),
+                cancellationToken);
+            if (prune.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Unable to prune flow worktree metadata for '{repository}': {prune.CombinedOutput}");
+            }
+
+            var localBranch = await processRunner.RunAsync(
+                "git",
+                ["-C", repository, "show-ref", "--verify", "--quiet", $"refs/heads/{branchName}"],
+                repository,
+                TimeSpan.FromSeconds(20),
+                cancellationToken);
+            if (localBranch.ExitCode == 0)
+            {
+                var deleteBranch = await processRunner.RunAsync(
+                    "git",
+                    ["-C", repository, "branch", "-D", branchName],
+                    repository,
+                    TimeSpan.FromSeconds(30),
+                    cancellationToken);
+                if (deleteBranch.ExitCode != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unable to delete local flow branch '{branchName}': {deleteBranch.CombinedOutput}");
+                }
+                localBranchesDeleted++;
+            }
+
+            var remote = await processRunner.RunAsync(
+                "git",
+                ["-C", repository, "remote", "get-url", "origin"],
+                repository,
+                TimeSpan.FromSeconds(20),
+                cancellationToken);
+            if (remote.ExitCode != 0)
+            {
+                continue;
+            }
+            var remoteBranch = await processRunner.RunAsync(
+                "git",
+                [
+                    "-C", repository,
+                    "ls-remote", "--exit-code", "--heads", "origin",
+                    $"refs/heads/{branchName}"
+                ],
+                repository,
+                TimeSpan.FromSeconds(30),
+                cancellationToken);
+            if (remoteBranch.ExitCode == 0 &&
+                !string.IsNullOrWhiteSpace(remoteBranch.StandardOutput))
+            {
+                var deleteRemote = await processRunner.RunAsync(
+                    "git",
+                    ["-C", repository, "push", "origin", "--delete", branchName],
+                    repository,
+                    TimeSpan.FromMinutes(2),
+                    cancellationToken);
+                if (deleteRemote.ExitCode != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unable to delete remote flow branch '{branchName}': {deleteRemote.CombinedOutput}");
+                }
+                remoteBranchesDeleted++;
+            }
+            else if (remoteBranch.ExitCode is not (0 or 2))
+            {
+                throw new InvalidOperationException(
+                    $"Unable to inspect remote flow branch '{branchName}': {remoteBranch.CombinedOutput}");
+            }
+        }
+
+        if (Directory.Exists(expectedWorkspace))
+        {
+            Directory.Delete(expectedWorkspace, recursive: true);
+        }
+        logger.LogInformation(
+            "Removed flow workspace {WorkspacePath}, {WorktreeCount} worktrees, {LocalBranchCount} local branches, and {RemoteBranchCount} remote branches for flow {FlowId}",
+            expectedWorkspace,
+            worktreesRemoved,
+            localBranchesDeleted,
+            remoteBranchesDeleted,
+            flow.Id);
+        return new WorkspaceCleanupResult(
+            worktreesRemoved,
+            localBranchesDeleted,
+            remoteBranchesDeleted);
+    }
+
     private async Task<bool> PrepareProjectWorkspaceAsync(
         string projectPath,
         IReadOnlyList<string> repositories,

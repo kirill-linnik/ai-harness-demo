@@ -415,7 +415,7 @@ public sealed class ApprovalGatedReleaseTests
             step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
         Assert.Equal(StepStatus.Pending, publication.Status);
         Assert.Contains(
-            WorkflowEngine.ApprovedPublicationAssignment,
+            WorkflowEngine.ApprovedPublicationAssignment(OutcomeType.PullRequest),
             publication.InputSummary);
         Assert.True(queue.Reader.TryRead(out var queuedFlowId));
         Assert.Equal(flow.Id, queuedFlowId);
@@ -466,13 +466,19 @@ public sealed class ApprovalGatedReleaseTests
     }
 
     [Fact]
-    public void PullRequestUrl_IsAcceptedOnlyFromPublishedReleaseOutput()
+    public void PullRequestReference_IsParsedFromPublishedReleaseOutput()
     {
+        var reference = PublishedOutcomeVerifier.ParsePullRequest(
+            "Published https://github.com/devclub/site/pull/38 after approval.");
+
+        Assert.NotNull(reference);
+        Assert.Equal("devclub/site", reference.Repository);
+        Assert.Equal(38, reference.Number);
+        Assert.Null(PublishedOutcomeVerifier.ParsePullRequest("Local candidate only."));
         Assert.Equal(
-            "https://github.com/devclub/site/pull/38",
-            WorkflowEngine.ExtractPullRequestUrl(
-                "Published https://github.com/devclub/site/pull/38 after approval."));
-        Assert.Null(WorkflowEngine.ExtractPullRequestUrl("Local candidate only."));
+            "devclub/site",
+            PublishedOutcomeVerifier.NormalizeGitHubRepository(
+                "git@github.com:devclub/site.git"));
     }
 
     private static FeedbackCoordinator CreateCoordinator(
@@ -486,7 +492,8 @@ public sealed class ApprovalGatedReleaseTests
             TestRoutingSupport.Recorder(databaseFactory),
             new NeverApprovalAgentRunner(),
             gate,
-            queue);
+            queue,
+            new FlowLifecycleCoordinator());
 
     private static async Task<FlowRun> SeedWaitingFlowAsync(
         IDbContextFactory<HarnessDbContext> databaseFactory)

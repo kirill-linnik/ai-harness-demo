@@ -6,8 +6,10 @@ tracker:
     - Queued
     - Running
     - WaitingForFeedback
+    - Abandoning
   terminal_states:
     - Approved
+    - Abandoned
     - Failed
 workspace:
   root: data/worktrees

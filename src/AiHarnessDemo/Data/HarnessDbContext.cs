@@ -77,6 +77,7 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.Id).ValueGeneratedNever();
             entity.Property(item => item.Status).HasConversion<string>();
             entity.Property(item => item.Phase).HasConversion<string>();
+            entity.Property(item => item.RemotePublicationAllowed).HasDefaultValue(false);
             entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.Sequence });
             entity.HasOne(item => item.FlowRun)
                 .WithMany(flow => flow.Steps)
@@ -329,6 +330,13 @@ public static class DatabaseInitializer
             "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
             "WHERE name = 'ModelEffort';",
             "ALTER TABLE FlowSteps ADD COLUMN ModelEffort TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'RemotePublicationAllowed';",
+            "ALTER TABLE FlowSteps ADD COLUMN RemotePublicationAllowed " +
+            "INTEGER NOT NULL DEFAULT 0;",
             cancellationToken);
     }
 

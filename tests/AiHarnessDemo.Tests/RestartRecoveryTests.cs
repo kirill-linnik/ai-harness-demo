@@ -125,6 +125,43 @@ public sealed class CopilotSessionJournalTests
         Assert.Equal(CopilotSessionJournalState.Interrupted, snapshot.State);
         Assert.Empty(snapshot.ActiveProcessIds);
     }
+
+    [Fact]
+    public async Task DeleteWorkspaceSessionsAsync_RemovesOnlyMatchingFlowSessions()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: true);
+        var unrelatedId = Guid.NewGuid();
+        var unrelatedDirectory = Path.Combine(
+            fixture.CopilotHome,
+            "session-state",
+            unrelatedId.ToString("D"));
+        Directory.CreateDirectory(unrelatedDirectory);
+        await File.WriteAllTextAsync(
+            Path.Combine(unrelatedDirectory, "events.jsonl"),
+            RecoveryFixture.Serialize(
+                "session.start",
+                DateTimeOffset.UtcNow,
+                new
+                {
+                    sessionId = unrelatedId,
+                    context = new
+                    {
+                        cwd = Path.Combine(fixture.Root, "unrelated")
+                    }
+                }));
+        var journal = new CopilotSessionJournal();
+
+        var deleted = await journal.DeleteWorkspaceSessionsAsync(
+            [fixture.CopilotHome],
+            fixture.WorkspacePath,
+            [fixture.SessionId]);
+
+        Assert.Equal(1, deleted);
+        Assert.False(Directory.Exists(fixture.SessionDirectory));
+        Assert.True(Directory.Exists(unrelatedDirectory));
+    }
 }
 
 public sealed class WorkflowRestartRecoveryTests

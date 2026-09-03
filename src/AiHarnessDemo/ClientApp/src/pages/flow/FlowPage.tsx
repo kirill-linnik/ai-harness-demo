@@ -12,6 +12,7 @@ import { IterationLane } from "./IterationLane";
 import { StepDetail } from "./StepDetail";
 import { Timeline } from "./Timeline";
 import { FeedbackCard } from "./FeedbackCard";
+import { AbandonFlowButton } from "./AbandonFlowButton";
 
 export function FlowPage() {
   const { id } = useParams<{ id: string }>();
@@ -105,6 +106,9 @@ export function FlowPage() {
           </div>
         </div>
         <div className="flow-heading-actions">
+          {flow.status !== "Approved" && flow.status !== "Abandoned" && (
+            <AbandonFlowButton flowId={flow.id} className="button danger small" />
+          )}
           <button className="button small" onClick={() => void copyFlowLink()}>
             <CopyIcon /> Copy link
           </button>
@@ -190,6 +194,22 @@ export function FlowPage() {
             <a className="button success" href={flow.outcomeUrl}>
               <ExternalIcon /> Published outcome
             </a>
+          </div>
+        </section>
+      )}
+      {flow.status === "Abandoning" && (
+        <section className="approval-banner">
+          <div>
+            <strong>Removing customer artifacts</strong>
+            <span>Execution history and model-learning evidence will remain available.</span>
+          </div>
+        </section>
+      )}
+      {flow.status === "Abandoned" && (
+        <section className="approval-banner">
+          <div>
+            <strong>Flow abandoned</strong>
+            <span>Customer artifacts were removed; execution history and learning evidence were retained.</span>
           </div>
         </section>
       )}

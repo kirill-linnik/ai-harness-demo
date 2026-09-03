@@ -27,6 +27,7 @@ public sealed record AgentExecutionContext(
     string CustomerFeedback = "",
     ModelSelectionStrategy ModelSelectionStrategy = ModelSelectionStrategy.MaximumQuality,
     double ExpectedAcceptedTimeSeconds = 0,
+    bool AllowRemotePublication = false,
     bool ResumeSession = false,
     bool RecoverInterruptedSession = false,
     Action<AgentRunProgress>? Progress = null);

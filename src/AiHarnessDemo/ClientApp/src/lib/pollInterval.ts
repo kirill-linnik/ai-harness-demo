@@ -4,7 +4,8 @@ import type { FlowStatus } from "../api/types";
 const ACTIVE_STATUSES: ReadonlySet<FlowStatus> = new Set<FlowStatus>([
   "Queued",
   "Running",
-  "Reworking"
+  "Reworking",
+  "Abandoning"
 ]);
 
 /**

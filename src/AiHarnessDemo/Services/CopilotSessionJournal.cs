@@ -145,6 +145,78 @@ public sealed class CopilotSessionJournal
         return true;
     }
 
+    internal async Task<int> DeleteWorkspaceSessionsAsync(
+        IEnumerable<string> copilotHomes,
+        string workspacePath,
+        IReadOnlyCollection<Guid> knownSessionIds,
+        CancellationToken cancellationToken = default)
+    {
+        var deleted = new HashSet<string>(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        var homes = copilotHomes
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(
+                         OperatingSystem.IsWindows()
+                             ? StringComparer.OrdinalIgnoreCase
+                             : StringComparer.Ordinal)
+            .ToList();
+        if (homes.Count == 0)
+        {
+            homes.Add(ExpectedHome());
+        }
+        foreach (var homeValue in homes)
+        {
+            var home = Path.GetFullPath(homeValue);
+            var sessionRoot = Path.Combine(home, "session-state");
+            if (!Directory.Exists(sessionRoot))
+            {
+                continue;
+            }
+
+            foreach (var sessionId in knownSessionIds)
+            {
+                var knownDirectory = Path.Combine(
+                    sessionRoot,
+                    sessionId.ToString("D"));
+                if (Directory.Exists(knownDirectory))
+                {
+                    DeleteSessionDirectory(knownDirectory);
+                    deleted.Add(knownDirectory);
+                }
+            }
+
+            foreach (var directory in Directory.EnumerateDirectories(sessionRoot))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (deleted.Contains(directory) ||
+                    !Guid.TryParse(Path.GetFileName(directory), out var sessionId))
+                {
+                    continue;
+                }
+                var snapshot = await InspectDirectoryAsync(
+                    home,
+                    directory,
+                    sessionId,
+                    cancellationToken);
+                if (!PathEquals(snapshot.WorkspacePath, workspacePath))
+                {
+                    continue;
+                }
+                if (snapshot.ActiveProcessIds.Count > 0 &&
+                    !TryStopActiveSession(snapshot))
+                {
+                    throw new InvalidOperationException(
+                        $"Copilot session {snapshot.SessionId:D} could not be stopped before deletion.");
+                }
+                DeleteSessionDirectory(directory);
+                deleted.Add(directory);
+            }
+        }
+        return deleted.Count;
+    }
+
     internal static async Task<CopilotSessionSnapshot> InspectDirectoryAsync(
         string copilotHome,
         string sessionDirectory,
@@ -432,5 +504,21 @@ public sealed class CopilotSessionJournal
             Path.TrimEndingDirectorySeparator(Path.GetFullPath(left)),
             Path.TrimEndingDirectorySeparator(Path.GetFullPath(right)),
             comparison);
+    }
+
+    private static void DeleteSessionDirectory(string directory)
+    {
+        var parent = Directory.GetParent(directory)
+            ?? throw new InvalidOperationException(
+                $"Copilot session path has no parent: {directory}");
+        if (!string.Equals(
+                parent.Name,
+                "session-state",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to delete a path outside a Copilot session-state directory: {directory}");
+        }
+        Directory.Delete(directory, recursive: true);
     }
 }

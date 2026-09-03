@@ -43,6 +43,10 @@ builder.Services.AddSingleton<IModelRouter>(
     services => services.GetRequiredService<AdaptiveModelRouter>());
 builder.Services.AddSingleton<RoutingObservationRecorder>();
 builder.Services.AddSingleton<PreviewArtifactCatalog>();
+builder.Services.AddSingleton<IWorkspaceProcessCleaner, WorkspaceProcessCleaner>();
+builder.Services.AddSingleton<IFlowSessionCleaner, FlowSessionCleaner>();
+builder.Services.AddSingleton<FlowLifecycleCoordinator>();
+builder.Services.AddSingleton<IPublishedOutcomeVerifier, PublishedOutcomeVerifier>();
 builder.Services.AddSingleton<CopilotReasoningHost>();
 builder.Services.AddSingleton(_ =>
 {
@@ -60,7 +64,12 @@ builder.Services.AddSingleton<CopilotSessionJournal>();
 builder.Services.AddSingleton<FlowQueue>();
 builder.Services.AddSingleton<WorkflowEngine>();
 builder.Services.AddSingleton<FeedbackCoordinator>();
-builder.Services.AddHostedService<FlowWorker>();
+builder.Services.AddSingleton<FlowWorker>();
+builder.Services.AddSingleton<IFlowExecutionController>(
+    services => services.GetRequiredService<FlowWorker>());
+builder.Services.AddSingleton<FlowAbandonmentService>();
+builder.Services.AddHostedService(
+    services => services.GetRequiredService<FlowWorker>());
 
 var app = builder.Build();
 
@@ -74,6 +83,9 @@ await app.Services
 await app.Services
     .GetRequiredService<ModelCatalogDiscovery>()
     .RefreshAsync(paths.Root);
+await app.Services
+    .GetRequiredService<FlowAbandonmentService>()
+    .ResumePendingAsync();
 
 app.UseExceptionHandler();
 app.Use(LocalRequestGuard.ApplyAsync);

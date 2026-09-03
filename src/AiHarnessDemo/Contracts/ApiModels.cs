@@ -267,6 +267,16 @@ public sealed record FeedbackResponse(FlowDetailDto Flow, string Reply, bool Sho
 
 public sealed record FlowDecisionRequest(bool Approve);
 
+public sealed record AbandonFlowResponse(
+    Guid FlowId,
+    FlowStatus Status,
+    int ProcessesStopped,
+    IReadOnlyList<int> ListeningPortsReleased,
+    int CopilotSessionsDeleted,
+    int WorktreesRemoved,
+    int LocalBranchesDeleted,
+    int RemoteBranchesDeleted);
+
 public sealed record PreviewDto(
     Guid FlowId,
     string Title,

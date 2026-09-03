@@ -56,6 +56,7 @@ flowchart LR
 | `AgentRunner` | Runs every selected role through Copilot CLI with model routing, bounded session-aware retries, progress events, and scrubbed tool-call audit. |
 | `CopilotSessionJournal` | Reads Copilot CLI session journals, discovers legacy in-flight sessions by workspace and agent, and distinguishes completed, active, and interrupted turns. |
 | `WorkspaceManager` | Creates one project workspace per flow, with an isolated worktree on the flow branch for every discovered repository. |
+| `FlowAbandonmentService` | Blocks/cancels flow execution, stops workspace-owned processes, removes Copilot sessions, worktrees, previews, and flow branches, then retains the durable ledger as an abandoned learning record. |
 | `FeedbackCoordinator` | Grounds Product Manager in the original request and full ledger, then closes or requeues the same flow with retained context. |
 | `HarnessDbContext` | Persists settings, agents, flows, dialogue, steps, events, catalogs, profiles, routing decisions, normalized evidence, durations, outcomes, and prompt refinements. |
 
@@ -97,7 +98,7 @@ The browser uses a same-origin minimal API:
 - `/api/bootstrap`, `/api/settings`, `/api/agents`
 - `/api/directories`, `/api/repositories/analyze`
 - `/api/intake`
-- `/api/flows`, `/api/flows/{id}`, `/start`, `/restart`, `/feedback`, `/decision`
+- `/api/flows`, `/api/flows/{id}`, `/start`, `/restart`, `/feedback`, `/decision`, `/abandon`
 - `/api/history`, `/api/learnings`, `/api/previews/{id}`
 - `/api/previews/{id}/artifacts/{variant}/{path}` serves the real isolated browser build used by the customer acceptance page.
 

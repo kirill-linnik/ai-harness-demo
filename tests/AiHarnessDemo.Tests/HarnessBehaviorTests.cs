@@ -568,6 +568,24 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
+    public void PreApprovalRelease_BlocksRemotePublicationCredentials()
+    {
+        var guarded = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
+            CopilotReasoningHost.BuildProcessEnvironment(
+                "release-engineer",
+                allowRemotePublication: false));
+
+        Assert.Equal("customer-approval-required", guarded["GH_TOKEN"]);
+        Assert.Equal("remote.origin.pushurl", guarded["GIT_CONFIG_KEY_0"]);
+        Assert.Null(CopilotReasoningHost.BuildProcessEnvironment(
+            "release-engineer",
+            allowRemotePublication: true));
+        Assert.Null(CopilotReasoningHost.BuildProcessEnvironment(
+            "software-engineer",
+            allowRemotePublication: false));
+    }
+
+    [Fact]
     public void InterruptedInvocation_ExplicitlyResumesTheExistingSession()
     {
         var sessionId = Guid.Parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
@@ -1338,6 +1356,7 @@ public sealed class PersistenceTests
         Assert.Contains("ExecutionPrompt", columns);
         Assert.Contains("CopilotSessionId", columns);
         Assert.Contains("CopilotSessionHome", columns);
+        Assert.Contains("RemotePublicationAllowed", columns);
         Assert.Equal(System.Data.ConnectionState.Open, connection.State);
     }
 }

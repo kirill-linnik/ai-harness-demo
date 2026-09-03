@@ -748,7 +748,8 @@ select:focus-visible {
 
 .status-pill.running,
 .status-pill.queued,
-.status-pill.reworking {
+.status-pill.reworking,
+.status-pill.abandoning {
   border-color: rgba(81, 168, 255, 0.28);
   color: #cce7ff;
   background: rgba(81, 168, 255, 0.08);
@@ -756,7 +757,8 @@ select:focus-visible {
 
 .status-pill.running::before,
 .status-pill.queued::before,
-.status-pill.reworking::before {
+.status-pill.reworking::before,
+.status-pill.abandoning::before {
   background: var(--blue);
   box-shadow: 0 0 8px rgba(81, 168, 255, 0.7);
 }
@@ -789,6 +791,12 @@ select:focus-visible {
 
 .status-pill.failed::before {
   background: var(--red);
+}
+
+.status-pill.abandoned {
+  border-color: rgba(117, 134, 154, 0.3);
+  color: #c9d3df;
+  background: rgba(117, 134, 154, 0.08);
 }
 
 .intake-layout {

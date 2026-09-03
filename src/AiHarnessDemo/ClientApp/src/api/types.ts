@@ -11,7 +11,9 @@ export type FlowStatus =
   | "Running"
   | "WaitingForFeedback"
   | "Reworking"
+  | "Abandoning"
   | "Approved"
+  | "Abandoned"
   | "Failed";
 
 export type StepStatus =
@@ -352,6 +354,17 @@ export interface FeedbackResponse {
 
 export interface FlowDecisionRequest {
   approve: boolean;
+}
+
+export interface AbandonFlowResponse {
+  flowId: string;
+  status: "Abandoned";
+  processesStopped: number;
+  listeningPortsReleased: number[];
+  copilotSessionsDeleted: number;
+  worktreesRemoved: number;
+  localBranchesDeleted: number;
+  remoteBranchesDeleted: number;
 }
 
 export interface PreviewDto {

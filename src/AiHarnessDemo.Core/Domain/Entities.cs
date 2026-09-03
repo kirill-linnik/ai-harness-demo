@@ -47,7 +47,9 @@ public enum FlowStatus
     Running,
     WaitingForFeedback,
     Reworking,
+    Abandoning,
     Approved,
+    Abandoned,
     Failed
 }
 
@@ -189,6 +191,8 @@ public sealed class FlowStep
     public string ModelEffort { get; set; } = string.Empty;
 
     public string ModelReason { get; set; } = string.Empty;
+
+    public bool RemotePublicationAllowed { get; set; }
 
     public StepStatus Status { get; set; } = StepStatus.Pending;
 

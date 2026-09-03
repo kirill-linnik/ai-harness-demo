@@ -5,6 +5,7 @@ import { request } from "./client";
 import type {
   AnalyzeRepositoryRequest,
   AnalyzeRepositoryResponse,
+  AbandonFlowResponse,
   BootstrapDto,
   DirectoryListingDto,
   FeedbackRequest,
@@ -48,6 +49,10 @@ export const api = {
     request<FlowDetailDto>(`/api/flows/${flowId}/decision`, {
       method: "POST",
       body: { approve }
+    }),
+  abandonFlow: (flowId: string) =>
+    request<AbandonFlowResponse>(`/api/flows/${flowId}/abandon`, {
+      method: "POST"
     }),
   history: () => request<HistoryItemDto[]>("/api/history"),
   learnings: () => request<LearningDto[]>("/api/learnings"),

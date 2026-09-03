@@ -6,6 +6,7 @@ import { BootScreen } from "../../components/BootScreen";
 import { BackIcon, CheckIcon, ExternalIcon, RefreshIcon } from "../../lib/icons";
 import { formatDuration } from "../../lib/format";
 import { useToast } from "../../lib/toast";
+import { AbandonFlowButton } from "../flow/AbandonFlowButton";
 
 export function PreviewPage() {
   const { id } = useParams<{ id: string }>();
@@ -175,6 +176,7 @@ export function PreviewPage() {
               />
             </label>
             <div className="feedback-actions">
+              <AbandonFlowButton flowId={preview.flowId} />
               <button
                 className="button danger"
                 disabled={deciding}
