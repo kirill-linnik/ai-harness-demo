@@ -2,7 +2,44 @@
 
 AI Harness Studio is a standalone .NET 10 conference demo that turns a spoken product idea into an observable multi-agent engineering flow.
 
-It is intentionally generic and suitable for an external audience. Its core is a C# implementation of the [OpenAI Symphony service specification](https://github.com/openai/symphony/blob/main/SPEC.md). It retains repository-owned workflow policy, durable orchestration, explicit gates, isolated workspaces, lifecycle hooks, Copilot CLI execution, retry and reconciliation, and a complete ledger without provider-specific operational dependencies.
+It is intentionally generic and suitable for an external audience. Its orchestration kernel is an
+independent .NET adaptation of selected concepts and normative invariants from the
+[OpenAI Symphony service specification](https://github.com/openai/symphony/blob/main/SPEC.md), not
+a drop-in port of Symphony's issue-tracker and Codex workflow. AI Harness Studio replaces that
+workflow with customer intake, GitHub Copilot CLI, a multi-role delivery system, and durable product
+feedback.
+
+## Symphony concepts and Studio extensions
+
+In this project, a Symphony work item maps to a `FlowRun`, and its per-issue workspace maps to a
+per-flow project workspace. The following concepts come from Symphony:
+
+| Symphony concept | AI Harness Studio adaptation |
+| --- | --- |
+| Repository-owned workflow contract | Root `WORKFLOW.md` combines YAML runtime policy with the shared prompt template. Configuration is typed and validated, template variables fail closed, and valid changes are hot-reloaded while an invalid reload leaves the last-known-good definition active. |
+| Layered service design | Policy, configuration, coordination, execution, integration, and observability remain separate across `AiHarnessDemo.Core`, the orchestration services, the Copilot boundary, and the customer-facing API. |
+| One authoritative orchestrator | `FlowQueue`, `FlowWorker`, and `WorkflowEngine` own dispatch and transitions, reject duplicate work, and enforce the hot-reloadable global concurrency bound. |
+| Isolated, reusable workspaces | Each flow receives a contained `data\worktrees\<flow-id>` workspace. Agent execution is restricted to that workspace, which is preserved across steps, retries, feedback iterations, and restarts. |
+| Workspace lifecycle and safety | Workspace keys are sanitized and collision-resistant, paths are checked against the configured root, and `after_create`, `before_run`, and `after_run` retain Symphony's failure semantics. `before_remove` is recognized by the contract, but current flow workspaces are preserved rather than automatically removed. |
+| Explicit run-attempt lifecycle | Workspace preparation, prompt rendering, process launch, streaming, completion, timeout, stall, cancellation, and failure are recorded as visible `FlowStep` phases and `FlowEvent` entries. |
+| Bounded recovery | Transient execution failures use capped exponential backoff with jitter; runtime availability has circuit-breaking behavior; persisted work is reconciled after restart instead of being dispatched twice. |
+| Pluggable agent-runner boundary | Orchestration depends on reasoning and workspace abstractions rather than a concrete agent process, while this product deliberately routes every real execution through Copilot CLI. |
+| Operator-visible state | Structured logs, runtime APIs, and a status surface expose active work, retries, failures, timing, and agent progress without becoming orchestration dependencies. |
+
+AI Harness Studio implements the following capabilities beyond Symphony's scheduler/runner
+contract:
+
+| Studio extension | What it adds |
+| --- | --- |
+| Customer-driven intake | Browser voice or text replaces issue-tracker polling. Account Manager separates clarification from explicit confirmation, and only a customer-confirmed brief can enter delivery. |
+| Dynamic multi-agent delivery | Team Lead selects enabled specialists from `.github\agents\*.agent.md`, emits validated role task profiles, and creates an ordered dependency-aware handoff plan rather than running one coding agent per work item. |
+| Handoff trust gates | Shadow, gated, and automatic decisions are recorded by action and blast radius. Release always requires a customer decision, and a kill switch dominates configured trust. |
+| Bounded pushback and feedback loops | A downstream `PUSHBACK` resumes the responsible upstream Copilot session, retries the blocked handoff in place, and stores a reusable learning. Product Manager can close the flow or send the same flow through another iteration with its ledger intact. |
+| Durable product state | SQLite persists settings, intake dialogue, flows, steps, gates, events, tool calls, model catalogs, routing evidence, outcomes, and cross-flow learnings. Symphony's core recovery does not require a durable orchestration database. |
+| Copilot-native model routing | A dedicated Copilot ACP process discovers enabled model and reasoning-effort candidates. Each step is profiled and routed immediately before execution using the selected quality, speed, or cost strategy plus normalized historical evidence. |
+| Repository study and multi-repository Git isolation | The harness can run `copilot init`, persist editable shared knowledge, discover every Git repository in a project folder, and create the same flow branch in an isolated worktree for each repository. Symphony leaves VCS workspace population implementation-defined. |
+| Durable Copilot session continuity | Step-level Copilot session IDs and journal state support same-session handoff correction, completed-turn recovery, interrupted-turn resume after host restart, and explicit manual restart of failed flows. |
+| Product UI and API | The React dashboard adds Settings, AI Factory, live execution graphs, customer previews, history, harness memory, model-routing explanations, and independently addressable flow pages on top of Symphony's optional status-surface concept. |
 
 ## Run
 
