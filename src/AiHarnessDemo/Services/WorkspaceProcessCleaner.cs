@@ -113,7 +113,7 @@ public sealed class WorkspaceProcessCleaner(
             workspacePath,
             TimeSpan.FromSeconds(30),
             cancellationToken,
-            environmentVariables: new Dictionary<string, string>
+            environmentVariables: new Dictionary<string, string?>
             {
                 ["AI_HARNESS_WORKSPACE_PATH"] = Path.GetFullPath(workspacePath)
             });

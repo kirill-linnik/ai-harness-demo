@@ -168,7 +168,8 @@ public sealed partial class FeedbackCoordinator(
                                     progress,
                                     CancellationToken.None)
                                 .GetAwaiter()
-                                .GetResult()),
+                                .GetResult(),
+                        InvocationStartedAt: step.StartedAt),
                     cancellationToken);
             }
             catch (Exception exception)
@@ -290,10 +291,15 @@ public sealed partial class FeedbackCoordinator(
             throw new InvalidOperationException("This flow is not waiting for a customer decision.");
         }
 
+        var currentStepIds = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .Select(step => step.Id)
+            .ToHashSet();
         var pendingReleaseGate = flow.GateRecords
             .Where(item =>
                 item.ActionType == HandoffActionType.Release &&
-                !item.Resolved)
+                !item.Resolved &&
+                currentStepIds.Contains(item.FlowStepId))
             .OrderByDescending(item => item.DecidedAt)
             .FirstOrDefault()
             ?? throw new InvalidOperationException(

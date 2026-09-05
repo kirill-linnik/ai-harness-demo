@@ -381,6 +381,467 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     [Fact]
+    public void PendingManualRestartResolvesOnlyItsFailedStep()
+    {
+        var flowId = Guid.NewGuid();
+        var failed = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 40,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Status = StepStatus.Failed,
+            Attempt = 1
+        };
+        var retry = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 50,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Label = "Manual restart of Software Engineer",
+            Status = StepStatus.Pending,
+            Attempt = 2,
+            RetryOfStepId = failed.Id
+        };
+
+        Assert.Null(WorkflowEngine.FindUnresolvedFailure([failed, retry]));
+
+        retry.RetryOfStepId = Guid.NewGuid();
+
+        Assert.Same(failed, WorkflowEngine.FindUnresolvedFailure([failed, retry]));
+    }
+
+    [Fact]
+    public void ManualRetry_DoesNotResolveAnotherFailureForTheSameAgent()
+    {
+        var flowId = Guid.NewGuid();
+        var firstFailure = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 20,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Status = StepStatus.Failed,
+            Attempt = 1
+        };
+        var secondFailure = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 40,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Status = StepStatus.Failed,
+            Attempt = 2
+        };
+        var secondRetry = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 50,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Label = "Manual restart of Software Engineer",
+            Status = StepStatus.Pending,
+            Attempt = 3,
+            RetryOfStepId = secondFailure.Id
+        };
+
+        Assert.Same(
+            firstFailure,
+            WorkflowEngine.FindUnresolvedFailure(
+                [firstFailure, secondFailure, secondRetry]));
+    }
+
+    [Fact]
+    public void CausalPushback_KeepsTheRecoveryChainActive()
+    {
+        var flowId = Guid.NewGuid();
+        var failure = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 20,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Failed,
+            Attempt = 1
+        };
+        var pushedBackRetry = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 30,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Pushback,
+            Attempt = 2,
+            RetryOfStepId = failure.Id
+        };
+
+        Assert.Null(WorkflowEngine.FindUnresolvedFailure(
+            [failure, pushedBackRetry]));
+        Assert.Same(
+            pushedBackRetry,
+            WorkflowEngine.FindUnresolvedPushback(
+                [failure, pushedBackRetry]));
+    }
+
+    [Fact]
+    public void IntentionallyDisabledPreMortemRetry_ResolvesItsFailure()
+    {
+        var flowId = Guid.NewGuid();
+        var failure = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 20,
+            AgentId = WorkflowEngine.PreMortemRole,
+            AgentName = "Pre-mortem Sceptic",
+            AgentRole = WorkflowEngine.PreMortemRole,
+            Status = StepStatus.Failed,
+            Attempt = 1
+        };
+        var disabledRetry = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 30,
+            AgentId = WorkflowEngine.PreMortemRole,
+            AgentName = "Pre-mortem Sceptic",
+            AgentRole = WorkflowEngine.PreMortemRole,
+            Status = StepStatus.Skipped,
+            Phase = AgentRunPhase.Succeeded,
+            Attempt = 1,
+            RetryOfStepId = failure.Id
+        };
+
+        Assert.Null(WorkflowEngine.FindUnresolvedFailure(
+            [failure, disabledRetry]));
+    }
+
+    [Fact]
+    public void TeamLeadCorrection_UsesItsCausalManualRetry()
+    {
+        var flowId = Guid.NewGuid();
+        var correction = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 15,
+            AgentId = "team-lead",
+            AgentName = "Team Lead",
+            AgentRole = "team-lead",
+            Label = "Correct Team Lead task profiles",
+            Status = StepStatus.Failed,
+            Attempt = 2
+        };
+        var retry = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 25,
+            AgentId = "team-lead",
+            AgentName = "Team Lead",
+            AgentRole = "team-lead",
+            Label = "Manual restart of Team Lead",
+            Status = StepStatus.Pending,
+            Attempt = 3,
+            RetryOfStepId = correction.Id
+        };
+
+        Assert.Same(
+            retry,
+            WorkflowEngine.SelectEffectiveManualRetryStep(
+                correction,
+                [correction, retry]));
+    }
+
+    [Fact]
+    public void EffectiveTeamLeadStep_IgnoresSupersededSkippedRetry()
+    {
+        var flowId = Guid.NewGuid();
+        var recovered = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 15,
+            AgentId = "team-lead",
+            AgentName = "Team Lead",
+            AgentRole = "team-lead",
+            Status = StepStatus.Completed,
+            Attempt = 2,
+            OutputSummary = "TEAM_TASK_PROFILES_V1_BEGIN"
+        };
+        var superseded = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 25,
+            AgentId = "team-lead",
+            AgentName = "Team Lead",
+            AgentRole = "team-lead",
+            Status = StepStatus.Skipped,
+            Phase = AgentRunPhase.Failed,
+            Attempt = 3,
+            RetryOfStepId = recovered.Id
+        };
+
+        Assert.Same(
+            recovered,
+            WorkflowEngine.SelectEffectiveManualRetryStep(
+                recovered,
+                [recovered, superseded]));
+    }
+
+    [Fact]
+    public async Task ManualPreMortemRestartPreservesItsCheckpointRound()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false,
+            persistSessionId: true);
+        var originStepId = Guid.NewGuid();
+        await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var failedStep = Assert.Single(flow.Steps);
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Pre-mortem output was invalid.";
+            failedStep.AgentId = WorkflowEngine.PreMortemRole;
+            failedStep.AgentName = "Pre-mortem Sceptic";
+            failedStep.AgentRole = WorkflowEngine.PreMortemRole;
+            failedStep.Label = "Pre-mortem review of Software Engineer (round 2)";
+            failedStep.Status = StepStatus.Failed;
+            failedStep.Phase = AgentRunPhase.Failed;
+            failedStep.Attempt = 2;
+            failedStep.PreMortemOriginStepId = originStepId;
+            failedStep.CompletedAt = DateTimeOffset.UtcNow;
+            await database.SaveChangesAsync();
+        }
+
+        var restarted = await fixture.Engine.RestartFailedFlowAsync(
+            fixture.FlowId,
+            CancellationToken.None);
+
+        var retry = restarted.Steps.Single(step =>
+            step.Label == "Manual restart of Pre-mortem Sceptic");
+        Assert.Equal(2, retry.Attempt);
+        Assert.Equal(originStepId, retry.PreMortemOriginStepId);
+        Assert.NotNull(retry.RetryOfStepId);
+        Assert.Null(WorkflowEngine.FindUnresolvedFailure(restarted.Steps));
+    }
+
+    [Fact]
+    public async Task RepeatedRestart_ReusesTheSkippedCausalRetry()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false,
+            persistSessionId: true);
+        await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var failedStep = Assert.Single(flow.Steps);
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Initial failure.";
+            failedStep.Status = StepStatus.Failed;
+            failedStep.Phase = AgentRunPhase.Failed;
+            failedStep.CompletedAt = DateTimeOffset.UtcNow;
+            await database.SaveChangesAsync();
+        }
+
+        var firstRestart = await fixture.Engine.RestartFailedFlowAsync(
+            fixture.FlowId,
+            CancellationToken.None);
+        var retryId = firstRestart.Steps.Single(step =>
+            step.Label == "Manual restart of Software Engineer").Id;
+        await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Setup failed before the retry ran.";
+            var retry = flow.Steps.Single(step => step.Id == retryId);
+            retry.Status = StepStatus.Skipped;
+            retry.Phase = AgentRunPhase.Failed;
+            retry.CompletedAt = DateTimeOffset.UtcNow;
+            await database.SaveChangesAsync();
+        }
+
+        var secondRestart = await fixture.Engine.RestartFailedFlowAsync(
+            fixture.FlowId,
+            CancellationToken.None);
+
+        Assert.Single(
+            secondRestart.Steps,
+            step => step.Label == "Manual restart of Software Engineer");
+        Assert.Equal(
+            StepStatus.Pending,
+            secondRestart.Steps.Single(step => step.Id == retryId).Status);
+    }
+
+    [Fact]
+    public void SkippedRetry_DoesNotHideAnUnresolvedPushback()
+    {
+        var flowId = Guid.NewGuid();
+        var pushback = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 10,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Pushback,
+            Attempt = 1
+        };
+        var skippedRetry = new FlowStep
+        {
+            FlowRunId = flowId,
+            Iteration = 1,
+            Sequence = 20,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Skipped,
+            Attempt = 2
+        };
+
+        Assert.Same(
+            pushback,
+            WorkflowEngine.FindUnresolvedPushback(
+                [pushback, skippedRetry]));
+    }
+
+    [Fact]
+    public void EffectiveRevision_RetargetsBlockedDependents()
+    {
+        var originalRevisionId = Guid.NewGuid();
+        var completed = new FlowStep
+        {
+            FlowRunId = Guid.NewGuid(),
+            Iteration = 1,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Status = StepStatus.Completed,
+            RetryOfStepId = originalRevisionId
+        };
+        var dependent = new FlowStep
+        {
+            FlowRunId = completed.FlowRunId,
+            Iteration = 1,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Pending,
+            DependsOnStepId = originalRevisionId
+        };
+
+        Assert.Equal(
+            1,
+            WorkflowEngine.RetargetDependentSteps(completed, [dependent]));
+        Assert.Equal(completed.Id, dependent.DependsOnStepId);
+    }
+
+    [Fact]
+    public void RecoveredStep_ReversesLinksFromSupersededRetries()
+    {
+        var recovered = new FlowStep
+        {
+            FlowRunId = Guid.NewGuid(),
+            Iteration = 1,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Status = StepStatus.Completed
+        };
+        var superseded = new FlowStep
+        {
+            FlowRunId = recovered.FlowRunId,
+            Iteration = 1,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Status = StepStatus.Skipped,
+            RetryOfStepId = recovered.Id
+        };
+        var dependent = new FlowStep
+        {
+            FlowRunId = recovered.FlowRunId,
+            Iteration = 1,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Skipped,
+            DependsOnStepId = superseded.Id
+        };
+        var review = new FlowStep
+        {
+            FlowRunId = recovered.FlowRunId,
+            Iteration = 1,
+            AgentId = WorkflowEngine.PreMortemRole,
+            AgentName = "Pre-mortem Sceptic",
+            AgentRole = WorkflowEngine.PreMortemRole,
+            Status = StepStatus.Skipped,
+            PreMortemTargetStepId = superseded.Id
+        };
+
+        Assert.Equal(
+            2,
+            WorkflowEngine.RetargetSupersededRetryLinks(
+                [recovered, superseded, dependent, review],
+                recovered));
+        Assert.Equal(recovered.Id, dependent.DependsOnStepId);
+        Assert.Equal(recovered.Id, review.PreMortemTargetStepId);
+    }
+
+    [Fact]
+    public void PreMortemRoundCount_IgnoresManualRetryDuplicates()
+    {
+        Assert.Equal(2, WorkflowEngine.CountPreMortemRounds([1, 1, 2]));
+    }
+
+    [Fact]
+    public void InvalidTeamLeadCorrection_BecomesRestartable()
+    {
+        var correction = new FlowStep
+        {
+            FlowRunId = Guid.NewGuid(),
+            Iteration = 1,
+            AgentId = "team-lead",
+            AgentName = "Team Lead",
+            AgentRole = "team-lead",
+            Status = StepStatus.Completed,
+            Phase = AgentRunPhase.Succeeded
+        };
+
+        WorkflowEngine.ApplyContractValidationFailure(correction);
+
+        Assert.Equal(StepStatus.Failed, correction.Status);
+        Assert.Equal(AgentRunPhase.Failed, correction.Phase);
+        Assert.NotNull(correction.CompletedAt);
+    }
+
+    [Fact]
+    public void DeliveryStartsAfterTheEffectiveTeamLeadCorrection()
+    {
+        Assert.Equal(20, WorkflowEngine.FirstDeliverySequence(10));
+        Assert.Equal(35, WorkflowEngine.FirstDeliverySequence(25));
+        Assert.Equal(15, WorkflowEngine.FirstCorrectionSequence(10));
+        Assert.Equal(25, WorkflowEngine.FirstCorrectionSequence(20));
+    }
+
+    [Fact]
     public async Task ManualRestartSkipsJournalDiscoveryForPreLaunchFailure()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(

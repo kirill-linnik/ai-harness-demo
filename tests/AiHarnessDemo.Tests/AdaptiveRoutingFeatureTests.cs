@@ -136,6 +136,159 @@ public sealed class TaskProfileTests
     }
 }
 
+public sealed class PreMortemContractTests
+{
+    [Fact]
+    public void TeamLeadPlan_SelectsOnlyPlannedRoles()
+    {
+        var roles = PreMortemRules.ParsePlan(
+            """
+            PRE_MORTEM_PLAN_V1_BEGIN
+            {"Version":"pre-mortem-plan-v1","AfterRoles":["architect","software-engineer"]}
+            PRE_MORTEM_PLAN_V1_END
+            """,
+            ["architect", "software-engineer", "quality-engineer"],
+            scepticAvailable: true);
+
+        Assert.Equal(
+            ["architect", "software-engineer"],
+            roles.Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void TeamLeadPlan_RejectsCheckpointsWhenScepticIsUnavailable()
+    {
+        var exception = Assert.Throws<PreMortemValidationException>(() =>
+            PreMortemRules.ParsePlan(
+                """
+                PRE_MORTEM_PLAN_V1_BEGIN
+                {"Version":"pre-mortem-plan-v1","AfterRoles":["software-engineer"]}
+                PRE_MORTEM_PLAN_V1_END
+                """,
+                ["software-engineer"],
+                scepticAvailable: false));
+
+        Assert.Contains(
+            exception.Errors,
+            error => error.Contains("must be empty", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Review_AllowsClearAndCapsEvidenceBackedFindingsAtFive()
+    {
+        var clear = PreMortemRules.ParseReview(
+            """
+            PRE_MORTEM_STATUS: CLEAR
+            PRE_MORTEM_FINDINGS_V1_BEGIN
+            {"Version":"pre-mortem-findings-v1","Findings":[]}
+            PRE_MORTEM_FINDINGS_V1_END
+            """);
+        var sixFindings = string.Join(
+            ",",
+            Enumerable.Range(1, 6).Select(index =>
+                $$"""{"FailureMode":"failure {{index}}","Evidence":"src\\file{{index}}.cs proves it","MissedSignal":"signal {{index}}","Prevention":"prevention {{index}}"}"""));
+
+        var exception = Assert.Throws<PreMortemValidationException>(() =>
+            PreMortemRules.ParseReview(
+                $$"""
+                 PRE_MORTEM_STATUS: FINDINGS
+                 PRE_MORTEM_FINDINGS_V1_BEGIN
+                 {"Version":"pre-mortem-findings-v1","Findings":[{{sixFindings}}]}
+                 PRE_MORTEM_FINDINGS_V1_END
+                 """));
+
+        Assert.False(clear.HasFindings);
+        Assert.Empty(clear.Findings);
+        Assert.Contains(
+            exception.Errors,
+            error => error.Contains("at most 5", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void RevisionAssignment_PreservesEveryValidatedFinding()
+    {
+        var findings = string.Join(
+            ",",
+            Enumerable.Range(1, 5).Select(index =>
+                $$"""{"FailureMode":"failure {{index}}","Evidence":"proof {{index}}","MissedSignal":"signal {{index}}","Prevention":"prevention {{index}}"}"""));
+        var review = $$"""
+            PRE_MORTEM_STATUS: FINDINGS
+            PRE_MORTEM_FINDINGS_V1_BEGIN
+            {"Version":"pre-mortem-findings-v1","Findings":[{{findings}}]}
+            PRE_MORTEM_FINDINGS_V1_END
+            """;
+
+        _ = PreMortemRules.ParseReview(review);
+        var assignment = WorkflowEngine.BuildPreMortemRevisionAssignment(
+            review,
+            "software-engineer");
+
+        Assert.Contains("\"FailureMode\":\"failure 1\"", assignment);
+        Assert.Contains("\"FailureMode\":\"failure 5\"", assignment);
+        Assert.Contains(PreMortemRules.FindingsEndSentinel, assignment);
+    }
+
+    [Fact]
+    public void RevisionAssignment_PreservesTheOriginalAgentsRoleBoundary()
+    {
+        var designer = WorkflowEngine.BuildPreMortemRevisionAssignment(
+            "PRE_MORTEM_STATUS: FINDINGS",
+            "product-designer");
+        var engineer = WorkflowEngine.BuildPreMortemRevisionAssignment(
+            "PRE_MORTEM_STATUS: FINDINGS",
+            "software-engineer");
+
+        Assert.Contains("Do not implement downstream product corrections", designer);
+        Assert.Contains("make the focused corrections owned by this role", engineer);
+    }
+
+    [Theory]
+    [InlineData("claude-sonnet-5", "anthropic")]
+    [InlineData("gpt-5.6-sol", "openai")]
+    [InlineData("o3-mini", "openai")]
+    [InlineData("gemini-3.7-flash", "google")]
+    [InlineData("grok-4.6", "xai")]
+    [InlineData("mai-code-1.1-flash", "microsoft")]
+    public void ModelFamily_IsStableAcrossKnownModelLines(
+        string model,
+        string expectedFamily)
+    {
+        Assert.Equal(expectedFamily, ModelFamilyClassifier.Classify(model));
+    }
+
+    [Fact]
+    public void PersistedCheckpoints_AreDisabledWhenTheCurrentCapIsZero()
+    {
+        var profile = new TaskProfile
+        {
+            FlowRunId = Guid.NewGuid(),
+            Iteration = 1,
+            Role = "software-engineer",
+            RiskReason = "Test checkpoint.",
+            PreMortemAfter = true
+        };
+
+        Assert.Empty(WorkflowEngine.SelectEnabledPreMortemCheckpoints(
+            [profile],
+            preMortemAvailable: false));
+    }
+
+    [Theory]
+    [InlineData(1, 0, false)]
+    [InlineData(1, 1, true)]
+    [InlineData(2, 1, false)]
+    [InlineData(2, 2, true)]
+    public void CurrentRoundCap_GatesPersistedReviews(
+        int round,
+        int maximumRounds,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            WorkflowEngine.ShouldRunPreMortemRound(round, maximumRounds));
+    }
+}
+
 public sealed class FeedbackRoutingAttributionTests
 {
     [Fact]
@@ -279,6 +432,82 @@ public sealed class RoutingPersistenceTests
             await database.TaskProfiles.CountAsync(item =>
                 item.FlowRunId == flow.Id &&
                 item.Role == "account-manager"));
+    }
+
+    [Fact]
+    public async Task RoutingSchema_AddsPreMortemCheckpointToExistingProfiles()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                CREATE TABLE TaskProfiles (
+                    Id TEXT NOT NULL CONSTRAINT PK_TaskProfiles PRIMARY KEY,
+                    FlowRunId TEXT NOT NULL,
+                    Iteration INTEGER NOT NULL,
+                    FlowStepId TEXT NULL,
+                    Role TEXT NOT NULL
+                );
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var database = new HarnessDbContext(options);
+
+        await DatabaseInitializer.EnsureRoutingSchemaAsync(database);
+        await using var probe = connection.CreateCommand();
+        probe.CommandText =
+            "SELECT COUNT(*) FROM pragma_table_info('TaskProfiles') " +
+            "WHERE name = 'PreMortemAfter';";
+
+        Assert.Equal(1L, Convert.ToInt64(await probe.ExecuteScalarAsync()));
+    }
+}
+
+public sealed class RetryProfileRoutingTests
+{
+    [Fact]
+    public void RetryProfile_UsesItsCausalCheckpoint()
+    {
+        var firstStepId = Guid.NewGuid();
+        var secondStepId = Guid.NewGuid();
+        var retry = new FlowStep
+        {
+            FlowRunId = Guid.NewGuid(),
+            Iteration = 1,
+            AgentId = WorkflowEngine.PreMortemRole,
+            AgentName = "Pre-mortem Sceptic",
+            AgentRole = WorkflowEngine.PreMortemRole,
+            RetryOfStepId = firstStepId
+        };
+        var first = new TaskProfile
+        {
+            FlowRunId = retry.FlowRunId,
+            Iteration = 1,
+            FlowStepId = firstStepId,
+            Role = WorkflowEngine.PreMortemRole,
+            Complexity = 3,
+            RiskReason = "First checkpoint."
+        };
+        var newerUnrelated = new TaskProfile
+        {
+            FlowRunId = retry.FlowRunId,
+            Iteration = 1,
+            FlowStepId = secondStepId,
+            Role = WorkflowEngine.PreMortemRole,
+            Complexity = 10,
+            RiskReason = "Later checkpoint.",
+            CreatedAt = first.CreatedAt.AddMinutes(1)
+        };
+
+        Assert.Same(
+            first,
+            AdaptiveModelRouter.SelectRetrySourceProfile(
+                retry,
+                [newerUnrelated, first]));
     }
 }
 

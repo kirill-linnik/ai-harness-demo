@@ -62,6 +62,24 @@ public sealed class HandoffGateEngineTests
     }
 
     [Fact]
+    public void SupersedeProposal_ResolvesAKillSwitchBlockedGate()
+    {
+        using var gate = new HandoffGateEngine();
+        gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
+        gate.EngageKillSwitch();
+        var record = gate.SubmitProposal(Proposal(HandoffActionType.Release));
+
+        var superseded = gate.SupersedeProposal(
+            record.Id,
+            "harness",
+            "Revised candidate.");
+
+        Assert.Equal(HandoffGateDecision.BlockedKillSwitch, superseded.Decision);
+        Assert.True(superseded.Resolved);
+        Assert.False(superseded.Approved);
+    }
+
+    [Fact]
     public void SetTrustLevel_RejectsAutomaticRelease()
     {
         using var gate = new HandoffGateEngine();

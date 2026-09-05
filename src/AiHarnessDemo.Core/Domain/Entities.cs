@@ -214,6 +214,18 @@ public sealed class FlowStep
 
     public string PushbackReason { get; set; } = string.Empty;
 
+    public Guid? RetryOfStepId { get; set; }
+
+    public Guid? DependsOnStepId { get; set; }
+
+    public Guid? PushbackRootStepId { get; set; }
+
+    public Guid? PreMortemOriginStepId { get; set; }
+
+    public Guid? PreMortemTargetStepId { get; set; }
+
+    public Guid? PreMortemReviewStepId { get; set; }
+
     public DateTimeOffset? StartedAt { get; set; }
 
     public DateTimeOffset? CompletedAt { get; set; }
@@ -261,6 +273,8 @@ public sealed class TaskProfile
 
     /// <summary>JSON array of bounded rationale strings.</summary>
     public string RationalesJson { get; set; } = "[]";
+
+    public bool PreMortemAfter { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

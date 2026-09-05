@@ -72,7 +72,8 @@ public static class TaskProfileRules
             Risk = Enum.Parse<TaskRisk>(input.Risk, ignoreCase: false),
             RiskReason = input.RiskReason.Trim(),
             Confidence = input.Confidence,
-            RationalesJson = JsonSerializer.Serialize(rationales)
+            RationalesJson = JsonSerializer.Serialize(rationales),
+            PreMortemAfter = false
         };
     }
 
@@ -246,8 +247,31 @@ public static class TaskProfileRules
             Risk = source.Risk,
             RiskReason = source.RiskReason,
             Confidence = source.Confidence,
-            RationalesJson = source.RationalesJson
+            RationalesJson = source.RationalesJson,
+            PreMortemAfter = source.PreMortemAfter
         };
+
+    public static TaskProfile CreatePreMortem(
+        TaskProfile source,
+        Guid flowStepId) =>
+        Create(
+            new TaskProfileInput(
+                "pre-mortem-sceptic",
+                source.Complexity,
+                Math.Max(8, source.ReasoningDepth),
+                Math.Max(8, source.ContextDemand),
+                Math.Max(6, source.ToolIntensity),
+                [TaskTypeTag.Quality.ToString(), TaskTypeTag.CrossCutting.ToString()],
+                source.Risk.ToString(),
+                "Independent evidence-based failure reconstruction for the selected handoff.",
+                source.Confidence,
+                [
+                    "The review must investigate the evaluated result independently.",
+                    "Only verifiable failure evidence can trigger a revision."
+                ]),
+            source.FlowRunId,
+            source.Iteration,
+            flowStepId);
 
     private static void ValidateMetric(int value, string name, ICollection<string> errors)
     {

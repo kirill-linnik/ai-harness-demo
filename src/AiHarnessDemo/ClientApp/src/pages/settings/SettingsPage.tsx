@@ -43,7 +43,7 @@ export function SettingsPage() {
 
   async function onSave() {
     if (!Number.isInteger(maxHandoffRetries) || maxHandoffRetries < 0 || maxHandoffRetries > 10) {
-      toast("Handoff retries must be a whole number between 0 and 10.", "error");
+      toast("Correction and pre-mortem rounds must be a whole number between 0 and 10.", "error");
       return;
     }
 
@@ -294,7 +294,7 @@ export function SettingsPage() {
                 </div>
               </div>
               <div className="field" style={{ marginTop: 16 }}>
-                <label htmlFor="max-handoff-retries">Handoff retries</label>
+                <label htmlFor="max-handoff-retries">Correction and pre-mortem rounds</label>
                 <input
                   id="max-handoff-retries"
                   type="number"
@@ -305,8 +305,8 @@ export function SettingsPage() {
                   onChange={event => setMaxHandoffRetries(Number(event.target.value))}
                 />
                 <small>
-                  Maximum corrective upstream turns for one blocked agent. The flow stops only after this limit is
-                  exhausted.
+                  Maximum upstream corrections per blocked handoff and total sceptic runs per Team Lead checkpoint.
+                  Pushback exhaustion stops the flow; pre-mortem exhaustion advances with the latest complete result.
                 </small>
               </div>
               <div className="callout" style={{ marginTop: 16 }}>

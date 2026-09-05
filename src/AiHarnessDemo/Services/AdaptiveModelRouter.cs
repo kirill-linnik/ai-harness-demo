@@ -14,7 +14,8 @@ public sealed record RoutingRequest(
     Guid FlowStepId,
     ModelSelectionStrategy Strategy,
     IReadOnlyCollection<ModelCandidateKey>? ExcludedCandidates = null,
-    bool SupersedeExisting = false);
+    bool SupersedeExisting = false,
+    IReadOnlyCollection<string>? ExcludedModelFamilies = null);
 
 public interface IModelRouter
 {
@@ -57,6 +58,8 @@ public sealed class AdaptiveModelRouter(
             .FirstOrDefaultAsync(cancellationToken);
         if (existing is not null && !request.SupersedeExisting)
         {
+            var persistedExcludedFamilies = NormalizeFamilies(
+                request.ExcludedModelFamilies);
             var stillAvailable = await database.ModelCatalogCandidates
                 .AsNoTracking()
                 .AnyAsync(
@@ -66,12 +69,14 @@ public sealed class AdaptiveModelRouter(
                         item.Model == existing.SelectedModel &&
                         item.Effort == existing.SelectedEffort,
                     cancellationToken);
-            if (!stillAvailable)
+            if (!stillAvailable ||
+                persistedExcludedFamilies.Contains(
+                    ModelFamilyClassifier.Classify(existing.SelectedModel)))
             {
                 throw new InvalidOperationException(
                     $"The persisted route {existing.SelectedModel}/{existing.SelectedEffort} " +
-                    "is not available in the current Copilot ACP catalog. The interrupted " +
-                    "execution cannot be rerouted safely.");
+                    "is unavailable or violates the required model-family separation. " +
+                    "The interrupted execution cannot be rerouted safely.");
             }
             return existing;
         }
@@ -86,32 +91,50 @@ public sealed class AdaptiveModelRouter(
             cancellationToken);
         if (profile is null)
         {
-            profile = await database.TaskProfiles
-                .Where(item =>
-                    item.FlowRunId == step.FlowRunId &&
-                    item.Iteration == step.Iteration &&
-                    item.Role == step.AgentRole &&
-                    item.FlowStepId == null)
-                .OrderBy(item => item.CreatedAt)
-                .FirstOrDefaultAsync(cancellationToken);
-            if (profile is not null)
-            {
-                profile.FlowStepId = step.Id;
-            }
-            else
-            {
-                var source = await database.TaskProfiles
+            var retryProfiles = step.RetryOfStepId is null
+                ? []
+                : await database.TaskProfiles
                     .AsNoTracking()
                     .Where(item =>
                         item.FlowRunId == step.FlowRunId &&
                         item.Iteration == step.Iteration &&
-                        item.Role == step.AgentRole)
-                    .OrderByDescending(item => item.CreatedAt)
-                    .FirstOrDefaultAsync(cancellationToken)
-                    ?? throw new InvalidOperationException(
-                        $"No validated task profile exists for role '{step.AgentRole}'.");
-                profile = TaskProfileRules.CopyForStep(source, step.Id);
+                        item.FlowStepId == step.RetryOfStepId)
+                    .ToListAsync(cancellationToken);
+            var retrySource = SelectRetrySourceProfile(step, retryProfiles);
+            if (retrySource is not null)
+            {
+                profile = TaskProfileRules.CopyForStep(retrySource, step.Id);
                 database.TaskProfiles.Add(profile);
+            }
+            else
+            {
+                profile = await database.TaskProfiles
+                    .Where(item =>
+                        item.FlowRunId == step.FlowRunId &&
+                        item.Iteration == step.Iteration &&
+                        item.Role == step.AgentRole &&
+                        item.FlowStepId == null)
+                    .OrderBy(item => item.CreatedAt)
+                    .FirstOrDefaultAsync(cancellationToken);
+                if (profile is not null)
+                {
+                    profile.FlowStepId = step.Id;
+                }
+                else
+                {
+                    var source = await database.TaskProfiles
+                        .AsNoTracking()
+                        .Where(item =>
+                            item.FlowRunId == step.FlowRunId &&
+                            item.Iteration == step.Iteration &&
+                            item.Role == step.AgentRole)
+                        .OrderByDescending(item => item.CreatedAt)
+                        .FirstOrDefaultAsync(cancellationToken)
+                        ?? throw new InvalidOperationException(
+                            $"No validated task profile exists for role '{step.AgentRole}'.");
+                    profile = TaskProfileRules.CopyForStep(source, step.Id);
+                    database.TaskProfiles.Add(profile);
+                }
             }
             await database.SaveChangesAsync(cancellationToken);
         }
@@ -125,6 +148,7 @@ public sealed class AdaptiveModelRouter(
             .ThenBy(item => item.EffortOrder)
             .ToListAsync(cancellationToken);
         var excluded = request.ExcludedCandidates?.ToHashSet() ?? [];
+        var excludedFamilies = NormalizeFamilies(request.ExcludedModelFamilies);
         var availabilityCutoff = timeProvider.GetUtcNow() - ModelAvailabilityCooldown;
         var unavailableRows = await (
                 from observation in database.RoutingObservations.AsNoTracking()
@@ -144,12 +168,20 @@ public sealed class AdaptiveModelRouter(
             new ModelCandidateKey(item.SelectedModel, item.SelectedEffort)));
         candidates = candidates
             .Where(candidate =>
-                !excluded.Contains(new ModelCandidateKey(candidate.Model, candidate.Effort)))
+                !excluded.Contains(new ModelCandidateKey(candidate.Model, candidate.Effort)) &&
+                !excludedFamilies.Contains(
+                    ModelFamilyClassifier.Classify(candidate.Model)))
             .ToList();
         if (candidates.Count == 0)
         {
+            var familyDetail = excludedFamilies.Count == 0
+                ? string.Empty
+                : " outside excluded model families: " +
+                  string.Join(", ", excludedFamilies.Order(StringComparer.Ordinal));
             throw new InvalidOperationException(
-                "No enabled discovered model/effort candidate remains after availability exclusions.");
+                "No enabled discovered model/effort candidate remains after availability exclusions" +
+                familyDetail +
+                ".");
         }
 
         var observations = await (
@@ -324,6 +356,22 @@ public sealed class AdaptiveModelRouter(
         TaskRisk.Critical => 1.00,
         _ => throw new ArgumentOutOfRangeException(nameof(risk), risk, null)
     };
+
+    private static HashSet<string> NormalizeFamilies(
+        IReadOnlyCollection<string>? families) =>
+        families?
+            .Where(family => !string.IsNullOrWhiteSpace(family))
+            .Select(family => family.Trim().ToLowerInvariant())
+            .ToHashSet(StringComparer.Ordinal) ??
+        [];
+
+    internal static TaskProfile? SelectRetrySourceProfile(
+        FlowStep step,
+        IEnumerable<TaskProfile> profiles) =>
+        step.RetryOfStepId is { } retryOfStepId
+            ? profiles.SingleOrDefault(
+                profile => profile.FlowStepId == retryOfStepId)
+            : null;
 
     private static CandidateScore Score(
         ModelCatalogCandidate candidate,

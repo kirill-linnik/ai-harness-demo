@@ -204,6 +204,7 @@ public sealed class HandoffGateEngine : IDisposable
                 throw new InvalidOperationException(
                     $"Gate record {recordId} does not require human approval.");
             }
+
             if (record.Resolved)
             {
                 throw new InvalidOperationException(
@@ -212,6 +213,29 @@ public sealed class HandoffGateEngine : IDisposable
 
             record.Resolved = true;
             record.Approved = approved;
+            record.ResolvedBy = resolvedBy;
+            record.ResolutionNote = note;
+            record.ResolvedAt = DateTimeOffset.UtcNow;
+            return record;
+        }
+    }
+
+    public HandoffGateRecord SupersedeProposal(
+        Guid recordId,
+        string resolvedBy,
+        string note)
+    {
+        lock (_lock)
+        {
+            var record = RequireRecord(recordId);
+            if (record.Resolved)
+            {
+                throw new InvalidOperationException(
+                    $"Gate record {recordId} was already resolved.");
+            }
+
+            record.Resolved = true;
+            record.Approved = false;
             record.ResolvedBy = resolvedBy;
             record.ResolutionNote = note;
             record.ResolvedAt = DateTimeOffset.UtcNow;

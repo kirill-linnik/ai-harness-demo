@@ -199,6 +199,31 @@ public sealed class AgentHandoffInspectorTests
         Assert.Null(AgentHandoffInspector.GetPushbackReason(output));
     }
 
+    [Theory]
+    [InlineData("PRE_MORTEM_DISPOSITION: UNCHANGED", false)]
+    [InlineData("HANDOFF_STATUS: PUSHBACK\nPRE_MORTEM_DISPOSITION: UNCHANGED", false)]
+    [InlineData("HANDOFF_STATUS: COMPLETE\nPRE_MORTEM_DISPOSITION: UNCHANGED", true)]
+    [InlineData("HANDOFF_STATUS: COMPLETE\nHANDOFF_STATUS: COMPLETE", false)]
+    public void CompleteStatus_RequiresOneExplicitCompleteMarker(
+        string output,
+        bool expected)
+    {
+        Assert.Equal(expected, AgentHandoffInspector.HasCompleteStatus(output));
+    }
+
+    [Fact]
+    public void PreMortemRevisionContract_RejectsPushbackEvenWithDisposition()
+    {
+        const string output = """
+            HANDOFF_STATUS: PUSHBACK
+            PUSHBACK_REASON: More upstream evidence is required.
+            PRE_MORTEM_DISPOSITION: UNCHANGED
+            """;
+
+        Assert.Throws<PreMortemValidationException>(
+            () => WorkflowEngine.ValidatePreMortemRevisionOutput(output));
+    }
+
     [Fact]
     public void ApplyFlowFailure_SkipsEveryPendingDownstreamStep()
     {
@@ -261,7 +286,7 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--add-dir --acp --agent --allow-all-tools --available-tools --disable-builtin-mcps " +
+                "--add-dir --acp --agent --allow-all-tools --available-tools --disable-builtin-mcps --deny-tool --disallow-temp-dir " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --output-format --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
@@ -328,7 +353,7 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--agent --allow-all-tools --available-tools --disable-builtin-mcps " +
+                "--agent --allow-all-tools --available-tools --disable-builtin-mcps --deny-tool --disallow-temp-dir " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --output-format --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
@@ -708,7 +733,7 @@ public sealed class ProcessRunnerTests
                 [],
                 directory,
                 TimeSpan.FromSeconds(20),
-                environmentVariables: new Dictionary<string, string>
+                environmentVariables: new Dictionary<string, string?>
                 {
                     ["AI_HARNESS_PROCESS_TEST"] = "isolated"
                 });
@@ -718,6 +743,59 @@ public sealed class ProcessRunnerTests
         }
         finally
         {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_RemovesInheritedEnvironmentVariables()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-process-environment-remove-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var variableName = $"AI_HARNESS_REMOVE_{Guid.NewGuid():N}";
+        Environment.SetEnvironmentVariable(variableName, "sensitive");
+
+        try
+        {
+            var command = Path.Combine(directory, "environment-command");
+            if (OperatingSystem.IsWindows())
+            {
+                await File.WriteAllTextAsync(
+                    $"{command}.cmd",
+                    "@echo off\r\nexit /b 1\r\n");
+                await File.WriteAllTextAsync(
+                    $"{command}.ps1",
+                    $"Write-Output $env:{variableName}\r\n");
+            }
+            else
+            {
+                await File.WriteAllTextAsync(
+                    command,
+                    $"#!/bin/sh\nprintf '%s\\n' \"${variableName}\"\n");
+                File.SetUnixFileMode(
+                    command,
+                    File.GetUnixFileMode(command) |
+                    UnixFileMode.UserExecute);
+            }
+
+            var result = await new ProcessRunner().RunAsync(
+                command,
+                [],
+                directory,
+                TimeSpan.FromSeconds(20),
+                environmentVariables: new Dictionary<string, string?>
+                {
+                    [variableName] = null
+                });
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(string.IsNullOrWhiteSpace(result.StandardOutput));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variableName, null);
             Directory.Delete(directory, recursive: true);
         }
     }

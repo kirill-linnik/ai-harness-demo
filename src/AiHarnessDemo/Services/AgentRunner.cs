@@ -30,7 +30,9 @@ public sealed record AgentExecutionContext(
     bool AllowRemotePublication = false,
     bool ResumeSession = false,
     bool RecoverInterruptedSession = false,
-    Action<AgentRunProgress>? Progress = null);
+    Action<AgentRunProgress>? Progress = null,
+    bool IsPreMortemRevision = false,
+    DateTimeOffset? InvocationStartedAt = null);
 
 public sealed record AgentExecutionResult(
     string Output,
@@ -134,7 +136,9 @@ public sealed class AgentRunner(
                             AgentId = context.AgentId,
                             Model = context.Model,
                             Effort = context.ModelEffort,
-                            CorrelationId = $"{context.FlowId:N}:{context.Iteration}:{context.AgentId}:{context.Attempt}",
+                            CorrelationId =
+                                $"{context.FlowId:N}:{context.Iteration}:{context.AgentId}:" +
+                                $"{context.CopilotSessionId:N}:{context.Attempt}",
                             CopilotSessionId = context.CopilotSessionId,
                             WorkingDirectory = context.WorkspacePath,
                             InputContext = new Dictionary<string, object?>

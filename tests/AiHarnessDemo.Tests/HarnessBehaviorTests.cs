@@ -513,6 +513,29 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
+    public void PreMortemInvocation_EnforcesReadOnlyResearchTools()
+    {
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            "pre-mortem-sceptic",
+            "pre-mortem-sceptic",
+            "gpt-5.6-sol",
+            "max",
+            Guid.Parse("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            "Investigate.");
+
+        Assert.Contains(
+            "--available-tools=view,grep,glob,web_search",
+            arguments);
+        Assert.Contains("--deny-tool=write,shell", arguments);
+        Assert.Contains("--disallow-temp-dir", arguments);
+        Assert.Contains("--no-custom-instructions", arguments);
+        Assert.Contains("--no-eager-powershell-resolution", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+    }
+
+    [Fact]
     public void SessionHome_UsesTheInheritedAuthenticatedCopilotHome()
     {
         Assert.Equal(
@@ -570,7 +593,7 @@ public sealed class CopilotReasoningHostTests
     [Fact]
     public void PreApprovalRelease_BlocksRemotePublicationCredentials()
     {
-        var guarded = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
+        var guarded = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
             CopilotReasoningHost.BuildProcessEnvironment(
                 "release-engineer",
                 allowRemotePublication: false));
@@ -583,6 +606,113 @@ public sealed class CopilotReasoningHostTests
         Assert.Null(CopilotReasoningHost.BuildProcessEnvironment(
             "software-engineer",
             allowRemotePublication: false));
+    }
+
+    [Fact]
+    public void PreMortemEnvironment_RemovesPublicationCredentials()
+    {
+        var guarded = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
+            CopilotReasoningHost.BuildProcessEnvironment(
+                "pre-mortem-sceptic",
+                allowRemotePublication: false));
+
+        Assert.Null(guarded["GH_TOKEN"]);
+        Assert.Null(guarded["GITHUB_TOKEN"]);
+        Assert.Equal(
+            "disabled://pre-mortem-read-only",
+            guarded["GIT_CONFIG_VALUE_0"]);
+    }
+
+    [Fact]
+    public async Task PreMortemAgentDefinition_IsStagedOutsideTheHarnessRoot()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"restricted-agent-{Guid.NewGuid():N}");
+        var harnessRoot = Path.Combine(root, "harness");
+        var copilotHome = Path.Combine(root, "copilot");
+        var sourceDirectory = Path.Combine(harnessRoot, ".github", "agents");
+        Directory.CreateDirectory(sourceDirectory);
+        var source = Path.Combine(
+            sourceDirectory,
+            "pre-mortem-sceptic.agent.md");
+        await File.WriteAllTextAsync(source, "# Pre-mortem Sceptic");
+
+        try
+        {
+            var access = await CopilotReasoningHost.PrepareRestrictedAgentRootAsync(
+                copilotHome,
+                "pre-mortem-sceptic",
+                source,
+                Guid.Parse("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"));
+            var files = Directory.GetFiles(
+                access.Root,
+                "*",
+                SearchOption.AllDirectories);
+
+            Assert.StartsWith(Path.GetFullPath(copilotHome), access.Root);
+            Assert.DoesNotContain(Path.GetFullPath(harnessRoot), access.Root);
+            Assert.Single(files);
+            Assert.EndsWith(
+                $"{access.AgentId}.agent.md",
+                files[0],
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void StagedAgentDefinition_RemovesModelOverride()
+    {
+        var sanitized = CopilotReasoningHost.RemoveAgentModelFrontMatter(
+            """
+            ---
+            name: Pre-mortem Sceptic
+            model: claude-opus-5
+            description: Independent review.
+            ---
+
+            # Contract
+            """);
+
+        Assert.DoesNotContain("model:", sanitized);
+        Assert.Contains("name: Pre-mortem Sceptic", sanitized);
+        Assert.Contains("# Contract", sanitized);
+    }
+
+    [Fact]
+    public void RevisionJournalRecovery_RequiresTheRevisionContract()
+    {
+        const string priorHandoff = "HANDOFF_STATUS: COMPLETE";
+        const string revision = """
+            HANDOFF_STATUS: COMPLETE
+            PRE_MORTEM_DISPOSITION: ADJUSTED
+            """;
+
+        Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
+            "software-engineer",
+            priorHandoff,
+            isPreMortemRevision: true));
+        Assert.True(CopilotReasoningHost.IsRecoverableCompletedOutput(
+            "software-engineer",
+            revision,
+            isPreMortemRevision: true));
+    }
+
+    [Fact]
+    public void ResumedJournalRecovery_RequiresOutputFromTheCurrentInvocation()
+    {
+        var invocationStartedAt = DateTimeOffset.UtcNow;
+
+        Assert.False(CopilotReasoningHost.IsRecoveryCurrent(
+            invocationStartedAt,
+            invocationStartedAt.AddSeconds(-1)));
+        Assert.True(CopilotReasoningHost.IsRecoveryCurrent(
+            invocationStartedAt,
+            invocationStartedAt.AddSeconds(1)));
     }
 
     [Fact]
@@ -770,6 +900,17 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("PUSHBACK_REASON", contract);
         Assert.DoesNotContain("harness will resume", contract, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public void PreMortemRevisionContract_RequiresCompleteAndDisposition()
+    {
+        var contract = CopilotReasoningHost.PreMortemRevisionResponseContract();
+
+        Assert.Contains("HANDOFF_STATUS: COMPLETE", contract);
+        Assert.Contains("PRE_MORTEM_DISPOSITION: ADJUSTED", contract);
+        Assert.Contains("PRE_MORTEM_DISPOSITION: UNCHANGED", contract);
+        Assert.Contains("Do not emit HANDOFF_STATUS: PUSHBACK", contract);
+    }
 }
 
 public sealed class AgentRunnerRecoveryTests
@@ -873,6 +1014,50 @@ public sealed class PushbackRecoveryTests
         Assert.Equal("quality-engineer", retry.AgentId);
         Assert.Equal(70, retry.Sequence);
         Assert.Equal(2, retry.Attempt);
+        Assert.Equal(blocked.Id, retry.RetryOfStepId);
+        Assert.Equal(revision.Id, retry.DependsOnStepId);
+        Assert.Equal(blocked.Id, retry.PushbackRootStepId);
+    }
+
+    [Fact]
+    public void PushbackRetry_PreservesManualRetryLineage()
+    {
+        var rootFailureId = Guid.NewGuid();
+        var flow = new FlowRun
+        {
+            Title = "Recover feature",
+            OriginalRequest = "Recover feature",
+            Iteration = 1
+        };
+        var blocked = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 50,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Status = StepStatus.Pushback,
+            Attempt = 2,
+            RetryOfStepId = rootFailureId,
+            PushbackReason = "Evidence is incomplete."
+        };
+        var upstream = new AgentRecord
+        {
+            Id = "software-engineer",
+            Name = "Software Engineer",
+            Description = "Implements changes.",
+            Role = "software-engineer",
+            SourcePath = "software-engineer.agent.md"
+        };
+
+        var (_, retry) = WorkflowEngine.CreateRecoverySteps(
+            flow,
+            blocked,
+            upstream,
+            revisionAttempt: 3);
+
+        Assert.Equal(rootFailureId, retry.RetryOfStepId);
     }
 
     [Fact]
@@ -1189,6 +1374,9 @@ public sealed class WorkflowPushbackLoopTests
                     TEAM_TASK_PROFILES_V1_BEGIN
                     {"Version":"task-profile-v1","Profiles":[{"Role":"software-engineer","Complexity":5,"ReasoningDepth":6,"ContextDemand":5,"ToolIntensity":8,"TaskTypeTags":["Implementation"],"Risk":"Medium","RiskReason":"Implementation changes product behavior.","Confidence":0.8,"Rationales":["Code and tests are required."]},{"Role":"quality-engineer","Complexity":5,"ReasoningDepth":6,"ContextDemand":6,"ToolIntensity":7,"TaskTypeTags":["Quality"],"Risk":"Medium","RiskReason":"Independent validation is required.","Confidence":0.8,"Rationales":["Acceptance evidence must be checked."]},{"Role":"release-engineer","Complexity":4,"ReasoningDepth":4,"ContextDemand":6,"ToolIntensity":6,"TaskTypeTags":["Release"],"Risk":"High","RiskReason":"Packaging changes repository state.","Confidence":0.8,"Rationales":["Verified work must be packaged."]}]}
                     TEAM_TASK_PROFILES_V1_END
+                    PRE_MORTEM_PLAN_V1_BEGIN
+                    {"Version":"pre-mortem-plan-v1","AfterRoles":[]}
+                    PRE_MORTEM_PLAN_V1_END
                     """;
             }
             return Task.FromResult(new AgentExecutionResult(
@@ -1330,9 +1518,44 @@ public sealed class PersistenceTests
         {
             command.CommandText = """
                 CREATE TABLE FlowSteps (
-                    Id TEXT NOT NULL CONSTRAINT PK_FlowSteps PRIMARY KEY
+                    Id TEXT NOT NULL CONSTRAINT PK_FlowSteps PRIMARY KEY,
+                    FlowRunId TEXT NOT NULL,
+                    Iteration INTEGER NOT NULL,
+                    Sequence INTEGER NOT NULL,
+                    AgentId TEXT NOT NULL,
+                    AgentName TEXT NOT NULL,
+                    Attempt INTEGER NOT NULL,
+                    Label TEXT NOT NULL,
+                    Status TEXT NOT NULL,
+                    Phase TEXT NOT NULL DEFAULT 'PreparingWorkspace'
                 );
-                INSERT INTO FlowSteps (Id) VALUES ('legacy-step');
+                CREATE TABLE FlowEvents (
+                    Id TEXT NOT NULL CONSTRAINT PK_FlowEvents PRIMARY KEY,
+                    FlowRunId TEXT NOT NULL,
+                    FlowStepId TEXT NULL,
+                    Type TEXT NOT NULL
+                );
+                INSERT INTO FlowSteps
+                    (Id, FlowRunId, Iteration, Sequence, AgentId, AgentName, Attempt, Label, Status)
+                VALUES
+                    ('failed-step', 'flow', 1, 10, 'software-engineer', 'Software Engineer', 1, 'Execute Software Engineer contract', 'Failed'),
+                    ('retry-step', 'flow', 1, 20, 'software-engineer', 'Software Engineer', 2, 'Manual restart of Software Engineer', 'Pending'),
+                    ('pushback-step', 'flow', 1, 30, 'quality-engineer', 'Quality Engineer', 1, 'Execute Quality Engineer contract', 'Pushback'),
+                    ('revision-step', 'flow', 1, 40, 'software-engineer', 'Software Engineer', 3, 'Revision after Quality Engineer pushback', 'Pushback'),
+                    ('effective-revision', 'flow', 1, 45, 'software-engineer', 'Software Engineer', 4, 'Retry after Architect revision', 'Completed'),
+                    ('handoff-retry', 'flow', 1, 50, 'quality-engineer', 'Quality Engineer', 2, 'Retry after Software Engineer revision', 'Failed'),
+                    ('manual-handoff-retry', 'flow', 1, 60, 'quality-engineer', 'Quality Engineer', 3, 'Manual restart of Quality Engineer', 'Pending'),
+                    ('legacy-qa-pushback', 'flow', 1, 70, 'quality-engineer', 'Quality Engineer', 4, 'Execute Quality Engineer contract', 'Pushback'),
+                    ('legacy-qa-revision', 'flow', 1, 80, 'software-engineer', 'Software Engineer', 5, 'Revision after QA pushback', 'Completed'),
+                    ('legacy-revalidate', 'flow', 1, 90, 'quality-engineer', 'Quality Engineer', 5, 'Re-validate corrected handoff', 'Pending'),
+                    ('old-pushback', 'flow', 1, 100, 'quality-engineer', 'Quality Engineer', 6, 'Execute Quality Engineer contract', 'Pushback'),
+                    ('old-revision', 'flow', 1, 110, 'software-engineer', 'Software Engineer', 6, 'Revision after Quality Engineer pushback', 'Completed'),
+                    ('latest-pushback', 'flow', 1, 120, 'quality-engineer', 'Quality Engineer', 7, 'Execute Quality Engineer contract', 'Pushback'),
+                    ('latest-revision', 'flow', 1, 130, 'software-engineer', 'Software Engineer', 7, 'Revision after Quality Engineer pushback', 'Running'),
+                    ('latest-retry', 'flow', 1, 140, 'quality-engineer', 'Quality Engineer', 8, 'Retry after Software Engineer revision', 'Pending'),
+                    ('legacy-invalid-correction', 'flow', 1, 150, 'team-lead', 'Team Lead', 2, 'Correct Team Lead task profiles', 'Completed');
+                INSERT INTO FlowEvents (Id, FlowRunId, FlowStepId, Type)
+                VALUES ('invalid-event', 'flow', 'legacy-invalid-correction', 'profile.validation-failed');
                 """;
             await command.ExecuteNonQueryAsync();
         }
@@ -1357,6 +1580,50 @@ public sealed class PersistenceTests
         Assert.Contains("CopilotSessionId", columns);
         Assert.Contains("CopilotSessionHome", columns);
         Assert.Contains("RemotePublicationAllowed", columns);
+        Assert.Contains("RetryOfStepId", columns);
+        Assert.Contains("DependsOnStepId", columns);
+        Assert.Contains("PushbackRootStepId", columns);
+        Assert.Contains("PreMortemOriginStepId", columns);
+        Assert.Contains("PreMortemTargetStepId", columns);
+        Assert.Contains("PreMortemReviewStepId", columns);
+        await using var backfillProbe = connection.CreateCommand();
+        backfillProbe.CommandText =
+            "SELECT RetryOfStepId FROM FlowSteps WHERE Id = 'retry-step';";
+        Assert.Equal("failed-step", await backfillProbe.ExecuteScalarAsync());
+        await using var dependencyProbe = connection.CreateCommand();
+        dependencyProbe.CommandText =
+            "SELECT DependsOnStepId || '|' || PushbackRootStepId " +
+            "FROM FlowSteps WHERE Id = 'handoff-retry';";
+        Assert.Equal(
+            "effective-revision|pushback-step",
+            await dependencyProbe.ExecuteScalarAsync());
+        await using var lineageProbe = connection.CreateCommand();
+        lineageProbe.CommandText =
+            "SELECT RetryOfStepId || '|' || PushbackRootStepId " +
+            "FROM FlowSteps WHERE Id = 'manual-handoff-retry';";
+        Assert.Equal(
+            "pushback-step|pushback-step",
+            await lineageProbe.ExecuteScalarAsync());
+        await using var historicalProbe = connection.CreateCommand();
+        historicalProbe.CommandText =
+            "SELECT RetryOfStepId || '|' || DependsOnStepId || '|' || PushbackRootStepId " +
+            "FROM FlowSteps WHERE Id = 'legacy-revalidate';";
+        Assert.Equal(
+            "legacy-qa-pushback|legacy-qa-revision|legacy-qa-pushback",
+            await historicalProbe.ExecuteScalarAsync());
+        await using var nearestProbe = connection.CreateCommand();
+        nearestProbe.CommandText =
+            "SELECT DependsOnStepId FROM FlowSteps WHERE Id = 'latest-retry';";
+        Assert.Equal(
+            "latest-revision",
+            await nearestProbe.ExecuteScalarAsync());
+        await using var correctionProbe = connection.CreateCommand();
+        correctionProbe.CommandText =
+            "SELECT Status || '|' || Phase " +
+            "FROM FlowSteps WHERE Id = 'legacy-invalid-correction';";
+        Assert.Equal(
+            "Failed|Failed",
+            await correctionProbe.ExecuteScalarAsync());
         Assert.Equal(System.Data.ConnectionState.Open, connection.State);
     }
 }

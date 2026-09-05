@@ -28,6 +28,9 @@ flowchart LR
     AM -->|customer-confirmed brief| TL[Team Lead]
     TL --> P[Dynamic agent plan]
     P --> A[Architecture and design]
+    A -. optional Team Lead checkpoint .-> S[Pre-mortem Sceptic]
+    S -->|evidence-backed findings| A
+    S -->|clear or round cap| E
     A --> E[Engineering]
     E --> Q[Quality gate]
     Q -->|pushback with exact gap| E
@@ -48,6 +51,7 @@ flowchart LR
 | `FlowPlanner` | Uses task complexity and domain signals to select only enabled specialists in dependency order. |
 | `ModelCatalogDiscovery` | Uses a dedicated bidirectional Copilot ACP process at startup to discover enabled explicit model + effort candidates and persist an audit snapshot. Current discovery is mandatory for readiness. |
 | `BootstrapTaskProfileFactory` / Team Lead profiles | Create strictly validated, normalized `task-profile-v1` routing inputs. Team Lead gets one visible correction turn for an invalid downstream profile contract. |
+| `PreMortemRules` / Pre-mortem Sceptic | Validate Team Lead's checkpoint plan, strict `CLEAR` or evidence-backed finding output, the five-finding cap, and the evaluated agent's adjustment disposition. |
 | `AdaptiveModelRouter` | Applies router-v1 recency-weighted Bayesian evidence, risk quality floors, lexicographic strategy objectives, and bounded deterministic exploration immediately before execution. |
 | `RoutingObservationRecorder` | Records normalized handoff quality, duration/retry, estimated premium use, availability failures, downstream pushback and targeted customer-rework attribution, and weak final approval evidence. |
 | `PreviewArtifactCatalog` | Resolves validated per-variant static builds from the isolated flow workspace and exposes them only after the customer release gate is ready. |
@@ -67,7 +71,7 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 - `Settings`: selected project folder, editable repository knowledge, outcome, retry bound, and model-selection strategy.
 - `Agents`: discovered role metadata and enabled state.
 - `Flows`: one durable customer workflow per shareable URL, including its queued strategy snapshot.
-- `FlowSteps`: agent, model + effort, attempt, state, duration, output, and pushback reason.
+- `FlowSteps`: agent, model + effort, attempt, state, duration, output, pushback reason, and durable pre-mortem origin/target/revision links.
 - `FlowMessages`: voice/text dialogue with Account Manager and Product Manager.
 - `FlowEvents`: append-only observable execution ledger.
 - `Learnings`: cross-flow prompt refinements created from failed handoff contracts.
@@ -86,10 +90,12 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 - Gives delivery agents only the two most recent completed handoffs in the current iteration; Product Manager receives the execution ledger required by its role.
 - Gives each agent project access inside the isolated workspace; use only with repositories you trust.
 - Classifies an explicit `PUSHBACK` before advance gating, records a revision request and reusable prompt refinement, resumes the responsible upstream Copilot session, then resumes the blocked agent with the corrected handoff.
+- Interleaves Team Lead-selected pre-mortem checkpoints with delivery steps. A review excludes the evaluated step's model family, receives an enforced read-only source/web research toolset with publication credentials removed, and fails closed when the discovered catalog has no different enabled family.
+- Feeds each evidence-backed pre-mortem result to the evaluated agent's original session. The agent returns a complete handoff plus an explicit adjusted/unchanged disposition; only adjusted results schedule another review.
 - Applies the hot-reloadable five-minute quiet watchdog to Fastest response and Lowest cost. Maximum quality scales that window up to the configured fifteen-minute cap using predicted accepted time while retaining the hard per-turn timeout.
 - Recovers a contract-valid final handoff from the Copilot session journal when the CLI does not shut down cleanly; otherwise only a confirmed interrupted journal is resumed on the next bounded runtime attempt.
 - Keeps release preparation local until the customer resolves the release gate. Approval queues a distinct Release Engineer publication step; only that post-approval step may push and create the configured pull request.
-- Bounds every agent-to-agent correction loop with the persisted Settings retry limit (`0-10`, default `2`); only exhaustion or a missing upstream owner makes the flow terminal and skips downstream steps.
+- Applies the persisted Settings limit (`0-10`, default `2`) independently to each blocked handoff and each Team Lead-selected pre-mortem checkpoint. Pushback exhaustion is terminal; pre-mortem exhaustion advances with the latest complete adjusted result.
 
 ## API shape
 

@@ -79,6 +79,12 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.Phase).HasConversion<string>();
             entity.Property(item => item.RemotePublicationAllowed).HasDefaultValue(false);
             entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.Sequence });
+            entity.HasIndex(item => item.RetryOfStepId);
+            entity.HasIndex(item => item.DependsOnStepId);
+            entity.HasIndex(item => item.PushbackRootStepId);
+            entity.HasIndex(item => item.PreMortemOriginStepId);
+            entity.HasIndex(item => item.PreMortemTargetStepId);
+            entity.HasIndex(item => item.PreMortemReviewStepId);
             entity.HasOne(item => item.FlowRun)
                 .WithMany(flow => flow.Steps)
                 .HasForeignKey(item => item.FlowRunId)
@@ -146,6 +152,7 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.HasKey(item => item.Id);
             entity.Property(item => item.Id).ValueGeneratedNever();
             entity.Property(item => item.Risk).HasConversion<string>();
+            entity.Property(item => item.PreMortemAfter).HasDefaultValue(false);
             entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.Role });
             entity.HasIndex(item => item.FlowStepId).IsUnique();
             entity.HasOne<FlowRun>()
@@ -338,6 +345,269 @@ public static class DatabaseInitializer
             "ALTER TABLE FlowSteps ADD COLUMN RemotePublicationAllowed " +
             "INTEGER NOT NULL DEFAULT 0;",
             cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'RetryOfStepId';",
+            "ALTER TABLE FlowSteps ADD COLUMN RetryOfStepId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'DependsOnStepId';",
+            "ALTER TABLE FlowSteps ADD COLUMN DependsOnStepId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PushbackRootStepId';",
+            "ALTER TABLE FlowSteps ADD COLUMN PushbackRootStepId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PreMortemOriginStepId';",
+            "ALTER TABLE FlowSteps ADD COLUMN PreMortemOriginStepId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PreMortemTargetStepId';",
+            "ALTER TABLE FlowSteps ADD COLUMN PreMortemTargetStepId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PreMortemReviewStepId';",
+            "ALTER TABLE FlowSteps ADD COLUMN PreMortemReviewStepId TEXT NULL;",
+            cancellationToken);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            UPDATE FlowSteps AS retry
+            SET RetryOfStepId = (
+                SELECT COALESCE(blocked.RetryOfStepId, blocked.Id)
+                FROM FlowSteps AS blocked
+                WHERE blocked.FlowRunId = retry.FlowRunId
+                  AND blocked.Iteration = retry.Iteration
+                  AND blocked.AgentId = retry.AgentId
+                  AND blocked.Sequence < retry.Sequence
+                  AND blocked.Status = 'Pushback'
+                ORDER BY blocked.Sequence DESC, blocked.Attempt DESC
+                LIMIT 1
+            )
+            WHERE retry.RetryOfStepId IS NULL
+              AND (
+                  retry.Label LIKE 'Retry after % revision'
+                  OR retry.Label = 'Re-validate corrected handoff'
+              );
+
+            UPDATE FlowSteps AS retry
+            SET RetryOfStepId = (
+                SELECT COALESCE(failed.RetryOfStepId, failed.Id)
+                FROM FlowSteps AS failed
+                WHERE failed.FlowRunId = retry.FlowRunId
+                  AND failed.Iteration = retry.Iteration
+                  AND failed.AgentId = retry.AgentId
+                  AND failed.Sequence < retry.Sequence
+                  AND failed.Status IN ('Failed', 'Pushback')
+                ORDER BY failed.Sequence DESC, failed.Attempt DESC
+                LIMIT 1
+            )
+            WHERE retry.RetryOfStepId IS NULL
+              AND retry.Label LIKE 'Manual restart of %'
+              AND EXISTS (
+                  SELECT 1
+                  FROM FlowSteps AS failed
+                  WHERE failed.FlowRunId = retry.FlowRunId
+                    AND failed.Iteration = retry.Iteration
+                    AND failed.AgentId = retry.AgentId
+                    AND failed.Sequence < retry.Sequence
+                    AND failed.Status IN ('Failed', 'Pushback')
+              );
+
+            UPDATE FlowSteps AS retry
+            SET DependsOnStepId = COALESCE(
+                (
+                    SELECT effective.Id
+                    FROM FlowSteps AS effective
+                    WHERE effective.FlowRunId = retry.FlowRunId
+                      AND effective.Iteration = retry.Iteration
+                      AND effective.Sequence < retry.Sequence
+                      AND effective.Status = 'Completed'
+                      AND (
+                          effective.Id = (
+                              SELECT revision.Id
+                              FROM FlowSteps AS revision
+                              WHERE revision.FlowRunId = retry.FlowRunId
+                                AND revision.Iteration = retry.Iteration
+                                AND revision.Sequence < retry.Sequence
+                                AND (
+                                    (retry.Label LIKE 'Retry after % revision'
+                                     AND revision.Label =
+                                         'Revision after ' || retry.AgentName || ' pushback')
+                                    OR
+                                    (retry.Label = 'Re-validate corrected handoff'
+                                     AND revision.Label = 'Revision after QA pushback')
+                                )
+                              ORDER BY revision.Sequence DESC, revision.Attempt DESC
+                              LIMIT 1
+                          )
+                          OR effective.RetryOfStepId = (
+                              SELECT revision.Id
+                              FROM FlowSteps AS revision
+                              WHERE revision.FlowRunId = retry.FlowRunId
+                                AND revision.Iteration = retry.Iteration
+                                AND revision.Sequence < retry.Sequence
+                                AND (
+                                    (retry.Label LIKE 'Retry after % revision'
+                                     AND revision.Label =
+                                         'Revision after ' || retry.AgentName || ' pushback')
+                                    OR
+                                    (retry.Label = 'Re-validate corrected handoff'
+                                     AND revision.Label = 'Revision after QA pushback')
+                                )
+                              ORDER BY revision.Sequence DESC, revision.Attempt DESC
+                              LIMIT 1
+                          )
+                      )
+                    ORDER BY effective.Sequence DESC, effective.Attempt DESC
+                    LIMIT 1
+                ),
+                (
+                    SELECT revision.Id
+                    FROM FlowSteps AS revision
+                    WHERE revision.FlowRunId = retry.FlowRunId
+                      AND revision.Iteration = retry.Iteration
+                      AND revision.Sequence < retry.Sequence
+                      AND (
+                          (retry.Label LIKE 'Retry after % revision'
+                           AND revision.Label =
+                               'Revision after ' || retry.AgentName || ' pushback')
+                          OR
+                          (retry.Label = 'Re-validate corrected handoff'
+                           AND revision.Label = 'Revision after QA pushback')
+                      )
+                    ORDER BY revision.Sequence DESC, revision.Attempt DESC
+                    LIMIT 1
+                )
+            )
+            WHERE retry.DependsOnStepId IS NULL
+              AND (
+                  retry.Label LIKE 'Retry after % revision'
+                  OR retry.Label = 'Re-validate corrected handoff'
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM FlowSteps AS revision
+                  WHERE revision.FlowRunId = retry.FlowRunId
+                    AND revision.Iteration = retry.Iteration
+                    AND revision.Sequence < retry.Sequence
+                    AND (
+                        (retry.Label LIKE 'Retry after % revision'
+                         AND revision.Label =
+                             'Revision after ' || retry.AgentName || ' pushback')
+                        OR
+                        (retry.Label = 'Re-validate corrected handoff'
+                         AND revision.Label = 'Revision after QA pushback')
+                    )
+              );
+
+            UPDATE FlowSteps AS retry
+            SET PushbackRootStepId = (
+                SELECT COALESCE(blocked.PushbackRootStepId, blocked.Id)
+                FROM FlowSteps AS blocked
+                WHERE blocked.FlowRunId = retry.FlowRunId
+                  AND blocked.Iteration = retry.Iteration
+                  AND blocked.AgentId = retry.AgentId
+                  AND blocked.Sequence < retry.Sequence
+                  AND blocked.Status = 'Pushback'
+                ORDER BY blocked.Sequence DESC, blocked.Attempt DESC
+                LIMIT 1
+            )
+            WHERE retry.PushbackRootStepId IS NULL
+              AND (
+                  retry.Label LIKE 'Retry after % revision'
+                  OR retry.Label = 'Re-validate corrected handoff'
+              );
+
+            UPDATE FlowSteps AS retry
+            SET PushbackRootStepId = (
+                SELECT COALESCE(
+                    parent.PushbackRootStepId,
+                    CASE
+                        WHEN parent.Status = 'Pushback' THEN parent.Id
+                        ELSE NULL
+                    END)
+                FROM FlowSteps AS parent
+                WHERE parent.Id = retry.RetryOfStepId
+            )
+            WHERE retry.PushbackRootStepId IS NULL
+              AND retry.Label LIKE 'Manual restart of %'
+              AND retry.RetryOfStepId IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_RetryOfStepId
+                ON FlowSteps (RetryOfStepId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_DependsOnStepId
+                ON FlowSteps (DependsOnStepId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_PushbackRootStepId
+                ON FlowSteps (PushbackRootStepId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_PreMortemOriginStepId
+                ON FlowSteps (PreMortemOriginStepId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_PreMortemTargetStepId
+                ON FlowSteps (PreMortemTargetStepId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_PreMortemReviewStepId
+                ON FlowSteps (PreMortemReviewStepId);
+            """,
+            cancellationToken);
+        for (var pass = 0; pass < 10; pass++)
+        {
+            await database.Database.ExecuteSqlRawAsync(
+                """
+                UPDATE FlowSteps AS retry
+                SET RetryOfStepId = (
+                    SELECT parent.RetryOfStepId
+                    FROM FlowSteps AS parent
+                    WHERE parent.Id = retry.RetryOfStepId
+                )
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM FlowSteps AS parent
+                    WHERE parent.Id = retry.RetryOfStepId
+                      AND parent.RetryOfStepId IS NOT NULL
+                      AND parent.RetryOfStepId <> retry.RetryOfStepId
+                );
+
+                UPDATE FlowSteps AS retry
+                SET PushbackRootStepId = (
+                    SELECT parent.PushbackRootStepId
+                    FROM FlowSteps AS parent
+                    WHERE parent.Id = retry.RetryOfStepId
+                )
+                WHERE retry.PushbackRootStepId IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM FlowSteps AS parent
+                      WHERE parent.Id = retry.RetryOfStepId
+                        AND parent.PushbackRootStepId IS NOT NULL
+                  );
+                """,
+                cancellationToken);
+        }
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            UPDATE FlowSteps
+            SET Status = 'Failed',
+                Phase = 'Failed'
+            WHERE Status = 'Completed'
+              AND Label = 'Correct Team Lead task profiles'
+              AND EXISTS (
+                  SELECT 1
+                  FROM FlowEvents
+                  WHERE FlowEvents.FlowStepId = FlowSteps.Id
+                    AND FlowEvents.Type = 'profile.validation-failed'
+              );
+            """,
+            cancellationToken);
     }
 
     internal static Task EnsureFlowRunSchemaAsync(
@@ -404,6 +674,7 @@ public static class DatabaseInitializer
                 RiskReason TEXT NOT NULL,
                 Confidence REAL NOT NULL,
                 RationalesJson TEXT NOT NULL,
+                PreMortemAfter INTEGER NOT NULL DEFAULT 0,
                 CreatedAt INTEGER NOT NULL
             );
             DROP INDEX IF EXISTS IX_TaskProfiles_Flow_Iteration_Role;
@@ -491,6 +762,13 @@ public static class DatabaseInitializer
             "WHERE name = 'EvidenceWeight';",
             "ALTER TABLE RoutingObservations ADD COLUMN EvidenceWeight " +
             "REAL NOT NULL DEFAULT 1;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('TaskProfiles') " +
+            "WHERE name = 'PreMortemAfter';",
+            "ALTER TABLE TaskProfiles ADD COLUMN PreMortemAfter " +
+            "INTEGER NOT NULL DEFAULT 0;",
             cancellationToken);
     }
 

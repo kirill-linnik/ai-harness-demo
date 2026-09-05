@@ -1,7 +1,6 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Core.Workflow;
-using AiHarnessDemo.Infrastructure;
 using System.Text.RegularExpressions;
 
 namespace AiHarnessDemo.Services;
@@ -10,7 +9,6 @@ namespace AiHarnessDemo.Services;
 public sealed partial class CopilotReasoningHost(
     AgentCatalog agentCatalog,
     ProcessRunner processRunner,
-    HarnessPaths paths,
     WorkflowDefinitionProvider workflowProvider,
     CopilotCliRuntime copilotCliRuntime,
     WorkflowPromptRenderer promptRenderer,
@@ -113,13 +111,19 @@ public sealed partial class CopilotReasoningHost(
             "Rendered the exact prompt for the Copilot CLI turn.",
             prompt));
         var copilotSessionHome = ResolveCopilotSessionHome();
+        var agentAccess = await PrepareRestrictedAgentRootAsync(
+            copilotSessionHome,
+            context.AgentId,
+            manifest.SourcePath,
+            request.CopilotSessionId,
+            cancellationToken);
         var environmentVariables = BuildProcessEnvironment(
             context.AgentRole,
             context.AllowRemotePublication);
         var arguments = BuildCliArguments(
             request.WorkingDirectory,
-            paths.Root,
-            context.AgentId,
+            agentAccess.Root,
+            agentAccess.AgentId,
             context.AgentRole,
             request.Model,
             request.Effort,
@@ -258,6 +262,20 @@ public sealed partial class CopilotReasoningHost(
                 "--no-eager-powershell-resolution"
             ]);
         }
+        else if (string.Equals(
+                     agentRole,
+                     "pre-mortem-sceptic",
+                     StringComparison.Ordinal))
+        {
+            arguments.AddRange(
+            [
+                "--available-tools=view,grep,glob,web_search",
+                "--deny-tool=write,shell",
+                "--disallow-temp-dir",
+                "--no-custom-instructions",
+                "--no-eager-powershell-resolution"
+            ]);
+        }
         else
         {
             arguments.Add("--allow-all-tools");
@@ -265,6 +283,61 @@ public sealed partial class CopilotReasoningHost(
 
         arguments.AddRange(["-p", prompt]);
         return arguments;
+    }
+
+    internal static async Task<RestrictedAgentAccess>
+        PrepareRestrictedAgentRootAsync(
+            string copilotHome,
+            string agentId,
+            string sourcePath,
+            Guid sessionId,
+            CancellationToken cancellationToken = default)
+    {
+        var root = Path.Combine(
+            Path.GetFullPath(copilotHome),
+            "harness-agent-definitions",
+            sessionId.ToString("N"));
+        var agentsDirectory = Path.Combine(root, ".github", "agents");
+        Directory.CreateDirectory(agentsDirectory);
+        var restrictedAgentId =
+            $"harness-{agentId}-{sessionId:N}";
+        var destination = Path.Combine(
+            agentsDirectory,
+            $"{restrictedAgentId}.agent.md");
+        var content = await File.ReadAllTextAsync(
+            Path.GetFullPath(sourcePath),
+            cancellationToken);
+        await File.WriteAllTextAsync(
+            destination,
+            RemoveAgentModelFrontMatter(content),
+            cancellationToken);
+        return new RestrictedAgentAccess(root, restrictedAgentId);
+    }
+
+    internal static string RemoveAgentModelFrontMatter(string content)
+    {
+        var normalized = content.ReplaceLineEndings("\n");
+        if (!normalized.StartsWith("---\n", StringComparison.Ordinal))
+        {
+            return normalized;
+        }
+        var end = normalized.IndexOf("\n---\n", 4, StringComparison.Ordinal);
+        if (end < 0)
+        {
+            return normalized;
+        }
+
+        var frontMatter = normalized[4..end]
+            .Split('\n')
+            .Where(line =>
+                !line.TrimStart().StartsWith(
+                    "model:",
+                    StringComparison.OrdinalIgnoreCase));
+        return
+            $"---{Environment.NewLine}" +
+            string.Join(Environment.NewLine, frontMatter) +
+            $"{Environment.NewLine}---{Environment.NewLine}" +
+            normalized[(end + 5)..];
     }
 
     internal static bool IsModelUnavailableDiagnostic(string diagnostic)
@@ -358,7 +431,13 @@ public sealed partial class CopilotReasoningHost(
 
         if (snapshot.State == CopilotSessionJournalState.Completed &&
             snapshot.Result is { Success: true } recovered &&
-            IsRecoverableCompletedOutput(context.AgentRole, recovered.OutputSummary))
+            IsRecoverableCompletedOutput(
+                context.AgentRole,
+                recovered.OutputSummary,
+                context.IsPreMortemRevision) &&
+            IsRecoveryCurrent(
+                context.InvocationStartedAt,
+                snapshot.CompletedAt))
         {
             request.Progress?.Invoke(new AgentRunProgress(
                 AgentRunPhase.Finishing,
@@ -376,13 +455,43 @@ public sealed partial class CopilotReasoningHost(
                     CopilotSessionJournalState.Completed);
     }
 
-    internal static bool IsRecoverableCompletedOutput(string agentRole, string output) =>
-        agentRole switch
+    internal static bool IsRecoverableCompletedOutput(
+        string agentRole,
+        string output,
+        bool isPreMortemRevision = false)
+    {
+        if (isPreMortemRevision)
+        {
+            try
+            {
+                if (!AgentHandoffInspector.HasCompleteStatus(output))
+                {
+                    return false;
+                }
+                _ = PreMortemRules.ParseDisposition(output);
+                return true;
+            }
+            catch (PreMortemValidationException)
+            {
+                return false;
+            }
+        }
+
+        return agentRole switch
         {
             "account-manager" => HasValidIntakeContract(output),
             "product-manager" => FeedbackCoordinator.HasReworkTargetMarker(output),
+            "pre-mortem-sceptic" => HasValidPreMortemContract(output),
             _ => AgentHandoffInspector.HasTerminalStatus(output)
         };
+    }
+
+    internal static bool IsRecoveryCurrent(
+        DateTimeOffset? invocationStartedAt,
+        DateTimeOffset? recoveredCompletedAt) =>
+        invocationStartedAt is null ||
+        recoveredCompletedAt is { } completedAt &&
+        completedAt >= invocationStartedAt.Value;
 
     private static bool HasValidIntakeContract(string output)
     {
@@ -397,6 +506,19 @@ public sealed partial class CopilotReasoningHost(
         }
     }
 
+    private static bool HasValidPreMortemContract(string output)
+    {
+        try
+        {
+            _ = PreMortemRules.ParseReview(output);
+            return true;
+        }
+        catch (PreMortemValidationException)
+        {
+            return false;
+        }
+    }
+
     internal static IReadOnlyDictionary<string, string> BuildPromptValues(
         AgentExecutionContext context,
         string agentInstructions,
@@ -404,9 +526,17 @@ public sealed partial class CopilotReasoningHost(
     {
         var isAccountManager = IsAccountManager(context.AgentRole);
         var isProductManager = IsProductManager(context.AgentRole);
+        var isPreMortem = string.Equals(
+            context.AgentRole,
+            "pre-mortem-sceptic",
+            StringComparison.Ordinal);
+        var usesCompactPreMortemContext =
+            isPreMortem || context.IsPreMortemRevision;
         var workspace = PrepareWorkspace(workingDirectory);
         var repositoryFacts = isProductManager
             ? string.Empty
+            : context.IsPreMortemRevision
+                ? string.Empty
             : Clip(
                 PrepareRepositoryFacts(
                     context.RepositoryKnowledge,
@@ -414,7 +544,7 @@ public sealed partial class CopilotReasoningHost(
                 isAccountManager
                     ? AccountManagerRepositoryKnowledgeCharacters
                     : DeliveryRepositoryKnowledgeCharacters);
-        var handoffs = isAccountManager
+        var handoffs = isAccountManager || usesCompactPreMortemContext
             ? string.Empty
             : isProductManager
                 ? CompactExecutionLedger(
@@ -427,11 +557,13 @@ public sealed partial class CopilotReasoningHost(
                         Clip(
                             RemoveSourceProjectPath(item, context.SourceProjectPath),
                             1_600)));
-        var learnings = string.Join(
-            Environment.NewLine,
-            context.Learnings
-                .TakeLast(2)
-                .Select(item => $"- {Clip(item.PromptRefinement, 500)}"));
+        var learnings = usesCompactPreMortemContext
+            ? string.Empty
+            : string.Join(
+                Environment.NewLine,
+                context.Learnings
+                    .TakeLast(2)
+                    .Select(item => $"- {Clip(item.PromptRefinement, 500)}"));
         var feedback = string.IsNullOrWhiteSpace(context.CustomerFeedback)
             ? string.Empty
             : Clip(context.CustomerFeedback, 2_000);
@@ -460,12 +592,16 @@ public sealed partial class CopilotReasoningHost(
         {
             ["agent.name"] = context.AgentName,
             ["agent.instructions"] = Clip(agentInstructions, 3_000),
-            ["task"] = Clip(context.Task, 6_000),
+            ["task"] = Clip(
+                context.Task,
+                usesCompactPreMortemContext ? 10_000 : 6_000),
             ["workspace"] = workspace,
             ["role.context"] = string.Join(
                 $"{Environment.NewLine}{Environment.NewLine}",
                 roleContext),
-            ["response.contract"] = ResponseContract(context.AgentRole),
+            ["response.contract"] = context.IsPreMortemRevision
+                ? PreMortemRevisionResponseContract()
+                : ResponseContract(context.AgentRole),
             // Retain legacy variables so a hot-reloaded older WORKFLOW.md remains valid.
             ["repository.knowledge"] = string.IsNullOrWhiteSpace(repositoryFacts)
                 ? workspace
@@ -639,25 +775,45 @@ public sealed partial class CopilotReasoningHost(
             : Path.GetFullPath(inheritedHome);
     }
 
-    internal static IReadOnlyDictionary<string, string>? BuildProcessEnvironment(
+    internal static IReadOnlyDictionary<string, string?>? BuildProcessEnvironment(
         string agentRole,
         bool allowRemotePublication)
     {
+        if (agentRole == "pre-mortem-sceptic")
+        {
+            var preMortemEnvironment = new Dictionary<string, string?>(
+                PushGuard("pre-mortem-read-only"),
+                StringComparer.Ordinal)
+            {
+                ["GH_TOKEN"] = null,
+                ["GITHUB_TOKEN"] = null
+            };
+            return preMortemEnvironment;
+        }
         if (agentRole != "release-engineer" ||
             allowRemotePublication)
         {
             return null;
         }
 
-        return new Dictionary<string, string>(StringComparer.Ordinal)
+        var environment = new Dictionary<string, string?>(
+            PushGuard("customer-approval-required"),
+            StringComparer.Ordinal)
         {
             ["GH_TOKEN"] = "customer-approval-required",
-            ["GITHUB_TOKEN"] = "customer-approval-required",
+            ["GITHUB_TOKEN"] = "customer-approval-required"
+        };
+        return environment;
+    }
+
+    private static IReadOnlyDictionary<string, string?> PushGuard(
+        string marker) =>
+        new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
             ["GIT_CONFIG_COUNT"] = "1",
             ["GIT_CONFIG_KEY_0"] = "remote.origin.pushurl",
-            ["GIT_CONFIG_VALUE_0"] = "disabled://customer-approval-required"
+            ["GIT_CONFIG_VALUE_0"] = $"disabled://{marker}"
         };
-    }
 
     internal static string PrepareRepositoryKnowledge(
         string knowledge,
@@ -717,6 +873,10 @@ public sealed partial class CopilotReasoningHost(
         TimeSpan TurnTimeout,
         TimeSpan StallTimeout);
 
+    internal sealed record RestrictedAgentAccess(
+        string Root,
+        string AgentId);
+
     internal static string ResponseContract(string agentRole) =>
         agentRole switch
         {
@@ -749,6 +909,21 @@ public sealed partial class CopilotReasoningHost(
               Property names and enum casing are exact. Integers are 1-10, confidence is 0-1, risk is Low/Medium/High/Critical, reasons are nonempty, and rationales contain 1-5 bounded entries.
               Allowed task tags are CustomerDialogue, Planning, Architecture, Design, Data, Implementation, Security, Quality, Documentation, Release, Feedback, and CrossCutting.
               Include exactly one profile for every already-planned downstream role in the supplied plan, excluding team-lead. Do not add, remove, or select roles; FlowPlanner remains role-selection authority.
+              Then output exactly one strict pre-mortem plan between these standalone sentinels:
+              PRE_MORTEM_PLAN_V1_BEGIN
+              {"Version":"pre-mortem-plan-v1","AfterRoles":[]}
+              PRE_MORTEM_PLAN_V1_END
+              AfterRoles may contain only exact role IDs from the supplied downstream plan. Keep it empty when the assignment says the sceptic is unavailable. Do not emit any sentinel more than once.
+              """,
+            "pre-mortem-sceptic" => """
+              Investigate the evaluated result independently. Do not modify product files.
+              Start with exactly one marker: PRE_MORTEM_STATUS: CLEAR or PRE_MORTEM_STATUS: FINDINGS.
+              Then output exactly one strict JSON document between these standalone sentinels:
+              PRE_MORTEM_FINDINGS_V1_BEGIN
+              {"Version":"pre-mortem-findings-v1","Findings":[{"FailureMode":"specific six-month failure chain","Evidence":"verifiable files, commands, observations, or authoritative URLs","MissedSignal":"current fact the evaluated result missed","Prevention":"precise change that breaks the failure chain"}]}
+              PRE_MORTEM_FINDINGS_V1_END
+              CLEAR requires an empty Findings array. FINDINGS requires 1-5 entries. Every entry needs concrete evidence; omit speculative, generic, duplicate, stylistic, or already-covered concerns.
+              Do not emit HANDOFF_STATUS, PUSHBACK, or PRE_MORTEM_DISPOSITION markers.
               """,
             "product-manager" => """
               Respond directly to the customer in concise plain language after reviewing the original brief and execution ledger.
@@ -764,6 +939,16 @@ public sealed partial class CopilotReasoningHost(
               If an upstream handoff is insufficient, stop this turn and select the PUSHBACK status.
               """
         };
+
+    internal static string PreMortemRevisionResponseContract() => """
+        Complete this role's response to the Pre-mortem Sceptic findings.
+        Start with exactly: HANDOFF_STATUS: COMPLETE
+        Return concise sections named Decision, Deliverable, Evidence, and Next owner.
+        Return the complete current deliverable or plan, not a delta.
+        End with exactly one marker: PRE_MORTEM_DISPOSITION: ADJUSTED or PRE_MORTEM_DISPOSITION: UNCHANGED.
+        Use ADJUSTED only when the complete result materially changed after investigating the findings.
+        Do not emit HANDOFF_STATUS: PUSHBACK or PUSHBACK_REASON in this turn.
+        """;
 
     private static bool IsAccountManager(string agentRole) =>
         string.Equals(agentRole, "account-manager", StringComparison.Ordinal);

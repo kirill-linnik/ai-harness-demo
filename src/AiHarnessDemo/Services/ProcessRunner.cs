@@ -25,7 +25,7 @@ public sealed class ProcessRunner
         CancellationToken cancellationToken = default,
         Action<string>? standardOutputLineReceived = null,
         TimeSpan? stallTimeout = null,
-        IReadOnlyDictionary<string, string>? environmentVariables = null)
+        IReadOnlyDictionary<string, string?>? environmentVariables = null)
     {
         if (string.IsNullOrWhiteSpace(executable))
         {
@@ -69,7 +69,14 @@ public sealed class ProcessRunner
         {
             foreach (var (name, value) in environmentVariables)
             {
-                startInfo.Environment[name] = value;
+                if (value is null)
+                {
+                    startInfo.Environment.Remove(name);
+                }
+                else
+                {
+                    startInfo.Environment[name] = value;
+                }
             }
         }
 

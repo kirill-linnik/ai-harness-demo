@@ -69,6 +69,16 @@ internal static partial class AgentHandoffInspector
     public static bool HasTerminalStatus(string output) =>
         HandoffStatusPattern().IsMatch(output);
 
+    public static bool HasCompleteStatus(string output)
+    {
+        var matches = HandoffStatusPattern().Matches(output);
+        return matches.Count == 1 &&
+               string.Equals(
+                   matches[0].Groups[1].Value,
+                   "COMPLETE",
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string CleanLine(string value)
     {
         var cleaned = value

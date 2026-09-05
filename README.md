@@ -35,6 +35,7 @@ contract:
 | Dynamic multi-agent delivery | Team Lead selects enabled specialists from `.github\agents\*.agent.md`, emits validated role task profiles, and creates an ordered dependency-aware handoff plan rather than running one coding agent per work item. |
 | Handoff trust gates | Shadow, gated, and automatic decisions are recorded by action and blast radius. Release always requires a customer decision, and a kill switch dominates configured trust. |
 | Bounded pushback and feedback loops | A downstream `PUSHBACK` resumes the responsible upstream Copilot session, retries the blocked handoff in place, and stores a reusable learning. Product Manager can close the flow or send the same flow through another iteration with its ledger intact. |
+| Evidence-based pre-mortems | Team Lead can place independent Pre-mortem Sceptic checkpoints after any planned delivery role. Each review uses a different model family and an enforced read-only research toolset, reports at most five evidence-backed findings, and feeds findings into the original agent session before the flow advances. |
 | Durable product state | SQLite persists settings, intake dialogue, flows, steps, gates, events, tool calls, model catalogs, routing evidence, outcomes, and cross-flow learnings. Symphony's core recovery does not require a durable orchestration database. |
 | Copilot-native model routing | A dedicated Copilot ACP process discovers enabled model and reasoning-effort candidates. Each step is profiled and routed immediately before execution using the selected quality, speed, or cost strategy plus normalized historical evidence. |
 | Repository study and multi-repository Git isolation | The harness can run `copilot init`, persist editable shared knowledge, discover every Git repository in a project folder, and create the same flow branch in an isolated worktree for each repository. Symphony leaves VCS workspace population implementation-defined. |
@@ -123,6 +124,8 @@ The AI Factory and every new-assignment control remain locked until Settings con
 - Agent definitions are loaded from `.github\agents\*.agent.md`.
 - Copilot CLI receives explicit project access to `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree, and source-folder paths remain intentionally inaccessible.
 - An explicit agent `PUSHBACK` is persisted as a rejected handoff, resumes the responsible upstream agent's Copilot session, then retries the blocked agent in its existing session.
+- Team Lead's strict pre-mortem plan can select zero or more downstream checkpoints. A selected Pre-mortem Sceptic investigates the completed result with a different model family, receives only source-search/read and web-research tools with publication credentials removed, and returns `CLEAR` or at most five evidence-backed findings.
+- Every non-empty pre-mortem result resumes the evaluated agent's original Copilot session. That agent must return a complete replacement handoff with an `ADJUSTED` or `UNCHANGED` disposition; adjusted results are reviewed again until that checkpoint's round cap is reached.
 - Copilot session IDs are persisted per step. After a host restart, completed CLI turns are recovered from the session journal; interrupted turns resume the same session and preserved workspace instead of starting over.
 - The quiet-process watchdog is strategy-aware: Maximum quality scales its quiet window from 5 to 15 minutes using the router's predicted accepted time, while other strategies retain the five-minute bound. The 20-minute hard turn limit and configured retry count still cap each attempt.
 - If Copilot writes a valid final handoff but hangs before clean shutdown, the harness recovers that handoff from the session journal instead of failing the flow. Confirmed interrupted sessions resume on bounded runtime retries, and each recovery transition remains visible in the event ledger.
@@ -134,7 +137,7 @@ The AI Factory and every new-assignment control remain locked until Settings con
   alternatives. A model-unavailable error is classified separately; automatic rerouting fails closed
   when the CLI result cannot prove that neither session nor tool activity began.
 - A failed flow can be manually restarted from its detail page. The failed attempt remains in history, while a new retry resumes its Copilot session when available and re-queues downstream work in the same workspace.
-- The handoff retry limit is persisted in Settings (`0-10`, default `2`); only an exhausted limit or an unroutable pushback stops the flow and skips downstream steps.
+- The shared correction limit is persisted in Settings (`0-10`, default `2`). It caps upstream retries per blocked handoff and total sceptic runs per Team Lead checkpoint. Pushback exhaustion stops the flow; pre-mortem exhaustion advances with the latest complete adjusted result.
 - Multiple flows can run in parallel; every flow receives an independent project workspace and a matching branch in each discovered repository.
 - No cloud credentials, private endpoints, or provider-specific work-item integrations are included.
 

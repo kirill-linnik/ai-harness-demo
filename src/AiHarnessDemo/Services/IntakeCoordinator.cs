@@ -204,7 +204,8 @@ public sealed partial class IntakeCoordinator(
                                 CancellationToken.None)
                             .GetAwaiter()
                             .GetResult();
-                    }),
+                    },
+                    InvocationStartedAt: intakeStep.StartedAt),
                 cancellationToken);
         }
         catch (Exception exception)
