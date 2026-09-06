@@ -49,7 +49,9 @@ const bootstrap: BootstrapDto = {
     lastError: null,
     maxConcurrentAgents: 1,
     maxAttempts: 1,
-    workspaceRoot: "E:\\projects\\demo\\.workspaces"
+    workspaceRoot: "E:\\projects\\demo\\.workspaces",
+    outcomeVerificationEnabled: true,
+    outcomeVerificationMaxRounds: 3
   },
   factoryEnabled: true,
   factoryDisabledReason: ""
@@ -105,7 +107,27 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
         createdAt: timestamp
       }
     ],
-    gateRecords: []
+    gateRecords: [],
+    outcomeVerification: {
+      status: "NotStarted",
+      legacyUnverified: false,
+      currentRound: 0,
+      maxRounds: 3,
+      planHashPrefix: "",
+      candidateFingerprintPrefix: "",
+      candidateFingerprint: "",
+      releaseGateId: null,
+      criteria: [],
+      evidence: [],
+      latestResults: [],
+      failedCriterionIds: [],
+      pendingOwnerRoles: [],
+      stale: false,
+      previewRequired: false,
+      releaseReady: false,
+      verifiedAt: null,
+      humanResolutionGate: null
+    }
   };
 }
 

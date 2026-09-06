@@ -27,9 +27,11 @@ public sealed partial class CopilotCliRuntime(
         "--acp",
         "--agent",
         "--allow-all-tools",
+        "--allow-tool",
         "--available-tools",
         "--disable-builtin-mcps",
         "--deny-tool",
+        "--deny-url",
         "--disallow-temp-dir",
         "--effort",
         "--model",
@@ -37,6 +39,7 @@ public sealed partial class CopilotCliRuntime(
         "--no-custom-instructions",
         "--no-eager-powershell-resolution",
         "--output-format",
+        "--secret-env-vars",
         "--session-id"
     ];
 

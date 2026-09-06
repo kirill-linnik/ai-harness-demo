@@ -6,6 +6,19 @@ public sealed record PlannedAgent(AgentRecord Agent, string Reason);
 
 public sealed class FlowPlanner
 {
+    private static readonly string[] GovernedRoleOrder =
+    [
+        "team-lead",
+        "architect",
+        "product-designer",
+        "data-engineer",
+        "software-engineer",
+        "security-engineer",
+        "technical-writer",
+        "release-engineer",
+        "quality-engineer"
+    ];
+
     private static readonly string[] ArchitectureSignals =
         ["architecture", "platform", "migration", "refactor", "integration", "multi-service", "redesign"];
 
@@ -55,14 +68,14 @@ public sealed class FlowPlanner
             AddIfEnabled(result, enabled, "security-engineer", "The task carries an identity, data, or trust-boundary risk.");
         }
 
-        AddIfEnabled(result, enabled, "quality-engineer", "Independent evidence is required before release.");
-
         if (ContainsAny(request, DocumentationSignals))
         {
             AddIfEnabled(result, enabled, "technical-writer", "Public or developer-facing behavior needs a clear contract.");
         }
 
-        AddIfEnabled(result, enabled, "release-engineer", "Package the verified outcome as the configured delivery artifact.");
+        AddIfEnabled(result, enabled, "release-engineer", "Prepare the local candidate for independent verification.");
+
+        AddIfEnabled(result, enabled, "quality-engineer", "Independently verify the prepared release candidate.");
 
         if (!result.Any(item => item.Agent.Role == "software-engineer"))
         {
@@ -70,7 +83,24 @@ public sealed class FlowPlanner
                 "No enabled software-engineer agent is available for implementation.");
         }
 
-        return result;
+        return OrderGovernedRoles(result);
+    }
+
+    public static IReadOnlyList<PlannedAgent> OrderGovernedRoles(
+        IEnumerable<PlannedAgent> plan)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        var rank = GovernedRoleOrder
+            .Select((role, index) => (role, index))
+            .ToDictionary(item => item.role, item => item.index, StringComparer.Ordinal);
+        return plan
+            .Select((item, index) => (item, index))
+            .OrderBy(item => rank.GetValueOrDefault(
+                item.item.Agent.Role,
+                int.MaxValue))
+            .ThenBy(item => item.index)
+            .Select(item => item.item)
+            .ToArray();
     }
 
     public int CalculateComplexity(string request)

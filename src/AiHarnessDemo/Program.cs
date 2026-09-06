@@ -43,6 +43,9 @@ builder.Services.AddSingleton<IModelRouter>(
     services => services.GetRequiredService<AdaptiveModelRouter>());
 builder.Services.AddSingleton<RoutingObservationRecorder>();
 builder.Services.AddSingleton<PreviewArtifactCatalog>();
+builder.Services.AddSingleton<CandidateFingerprintService>();
+builder.Services.AddSingleton<OutcomeVerificationContextBuilder>();
+builder.Services.AddSingleton<IVerifiedCandidatePublisher, VerifiedCandidatePublisher>();
 builder.Services.AddSingleton<IWorkspaceProcessCleaner, WorkspaceProcessCleaner>();
 builder.Services.AddSingleton<IFlowSessionCleaner, FlowSessionCleaner>();
 builder.Services.AddSingleton<FlowLifecycleCoordinator>();
@@ -54,6 +57,7 @@ builder.Services.AddSingleton(_ =>
     gate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
     gate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
     gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
+    gate.SetTrustLevel(HandoffActionType.OutcomeResolution, HandoffTrustLevel.Gated);
     return gate;
 });
 builder.Services.AddSingleton<IWorkspaceManager, WorkspaceManager>();

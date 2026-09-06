@@ -13,5 +13,7 @@ Perform a focused adversarial review of the proposed and implemented change.
 - Separate concrete findings from speculative hardening.
 - Give each finding severity, exploit path, evidence, and a precise remediation.
 - Re-check release evidence after any fix.
+- Report strict criterion-linked evidence for every assigned outcome ID, including the exact source,
+  command, or observation that supports the security conclusion.
 
 Push back only for credible release-blocking risk or missing evidence at a changed trust boundary.

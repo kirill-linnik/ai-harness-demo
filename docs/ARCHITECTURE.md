@@ -16,6 +16,7 @@
 | Role-focused prompting | The hot-reloaded workflow renders the current assignment first, compact repository facts, at most two immediate upstream handoffs for delivery roles, applicable learned constraints, and the role's completion contract. Retry diagnostics remain in durable events rather than agent prompts. |
 | Observable run state | SQLite step attempts, events, gate history, models, durations, prompt refinements, `/api/v1/state`, and per-flow routes. |
 | Human handoff state | Release proposals stop at a customer gate; approval and execution state are intentionally separate. |
+| Outcome proof ledger | `FlowRun.OutcomeVerificationJson` stores the bounded, versioned acceptance plan, normalized evidence, candidate identity, QA rounds, and restart cursor. |
 
 ## Product flow
 
@@ -32,10 +33,14 @@ flowchart LR
     S -->|evidence-backed findings| A
     S -->|clear or round cap| E
     A --> E[Engineering]
-    E --> Q[Quality gate]
-    Q -->|pushback with exact gap| E
-    Q --> R[Release Engineer]
-    R --> V[Customer preview]
+    E --> R[Release Engineer local candidate]
+    R --> Q[Independent QA]
+    Q -->|failed criteria| E
+    E -->|correction complete| R
+    Q -->|current all-criteria PASS| V[Customer preview and release gate]
+    Q -->|budget exhausted| H[Outcome resolution]
+    H -->|Continue one round| Q
+    H -->|Replan| TL
     V --> PM[Product Manager]
     PM -->|rework with retained context| TL
     PM -->|approve| X[Closed flow]
@@ -52,6 +57,9 @@ flowchart LR
 | `ModelCatalogDiscovery` | Uses a dedicated bidirectional Copilot ACP process at startup to discover enabled explicit model + effort candidates and persist an audit snapshot. Current discovery is mandatory for readiness. |
 | `BootstrapTaskProfileFactory` / Team Lead profiles | Create strictly validated, normalized `task-profile-v1` routing inputs. Team Lead gets one visible correction turn for an invalid downstream profile contract. |
 | `PreMortemRules` / Pre-mortem Sceptic | Validate Team Lead's checkpoint plan, strict `CLEAR` or evidence-backed finding output, the five-finding cap, and the evaluated agent's adjustment disposition. |
+| `OutcomeVerificationRules` | Strictly parses versioned acceptance, delivery-evidence, and QA contracts; canonicalizes JSON; hashes plans; derives the global verdict; and validates the 128 KiB aggregate. |
+| `CandidateFingerprintService` | Rejects dirty or unsafe local candidates, added repositories, live-origin drift from the workspace-authorized repository map, and ignored paths outside the documented transient-output policy; it hashes deterministic trusted repository commit/tree/target identities plus bounded, servable `.customer-preview` files. |
+| `OutcomeVerificationContextBuilder` | Reconstructs the complete QA assignment from SQLite, writes `.ai-harness\outcome-verification\<fingerprint>\qa-context.json`, and verifies its content hash without deciding success. |
 | `AdaptiveModelRouter` | Applies router-v1 recency-weighted Bayesian evidence, risk quality floors, lexicographic strategy objectives, and bounded deterministic exploration immediately before execution. |
 | `RoutingObservationRecorder` | Records normalized handoff quality, duration/retry, estimated premium use, availability failures, downstream pushback and targeted customer-rework attribution, and weak final approval evidence. |
 | `PreviewArtifactCatalog` | Resolves validated per-variant static builds from the isolated flow workspace and exposes them only after the customer release gate is ready. |
@@ -70,7 +78,8 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 
 - `Settings`: selected project folder, editable repository knowledge, outcome, retry bound, and model-selection strategy.
 - `Agents`: discovered role metadata and enabled state.
-- `Flows`: one durable customer workflow per shareable URL, including its queued strategy snapshot.
+- `Flows`: one durable customer workflow per shareable URL, including its queued strategy snapshot
+  and the versioned outcome-verification proof ledger. Empty ledgers identify legacy/unverified flows.
 - `FlowSteps`: agent, model + effort, attempt, state, duration, output, pushback reason, and durable pre-mortem origin/target/revision links.
 - `FlowMessages`: voice/text dialogue with Account Manager and Product Manager.
 - `FlowEvents`: append-only observable execution ledger.
@@ -94,7 +103,37 @@ SQLite uses write-ahead logging for concurrent readers and short concurrent writ
 - Feeds each evidence-backed pre-mortem result to the evaluated agent's original session. The agent returns a complete handoff plus an explicit adjusted/unchanged disposition; only adjusted results schedule another review.
 - Applies the hot-reloadable five-minute quiet watchdog to Fastest response and Lowest cost. Maximum quality scales that window up to the configured fifteen-minute cap using predicted accepted time while retaining the hard per-turn timeout.
 - Recovers a contract-valid final handoff from the Copilot session journal when the CLI does not shut down cleanly; otherwise only a confirmed interrupted journal is resumed on the next bounded runtime attempt.
-- Keeps release preparation local until the customer resolves the release gate. Approval queues a distinct Release Engineer publication step; only that post-approval step may push and create the configured pull request.
+- Keeps release preparation local until the customer resolves the release gate. Approval queues a
+  distinct Release Engineer publication step; no remote publication is possible before that gate.
+- For governed publication, the Release Engineer's Copilot process remains push-guarded. After its
+  successful turn, `VerifiedCandidatePublisher` compares the live repository to the immutable
+  workspace-authorized mapping, pushes exact manifest SHAs to the trusted target URL rather than a
+  mutable remote alias, and creates/reuses only same-target PRs. Per-repository
+  `Publishing`/`Published` state is persisted before and after side effects, and
+  `PublishedOutcomeVerifier` confirms every remote head before the journal becomes `Verified`.
+  Legacy publication retains the original agent-driven behavior.
+- Runs local Release Engineer candidate preparation before independent QA. Candidate preparation is
+  an `Advance` handoff and never opens a customer gate.
+- Uses one governed role order for profile contracts, displayed plans, step dependencies, execution,
+  and pushback ownership. Optional Technical Writer work precedes Release candidate preparation;
+  Release pushback returns to its actual predecessor and QA pushback returns to Release.
+- Gives each QA round a complete database-derived context packet rather than the ordinary two-handoff
+  prompt. QA reuses its exact persisted Copilot session but treats SQLite and the current fingerprint
+  as authoritative.
+- Persists structured host tool observations and accepts QA PASS checks only when command, scope,
+  exit status, and captured result agree. Context/evidence reads and out-of-candidate paths are not
+  verification.
+- Protects authoritative worktree metadata during governed turns with a crash-journaled pointer
+  swap: the child sees a disposable `.git` snapshot, while the host restores the original pointer
+  and rejects any shadow metadata mutation. Recovery runs before workspace reuse and candidate
+  inspection. This is the strongest deterministic same-user boundary used when an OS sandbox
+  identity is unavailable; it does not claim to stop a process that independently knows an
+  authoritative absolute path.
+- Counts valid terminal QA results and persisted invalid QA contracts against the independent
+  snapshotted round budget. Agent runtime retries, pre-mortems, and correction turns do not consume
+  that budget.
+- Reconciles plan, evidence, candidate, QA, correction, PASS, and gate transitions idempotently after
+  restart. Outcome QA never uses workspace/agent “latest session” discovery.
 - Applies the persisted Settings limit (`0-10`, default `2`) independently to each blocked handoff and each Team Lead-selected pre-mortem checkpoint. Pushback exhaustion is terminal; pre-mortem exhaustion advances with the latest complete adjusted result.
 
 ## API shape
@@ -104,11 +143,17 @@ The browser uses a same-origin minimal API:
 - `/api/bootstrap`, `/api/settings`, `/api/agents`
 - `/api/directories`, `/api/repositories/analyze`
 - `/api/intake`
-- `/api/flows`, `/api/flows/{id}`, `/start`, `/restart`, `/feedback`, `/decision`, `/abandon`
+- `/api/flows`, `/api/flows/{id}`, `/start`, `/restart`, `/feedback`, `/decision`,
+  `/outcome-resolution`, `/abandon`
 - `/api/history`, `/api/learnings`, `/api/previews/{id}`
 - `/api/previews/{id}/artifacts/{variant}/{path}` serves the real isolated browser build used by the customer acceptance page.
 
 The UI polls only active flows. Completed flows remain static and independently addressable through `#/factory/{id}`.
+
+`POST /api/flows/{id}/decision` binds the decision to `{ approve, gateId,
+candidateFingerprint, feedback }`. Governed decisions must match the current unresolved Release
+gate and full verified fingerprint. The response outcome is `Approved`, `Rejected`,
+`RefreshQueued`, or `Conflict`; conflicts return HTTP 409 and leave the current gate unresolved.
 
 ## Browser client
 

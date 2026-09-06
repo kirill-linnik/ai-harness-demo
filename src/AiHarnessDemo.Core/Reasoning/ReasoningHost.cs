@@ -62,11 +62,22 @@ public sealed class AgentRunResult
     public bool CanResumeSession { get; init; }
 }
 
-/// <summary>A scrubbed tool invocation. Raw tool arguments and results are not part of the audit record.</summary>
+/// <summary>
+/// Host-observed tool evidence. Sensitive argument fields remain redacted, while normalized
+/// verification inputs and bounded result evidence are retained so QA claims can be checked
+/// against what the host actually executed and observed.
+/// </summary>
 public sealed record ToolCallRecord(
     string ToolName,
     string ArgumentsSummary,
-    bool Succeeded);
+    bool Succeeded,
+    string ToolType = "Unknown",
+    string NormalizedCommand = "",
+    string NormalizedArguments = "",
+    string WorkingDirectory = "",
+    int? ExitCode = null,
+    string ResultDigest = "",
+    string ResultSummary = "");
 
 public readonly record struct ReasoningHostReadiness(
     bool IsAvailable,

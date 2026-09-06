@@ -11,11 +11,14 @@ import type {
   FeedbackRequest,
   FeedbackResponse,
   FlowDetailDto,
+  FlowDecisionRequest,
+  FlowDecisionResponse,
   FlowSummaryDto,
   HistoryItemDto,
   IntakeRequest,
   IntakeResponse,
   LearningDto,
+  OutcomeResolutionRequest,
   PreviewDto,
   SaveSettingsRequest,
   SettingsDto,
@@ -45,10 +48,15 @@ export const api = {
     request<FlowDetailDto>(`/api/flows/${flowId}/restart`, { method: "POST", body: {} }),
   sendFeedback: (flowId: string, body: FeedbackRequest) =>
     request<FeedbackResponse>(`/api/flows/${flowId}/feedback`, { method: "POST", body }),
-  decideFlow: (flowId: string, approve: boolean) =>
-    request<FlowDetailDto>(`/api/flows/${flowId}/decision`, {
+  decideFlow: (flowId: string, body: FlowDecisionRequest) =>
+    request<FlowDecisionResponse>(`/api/flows/${flowId}/decision`, {
       method: "POST",
-      body: { approve }
+      body
+    }),
+  resolveOutcome: (flowId: string, body: OutcomeResolutionRequest) =>
+    request<FlowDetailDto>(`/api/flows/${flowId}/outcome-resolution`, {
+      method: "POST",
+      body
     }),
   abandonFlow: (flowId: string) =>
     request<AbandonFlowResponse>(`/api/flows/${flowId}/abandon`, {

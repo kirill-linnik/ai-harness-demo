@@ -34,6 +34,27 @@ public sealed class CopilotSessionJournalTests
     }
 
     [Fact]
+    public async Task InspectAsync_PreservesWorkspaceBindingForRecoveredToolEvidence()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: true,
+            includeToolCall: true);
+
+        var snapshot = await CopilotSessionJournal.InspectDirectoryAsync(
+            fixture.CopilotHome,
+            fixture.SessionDirectory,
+            fixture.SessionId);
+
+        var toolCall = Assert.Single(snapshot.Result!.ToolCalls);
+        Assert.Equal(fixture.WorkspacePath, toolCall.WorkingDirectory);
+        Assert.Equal("Command", toolCall.ToolType);
+        Assert.Equal("dotnet test", toolCall.NormalizedCommand);
+        Assert.Equal(0, toolCall.ExitCode);
+        Assert.Contains("passed", toolCall.ResultSummary);
+    }
+
+    [Fact]
     public async Task InspectAsync_RecoversACompletedHandoffWhenCliNeverShutsDownCleanly()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
@@ -496,6 +517,52 @@ public sealed class WorkflowRestartRecoveryTests
             pushedBackRetry,
             WorkflowEngine.FindUnresolvedPushback(
                 [failure, pushedBackRetry]));
+    }
+
+    [Fact]
+    public void OutcomeQaPushbackRetry_PreservesTypedMetadataAndStableRoot()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Governed pushback",
+            OriginalRequest = "Governed pushback"
+        };
+        var blocked = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 30,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Label = "Unexpected QA label",
+            Kind = FlowStepKind.OutcomeQa,
+            Status = StepStatus.Pushback,
+            Attempt = 2,
+            OutcomeQaRound = 2,
+            OutcomePlanHash = "sha256:" + new string('a', 64),
+            StableSemanticRootId = Guid.NewGuid()
+        };
+        var upstreamOwner = new AgentRecord
+        {
+            Id = "software-engineer",
+            Name = "Software Engineer",
+            Description = "Implements the fix.",
+            Role = "software-engineer",
+            SourcePath = "software-engineer.agent.md"
+        };
+
+        var (_, retry) = WorkflowEngine.CreateRecoverySteps(
+            flow,
+            blocked,
+            upstreamOwner,
+            revisionAttempt: 3);
+
+        Assert.Equal(FlowStepKind.OutcomeQa, retry.Kind);
+        Assert.Equal(2, retry.OutcomeQaRound);
+        Assert.Equal(blocked.OutcomePlanHash, retry.OutcomePlanHash);
+        Assert.Equal(blocked.StableSemanticRootId, retry.StableSemanticRootId);
+        Assert.Equal(blocked.StableSemanticRootId, retry.RetryOfStepId);
     }
 
     [Fact]
@@ -972,7 +1039,8 @@ internal sealed class RecoveryFixture : IAsyncDisposable
     public static async Task<RecoveryFixture> CreateAsync(
         bool completed,
         bool persistSessionId,
-        bool includeShutdown = true)
+        bool includeShutdown = true,
+        bool includeToolCall = false)
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -991,7 +1059,12 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         Directory.CreateDirectory(sessionDirectory);
         await File.WriteAllTextAsync(
             Path.Combine(sessionDirectory, "events.jsonl"),
-            BuildJournal(sessionId, workspacePath, completed, includeShutdown));
+            BuildJournal(
+                sessionId,
+                workspacePath,
+                completed,
+                includeShutdown,
+                includeToolCall));
 
         var options = new DbContextOptionsBuilder<HarnessDbContext>()
             .UseSqlite($"Data Source={databasePath};Pooling=False")
@@ -1074,7 +1147,8 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         Guid sessionId,
         string workspacePath,
         bool completed,
-        bool includeShutdown)
+        bool includeShutdown,
+        bool includeToolCall)
     {
         var startedAt = DateTimeOffset.UtcNow.AddMinutes(-4);
         var events = new List<string>
@@ -1108,6 +1182,34 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         };
         if (completed)
         {
+            if (includeToolCall)
+            {
+                events.Add(Serialize(
+                    "tool.execution_start",
+                    startedAt.AddMilliseconds(2500),
+                    new
+                    {
+                        toolCallId = "qa-test",
+                        toolName = "powershell",
+                        arguments = new
+                        {
+                            command = "dotnet test"
+                        }
+                    }));
+                events.Add(Serialize(
+                    "tool.execution_complete",
+                    startedAt.AddMilliseconds(2750),
+                    new
+                    {
+                        toolCallId = "qa-test",
+                        success = true,
+                        result = new
+                        {
+                            exitCode = 0,
+                            content = "All tests passed."
+                        }
+                    }));
+            }
             events.Add(Serialize(
                 "assistant.message",
                 startedAt.AddSeconds(3),

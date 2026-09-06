@@ -357,8 +357,11 @@ public sealed class CopilotSessionJournal
             }
         }
 
+        workspacePath ??= string.Empty;
         var activeProcessIds = FindActiveProcessIds(sessionDirectory, startedAt);
-        var parsed = CopilotJsonlParser.Parse(validJournal.ToString());
+        var parsed = CopilotJsonlParser.Parse(
+            validJournal.ToString(),
+            workingDirectory: workspacePath);
         var completed =
             parsed.Success &&
             (routineShutdown ||

@@ -44,7 +44,7 @@ export type AgentRunPhase =
   | "Stalled"
   | "CanceledByReconciliation";
 
-export type HandoffActionType = "Advance" | "RequestRevision" | "Release";
+export type HandoffActionType = "Advance" | "RequestRevision" | "Release" | "OutcomeResolution";
 
 export type HandoffGateDecision =
   | "BlockedKillSwitch"
@@ -53,6 +53,30 @@ export type HandoffGateDecision =
   | "AutoApproved";
 
 export type HandoffTrustLevel = "Shadow" | "Gated" | "Auto";
+
+export type OutcomeVerificationStatus =
+  | "LegacyUnverified"
+  | "NotStarted"
+  | "Planning"
+  | "CollectingEvidence"
+  | "PreparingCandidate"
+  | "AwaitingQa"
+  | "Correcting"
+  | "AwaitingCandidateRefresh"
+  | "Passed"
+  | "AwaitingHumanResolution"
+  | "Superseded";
+
+export type OutcomeEvidenceKind =
+  | "Test"
+  | "Command"
+  | "Artifact"
+  | "Observation"
+  | "SourceInspection";
+
+export type OutcomeEvidenceDisposition = "Supports" | "Contradicts" | "Inconclusive";
+export type OutcomeCriterionStatus = "PASS" | "FAIL" | "BLOCKED";
+export type OutcomeResolutionAction = "Continue" | "Replan";
 
 export interface SettingsDto {
   repositoryPath: string;
@@ -75,9 +99,9 @@ export interface AgentDto {
 
 export interface AgentToolCallDto {
   id: string;
-  toolName: string;
-  argumentsSummary: string;
-  succeeded: boolean;
+  toolName: string
+  argumentsSummary: string
+  succeeded: boolean
 }
 
 export interface FlowSummaryDto {
@@ -118,6 +142,8 @@ export interface FlowStepDto {
   completedAt: string | null;
   durationMilliseconds: number;
   toolCalls: AgentToolCallDto[];
+  assignedCriterionIds: string[];
+  outcomeQaRound: number | null;
 }
 
 export interface FlowMessageDto {
@@ -176,6 +202,65 @@ export interface FlowDetailDto {
   messages: FlowMessageDto[];
   events: FlowEventDto[];
   gateRecords: HandoffGateRecordDto[];
+  outcomeVerification: OutcomeVerificationDto;
+}
+
+export interface OutcomeCriterionDto {
+  id: string;
+  requirement: string;
+  verification: string;
+  ownerRoles: string[];
+  evidenceKinds: OutcomeEvidenceKind[];
+  customerVisible: boolean;
+}
+
+export interface OutcomeEvidenceDto {
+  evidenceId: string;
+  criterionId: string;
+  disposition: OutcomeEvidenceDisposition;
+  kind: OutcomeEvidenceKind;
+  locator: string;
+  observedResult: string;
+  exitCode: number | null;
+  producerRole: string;
+  producerStepId: string;
+  producedAt: string;
+}
+
+export interface OutcomeCriterionResultDto {
+  criterionId: string;
+  status: OutcomeCriterionStatus;
+  rationale: string;
+  responsibleRoles: string[];
+  remediation: string | null;
+}
+
+export interface OutcomeResolutionGateDto {
+  gateId: string;
+  decision: HandoffGateDecision;
+  summary: string;
+  createdAt: string;
+}
+
+export interface OutcomeVerificationDto {
+  status: OutcomeVerificationStatus;
+  legacyUnverified: boolean;
+  currentRound: number;
+  maxRounds: number;
+  planHashPrefix: string;
+  candidateFingerprintPrefix: string;
+  candidateFingerprint: string;
+  releaseGateId: string | null;
+  criteria: OutcomeCriterionDto[];
+  evidence: OutcomeEvidenceDto[];
+  latestResults: OutcomeCriterionResultDto[];
+  failedCriterionIds: string[];
+  pendingOwnerRoles: string[];
+  stale: boolean;
+  previewRequired: boolean;
+  releaseReady: boolean;
+  verifiedAt: string | null;
+  humanResolutionGate: OutcomeResolutionGateDto | null;
 }
 
 export interface LearningDto {
@@ -220,6 +305,8 @@ export interface WorkflowStatusDto {
   maxConcurrentAgents: number | null;
   maxAttempts: number | null;
   workspaceRoot: string | null;
+  outcomeVerificationEnabled: boolean | null;
+  outcomeVerificationMaxRounds: number | null;
 }
 
 export interface CopilotCliStatusDto {
@@ -354,6 +441,27 @@ export interface FeedbackResponse {
 
 export interface FlowDecisionRequest {
   approve: boolean;
+  gateId: string;
+  candidateFingerprint: string;
+  feedback: string;
+}
+
+export type ReleaseDecisionOutcome =
+  | "Approved"
+  | "Rejected"
+  | "RefreshQueued"
+  | "Conflict";
+
+export interface FlowDecisionResponse {
+  outcome: ReleaseDecisionOutcome;
+  flow: FlowDetailDto;
+  message: string;
+}
+
+export interface OutcomeResolutionRequest {
+  gateId: string;
+  action: OutcomeResolutionAction;
+  reason: string;
 }
 
 export interface AbandonFlowResponse {
@@ -377,6 +485,7 @@ export interface PreviewDto {
   outcomeLabel: string;
   artifacts: PreviewArtifactDto[];
   deliveredBy: FlowStepDto[];
+  outcomeVerification: OutcomeVerificationDto;
   generatedAt: string;
 }
 
@@ -384,4 +493,5 @@ export interface PreviewArtifactDto {
   id: string;
   label: string;
   url: string;
+  openUrl: string;
 }

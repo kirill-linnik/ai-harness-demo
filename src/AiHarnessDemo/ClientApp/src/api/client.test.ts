@@ -68,6 +68,8 @@ describe("request", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(request("/api/settings")).rejects.toThrow(new ApiError("Internal failure"));
+    await expect(request("/api/settings")).rejects.toThrow(
+      new ApiError("Internal failure", 500, "Internal failure")
+    );
   });
 });

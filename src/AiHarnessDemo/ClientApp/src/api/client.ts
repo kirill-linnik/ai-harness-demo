@@ -5,7 +5,16 @@
 // - Throws an Error using the ProblemDetails `detail`/`title` on non-2xx responses.
 // - Returns null for 204 No Content.
 
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly payload: unknown
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 export interface RequestOptions {
   method?: string;
@@ -25,13 +34,20 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
   if (!response.ok) {
     const responseText = await response.text();
     let message = responseText;
+    let payload: unknown = responseText;
     try {
-      const problem = JSON.parse(responseText) as { detail?: string; title?: string };
+      payload = JSON.parse(responseText) as unknown;
+      const problem = payload as { detail?: string; title?: string; message?: string };
       message = problem.detail || problem.title || responseText;
+      message = problem.message || message;
     } catch {
       // Plain-text error responses are surfaced as-is.
     }
-    throw new ApiError(message || `Request failed with ${response.status}.`);
+    throw new ApiError(
+      message || `Request failed with ${response.status}.`,
+      response.status,
+      payload
+    );
   }
 
   if (response.status === 204) {

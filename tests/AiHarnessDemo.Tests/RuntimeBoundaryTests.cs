@@ -35,6 +35,54 @@ public sealed class CopilotJsonlParserTests
         Assert.Contains("path", toolCall.ArgumentsSummary);
         Assert.DoesNotContain("secret.txt", toolCall.ArgumentsSummary);
         Assert.DoesNotContain("do-not-store", toolCall.ArgumentsSummary);
+        Assert.Contains("secret.txt", toolCall.NormalizedArguments);
+        Assert.DoesNotContain("do-not-store", toolCall.NormalizedArguments);
+        Assert.Contains("redacted", toolCall.NormalizedArguments);
+        Assert.StartsWith("sha256:", toolCall.ResultDigest);
+        Assert.Equal("done", toolCall.ResultSummary);
+    }
+
+    [Fact]
+    public void Parse_PersistsOnlyNormalizedCommandDigestForQaCorrelation()
+    {
+        const string jsonl = """
+            {"type":"tool.execution_start","data":{"toolCallId":"one","toolName":"powershell","arguments":{"command":"  dotnet   test .\\AiHarnessDemo.slnx  ","description":"Run tests"}}}
+            {"type":"tool.execution_complete","data":{"toolCallId":"one","success":true}}
+            {"type":"assistant.message","data":{"content":"HANDOFF_STATUS: COMPLETE"}}
+            {"type":"result","exitCode":0}
+            """;
+
+        var workspace = Path.GetFullPath(Path.GetTempPath());
+        var result = CopilotJsonlParser.Parse(
+            jsonl,
+            workingDirectory: workspace);
+
+        var toolCall = Assert.Single(result.ToolCalls);
+        Assert.True(toolCall.Succeeded);
+        Assert.Equal("Command", toolCall.ToolType);
+        Assert.Equal(
+            "dotnet test ./AiHarnessDemo.slnx",
+            toolCall.NormalizedCommand);
+        Assert.Equal(workspace, toolCall.WorkingDirectory);
+        Assert.True(HostObservedToolLocator.MatchesCommand(
+            toolCall.ArgumentsSummary,
+            "dotnet test ./AiHarnessDemo.slnx"));
+        Assert.DoesNotContain("AiHarnessDemo.slnx", toolCall.ArgumentsSummary);
+    }
+
+    [Fact]
+    public void Parse_TreatsNonzeroToolExitAsUnsuccessfulWithoutSuccessFlag()
+    {
+        const string jsonl = """
+            {"type":"tool.execution_start","data":{"toolCallId":"one","toolName":"powershell","arguments":{"command":"dotnet test"}}}
+            {"type":"tool.execution_complete","data":{"toolCallId":"one","result":{"exitCode":1}}}
+            {"type":"assistant.message","data":{"content":"HANDOFF_STATUS: COMPLETE"}}
+            {"type":"result","exitCode":0}
+            """;
+
+        var result = CopilotJsonlParser.Parse(jsonl);
+
+        Assert.False(Assert.Single(result.ToolCalls).Succeeded);
     }
 
     [Fact]
@@ -267,6 +315,681 @@ public sealed class AgentHandoffInspectorTests
     }
 }
 
+public sealed class GovernedPublicationBoundaryTests
+{
+    [Theory]
+    [InlineData("team-lead")]
+    [InlineData("architect")]
+    [InlineData("software-engineer")]
+    [InlineData("quality-engineer")]
+    [InlineData("release-engineer")]
+    [InlineData("product-manager")]
+    public void EveryGovernedNonPublicationCopilotTurn_IsRemotePublicationGuarded(
+        string agentRole)
+    {
+        var environment =
+            Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
+                CopilotReasoningHost.BuildProcessEnvironment(
+                    agentRole,
+                    allowRemotePublication: true,
+                    isGovernedOutcomeVerification: true));
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\governed-worktree",
+            @"C:\harness",
+            agentRole,
+            agentRole,
+            "model",
+            "high",
+            Guid.NewGuid(),
+            "Governed turn",
+            isGovernedOutcomeVerification: true,
+            blockRemotePublication: true);
+
+        Assert.Null(environment["GH_TOKEN"]);
+        Assert.Null(environment["GITHUB_TOKEN"]);
+        Assert.Null(environment["SSH_AUTH_SOCK"]);
+        Assert.Equal("Never", environment["GCM_INTERACTIVE"]);
+        Assert.Contains(
+            $"--available-tools={CopilotReasoningHost.GovernedNonPublicationTools()}",
+            arguments);
+        Assert.Contains("--allow-tool=write", arguments);
+        Assert.Contains("--allow-tool=shell", arguments);
+        Assert.Contains(
+            "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS",
+            arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+        Assert.DoesNotContain("--deny-tool=shell(git:*)", arguments);
+        Assert.Contains("--deny-tool=shell(git.exe:*)", arguments);
+        Assert.Contains("--deny-tool=shell(git commit)", arguments);
+        Assert.Contains("--deny-tool=shell(git.exe commit)", arguments);
+        Assert.Contains("--deny-tool=shell(git branch)", arguments);
+        Assert.Contains("--deny-tool=shell(git checkout)", arguments);
+        Assert.Contains("--deny-tool=shell(git switch)", arguments);
+        Assert.Contains("--deny-tool=shell(git tag)", arguments);
+        Assert.Contains("--deny-tool=shell(git push)", arguments);
+        Assert.Contains("--deny-tool=shell(git send-pack)", arguments);
+        Assert.Contains("--deny-tool=shell(gh:*)", arguments);
+        Assert.Contains("--deny-tool=shell(ssh:*)", arguments);
+        Assert.Contains("--deny-url=github.com", arguments);
+        Assert.Contains("--deny-url=api.github.com", arguments);
+        Assert.Contains("--no-remote", arguments);
+        Assert.Contains("--no-remote-export", arguments);
+    }
+
+    [Theory]
+    [InlineData("git status --short")]
+    [InlineData("git -C repo diff --stat")]
+    [InlineData("git show HEAD:file.txt")]
+    [InlineData("git log -1 --format=%H")]
+    [InlineData("git rev-parse HEAD")]
+    [InlineData("git ls-files")]
+    [InlineData("git cat-file -p HEAD")]
+    public void GovernedGitArgumentPolicy_AllowsReadOnlyCommands(string command)
+    {
+        Assert.True(HostObservedToolLocator.IsReadOnlyGitCommand(command));
+    }
+
+    [Theory]
+    [InlineData("git add -A")]
+    [InlineData("git -C repo commit -m sealed")]
+    [InlineData("git update-ref refs/heads/test HEAD")]
+    [InlineData("git push origin HEAD")]
+    [InlineData("git -c core.hooksPath=NUL reset --hard HEAD")]
+    [InlineData("git --git-dir=C:/outside/.git show HEAD:file.txt")]
+    [InlineData("git.exe status --short")]
+    public void GovernedGitArgumentPolicy_DeniesMutatingOrNetworkingCommands(
+        string command)
+    {
+        Assert.False(HostObservedToolLocator.IsReadOnlyGitCommand(command));
+    }
+
+    [Fact]
+    public void HostControlledPublicationTurn_KeepsOnlyReadOnlyLocalTools()
+    {
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\governed-worktree",
+            @"C:\harness",
+            "release-engineer",
+            "release-engineer",
+            "model",
+            "high",
+            Guid.NewGuid(),
+            "Prepare the host-controlled publication narrative.",
+            isHostControlledPublication: true,
+            isGovernedOutcomeVerification: true,
+            blockRemotePublication: true);
+
+        Assert.Contains("--available-tools=view,grep,glob", arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.Contains("--deny-tool=write,shell", arguments);
+        Assert.DoesNotContain(
+            $"--available-tools={CopilotReasoningHost.GovernedNonPublicationTools()}",
+            arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+        Assert.Contains("--deny-tool=shell(git push)", arguments);
+        Assert.Contains("--deny-tool=shell(gh:*)", arguments);
+        Assert.Contains("--deny-url=github.com", arguments);
+        Assert.Contains("--no-remote", arguments);
+        Assert.Contains("--no-remote-export", arguments);
+    }
+
+    [Fact]
+    public async Task GovernedGitIsolation_HidesAuthoritativePointerAndRejectsShadowMetadataMutation()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"governed-git-isolation-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var worktree = Path.Combine(root, "worktree");
+        Directory.CreateDirectory(source);
+        try
+        {
+            RunGit(source, "init", "--quiet");
+            RunGit(source, "config", "user.email", "tests@example.invalid");
+            RunGit(source, "config", "user.name", "Governed Isolation Tests");
+            await File.WriteAllTextAsync(
+                Path.Combine(source, "tracked.txt"),
+                "initial");
+            RunGit(source, "add", "tracked.txt");
+            RunGit(source, "commit", "--quiet", "-m", "initial");
+            RunGit(
+                source,
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "test/governed",
+                worktree);
+            var markerPath = Path.Combine(worktree, ".git");
+            var originalMarkerBytes = File.ReadAllBytes(markerPath);
+            var realGitDirectory = RunGitOutput(
+                    worktree,
+                    "rev-parse",
+                    "--absolute-git-dir")
+                .Trim();
+            var realHead = RunGitOutput(worktree, "rev-parse", "HEAD").Trim();
+            var realTree = RunGitOutput(worktree, "rev-parse", "HEAD^{tree}").Trim();
+            const string directShadowRef = "refs/heads/agent-created";
+            const string childShadowRef = "refs/heads/child-created";
+
+            string isolationRoot;
+            using (var isolation =
+                   CopilotReasoningHost.GovernedGitIsolationScope.Create(worktree))
+            {
+                isolationRoot = isolation.RootPath;
+                Assert.False(File.Exists(markerPath));
+                Assert.True(Directory.Exists(markerPath));
+                Assert.Throws<InvalidOperationException>(() =>
+                    CopilotReasoningHost.GovernedGitIsolationScope
+                        .RecoverInterrupted(worktree));
+                var shadowGitDirectory = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "rev-parse",
+                    "--absolute-git-dir");
+                var tree = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "rev-parse",
+                    "HEAD^{tree}");
+                var show = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "show",
+                    "HEAD:tracked.txt");
+                var log = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "log",
+                    "-1",
+                    "--format=%H");
+                var diff = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "diff",
+                    "--",
+                    "tracked.txt");
+                var status = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "status",
+                    "--porcelain=v1");
+                var directMutation = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "update-ref",
+                    directShadowRef,
+                    realHead);
+                var directFileMutation = await RunShellCommandAsync(
+                    worktree,
+                    OperatingSystem.IsWindows()
+                        ? "echo unauthorized>.git\\direct-write"
+                        : "printf unauthorized > .git/direct-write",
+                    isolation.EnvironmentVariables);
+                var nestedGitMutation = await RunShellCommandAsync(
+                    worktree,
+                    OperatingSystem.IsWindows()
+                        ? "mkdir rogue\\.git && echo unauthorized>rogue\\.git\\config"
+                        : "mkdir -p rogue/.git && printf unauthorized > rogue/.git/config",
+                    isolation.EnvironmentVariables);
+                var childMutation = await RunShellCommandAsync(
+                    worktree,
+                    $"git update-ref {childShadowRef} {realHead}",
+                    isolation.EnvironmentVariables);
+                var repositoryOverride = await RunShellCommandAsync(
+                    worktree,
+                    $"git --git-dir=\"{realGitDirectory}\" rev-parse HEAD",
+                    isolation.EnvironmentVariables);
+                var remoteRead = await RunShellCommandAsync(
+                    worktree,
+                    "git ls-remote https://example.invalid/repository.git",
+                    isolation.EnvironmentVariables);
+
+                Assert.Equal(0, shadowGitDirectory.ExitCode);
+                Assert.Equal(0, tree.ExitCode);
+                Assert.Equal(0, show.ExitCode);
+                Assert.Equal(0, log.ExitCode);
+                Assert.Equal(0, diff.ExitCode);
+                Assert.Equal(0, status.ExitCode);
+                Assert.Equal(0, directMutation.ExitCode);
+                Assert.Equal(0, directFileMutation.ExitCode);
+                Assert.Equal(0, nestedGitMutation.ExitCode);
+                Assert.Equal(126, childMutation.ExitCode);
+                Assert.Equal(126, repositoryOverride.ExitCode);
+                Assert.Equal(126, remoteRead.ExitCode);
+                Assert.Equal(
+                    Path.GetFullPath(markerPath),
+                    Path.GetFullPath(shadowGitDirectory.StandardOutput.Trim()),
+                    OperatingSystem.IsWindows()
+                        ? StringComparer.OrdinalIgnoreCase
+                        : StringComparer.Ordinal);
+                Assert.Equal(realTree, tree.StandardOutput.Trim());
+                Assert.Equal("initial", show.StandardOutput.Trim());
+                Assert.Equal(realHead, log.StandardOutput.Trim());
+                Assert.True(string.IsNullOrWhiteSpace(diff.StandardOutput));
+                Assert.True(string.IsNullOrWhiteSpace(status.StandardOutput));
+                var directShadowLookup = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "show-ref",
+                    "--hash",
+                    directShadowRef);
+                var childShadowLookup = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "show-ref",
+                    "--hash",
+                    childShadowRef);
+                Assert.Equal(realHead, directShadowLookup.StandardOutput.Trim());
+                Assert.NotEqual(0, childShadowLookup.ExitCode);
+                isolation.RestoreAndValidate();
+                Assert.True(isolation.UnauthorizedMetadataMutationDetected);
+            }
+
+            Assert.False(Directory.Exists(isolationRoot));
+            Assert.False(Directory.Exists(Path.Combine(worktree, "rogue", ".git")));
+            Assert.Equal(originalMarkerBytes, File.ReadAllBytes(markerPath));
+            Assert.Equal(
+                realGitDirectory,
+                RunGitOutput(worktree, "rev-parse", "--absolute-git-dir").Trim());
+            Assert.Equal(realHead, RunGitOutput(worktree, "rev-parse", "HEAD").Trim());
+            Assert.NotEqual(
+                0,
+                TryRunGit(
+                    worktree,
+                    "show-ref",
+                    "--verify",
+                    directShadowRef));
+            Assert.NotEqual(
+                0,
+                TryRunGit(
+                    worktree,
+                    "show-ref",
+                    "--verify",
+                    childShadowRef));
+        }
+        finally
+        {
+            if (Directory.Exists(source))
+            {
+                _ = TryRunGit(
+                    source,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree);
+            }
+            if (Directory.Exists(root))
+            {
+                try
+                {
+                    foreach (var file in Directory.EnumerateFiles(
+                                 root,
+                                 "*",
+                                 SearchOption.AllDirectories))
+                    {
+                        File.SetAttributes(file, FileAttributes.Normal);
+                    }
+                    Directory.Delete(root, recursive: true);
+                }
+                catch (Exception exception) when (
+                    exception is IOException or UnauthorizedAccessException)
+                {
+                    // Test cleanup only.
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GovernedGitIsolation_RecoversPointerAfterInjectedHostInterruption()
+    {
+        var root = Path.Combine(
+            AppContext.BaseDirectory,
+            $"gitiso-rec-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var worktree = Path.Combine(root, "worktree");
+        Directory.CreateDirectory(source);
+        try
+        {
+            RunGit(source, "init", "--quiet");
+            RunGit(source, "config", "user.email", "tests@example.invalid");
+            RunGit(source, "config", "user.name", "Governed Isolation Tests");
+            await File.WriteAllTextAsync(Path.Combine(source, "tracked.txt"), "initial");
+            RunGit(source, "add", "tracked.txt");
+            RunGit(source, "commit", "--quiet", "-m", "initial");
+            RunGit(
+                source,
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "test/governed-recovery",
+                worktree);
+            var markerPath = Path.Combine(worktree, ".git");
+            var originalMarkerBytes = File.ReadAllBytes(markerPath);
+            var originalHead = RunGitOutput(worktree, "rev-parse", "HEAD").Trim();
+
+            using (var interrupted =
+                   CopilotReasoningHost.GovernedGitIsolationScope.Create(worktree))
+            {
+                Assert.True(Directory.Exists(markerPath));
+                await File.WriteAllTextAsync(
+                    Path.Combine(worktree, "tracked.txt"),
+                    "product edit survives");
+                await File.WriteAllTextAsync(
+                    Path.Combine(markerPath, "unauthorized"),
+                    "discard me");
+                interrupted.LeaveInterruptedForRecoveryTest();
+            }
+
+            Assert.True(Directory.Exists(markerPath));
+            CopilotReasoningHost.GovernedGitIsolationScope.RecoverInterrupted(worktree);
+
+            Assert.True(File.Exists(markerPath));
+            Assert.False(Directory.Exists(markerPath));
+            Assert.Equal(originalMarkerBytes, File.ReadAllBytes(markerPath));
+            Assert.Equal(originalHead, RunGitOutput(worktree, "rev-parse", "HEAD").Trim());
+            Assert.Equal(
+                "product edit survives",
+                await File.ReadAllTextAsync(Path.Combine(worktree, "tracked.txt")));
+            Assert.Contains(
+                "tracked.txt",
+                RunGitOutput(worktree, "status", "--short"));
+        }
+        finally
+        {
+            if (Directory.Exists(source))
+            {
+                _ = TryRunGit(
+                    source,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree);
+            }
+            if (Directory.Exists(root))
+            {
+                foreach (var file in Directory.EnumerateFiles(
+                             root,
+                             "*",
+                             SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GovernedGitIsolation_DispatchesReadOnlyGitPerRepository()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"governed-git-multi-{Guid.NewGuid():N}");
+        var workspace = Path.Combine(root, "workspace");
+        var sources = new[]
+        {
+            Path.Combine(root, "source-a"),
+            Path.Combine(root, "source-b")
+        };
+        var worktrees = new[]
+        {
+            Path.Combine(workspace, "a"),
+            Path.Combine(workspace, "b")
+        };
+        Directory.CreateDirectory(workspace);
+        try
+        {
+            for (var index = 0; index < sources.Length; index++)
+            {
+                Directory.CreateDirectory(sources[index]);
+                RunGit(sources[index], "init", "--quiet");
+                RunGit(sources[index], "config", "user.email", "tests@example.invalid");
+                RunGit(sources[index], "config", "user.name", "Governed Isolation Tests");
+                await File.WriteAllTextAsync(
+                    Path.Combine(sources[index], "tracked.txt"),
+                    $"repository-{index}");
+                RunGit(sources[index], "add", "tracked.txt");
+                RunGit(sources[index], "commit", "--quiet", "-m", "initial");
+                RunGit(
+                    sources[index],
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    $"test/governed-{index}",
+                    worktrees[index]);
+            }
+            var markerBytes = worktrees.ToDictionary(
+                path => path,
+                path => File.ReadAllBytes(Path.Combine(path, ".git")));
+            var planted = Path.Combine(workspace, "planted");
+            Directory.CreateDirectory(planted);
+            await File.WriteAllTextAsync(
+                Path.Combine(planted, ".git"),
+                $"gitdir: {Path.Combine(sources[0], ".git").Replace('\\', '/')}\n");
+
+            using (var isolation =
+                   CopilotReasoningHost.GovernedGitIsolationScope.Create(
+                       workspace,
+                       ["a", "b"]))
+            {
+                for (var index = 0; index < worktrees.Length; index++)
+                {
+                    var read = await RunShellCommandAsync(
+                        workspace,
+                        $"git -C \"{worktrees[index]}\" show HEAD:tracked.txt",
+                        isolation.EnvironmentVariables);
+                    Assert.True(read.ExitCode == 0, read.CombinedOutput);
+                    Assert.Equal(
+                        $"repository-{index}",
+                        read.StandardOutput.Trim());
+                    Assert.False(File.Exists(Path.Combine(worktrees[index], ".git")));
+                    Assert.True(Directory.Exists(Path.Combine(worktrees[index], ".git")));
+                }
+                var plantedRead = await RunShellCommandAsync(
+                    workspace,
+                    $"git -C \"{planted}\" rev-parse HEAD",
+                    isolation.EnvironmentVariables);
+                Assert.Equal(128, plantedRead.ExitCode);
+                isolation.RestoreAndValidate();
+                Assert.False(isolation.UnauthorizedMetadataMutationDetected);
+            }
+
+            foreach (var worktree in worktrees)
+            {
+                Assert.Equal(
+                    markerBytes[worktree],
+                    File.ReadAllBytes(Path.Combine(worktree, ".git")));
+            }
+        }
+        finally
+        {
+            for (var index = 0; index < sources.Length; index++)
+            {
+                if (Directory.Exists(sources[index]))
+                {
+                    _ = TryRunGit(
+                        sources[index],
+                        "worktree",
+                        "remove",
+                        "--force",
+                        worktrees[index]);
+                }
+            }
+            if (Directory.Exists(root))
+            {
+                foreach (var file in Directory.EnumerateFiles(
+                             root,
+                             "*",
+                             SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GovernedGitIsolation_PreservesSha256ObjectFormat()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"governed-git-sha256-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var worktree = Path.Combine(root, "worktree");
+        Directory.CreateDirectory(source);
+        try
+        {
+            if (TryRunGit(source, "init", "--quiet", "--object-format=sha256") != 0)
+            {
+                return;
+            }
+            RunGit(source, "config", "user.email", "tests@example.invalid");
+            RunGit(source, "config", "user.name", "Governed Isolation Tests");
+            await File.WriteAllTextAsync(
+                Path.Combine(source, "tracked.txt"),
+                "sha256");
+            RunGit(source, "add", "tracked.txt");
+            RunGit(source, "commit", "--quiet", "-m", "initial");
+            RunGit(
+                source,
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "test/governed-sha256",
+                worktree);
+            var expectedHead = RunGitOutput(worktree, "rev-parse", "HEAD").Trim();
+
+            using var isolation =
+                CopilotReasoningHost.GovernedGitIsolationScope.Create(worktree);
+            var actual = await RunGitProcessAsync(
+                worktree,
+                isolation.EnvironmentVariables,
+                "rev-parse",
+                "HEAD");
+
+            Assert.True(actual.ExitCode == 0, actual.CombinedOutput);
+            Assert.Equal(expectedHead, actual.StandardOutput.Trim());
+            Assert.Equal(64, expectedHead.Length);
+        }
+        finally
+        {
+            if (Directory.Exists(source))
+            {
+                _ = TryRunGit(
+                    source,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree);
+            }
+            if (Directory.Exists(root))
+            {
+                foreach (var file in Directory.EnumerateFiles(
+                             root,
+                             "*",
+                             SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static void RunGit(
+        string workingDirectory,
+        params string[] arguments)
+    {
+        var exitCode = TryRunGit(workingDirectory, arguments);
+        Assert.Equal(0, exitCode);
+    }
+
+    private static string RunGitOutput(
+        string workingDirectory,
+        params string[] arguments)
+    {
+        using var process = StartGit(workingDirectory, arguments);
+        var output = process.StandardOutput.ReadToEnd();
+        var error = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0, error);
+        return output;
+    }
+
+    private static int TryRunGit(
+        string workingDirectory,
+        params string[] arguments)
+    {
+        using var process = StartGit(workingDirectory, arguments);
+        _ = process.StandardOutput.ReadToEnd();
+        _ = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        return process.ExitCode;
+    }
+
+    private static Task<ProcessResult> RunGitProcessAsync(
+        string workingDirectory,
+        IReadOnlyDictionary<string, string?>? environmentVariables,
+        params string[] arguments) =>
+        new ProcessRunner().RunAsync(
+            "git",
+            arguments,
+            workingDirectory,
+            TimeSpan.FromSeconds(20),
+            environmentVariables: environmentVariables);
+
+    private static Task<ProcessResult> RunShellCommandAsync(
+        string workingDirectory,
+        string command,
+        IReadOnlyDictionary<string, string?>? environmentVariables)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return new ProcessRunner().RunAsync(
+                Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+                ["/d", "/c", command],
+                workingDirectory,
+                TimeSpan.FromSeconds(20),
+                environmentVariables: environmentVariables);
+        }
+
+        return new ProcessRunner().RunAsync(
+            "/bin/sh",
+            ["-lc", command],
+            workingDirectory,
+            TimeSpan.FromSeconds(20),
+            environmentVariables: environmentVariables);
+    }
+
+    private static Process StartGit(
+        string workingDirectory,
+        IEnumerable<string> arguments)
+    {
+        var start = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var argument in arguments)
+        {
+            start.ArgumentList.Add(argument);
+        }
+        return Process.Start(start)
+            ?? throw new InvalidOperationException("Could not start git.");
+    }
+}
+
 public sealed class CopilotCliRuntimeTests
 {
     [Fact]
@@ -286,9 +1009,9 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--add-dir --acp --agent --allow-all-tools --available-tools --disable-builtin-mcps --deny-tool --disallow-temp-dir " +
+                "--add-dir --acp --agent --allow-all-tools --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
-                "--no-eager-powershell-resolution --output-format --session-id");
+                "--no-eager-powershell-resolution --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
 
             Assert.True(status.Ready);
@@ -353,9 +1076,9 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--agent --allow-all-tools --available-tools --disable-builtin-mcps --deny-tool --disallow-temp-dir " +
+                "--agent --allow-all-tools --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
-                "--no-eager-powershell-resolution --output-format --session-id");
+                "--no-eager-powershell-resolution --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
 
             Assert.False(status.Ready);

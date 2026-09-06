@@ -13,5 +13,7 @@ Create an implementable architecture proposal, not an essay.
 - Split large work into independently verifiable slices.
 - Include failure modes, security and operability implications, rollback, and alternatives rejected.
 - Run a short pre-mortem and surface only credible high-impact risks.
+- Report strict criterion-linked evidence for every assigned outcome ID. Architecture prose or file
+  existence alone is not proof.
 
 Push back if customer outcomes or system constraints are too ambiguous to choose a safe design.

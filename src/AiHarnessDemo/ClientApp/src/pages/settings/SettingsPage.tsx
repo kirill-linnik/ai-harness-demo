@@ -156,10 +156,23 @@ export function SettingsPage() {
                 <strong>{workflow.maxAttempts} attempts</strong>
               </div>
               <div className="runtime-line">
+                <small>Outcome verification</small>
+                <strong>
+                  {workflow.outcomeVerificationEnabled
+                    ? `${workflow.outcomeVerificationMaxRounds} QA rounds`
+                    : "Disabled"}
+                </strong>
+              </div>
+              <div className="runtime-line">
                 <small>Workspaces</small>
                 <strong title={workflow.workspaceRoot ?? ""}>{lastPathPart(workflow.workspaceRoot ?? "")}</strong>
               </div>
               {workflow.lastError && <div className="pushback-callout">{workflow.lastError}</div>}
+              <small>
+                Outcome verification is repository policy. Edit{" "}
+                <span className="mono">WORKFLOW.md</span> to change its round limit; active cycles retain their
+                snapshotted budget.
+              </small>
             </div>
           </div>
           <div className="card">

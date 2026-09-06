@@ -89,6 +89,27 @@ public sealed class HandoffGateEngineTests
     }
 
     [Fact]
+    public void OutcomeResolution_IsAlwaysHumanGated()
+    {
+        using var gate = new HandoffGateEngine();
+        gate.SetTrustLevel(
+            HandoffActionType.OutcomeResolution,
+            HandoffTrustLevel.Gated);
+
+        var record = gate.SubmitProposal(
+            Proposal(HandoffActionType.OutcomeResolution));
+
+        Assert.Equal(
+            HandoffGateDecision.AwaitingHumanApproval,
+            record.Decision);
+        Assert.Contains("Operator resolution", record.Reason);
+        Assert.Throws<InvalidOperationException>(() =>
+            gate.SetTrustLevel(
+                HandoffActionType.OutcomeResolution,
+                HandoffTrustLevel.Auto));
+    }
+
+    [Fact]
     public void SubmitProposal_DescribesPushbackAsARevisionRequest()
     {
         using var gate = new HandoffGateEngine();

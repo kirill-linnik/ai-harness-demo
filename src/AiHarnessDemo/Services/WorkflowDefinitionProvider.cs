@@ -10,7 +10,9 @@ public sealed record WorkflowRuntimeStatus(
     string? LastError,
     int? MaxConcurrentAgents,
     int? MaxAttempts,
-    string? WorkspaceRoot);
+    string? WorkspaceRoot,
+    bool? OutcomeVerificationEnabled,
+    int? OutcomeVerificationMaxRounds);
 
 /// <summary>
 /// Keeps the last-known-good Symphony WORKFLOW.md in memory and hot-reloads changes. Invalid reloads
@@ -59,7 +61,9 @@ public sealed class WorkflowDefinitionProvider(
                 _lastError,
                 _current?.Config.Agent.MaxConcurrentAgents,
                 _current?.Config.Agent.MaxAttempts,
-                _current?.Config.Workspace.ResolvedRoot);
+                _current?.Config.Workspace.ResolvedRoot,
+                _current?.Config.OutcomeVerification.Enabled,
+                _current?.Config.OutcomeVerification.MaxRounds);
         }
     }
 

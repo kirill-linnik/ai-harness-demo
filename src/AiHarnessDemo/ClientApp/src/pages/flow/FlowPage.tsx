@@ -13,6 +13,8 @@ import { StepDetail } from "./StepDetail";
 import { Timeline } from "./Timeline";
 import { FeedbackCard } from "./FeedbackCard";
 import { AbandonFlowButton } from "./AbandonFlowButton";
+import { OutcomeResolutionCard } from "./OutcomeResolutionCard";
+import { OutcomeVerificationPanel } from "./OutcomeVerificationPanel";
 
 export function FlowPage() {
   const { id } = useParams<{ id: string }>();
@@ -103,6 +105,11 @@ export function FlowPage() {
             <span>Created {timeAgo(flow.createdAt)}</span>
             <span>{allSteps.length} agent executions</span>
             <span>{allSteps.filter(step => step.status === "Pushback").length} pushbacks observed</span>
+            {!flow.outcomeVerification.legacyUnverified && (
+              <span>
+                QA {flow.outcomeVerification.currentRound}/{flow.outcomeVerification.maxRounds}
+              </span>
+            )}
           </div>
         </div>
         <div className="flow-heading-actions">
@@ -128,7 +135,7 @@ export function FlowPage() {
           <span className={`status-pill ${flow.status.toLowerCase()}`}>{progress}% current iteration</span>
         </div>
         <div className="progress-line">
-          <span style={{ width: `${progress}%` }}></span>
+          <span style={{ transform: `scaleX(${progress / 100})` }}></span>
         </div>
         {Object.keys(grouped).length ? (
           Object.entries(grouped).map(([iteration, steps]) => (
@@ -152,6 +159,7 @@ export function FlowPage() {
           </div>
         )}
       </div>
+      <OutcomeVerificationPanel outcome={flow.outcomeVerification} />
       <section className="factory-detail-grid">
         <div className="card detail-panel">
           <div className="card-header">
@@ -180,7 +188,12 @@ export function FlowPage() {
           </div>
         </div>
       </section>
-      {flow.status === "WaitingForFeedback" && <FeedbackCard flow={flow} />}
+      {flow.status === "WaitingForFeedback" &&
+        flow.outcomeVerification.status !== "AwaitingHumanResolution" && <FeedbackCard flow={flow} />}
+      {flow.status === "WaitingForFeedback" &&
+        flow.outcomeVerification.status === "AwaitingHumanResolution" && (
+          <OutcomeResolutionCard flow={flow} />
+        )}
       {flow.status === "Approved" && (
         <section className="approval-banner">
           <div>

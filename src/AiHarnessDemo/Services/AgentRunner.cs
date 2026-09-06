@@ -32,7 +32,14 @@ public sealed record AgentExecutionContext(
     bool RecoverInterruptedSession = false,
     Action<AgentRunProgress>? Progress = null,
     bool IsPreMortemRevision = false,
-    DateTimeOffset? InvocationStartedAt = null);
+    DateTimeOffset? InvocationStartedAt = null,
+    string OutcomeContext = "",
+    string OutcomeContract = "",
+    string DirectPrompt = "",
+    bool IsOutcomeQa = false,
+    bool IsHostControlledPublication = false,
+    bool IsGovernedOutcomeVerification = false,
+    IReadOnlyList<string>? GovernedRepositoryRelativePaths = null);
 
 public sealed record AgentExecutionResult(
     string Output,

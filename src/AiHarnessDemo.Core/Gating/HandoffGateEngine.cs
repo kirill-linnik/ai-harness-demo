@@ -12,7 +12,8 @@ public enum HandoffActionType
 {
     Advance,
     RequestRevision,
-    Release
+    Release,
+    OutcomeResolution
 }
 
 public enum HandoffBlastRadius
@@ -154,10 +155,11 @@ public sealed class HandoffGateEngine : IDisposable
 
     public void SetTrustLevel(HandoffActionType actionType, HandoffTrustLevel trustLevel)
     {
-        if (trustLevel == HandoffTrustLevel.Auto && actionType == HandoffActionType.Release)
+        if (trustLevel == HandoffTrustLevel.Auto &&
+            actionType is HandoffActionType.Release or HandoffActionType.OutcomeResolution)
         {
             throw new InvalidOperationException(
-                "Release is customer-gated and can never receive automatic trust.");
+                $"{actionType} is human-gated and can never receive automatic trust.");
         }
 
         lock (_lock)
@@ -199,25 +201,59 @@ public sealed class HandoffGateEngine : IDisposable
         lock (_lock)
         {
             var record = RequireRecord(recordId);
-            if (record.Decision != HandoffGateDecision.AwaitingHumanApproval)
-            {
-                throw new InvalidOperationException(
-                    $"Gate record {recordId} does not require human approval.");
-            }
-
-            if (record.Resolved)
-            {
-                throw new InvalidOperationException(
-                    $"Gate record {recordId} was already resolved.");
-            }
-
-            record.Resolved = true;
-            record.Approved = approved;
-            record.ResolvedBy = resolvedBy;
-            record.ResolutionNote = note;
-            record.ResolvedAt = DateTimeOffset.UtcNow;
+            var resolved = PrepareResolution(
+                record,
+                approved,
+                resolvedBy,
+                note);
+            CopyRecord(resolved, record);
             return record;
         }
+    }
+
+    public HandoffGateRecord PrepareResolution(
+        HandoffGateRecord record,
+        bool approved,
+        string resolvedBy,
+        string? note = null,
+        DateTimeOffset? resolvedAt = null)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        if (record.Decision != HandoffGateDecision.AwaitingHumanApproval)
+        {
+            throw new InvalidOperationException(
+                $"Gate record {record.Id} does not require human approval.");
+        }
+        if (record.Resolved)
+        {
+            throw new InvalidOperationException(
+                $"Gate record {record.Id} was already resolved.");
+        }
+        if (string.IsNullOrWhiteSpace(resolvedBy))
+        {
+            throw new ArgumentException(
+                "A gate resolution requires an actor.",
+                nameof(resolvedBy));
+        }
+
+        return new HandoffGateRecord
+        {
+            Id = record.Id,
+            FlowRunId = record.FlowRunId,
+            FlowStepId = record.FlowStepId,
+            ActionType = record.ActionType,
+            Decision = record.Decision,
+            TrustLevelAtDecision = record.TrustLevelAtDecision,
+            Summary = record.Summary,
+            Evidence = record.Evidence,
+            Reason = record.Reason,
+            DecidedAt = record.DecidedAt,
+            Resolved = true,
+            Approved = approved,
+            ResolvedBy = resolvedBy,
+            ResolutionNote = note,
+            ResolvedAt = resolvedAt ?? DateTimeOffset.UtcNow
+        };
     }
 
     public HandoffGateRecord SupersedeProposal(
@@ -228,19 +264,58 @@ public sealed class HandoffGateEngine : IDisposable
         lock (_lock)
         {
             var record = RequireRecord(recordId);
-            if (record.Resolved)
-            {
-                throw new InvalidOperationException(
-                    $"Gate record {recordId} was already resolved.");
-            }
-
-            record.Resolved = true;
-            record.Approved = false;
-            record.ResolvedBy = resolvedBy;
-            record.ResolutionNote = note;
-            record.ResolvedAt = DateTimeOffset.UtcNow;
+            var superseded = PrepareSupersession(
+                record,
+                resolvedBy,
+                note);
+            CopyRecord(superseded, record);
             return record;
         }
+    }
+
+    public HandoffGateRecord PrepareSupersession(
+        HandoffGateRecord record,
+        string resolvedBy,
+        string note,
+        DateTimeOffset? resolvedAt = null)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        if (record.Resolved)
+        {
+            throw new InvalidOperationException(
+                $"Gate record {record.Id} was already resolved.");
+        }
+        if (string.IsNullOrWhiteSpace(resolvedBy))
+        {
+            throw new ArgumentException(
+                "A gate supersession requires an actor.",
+                nameof(resolvedBy));
+        }
+        if (string.IsNullOrWhiteSpace(note))
+        {
+            throw new ArgumentException(
+                "A gate supersession requires a reason.",
+                nameof(note));
+        }
+
+        return new HandoffGateRecord
+        {
+            Id = record.Id,
+            FlowRunId = record.FlowRunId,
+            FlowStepId = record.FlowStepId,
+            ActionType = record.ActionType,
+            Decision = record.Decision,
+            TrustLevelAtDecision = record.TrustLevelAtDecision,
+            Summary = record.Summary,
+            Evidence = record.Evidence,
+            Reason = record.Reason,
+            DecidedAt = record.DecidedAt,
+            Resolved = true,
+            Approved = false,
+            ResolvedBy = resolvedBy,
+            ResolutionNote = note,
+            ResolvedAt = resolvedAt ?? DateTimeOffset.UtcNow
+        };
     }
 
     public IReadOnlyList<HandoffGateRecord> History()
@@ -255,12 +330,40 @@ public sealed class HandoffGateEngine : IDisposable
     {
         lock (_lock)
         {
-            var known = _history.Select(item => item.Id).ToHashSet();
-            foreach (var record in records.Where(item => known.Add(item.Id)))
+            foreach (var record in records)
             {
-                _history.Add(record);
+                var existing = _history.FirstOrDefault(item => item.Id == record.Id);
+                if (existing is null)
+                {
+                    _history.Add(record);
+                }
+                else
+                {
+                    CopyRecord(record, existing);
+                }
             }
         }
+    }
+
+    private static void CopyRecord(
+        HandoffGateRecord source,
+        HandoffGateRecord destination)
+    {
+        destination.Id = source.Id;
+        destination.FlowRunId = source.FlowRunId;
+        destination.FlowStepId = source.FlowStepId;
+        destination.ActionType = source.ActionType;
+        destination.Decision = source.Decision;
+        destination.TrustLevelAtDecision = source.TrustLevelAtDecision;
+        destination.Summary = source.Summary;
+        destination.Evidence = source.Evidence;
+        destination.Reason = source.Reason;
+        destination.DecidedAt = source.DecidedAt;
+        destination.Resolved = source.Resolved;
+        destination.Approved = source.Approved;
+        destination.ResolvedBy = source.ResolvedBy;
+        destination.ResolutionNote = source.ResolutionNote;
+        destination.ResolvedAt = source.ResolvedAt;
     }
 
     private HandoffGateDecision Decide(
@@ -275,7 +378,8 @@ public sealed class HandoffGateEngine : IDisposable
         {
             return HandoffGateDecision.LoggedShadow;
         }
-        if (proposal.ActionType == HandoffActionType.Release ||
+        if (proposal.ActionType is
+                HandoffActionType.Release or HandoffActionType.OutcomeResolution ||
             proposal.BlastRadius == HandoffBlastRadius.High ||
             trustLevel == HandoffTrustLevel.Gated)
         {
@@ -295,6 +399,9 @@ public sealed class HandoffGateEngine : IDisposable
             "This action is in shadow mode and was observed without execution.",
         HandoffGateDecision.AwaitingHumanApproval when proposal.ActionType == HandoffActionType.Release =>
             "Customer approval is required before the release outcome is final.",
+        HandoffGateDecision.AwaitingHumanApproval
+            when proposal.ActionType == HandoffActionType.OutcomeResolution =>
+            "Operator resolution is required before outcome verification can continue.",
         HandoffGateDecision.AwaitingHumanApproval =>
             "The proposal is gated because its trust level or blast radius requires human approval.",
         HandoffGateDecision.AutoApproved

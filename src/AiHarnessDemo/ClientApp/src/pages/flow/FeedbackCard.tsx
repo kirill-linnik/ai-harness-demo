@@ -7,6 +7,7 @@ import { CheckIcon, ExternalIcon, MicIcon, RefreshIcon, SendIcon } from "../../l
 import { speak, toggleVoice } from "../../lib/voice";
 import { useToast } from "../../lib/toast";
 import { AbandonFlowButton } from "./AbandonFlowButton";
+import { ApiError } from "../../api/client";
 
 export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
   const queryClient = useQueryClient();
@@ -38,15 +39,33 @@ export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
 
   async function decide(approve: boolean) {
     try {
-      const updated = await decideFlow.mutateAsync({ flowId: flow.id, approve });
-      queryClient.setQueryData(queryKeys.flow(flow.id), updated);
-      toast(
-        approve
-          ? "Approval recorded. Publishing the pull request now."
-          : "Feedback retained. New iteration started.",
-        "success"
-      );
+      const result = await decideFlow.mutateAsync({
+        flowId: flow.id,
+        body: {
+          approve,
+          gateId: flow.outcomeVerification.releaseGateId ?? "",
+          candidateFingerprint: flow.outcomeVerification.candidateFingerprint,
+          feedback: ""
+        }
+      });
+      queryClient.setQueryData(queryKeys.flow(flow.id), result.flow);
+      if (result.outcome === "RefreshQueued") {
+        toast(
+          "The candidate changed during approval. Refresh and re-verification were queued; approval was not recorded.",
+          "error"
+        );
+        return;
+      }
+      toast(result.message, "success");
     } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        await queryClient.invalidateQueries({ queryKey: queryKeys.flow(flow.id) });
+        toast(
+          "This reviewed gate or candidate is stale. Flow details were refreshed; review the current candidate before deciding.",
+          "error"
+        );
+        return;
+      }
       toast(error instanceof Error ? error.message : String(error), "error");
     }
   }
@@ -100,12 +119,16 @@ export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
           </button>
           <button
             className="button danger"
-            disabled={!reviewed || decideFlow.isPending}
+            disabled={!reviewed || decideFlow.isPending || !flow.outcomeVerification.releaseGateId}
             onClick={() => void decide(false)}
           >
             <RefreshIcon /> {decideFlow.isPending ? "Queuing..." : "Re-do with feedback"}
           </button>
-          <button className="button success" disabled={decideFlow.isPending} onClick={() => void decide(true)}>
+          <button
+            className="button success"
+            disabled={decideFlow.isPending || !flow.outcomeVerification.releaseGateId}
+            onClick={() => void decide(true)}
+          >
             <CheckIcon /> {decideFlow.isPending ? "Queuing publication..." : "Approve and publish"}
           </button>
         </div>

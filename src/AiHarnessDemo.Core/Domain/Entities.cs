@@ -63,6 +63,19 @@ public enum StepStatus
     Skipped
 }
 
+public enum FlowStepKind
+{
+    Standard,
+    OutcomePlan,
+    OutcomeDelivery,
+    OutcomeLocalReleaseCandidate,
+    OutcomeQa,
+    OutcomeOwnerCorrection,
+    OutcomePlanCorrection,
+    OutcomeCandidateRefresh,
+    OutcomeApprovedPublication
+}
+
 public enum ConversationRole
 {
     Customer,
@@ -149,6 +162,8 @@ public sealed class FlowRun
 
     public string FailureReason { get; set; } = string.Empty;
 
+    public string OutcomeVerificationJson { get; set; } = string.Empty;
+
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -185,6 +200,14 @@ public sealed class FlowStep
     public required string AgentRole { get; set; }
 
     public string Label { get; set; } = string.Empty;
+
+    public FlowStepKind Kind { get; set; } = FlowStepKind.Standard;
+
+    public int? OutcomeQaRound { get; set; }
+
+    public string OutcomePlanHash { get; set; } = string.Empty;
+
+    public Guid? StableSemanticRootId { get; set; }
 
     public string Model { get; set; } = string.Empty;
 
@@ -437,7 +460,10 @@ public sealed class RoutingObservation
     public DateTimeOffset ObservedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
-/// <summary>Scrubbed tool trace. Raw tool arguments and results are deliberately not persisted.</summary>
+/// <summary>
+/// Structured host-observed tool trace. Sensitive argument values are redacted and result text is
+/// bounded; the normalized verification inputs and result digest make QA evidence auditable.
+/// </summary>
 public sealed class AgentToolCall
 {
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -451,6 +477,20 @@ public sealed class AgentToolCall
     public required string ArgumentsSummary { get; set; }
 
     public bool Succeeded { get; set; }
+
+    public string ToolType { get; set; } = "Unknown";
+
+    public string NormalizedCommand { get; set; } = string.Empty;
+
+    public string NormalizedArguments { get; set; } = string.Empty;
+
+    public string WorkingDirectory { get; set; } = string.Empty;
+
+    public int? ExitCode { get; set; }
+
+    public string ResultDigest { get; set; } = string.Empty;
+
+    public string ResultSummary { get; set; } = string.Empty;
 }
 
 public sealed class FlowMessage

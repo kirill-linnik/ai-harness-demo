@@ -2,7 +2,15 @@ using AiHarnessDemo.Core.Domain;
 
 namespace AiHarnessDemo.Core.Orchestration;
 
-public sealed record WorkspaceInfo(string Path, string BranchName, bool CreatedNow);
+public sealed record WorkspaceRepositoryIdentity(
+    string RelativePath,
+    string RemoteRepository);
+
+public sealed record WorkspaceInfo(
+    string Path,
+    string BranchName,
+    bool CreatedNow,
+    IReadOnlyList<WorkspaceRepositoryIdentity>? TrustedRepositories = null);
 
 public sealed record WorkspaceCleanupResult(
     int WorktreesRemoved,

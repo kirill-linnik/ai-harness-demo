@@ -16,7 +16,13 @@ function PipelineNode({
       <span className="node-avatar">{initials(step.agentName)}</span>
       <span className="node-copy">
         <strong>{step.agentName}</strong>
-        <span>{step.model || "Model pending"}</span>
+        <span>
+          {step.model || "Model pending"}
+          {step.outcomeQaRound ? ` · QA round ${step.outcomeQaRound}` : ""}
+        </span>
+        {step.assignedCriterionIds.length > 0 && (
+          <span className="mono">{step.assignedCriterionIds.join(", ")}</span>
+        )}
       </span>
       <span className="node-state">
         <span>

@@ -1,5 +1,6 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Orchestration;
+using AiHarnessDemo.Core.Verification;
 using System.Text.RegularExpressions;
 
 namespace AiHarnessDemo.Services;
@@ -30,23 +31,49 @@ public sealed partial class WorkspaceManager(
                 $"The selected project folder no longer exists: {projectPath}");
         }
 
-        if (!string.IsNullOrWhiteSpace(flow.WorkspacePath) &&
-            Directory.Exists(flow.WorkspacePath))
-        {
-            return new WorkspaceInfo(flow.WorkspacePath, flow.BranchName, CreatedNow: false);
-        }
-
         var repositories = RepositoryAnalyzer.FindGitRepositories(projectPath);
         if (repositories.Count == 0)
         {
             throw new InvalidOperationException(
                 "Copilot flows require at least one Git repository inside the selected project folder.");
         }
-
+        var trustedRepositories = await ReadTrustedRepositoriesAsync(
+            flow,
+            projectPath,
+            repositories,
+            cancellationToken);
+        var authorizedWorkspaceRoot = Path.GetFullPath(
+            workflowProvider.GetValidated().Config.Workspace.ResolvedRoot);
+        Directory.CreateDirectory(authorizedWorkspaceRoot);
+        WorkspacePathGuard.ValidateAuthorizedRoot(
+            authorizedWorkspaceRoot,
+            "Workspace preparation");
         var shortId = flow.Id.ToString("N")[..16];
-        var branchName = $"ai-harness/{Slug(flow.Title)}-{shortId}";
-        Directory.CreateDirectory(workflowProvider.GetValidated().Config.Workspace.ResolvedRoot);
         var workspacePath = ResolveContained(UnsafeCharacters().Replace(shortId, "_"));
+        if (!string.IsNullOrWhiteSpace(flow.WorkspacePath) &&
+            !PathsEqual(workspacePath, flow.WorkspacePath))
+        {
+            throw new InvalidOperationException(
+                $"Flow workspace is outside its expected isolated location: {flow.WorkspacePath}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(flow.WorkspacePath) &&
+            Directory.Exists(flow.WorkspacePath))
+        {
+            var validatedWorkspace = WorkspacePathGuard.ValidateExistingRoot(
+                flow.WorkspacePath,
+                authorizedWorkspaceRoot,
+                "Workspace recovery");
+            CopilotReasoningHost.GovernedGitIsolationScope.RecoverInterrupted(
+                validatedWorkspace);
+            return new WorkspaceInfo(
+                validatedWorkspace,
+                flow.BranchName,
+                CreatedNow: false,
+                trustedRepositories);
+        }
+
+        var branchName = $"ai-harness/{Slug(flow.Title)}-{shortId}";
 
         bool createdNow;
         if (repositories.Count == 1 &&
@@ -67,6 +94,10 @@ public sealed partial class WorkspaceManager(
                 branchName,
                 cancellationToken);
         }
+        workspacePath = WorkspacePathGuard.ValidateExistingRoot(
+            workspacePath,
+            authorizedWorkspaceRoot,
+            "Workspace preparation");
 
         logger.LogInformation(
             "Prepared project workspace {WorkspacePath} with {RepositoryCount} repositories on {BranchName} for flow {FlowId}",
@@ -82,8 +113,128 @@ public sealed partial class WorkspaceManager(
                 cancellationToken);
         }
 
-        return new WorkspaceInfo(workspacePath, branchName, createdNow);
+        return new WorkspaceInfo(
+            workspacePath,
+            branchName,
+            createdNow,
+            trustedRepositories);
     }
+
+    private async Task<IReadOnlyList<WorkspaceRepositoryIdentity>>
+        ReadTrustedRepositoriesAsync(
+            FlowRun flow,
+            string projectPath,
+            IReadOnlyList<string> repositories,
+            CancellationToken cancellationToken)
+    {
+        var relativePaths = repositories
+            .Select(repository => NormalizeRepositoryPath(projectPath, repository))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            var state = OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson);
+            if (state.TrustedRepositories.Count > 0)
+            {
+                var persistedPaths = state.TrustedRepositories
+                    .Select(item => item.RelativePath)
+                    .ToArray();
+                if (!persistedPaths.SequenceEqual(
+                        relativePaths,
+                        StringComparer.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "The selected source repository set changed after workspace authorization.");
+                }
+                return state.TrustedRepositories
+                    .Select(item => new WorkspaceRepositoryIdentity(
+                        item.RelativePath,
+                        item.RemoteRepository))
+                    .ToArray();
+            }
+        }
+
+        var result = new List<WorkspaceRepositoryIdentity>(repositories.Count);
+        foreach (var repository in repositories)
+        {
+            var remoteRepository = await ReadConfiguredRemoteRepositoryAsync(
+                repository,
+                cancellationToken);
+            result.Add(new WorkspaceRepositoryIdentity(
+                NormalizeRepositoryPath(projectPath, repository),
+                remoteRepository));
+        }
+        return result
+            .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private async Task<string> ReadConfiguredRemoteRepositoryAsync(
+        string repository,
+        CancellationToken cancellationToken)
+    {
+        var pushUrls = await ReadConfiguredRemoteValuesAsync(
+            repository,
+            "remote.origin.pushurl",
+            cancellationToken);
+        if (pushUrls.Count > 0)
+        {
+            return PublishedOutcomeVerifier.NormalizeSingleGitHubRemote(
+                       string.Join(Environment.NewLine, pushUrls))
+                   ?? string.Empty;
+        }
+
+        var urls = await ReadConfiguredRemoteValuesAsync(
+            repository,
+            "remote.origin.url",
+            cancellationToken);
+        return PublishedOutcomeVerifier.NormalizeSingleGitHubRemote(
+                   string.Join(Environment.NewLine, urls))
+               ?? string.Empty;
+    }
+
+    private async Task<IReadOnlyList<string>> ReadConfiguredRemoteValuesAsync(
+        string repository,
+        string key,
+        CancellationToken cancellationToken)
+    {
+        var result = await processRunner.RunAsync(
+            "git",
+            [
+                "-C", repository,
+                "config", "--local", "--null", "--get-all", "--no-includes", key
+            ],
+            repository,
+            TimeSpan.FromSeconds(20),
+            cancellationToken);
+        if (result.ExitCode == 1 &&
+            string.IsNullOrWhiteSpace(result.StandardOutput) &&
+            string.IsNullOrWhiteSpace(result.StandardError))
+        {
+            return [];
+        }
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to read Git configuration '{key}' for '{repository}': {result.CombinedOutput}");
+        }
+
+        return result.StandardOutput.Split(
+                '\0',
+                StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => value.Trim())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToArray();
+    }
+
+    private static string NormalizeRepositoryPath(
+        string projectPath,
+        string repositoryPath) =>
+        PathsEqual(projectPath, repositoryPath)
+            ? "."
+            : Path.GetRelativePath(projectPath, repositoryPath)
+                .Replace('\\', '/');
 
     public async Task<WorkspaceCleanupResult> RemoveAsync(
         FlowRun flow,
@@ -99,6 +250,21 @@ public sealed partial class WorkspaceManager(
         {
             throw new InvalidOperationException(
                 $"Flow workspace is outside its expected isolated location: {flow.WorkspacePath}");
+        }
+        var authorizedWorkspaceRoot = Path.GetFullPath(
+            workflowProvider.GetValidated().Config.Workspace.ResolvedRoot);
+        if (Directory.Exists(authorizedWorkspaceRoot))
+        {
+            WorkspacePathGuard.ValidateAuthorizedRoot(
+                authorizedWorkspaceRoot,
+                "Workspace cleanup");
+        }
+        if (Directory.Exists(expectedWorkspace))
+        {
+            WorkspacePathGuard.ValidateExistingRoot(
+                expectedWorkspace,
+                authorizedWorkspaceRoot,
+                "Workspace cleanup");
         }
 
         var projectPath = Path.GetFullPath(flow.RepositoryPath);
@@ -363,6 +529,7 @@ public sealed partial class WorkspaceManager(
             : StringComparer.Ordinal;
         var excludedDirectories = repositories
             .Append(workflowProvider.GetValidated().Config.Workspace.ResolvedRoot)
+            .Append(workspacePath)
             .Select(Path.GetFullPath)
             .ToHashSet(comparison);
         var pending = new Stack<(string Source, string Destination)>();

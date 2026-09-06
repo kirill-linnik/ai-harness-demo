@@ -1,5 +1,6 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Services;
 using System.Data;
 using Microsoft.EntityFrameworkCore;
@@ -67,6 +68,7 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.Outcome).HasConversion<string>();
             entity.Property(item => item.ModelSelectionStrategy).HasConversion<string>();
             entity.Property(item => item.RuntimeMarker).HasColumnName("ExecutionMode");
+            entity.Property(item => item.OutcomeVerificationJson).HasDefaultValue(string.Empty);
             entity.HasIndex(item => item.CreatedAt);
             entity.HasIndex(item => item.Status);
         });
@@ -77,6 +79,8 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.Id).ValueGeneratedNever();
             entity.Property(item => item.Status).HasConversion<string>();
             entity.Property(item => item.Phase).HasConversion<string>();
+            entity.Property(item => item.Kind).HasConversion<string>();
+            entity.Property(item => item.OutcomePlanHash).HasDefaultValue(string.Empty);
             entity.Property(item => item.RemotePublicationAllowed).HasDefaultValue(false);
             entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.Sequence });
             entity.HasIndex(item => item.RetryOfStepId);
@@ -85,6 +89,14 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.HasIndex(item => item.PreMortemOriginStepId);
             entity.HasIndex(item => item.PreMortemTargetStepId);
             entity.HasIndex(item => item.PreMortemReviewStepId);
+            entity.HasIndex(item => item.StableSemanticRootId);
+            entity.HasIndex(item => new
+            {
+                item.FlowRunId,
+                item.Iteration,
+                item.Kind,
+                item.OutcomeQaRound
+            });
             entity.HasOne(item => item.FlowRun)
                 .WithMany(flow => flow.Steps)
                 .HasForeignKey(item => item.FlowRunId)
@@ -258,6 +270,7 @@ public static class DatabaseInitializer
         await EnsureSettingsSchemaAsync(database);
         await EnsureFlowRunSchemaAsync(database);
         await EnsureFlowStepSchemaAsync(database);
+        await EnsureAgentToolCallSchemaAsync(database);
         await EnsureRoutingSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
@@ -380,6 +393,32 @@ public static class DatabaseInitializer
             "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
             "WHERE name = 'PreMortemReviewStepId';",
             "ALTER TABLE FlowSteps ADD COLUMN PreMortemReviewStepId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'Kind';",
+            "ALTER TABLE FlowSteps ADD COLUMN Kind " +
+            "TEXT NOT NULL DEFAULT 'Standard';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'OutcomeQaRound';",
+            "ALTER TABLE FlowSteps ADD COLUMN OutcomeQaRound INTEGER NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'OutcomePlanHash';",
+            "ALTER TABLE FlowSteps ADD COLUMN OutcomePlanHash " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'StableSemanticRootId';",
+            "ALTER TABLE FlowSteps ADD COLUMN StableSemanticRootId TEXT NULL;",
             cancellationToken);
         await database.Database.ExecuteSqlRawAsync(
             """
@@ -557,6 +596,10 @@ public static class DatabaseInitializer
                 ON FlowSteps (PreMortemTargetStepId);
             CREATE INDEX IF NOT EXISTS IX_FlowSteps_PreMortemReviewStepId
                 ON FlowSteps (PreMortemReviewStepId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_StableSemanticRootId
+                ON FlowSteps (StableSemanticRootId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_Flow_Iteration_Kind_QaRound
+                ON FlowSteps (FlowRunId, Iteration, Kind, OutcomeQaRound);
             """,
             cancellationToken);
         for (var pass = 0; pass < 10; pass++)
@@ -593,6 +636,7 @@ public static class DatabaseInitializer
                 """,
                 cancellationToken);
         }
+
         await database.Database.ExecuteSqlRawAsync(
             """
             UPDATE FlowSteps
@@ -608,18 +652,599 @@ public static class DatabaseInitializer
               );
             """,
             cancellationToken);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            UPDATE FlowSteps
+            SET StableSemanticRootId = COALESCE(RetryOfStepId, Id)
+            WHERE StableSemanticRootId IS NULL;
+            """,
+            cancellationToken);
+        await BackfillFlowStepMetadataAsync(database, cancellationToken);
     }
 
-    internal static Task EnsureFlowRunSchemaAsync(
+    internal static async Task EnsureAgentToolCallSchemaAsync(
         HarnessDbContext database,
-        CancellationToken cancellationToken = default) =>
-        EnsureColumnAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('AgentToolCalls') " +
+            "WHERE name = 'ToolType';",
+            "ALTER TABLE AgentToolCalls ADD COLUMN ToolType " +
+            "TEXT NOT NULL DEFAULT 'Unknown';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('AgentToolCalls') " +
+            "WHERE name = 'NormalizedCommand';",
+            "ALTER TABLE AgentToolCalls ADD COLUMN NormalizedCommand " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('AgentToolCalls') " +
+            "WHERE name = 'NormalizedArguments';",
+            "ALTER TABLE AgentToolCalls ADD COLUMN NormalizedArguments " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('AgentToolCalls') " +
+            "WHERE name = 'WorkingDirectory';",
+            "ALTER TABLE AgentToolCalls ADD COLUMN WorkingDirectory " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('AgentToolCalls') " +
+            "WHERE name = 'ExitCode';",
+            "ALTER TABLE AgentToolCalls ADD COLUMN ExitCode INTEGER NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('AgentToolCalls') " +
+            "WHERE name = 'ResultDigest';",
+            "ALTER TABLE AgentToolCalls ADD COLUMN ResultDigest " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('AgentToolCalls') " +
+            "WHERE name = 'ResultSummary';",
+            "ALTER TABLE AgentToolCalls ADD COLUMN ResultSummary " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+    }
+
+    internal static async Task EnsureFlowRunSchemaAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureColumnAsync(
             database,
             "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
             "WHERE name = 'ModelSelectionStrategy';",
             "ALTER TABLE Flows ADD COLUMN ModelSelectionStrategy " +
             "TEXT NOT NULL DEFAULT 'MaximumQuality';",
             cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'OutcomeVerificationJson';",
+            "ALTER TABLE Flows ADD COLUMN OutcomeVerificationJson " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+    }
+
+    private static async Task BackfillFlowStepMetadataAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken)
+    {
+        if (!await ColumnExistsAsync(
+                database,
+                "FlowSteps",
+                "AgentRole",
+                cancellationToken))
+        {
+            return;
+        }
+
+        var steps = await database.FlowSteps
+            .OrderBy(item => item.FlowRunId)
+            .ThenBy(item => item.Iteration)
+            .ThenBy(item => item.Sequence)
+            .ThenBy(item => item.Attempt)
+            .ToListAsync(cancellationToken);
+        if (steps.Count == 0)
+        {
+            return;
+        }
+
+        var hasFlowsTable = await TableExistsAsync(database, "Flows", cancellationToken);
+        var flowStates = hasFlowsTable
+            ? await database.Flows
+                .AsNoTracking()
+                .Select(flow => new
+                {
+                    flow.Id,
+                    flow.OutcomeVerificationJson
+                })
+                .ToDictionaryAsync(
+                    item => item.Id,
+                    item => item.OutcomeVerificationJson,
+                    cancellationToken)
+            : new Dictionary<Guid, string>();
+
+        var changed = false;
+        foreach (var flowGroup in steps.GroupBy(item => item.FlowRunId))
+        {
+            var ordered = flowGroup
+                .OrderBy(item => item.Iteration)
+                .ThenBy(item => item.Sequence)
+                .ThenBy(item => item.Attempt)
+                .ToList();
+            var byId = ordered.ToDictionary(item => item.Id);
+            foreach (var step in ordered)
+            {
+                var stableRootId = ResolveLegacyStableSemanticRootId(step, byId);
+                if (step.StableSemanticRootId != stableRootId)
+                {
+                    step.StableSemanticRootId = stableRootId;
+                    changed = true;
+                }
+            }
+
+            if (!flowStates.TryGetValue(flowGroup.Key, out var flowState) ||
+                string.IsNullOrWhiteSpace(flowState))
+            {
+                continue;
+            }
+
+            var iterations = BuildLegacyOutcomeIterations(
+                flowState);
+            foreach (var step in ordered)
+            {
+                if (!iterations.TryGetValue(step.Iteration, out var iteration))
+                {
+                    continue;
+                }
+
+                if (step.Kind == FlowStepKind.Standard &&
+                    TryInferLegacyOutcomeStepKind(step, byId, out var inferredKind))
+                {
+                    step.Kind = inferredKind;
+                    changed = true;
+                }
+
+                if (step.OutcomeQaRound is null &&
+                    TryInferLegacyOutcomeQaRound(step, byId, iteration, out var qaRound))
+                {
+                    step.OutcomeQaRound = qaRound;
+                    changed = true;
+                }
+
+                if (string.IsNullOrWhiteSpace(step.OutcomePlanHash) &&
+                    TryInferLegacyOutcomePlanHash(step, byId, iteration, out var planHash))
+                {
+                    step.OutcomePlanHash = planHash;
+                    changed = true;
+                }
+            }
+        }
+
+        if (changed)
+        {
+            await database.SaveChangesAsync(cancellationToken);
+        }
+    }
+
+    private static IReadOnlyDictionary<int, LegacyOutcomeIterationState>
+        BuildLegacyOutcomeIterations(string json)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(json);
+        var iterations = new Dictionary<int, LegacyOutcomeIterationState>();
+        foreach (var archive in state.PriorIterations)
+        {
+            iterations[archive.Iteration] = new LegacyOutcomeIterationState(
+                archive.AcceptancePlan?.Hash,
+                archive.EvidenceProcessing.ToDictionary(
+                    item => item.ProducerStepId,
+                    item => item.AcceptancePlanHash),
+                archive.Rounds.ToDictionary(item => item.QaStepId),
+                archive.CurrentCandidate?.PreparedByStepId,
+                archive.CurrentCandidate?.Manifest.AcceptancePlanHash,
+                null,
+                null,
+                archive.Rounds
+                    .Where(round =>
+                        !round.Stale &&
+                        round.Result?.Verdict == OutcomeQaVerdict.PASS)
+                    .Select(round => (int?)round.Round)
+                    .Max());
+        }
+
+        iterations[state.Iteration] = new LegacyOutcomeIterationState(
+            state.AcceptancePlan?.Hash,
+            state.EvidenceProcessing.ToDictionary(
+                item => item.ProducerStepId,
+                item => item.AcceptancePlanHash),
+            state.Rounds.ToDictionary(item => item.QaStepId),
+            state.CurrentCandidate?.PreparedByStepId,
+            state.CurrentCandidate?.Manifest.AcceptancePlanHash,
+            state.ActiveQaStepId,
+            state.ActiveQaRound,
+            state.Rounds
+                .Where(round =>
+                    !round.Stale &&
+                    round.Result?.Verdict == OutcomeQaVerdict.PASS &&
+                    string.Equals(
+                        round.CandidateFingerprint,
+                        state.VerifiedCandidateFingerprint,
+                        StringComparison.Ordinal))
+                .Select(round => (int?)round.Round)
+                .Max());
+        return iterations;
+    }
+
+    private static bool TryInferLegacyOutcomeStepKind(
+        FlowStep step,
+        IReadOnlyDictionary<Guid, FlowStep> stepsById,
+        out FlowStepKind kind)
+    {
+        if (step.RetryOfStepId is { } retryOfStepId &&
+            stepsById.TryGetValue(retryOfStepId, out var source) &&
+            source.Kind != FlowStepKind.Standard)
+        {
+            kind = source.Kind;
+            return true;
+        }
+
+        if (step.DependsOnStepId is { } dependencyId &&
+            stepsById.TryGetValue(dependencyId, out var dependency) &&
+            dependency.Kind == FlowStepKind.OutcomePlanCorrection &&
+            string.Equals(step.AgentRole, "team-lead", StringComparison.Ordinal))
+        {
+            kind = FlowStepKind.OutcomePlanCorrection;
+            return true;
+        }
+
+        if (string.Equals(
+                step.Label,
+                WorkflowEngine.ApprovedPublicationLabel,
+                StringComparison.Ordinal))
+        {
+            kind = FlowStepKind.OutcomeApprovedPublication;
+            return true;
+        }
+
+        if (string.Equals(
+                step.Label,
+                WorkflowEngine.ReleaseCandidateLabel,
+                StringComparison.Ordinal))
+        {
+            kind = FlowStepKind.OutcomeLocalReleaseCandidate;
+            return true;
+        }
+
+        if (step.Label.StartsWith(
+                WorkflowEngine.OutcomeQaLabelPrefix,
+                StringComparison.Ordinal) ||
+            string.Equals(
+                step.Label,
+                "Re-validate corrected handoff",
+                StringComparison.Ordinal))
+        {
+            kind = FlowStepKind.OutcomeQa;
+            return true;
+        }
+
+        if (step.Label.StartsWith(
+                WorkflowEngine.OutcomePlanCorrectionLabelPrefix,
+                StringComparison.Ordinal))
+        {
+            kind = FlowStepKind.OutcomePlanCorrection;
+            return true;
+        }
+
+        if (step.Label.StartsWith(
+                WorkflowEngine.OutcomeCandidateRefreshLabelPrefix,
+                StringComparison.Ordinal))
+        {
+            kind = FlowStepKind.OutcomeCandidateRefresh;
+            return true;
+        }
+
+        if (step.Label.StartsWith(
+                WorkflowEngine.OutcomeCorrectionLabelPrefix,
+                StringComparison.Ordinal))
+        {
+            kind = FlowStepKind.OutcomeOwnerCorrection;
+            return true;
+        }
+
+        if (string.Equals(step.AgentRole, "team-lead", StringComparison.Ordinal) &&
+            step.Label.Contains("acceptance plan", StringComparison.OrdinalIgnoreCase))
+        {
+            kind = FlowStepKind.OutcomePlan;
+            return true;
+        }
+
+        if (string.Equals(step.AgentRole, "release-engineer", StringComparison.Ordinal) &&
+            !step.RemotePublicationAllowed)
+        {
+            kind = FlowStepKind.OutcomeLocalReleaseCandidate;
+            return true;
+        }
+
+        if (string.Equals(step.AgentRole, "quality-engineer", StringComparison.Ordinal) &&
+            !step.RemotePublicationAllowed)
+        {
+            kind = FlowStepKind.OutcomeQa;
+            return true;
+        }
+
+        if (step.AgentRole is not ("team-lead" or "quality-engineer" or "product-manager" or
+            WorkflowEngine.PreMortemRole) &&
+            !step.RemotePublicationAllowed)
+        {
+            kind = FlowStepKind.OutcomeDelivery;
+            return true;
+        }
+
+        kind = FlowStepKind.Standard;
+        return false;
+    }
+
+    private static bool TryInferLegacyOutcomeQaRound(
+        FlowStep step,
+        IReadOnlyDictionary<Guid, FlowStep> stepsById,
+        LegacyOutcomeIterationState iteration,
+        out int round)
+    {
+        if (step.RetryOfStepId is { } retryOfStepId &&
+            stepsById.TryGetValue(retryOfStepId, out var source) &&
+            source.OutcomeQaRound is { } sourceRound)
+        {
+            round = sourceRound;
+            return true;
+        }
+
+        if (iteration.RoundsByQaStepId.TryGetValue(step.Id, out var persistedRound))
+        {
+            round = persistedRound.Round;
+            return true;
+        }
+
+        if (iteration.ActiveQaStepId == step.Id && iteration.ActiveQaRound is { } activeRound)
+        {
+            round = activeRound;
+            return true;
+        }
+
+        if ((step.Kind == FlowStepKind.OutcomeQa &&
+             TryParseRoundSuffix(step.Label, WorkflowEngine.OutcomeQaLabelPrefix, ")", out round)) ||
+            (step.Kind == FlowStepKind.OutcomePlanCorrection &&
+             TryParseRoundSuffix(step.Label, WorkflowEngine.OutcomePlanCorrectionLabelPrefix, null, out round)) ||
+            (step.Kind == FlowStepKind.OutcomeCandidateRefresh &&
+             TryParseRoundSuffix(step.Label, WorkflowEngine.OutcomeCandidateRefreshLabelPrefix, null, out round)) ||
+            (step.Kind == FlowStepKind.OutcomeOwnerCorrection &&
+             TryParseRoundSuffix(step.Label, WorkflowEngine.OutcomeCorrectionLabelPrefix, ":", out round)))
+        {
+            return true;
+        }
+
+        if (step.Kind == FlowStepKind.OutcomeApprovedPublication &&
+            iteration.LatestPassedRound is { } passedRound)
+        {
+            round = passedRound;
+            return true;
+        }
+
+        round = default;
+        return false;
+    }
+
+    private static bool TryInferLegacyOutcomePlanHash(
+        FlowStep step,
+        IReadOnlyDictionary<Guid, FlowStep> stepsById,
+        LegacyOutcomeIterationState iteration,
+        out string planHash)
+    {
+        if (step.RetryOfStepId is { } retryOfStepId &&
+            stepsById.TryGetValue(retryOfStepId, out var source) &&
+            !string.IsNullOrWhiteSpace(source.OutcomePlanHash))
+        {
+            planHash = source.OutcomePlanHash;
+            return true;
+        }
+
+        if (iteration.EvidencePlanHashesByStepId.TryGetValue(
+                step.Id,
+                out var evidencePlanHash))
+        {
+            planHash = evidencePlanHash;
+            return true;
+        }
+
+        if (iteration.RoundsByQaStepId.TryGetValue(step.Id, out var round))
+        {
+            planHash = round.AcceptancePlanHash;
+            return true;
+        }
+
+        if (iteration.ActiveQaStepId == step.Id &&
+            !string.IsNullOrWhiteSpace(iteration.AcceptancePlanHash))
+        {
+            planHash = iteration.AcceptancePlanHash!;
+            return true;
+        }
+
+        if (iteration.CurrentCandidatePreparedByStepId == step.Id &&
+            !string.IsNullOrWhiteSpace(iteration.CurrentCandidatePlanHash))
+        {
+            planHash = iteration.CurrentCandidatePlanHash!;
+            return true;
+        }
+
+        if (step.Kind == FlowStepKind.OutcomePlanCorrection &&
+            step.OutcomeQaRound is { } correctionRound &&
+            iteration.RoundsByQaStepId.Values.FirstOrDefault(item =>
+                item.Round == correctionRound) is { } correctionResult)
+        {
+            planHash = correctionResult.AcceptancePlanHash;
+            return true;
+        }
+
+        if (step.Kind == FlowStepKind.OutcomePlan &&
+            string.IsNullOrWhiteSpace(iteration.AcceptancePlanHash) == false)
+        {
+            planHash = iteration.AcceptancePlanHash!;
+            return true;
+        }
+
+        if (step.Kind != FlowStepKind.Standard &&
+            !string.IsNullOrWhiteSpace(iteration.AcceptancePlanHash))
+        {
+            planHash = iteration.AcceptancePlanHash!;
+            return true;
+        }
+
+        planHash = string.Empty;
+        return false;
+    }
+
+    private static Guid ResolveLegacyStableSemanticRootId(
+        FlowStep step,
+        IReadOnlyDictionary<Guid, FlowStep> stepsById)
+    {
+        if (step.StableSemanticRootId is { } existingRootId)
+        {
+            return existingRootId;
+        }
+
+        if (step.RetryOfStepId is not { } retryOfStepId)
+        {
+            return step.Id;
+        }
+
+        var currentRetryOfStepId = retryOfStepId;
+        for (var pass = 0; pass < 20; pass++)
+        {
+            if (!stepsById.TryGetValue(currentRetryOfStepId, out var current))
+            {
+                return currentRetryOfStepId;
+            }
+
+            if (current.StableSemanticRootId is { } rootId)
+            {
+                return rootId;
+            }
+
+            if (current.RetryOfStepId is not { } parentRetryId ||
+                parentRetryId == current.Id)
+            {
+                return current.Id;
+            }
+
+            currentRetryOfStepId = parentRetryId;
+        }
+
+        return currentRetryOfStepId;
+    }
+
+    private static bool TryParseRoundSuffix(
+        string label,
+        string prefix,
+        string? terminator,
+        out int round)
+    {
+        round = default;
+        if (string.IsNullOrWhiteSpace(label) ||
+            !label.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var remainder = label[prefix.Length..];
+        if (terminator is not null)
+        {
+            var index = remainder.IndexOf(terminator, StringComparison.Ordinal);
+            if (index < 0)
+            {
+                return false;
+            }
+            remainder = remainder[..index];
+        }
+
+        return int.TryParse(
+            remainder.Trim(),
+            out round);
+    }
+
+    private static async Task<bool> TableExistsAsync(
+        HarnessDbContext database,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        var connection = database.Database.GetDbConnection();
+        var shouldClose = connection.State != ConnectionState.Open;
+        if (shouldClose)
+        {
+            await database.Database.OpenConnectionAsync(cancellationToken);
+        }
+        try
+        {
+            await using var probe = connection.CreateCommand();
+            probe.CommandText =
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = @name;";
+            var parameter = probe.CreateParameter();
+            parameter.ParameterName = "@name";
+            parameter.Value = tableName;
+            probe.Parameters.Add(parameter);
+            return Convert.ToInt64(
+                       await probe.ExecuteScalarAsync(cancellationToken)) > 0;
+        }
+        finally
+        {
+            if (shouldClose)
+            {
+                await database.Database.CloseConnectionAsync();
+            }
+        }
+    }
+
+    private static async Task<bool> ColumnExistsAsync(
+        HarnessDbContext database,
+        string tableName,
+        string columnName,
+        CancellationToken cancellationToken)
+    {
+        var connection = database.Database.GetDbConnection();
+        var shouldClose = connection.State != ConnectionState.Open;
+        if (shouldClose)
+        {
+            await database.Database.OpenConnectionAsync(cancellationToken);
+        }
+        try
+        {
+            await using var probe = connection.CreateCommand();
+            probe.CommandText =
+                $"SELECT COUNT(*) FROM pragma_table_info('{tableName}') WHERE name = @name;";
+            var parameter = probe.CreateParameter();
+            parameter.ParameterName = "@name";
+            parameter.Value = columnName;
+            probe.Parameters.Add(parameter);
+            return Convert.ToInt64(
+                await probe.ExecuteScalarAsync(cancellationToken)) > 0;
+        }
+        finally
+        {
+            if (shouldClose)
+            {
+                await database.Database.CloseConnectionAsync();
+            }
+        }
+    }
 
     internal static async Task EnsureRoutingSchemaAsync(
         HarnessDbContext database,
@@ -771,6 +1396,16 @@ public static class DatabaseInitializer
             "INTEGER NOT NULL DEFAULT 0;",
             cancellationToken);
     }
+
+    private sealed record LegacyOutcomeIterationState(
+        string? AcceptancePlanHash,
+        IReadOnlyDictionary<Guid, string> EvidencePlanHashesByStepId,
+        IReadOnlyDictionary<Guid, OutcomeQaRound> RoundsByQaStepId,
+        Guid? CurrentCandidatePreparedByStepId,
+        string? CurrentCandidatePlanHash,
+        Guid? ActiveQaStepId,
+        int? ActiveQaRound,
+        int? LatestPassedRound);
 
     private static async Task EnsureColumnAsync(
         HarnessDbContext database,

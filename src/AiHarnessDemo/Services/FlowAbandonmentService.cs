@@ -2,6 +2,7 @@ using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Data;
 using Microsoft.EntityFrameworkCore;
 
@@ -76,14 +77,12 @@ public sealed class FlowAbandonmentService(
                     throw new InvalidOperationException(
                         "An approved and published flow cannot be abandoned.");
                 }
-                if (flow.GateRecords.Any(item =>
-                        item.ActionType == AiHarnessDemo.Core.Gating.HandoffActionType.Release &&
-                        item.Resolved &&
-                        item.Approved == true))
+                if (HasEffectiveApprovedRelease(flow))
                 {
                     throw new InvalidOperationException(
                         "Customer approval is already recorded, so release publication cannot be abandoned.");
                 }
+
                 if (flow.Status == FlowStatus.Abandoned)
                 {
                     return new AbandonFlowResponse(
@@ -184,6 +183,41 @@ public sealed class FlowAbandonmentService(
                 await database.SaveChangesAsync(CancellationToken.None);
                 throw;
             }
+    }
+
+    internal static bool HasEffectiveApprovedRelease(FlowRun flow)
+    {
+        var approvedReleaseGates = flow.GateRecords
+            .Where(item =>
+                item.ActionType ==
+                AiHarnessDemo.Core.Gating.HandoffActionType.Release &&
+                item.Resolved &&
+                item.Approved == true)
+            .ToArray();
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            return approvedReleaseGates.Length > 0;
+        }
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (state.Status != OutcomeVerificationStatus.Passed ||
+            state.Stale ||
+            string.IsNullOrWhiteSpace(state.VerifiedCandidateFingerprint))
+        {
+            return false;
+        }
+        var currentQaStepIds = state.Rounds
+            .Where(round =>
+                !round.Stale &&
+                round.Result?.Verdict == OutcomeQaVerdict.PASS &&
+                string.Equals(
+                    round.CandidateFingerprint,
+                    state.VerifiedCandidateFingerprint,
+                    StringComparison.Ordinal))
+            .Select(round => round.QaStepId)
+            .ToHashSet();
+        return approvedReleaseGates.Any(gate =>
+            currentQaStepIds.Contains(gate.FlowStepId));
     }
 
     public async Task ResumePendingAsync(CancellationToken cancellationToken = default)

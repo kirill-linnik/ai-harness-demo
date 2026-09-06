@@ -4,7 +4,9 @@ import { flowPollIntervalMs } from "../lib/pollInterval";
 import type {
   AnalyzeRepositoryRequest,
   FeedbackRequest,
+  FlowDecisionRequest,
   IntakeRequest,
+  OutcomeResolutionRequest,
   SaveSettingsRequest,
   ToggleAgentRequest
 } from "./types";
@@ -138,11 +140,33 @@ export function useSendFeedbackMutation() {
 }
 
 export function useDecideFlowMutation() {
+  const queryClient = useQueryClient();
   const invalidateBootstrap = useInvalidateBootstrap();
   return useMutation({
-    mutationFn: ({ flowId, approve }: { flowId: string; approve: boolean }) =>
-      api.decideFlow(flowId, approve),
-    onSuccess: () => invalidateBootstrap()
+    mutationFn: ({ flowId, body }: { flowId: string; body: FlowDecisionRequest }) =>
+      api.decideFlow(flowId, body),
+    onSuccess: result => {
+      queryClient.setQueryData(queryKeys.flow(result.flow.id), result.flow);
+      invalidateBootstrap();
+    }
+  });
+}
+
+export function useResolveOutcomeMutation() {
+  const queryClient = useQueryClient();
+  const invalidateBootstrap = useInvalidateBootstrap();
+  return useMutation({
+    mutationFn: ({
+      flowId,
+      body
+    }: {
+      flowId: string;
+      body: OutcomeResolutionRequest;
+    }) => api.resolveOutcome(flowId, body),
+    onSuccess: flow => {
+      queryClient.setQueryData(queryKeys.flow(flow.id), flow);
+      invalidateBootstrap();
+    }
   });
 }
 

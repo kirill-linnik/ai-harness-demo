@@ -1,6 +1,8 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
+using AiHarnessDemo.Services;
 
 namespace AiHarnessDemo.Contracts;
 
@@ -63,7 +65,9 @@ public sealed record FlowStepDto(
     DateTimeOffset? StartedAt,
     DateTimeOffset? CompletedAt,
     long DurationMilliseconds,
-    IReadOnlyList<AgentToolCallDto> ToolCalls);
+    IReadOnlyList<AgentToolCallDto> ToolCalls,
+    IReadOnlyList<string> AssignedCriterionIds,
+    int? OutcomeQaRound);
 
 public sealed record FlowMessageDto(
     Guid Id,
@@ -117,7 +121,61 @@ public sealed record FlowDetailDto(
     IReadOnlyList<FlowStepDto> Steps,
     IReadOnlyList<FlowMessageDto> Messages,
     IReadOnlyList<FlowEventDto> Events,
-    IReadOnlyList<HandoffGateRecordDto> GateRecords);
+    IReadOnlyList<HandoffGateRecordDto> GateRecords,
+    OutcomeVerificationDto OutcomeVerification);
+
+public sealed record OutcomeVerificationDto(
+    string Status,
+    bool LegacyUnverified,
+    int CurrentRound,
+    int MaxRounds,
+    string PlanHashPrefix,
+    string CandidateFingerprintPrefix,
+    string CandidateFingerprint,
+    Guid? ReleaseGateId,
+    IReadOnlyList<OutcomeCriterionDto> Criteria,
+    IReadOnlyList<OutcomeEvidenceDto> Evidence,
+    IReadOnlyList<OutcomeCriterionResultDto> LatestResults,
+    IReadOnlyList<string> FailedCriterionIds,
+    IReadOnlyList<string> PendingOwnerRoles,
+    bool Stale,
+    bool PreviewRequired,
+    bool ReleaseReady,
+    DateTimeOffset? VerifiedAt,
+    OutcomeResolutionGateDto? HumanResolutionGate);
+
+public sealed record OutcomeCriterionDto(
+    string Id,
+    string Requirement,
+    string Verification,
+    IReadOnlyList<string> OwnerRoles,
+    IReadOnlyList<OutcomeEvidenceKind> EvidenceKinds,
+    bool CustomerVisible);
+
+public sealed record OutcomeEvidenceDto(
+    string EvidenceId,
+    string CriterionId,
+    OutcomeEvidenceDisposition Disposition,
+    OutcomeEvidenceKind Kind,
+    string Locator,
+    string ObservedResult,
+    int? ExitCode,
+    string ProducerRole,
+    Guid ProducerStepId,
+    DateTimeOffset ProducedAt);
+
+public sealed record OutcomeCriterionResultDto(
+    string CriterionId,
+    OutcomeCriterionStatus Status,
+    string Rationale,
+    IReadOnlyList<string> ResponsibleRoles,
+    string? Remediation);
+
+public sealed record OutcomeResolutionGateDto(
+    Guid GateId,
+    HandoffGateDecision Decision,
+    string Summary,
+    DateTimeOffset CreatedAt);
 
 public sealed record LearningDto(
     Guid Id,
@@ -157,7 +215,9 @@ public sealed record WorkflowStatusDto(
     string? LastError,
     int? MaxConcurrentAgents,
     int? MaxAttempts,
-    string? WorkspaceRoot);
+    string? WorkspaceRoot,
+    bool? OutcomeVerificationEnabled,
+    int? OutcomeVerificationMaxRounds);
 
 public sealed record CopilotCliStatusDto(
     bool Ready,
@@ -265,7 +325,29 @@ public sealed record FeedbackRequest(string Message);
 
 public sealed record FeedbackResponse(FlowDetailDto Flow, string Reply, bool ShouldSpeak);
 
-public sealed record FlowDecisionRequest(bool Approve);
+public enum ReleaseDecisionOutcome
+{
+    Approved,
+    Rejected,
+    RefreshQueued,
+    Conflict
+}
+
+public sealed record FlowDecisionRequest(
+    bool Approve,
+    Guid GateId,
+    string CandidateFingerprint,
+    string Feedback);
+
+public sealed record FlowDecisionResponse(
+    ReleaseDecisionOutcome Outcome,
+    FlowDetailDto Flow,
+    string Message);
+
+public sealed record OutcomeResolutionRequest(
+    Guid GateId,
+    OutcomeResolutionAction Action,
+    string Reason);
 
 public sealed record AbandonFlowResponse(
     Guid FlowId,
@@ -287,12 +369,14 @@ public sealed record PreviewDto(
     string OutcomeLabel,
     IReadOnlyList<PreviewArtifactDto> Artifacts,
     IReadOnlyList<FlowStepDto> DeliveredBy,
+    OutcomeVerificationDto OutcomeVerification,
     DateTimeOffset GeneratedAt);
 
 public sealed record PreviewArtifactDto(
     string Id,
     string Label,
-    string Url);
+    string Url,
+    string OpenUrl);
 
 public static class ApiMappings
 {
@@ -327,8 +411,13 @@ public static class ApiMappings
             flow.CreatedAt,
             flow.UpdatedAt);
 
-    public static FlowDetailDto ToDetailDto(this FlowRun flow) =>
-        new(
+    public static FlowDetailDto ToDetailDto(this FlowRun flow)
+    {
+        var outcomeState = string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+            ? null
+            : OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson);
+        return new(
             flow.Id,
             flow.Title,
             flow.OriginalRequest,
@@ -350,7 +439,7 @@ public static class ApiMappings
             flow.Steps
                 .OrderBy(step => step.Iteration)
                 .ThenBy(step => step.Sequence)
-                .Select(step => step.ToDto())
+                .Select(step => step.ToDto(outcomeState))
                 .ToList(),
             flow.Messages
                 .OrderBy(message => message.CreatedAt)
@@ -387,9 +476,13 @@ public static class ApiMappings
                     item.ResolvedBy,
                     item.ResolutionNote,
                     item.ResolvedAt))
-                .ToList());
+                .ToList(),
+            ToOutcomeVerificationDto(flow));
+    }
 
-    public static FlowStepDto ToDto(this FlowStep step) =>
+    public static FlowStepDto ToDto(
+        this FlowStep step,
+        OutcomeVerificationState? outcomeState = null) =>
         new(
             step.Id,
             step.Iteration,
@@ -429,7 +522,9 @@ public static class ApiMappings
                     item.ToolName,
                     item.ArgumentsSummary,
                     item.Succeeded))
-                .ToList());
+                .ToList(),
+            AssignedCriteria(step, outcomeState),
+            OutcomeQaRound(step, outcomeState));
 
     public static TaskProfileDto ToDto(this TaskProfile profile) =>
         new(
@@ -485,4 +580,159 @@ public static class ApiMappings
             learning.TimesApplied,
             learning.TimesObserved,
             learning.CreatedAt);
+
+    public static OutcomeVerificationDto ToOutcomeVerificationDto(this FlowRun flow)
+    {
+        var currentStepIds = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .Select(step => step.Id)
+            .ToHashSet();
+        var releaseGate = flow.GateRecords
+            .Where(gate =>
+                gate.ActionType == HandoffActionType.Release &&
+                !gate.Resolved &&
+                currentStepIds.Contains(gate.FlowStepId))
+            .OrderByDescending(gate => gate.DecidedAt)
+            .FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            return new OutcomeVerificationDto(
+                "LegacyUnverified",
+                true,
+                0,
+                0,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                releaseGate?.Id,
+                [],
+                [],
+                [],
+                [],
+                [],
+                false,
+                false,
+                false,
+                null,
+                null);
+        }
+
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var latestRound = state.Rounds
+            .OrderByDescending(item => item.Round)
+            .FirstOrDefault();
+        var latestResults = latestRound?.Result?.Criteria ?? [];
+        var resolutionGate = flow.GateRecords
+            .Where(item =>
+                item.ActionType == HandoffActionType.OutcomeResolution &&
+                !item.Resolved)
+            .OrderByDescending(item => item.DecidedAt)
+            .FirstOrDefault();
+        var currentFingerprint = state.CurrentCandidate?.Fingerprint;
+        var releaseReady =
+            state.Status == OutcomeVerificationStatus.Passed &&
+            !state.Stale &&
+            !string.IsNullOrWhiteSpace(currentFingerprint) &&
+            string.Equals(
+                currentFingerprint,
+                state.VerifiedCandidateFingerprint,
+                StringComparison.Ordinal);
+
+        return new OutcomeVerificationDto(
+            state.Status.ToString(),
+            false,
+            state.ActiveQaRound ??
+            state.Rounds.OrderByDescending(item => item.Round)
+                .Select(item => (int?)item.Round)
+                .FirstOrDefault() ??
+            0,
+            state.MaxRounds,
+            Prefix(state.AcceptancePlan?.Hash),
+            Prefix(currentFingerprint),
+            releaseReady
+                ? state.VerifiedCandidateFingerprint ?? string.Empty
+                : string.Empty,
+            releaseReady
+                ? releaseGate?.Id
+                : null,
+            state.AcceptancePlan?.Criteria.Select(criterion =>
+                new OutcomeCriterionDto(
+                    criterion.Id,
+                    criterion.Requirement,
+                    criterion.Verification,
+                    criterion.OwnerRoles,
+                    criterion.EvidenceKinds,
+                    criterion.CustomerVisible)).ToList() ?? [],
+            state.Evidence.Select(item => new OutcomeEvidenceDto(
+                item.EvidenceId,
+                item.CriterionId,
+                item.Disposition,
+                item.Kind,
+                item.Locator,
+                item.ObservedResult,
+                item.ExitCode,
+                item.ProducerRole,
+                item.ProducerStepId,
+                item.ProducedAt)).ToList(),
+            latestResults.Select(item => new OutcomeCriterionResultDto(
+                item.CriterionId,
+                item.Status,
+                item.Rationale,
+                item.ResponsibleRoles,
+                item.Remediation)).ToList(),
+            latestResults
+                .Where(item => item.Status != OutcomeCriterionStatus.PASS)
+                .Select(item => item.CriterionId)
+                .ToList(),
+            state.PendingOwnerRoles,
+            state.Stale,
+            CandidateFingerprintService.RequiresPreview(
+                state.AcceptancePlan),
+            releaseReady,
+            state.VerifiedAt,
+            resolutionGate is null
+                ? null
+                : new OutcomeResolutionGateDto(
+                    resolutionGate.Id,
+                    resolutionGate.Decision,
+                    resolutionGate.Summary,
+                    resolutionGate.DecidedAt));
+    }
+
+    private static string Prefix(string? digest) =>
+        string.IsNullOrWhiteSpace(digest)
+            ? string.Empty
+            : digest[..Math.Min(digest.Length, 19)];
+
+    private static IReadOnlyList<string> AssignedCriteria(
+        FlowStep step,
+        OutcomeVerificationState? state)
+    {
+        if (state?.AcceptancePlan is null)
+        {
+            return [];
+        }
+        if (step.Kind == FlowStepKind.OutcomeQa)
+        {
+            return state.AcceptancePlan.Criteria.Select(item => item.Id).ToList();
+        }
+        if (step.AgentRole == "team-lead")
+        {
+            return state.AcceptancePlan.Criteria.Select(item => item.Id).ToList();
+        }
+        return state.AcceptancePlan.Criteria
+            .Where(item => item.OwnerRoles.Contains(
+                step.AgentRole,
+                StringComparer.Ordinal))
+            .Select(item => item.Id)
+            .ToList();
+    }
+
+    private static int? OutcomeQaRound(
+        FlowStep step,
+        OutcomeVerificationState? state) =>
+        step.OutcomeQaRound ??
+        state?.Rounds.FirstOrDefault(item => item.QaStepId == step.Id)?.Round ??
+        (state?.ActiveQaStepId == step.Id ? state.ActiveQaRound : null);
 }

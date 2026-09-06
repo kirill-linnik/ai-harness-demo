@@ -1,3 +1,4 @@
+using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Reasoning;
@@ -630,17 +631,26 @@ public sealed class ApprovalGatedReleaseTests
         gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
         await RestoreGateAsync(databaseFactory, gate);
         var coordinator = CreateCoordinator(databaseFactory, gate, queue);
+        Guid gateId;
+        await using (var gateDatabase = await databaseFactory.CreateDbContextAsync())
+        {
+            gateId = await gateDatabase.GateRecords.Select(item => item.Id).SingleAsync();
+        }
 
         var updated = await coordinator.DecideAsync(
             flow.Id,
             approve: true,
+            gateId,
+            candidateFingerprint: string.Empty,
+            feedback: string.Empty,
             CancellationToken.None);
 
-        Assert.Equal(FlowStatus.Queued, updated.Status);
-        Assert.Null(updated.CompletedAt);
-        Assert.Equal($"#/preview/{flow.Id}", updated.OutcomeUrl);
+        Assert.Equal(ReleaseDecisionOutcome.Approved, updated.Outcome);
+        Assert.Equal(FlowStatus.Queued, updated.Flow.Status);
+        Assert.Null(updated.Flow.CompletedAt);
+        Assert.Equal($"#/preview/{flow.Id}", updated.Flow.OutcomeUrl);
         var publication = Assert.Single(
-            updated.Steps,
+            updated.Flow.Steps,
             step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
         Assert.Equal(StepStatus.Pending, publication.Status);
         Assert.Contains(
@@ -679,16 +689,25 @@ public sealed class ApprovalGatedReleaseTests
         gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
         await RestoreGateAsync(databaseFactory, gate);
         var coordinator = CreateCoordinator(databaseFactory, gate, queue);
+        Guid gateId;
+        await using (var gateDatabase = await databaseFactory.CreateDbContextAsync())
+        {
+            gateId = await gateDatabase.GateRecords.Select(item => item.Id).SingleAsync();
+        }
 
         var updated = await coordinator.DecideAsync(
             flow.Id,
             approve: false,
+            gateId,
+            candidateFingerprint: string.Empty,
+            feedback: string.Empty,
             CancellationToken.None);
 
-        Assert.Equal(FlowStatus.Queued, updated.Status);
-        Assert.Equal(2, updated.Iteration);
+        Assert.Equal(ReleaseDecisionOutcome.Rejected, updated.Outcome);
+        Assert.Equal(FlowStatus.Queued, updated.Flow.Status);
+        Assert.Equal(2, updated.Flow.Iteration);
         Assert.DoesNotContain(
-            updated.Steps,
+            updated.Flow.Steps,
             step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
         Assert.True(queue.Reader.TryRead(out var queuedFlowId));
         Assert.Equal(flow.Id, queuedFlowId);
@@ -708,6 +727,23 @@ public sealed class ApprovalGatedReleaseTests
             "devclub/site",
             PublishedOutcomeVerifier.NormalizeGitHubRepository(
                 "git@github.com:devclub/site.git"));
+        Assert.Equal(
+            "devclub/site.gitops",
+            PublishedOutcomeVerifier.NormalizeGitHubRepository(
+                "git@github.com:devclub/site.gitops.git"));
+        Assert.Null(PublishedOutcomeVerifier.NormalizeSingleGitHubRemote(
+            "https://github.com/devclub/site.git\n" +
+            "https://github.com/other/site.git"));
+        using var ownHead = System.Text.Json.JsonDocument.Parse(
+            """{"headRepository":{"nameWithOwner":"devclub/site"},"headRepositoryOwner":{"login":"devclub"}}""");
+        using var forkHead = System.Text.Json.JsonDocument.Parse(
+            """{"headRepository":{"nameWithOwner":"someone/site"},"headRepositoryOwner":{"login":"someone"}}""");
+        Assert.True(PublishedOutcomeVerifier.IsExpectedHeadRepository(
+            ownHead.RootElement,
+            "devclub/site"));
+        Assert.False(PublishedOutcomeVerifier.IsExpectedHeadRepository(
+            forkHead.RootElement,
+            "devclub/site"));
     }
 
     private static FeedbackCoordinator CreateCoordinator(

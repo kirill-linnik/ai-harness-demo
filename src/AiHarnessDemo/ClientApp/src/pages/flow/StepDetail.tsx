@@ -51,6 +51,14 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
           </span>
         )}
       </div>
+      {(step.outcomeQaRound || step.assignedCriterionIds.length > 0) && (
+        <div className="detail-model" aria-label="Outcome verification assignment">
+          {step.outcomeQaRound && <span>QA round {step.outcomeQaRound}</span>}
+          {step.assignedCriterionIds.map(criterionId => (
+            <span className="model-chip" key={criterionId}>{criterionId}</span>
+          ))}
+        </div>
+      )}
       <p className="muted">{step.modelReason || step.inputSummary || "Waiting for Team Lead selection."}</p>
       {step.routing && (
         <section className="callout" aria-label="Routing decision" style={{ marginTop: 14 }}>

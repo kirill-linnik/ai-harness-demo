@@ -26,6 +26,9 @@ copilot:
   turn_timeout_ms: 1200000
   stall_timeout_ms: 300000
   maximum_quality_stall_timeout_ms: 900000
+outcome_verification:
+  enabled: true
+  max_rounds: 3
 ---
 
 You are {{ agent.name }}. Execute only the current assignment for this role.
@@ -43,6 +46,24 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
 {{ workspace }}
 
 {{ role.context }}
+
+## Outcome verification policy
+
+- Team Lead converts the confirmed brief into objective, independently verifiable criteria.
+- Delivery roles report evidence only for assigned criterion IDs.
+- Release Engineer prepares a local candidate and must not publish remotely.
+- Quality Engineer independently verifies every criterion against the supplied candidate fingerprint.
+- QA must inspect the actual candidate and may not mark PASS from upstream claims or artifact existence alone.
+- Failed criteria identify responsible original delivery roles.
+- Only a current all-criteria PASS permits the customer release gate.
+
+## Current outcome-verification assignment
+
+{{ outcome.context }}
+
+## Required machine contract
+
+{{ outcome.contract }}
 
 ## Completion contract
 

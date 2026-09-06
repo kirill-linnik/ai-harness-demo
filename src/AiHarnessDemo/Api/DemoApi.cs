@@ -30,10 +30,16 @@ public static class DemoApi
         api.MapPost("/flows/{flowId:guid}/restart", RestartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/feedback", AddFeedbackAsync);
         api.MapPost("/flows/{flowId:guid}/decision", DecideFlowAsync);
+        api.MapPost(
+            "/flows/{flowId:guid}/outcome-resolution",
+            ResolveOutcomeAsync);
         api.MapPost("/flows/{flowId:guid}/abandon", AbandonFlowAsync);
         api.MapGet("/history", GetHistoryAsync);
         api.MapGet("/learnings", GetLearningsAsync);
         api.MapGet("/previews/{flowId:guid}", GetPreviewAsync);
+        api.MapGet(
+            "/previews/{flowId:guid}/artifacts/{artifactId}/view",
+            GetIsolatedPreviewView);
         api.MapGet(
             "/previews/{flowId:guid}/artifacts/{artifactId}/{**path}",
             GetPreviewArtifactAsync);
@@ -336,12 +342,49 @@ public static class DemoApi
         CancellationToken cancellationToken) =>
         Results.Ok(await abandonment.AbandonAsync(flowId, cancellationToken));
 
-    private static async Task<IResult> DecideFlowAsync(
+    internal static async Task<IResult> DecideFlowAsync(
         Guid flowId,
         FlowDecisionRequest request,
         FeedbackCoordinator coordinator,
-        CancellationToken cancellationToken) =>
-        Results.Ok(await coordinator.DecideAsync(flowId, request.Approve, cancellationToken));
+        CancellationToken cancellationToken)
+    {
+        var decision = await coordinator.DecideAsync(
+            flowId,
+            request.Approve,
+            request.GateId,
+            request.CandidateFingerprint,
+            request.Feedback,
+            cancellationToken);
+        return ToFlowDecisionResult(decision);
+    }
+
+    internal static IResult ToFlowDecisionResult(FlowDecisionResponse decision) =>
+        decision.Outcome == ReleaseDecisionOutcome.Conflict
+            ? Results.Json(
+                decision,
+                statusCode: StatusCodes.Status409Conflict)
+            : Results.Ok(decision);
+
+    private static async Task<IResult> ResolveOutcomeAsync(
+        Guid flowId,
+        OutcomeResolutionRequest request,
+        WorkflowEngine engine,
+        FlowQueue queue,
+        CancellationToken cancellationToken)
+    {
+        var flow = await engine.ResolveOutcomeAsync(
+            flowId,
+            request.GateId,
+            request.Action,
+            request.Reason,
+            cancellationToken);
+        if (!queue.Queue(flowId))
+        {
+            throw new InvalidOperationException(
+                "Unable to queue the resolved outcome-verification flow.");
+        }
+        return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
+    }
 
     private static async Task<IResult> GetHistoryAsync(
         IDbContextFactory<HarnessDbContext> databaseFactory,
@@ -386,6 +429,8 @@ public static class DemoApi
         Guid flowId,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         PreviewArtifactCatalog artifactCatalog,
+        WorkflowEngine workflowEngine,
+        FlowQueue flowQueue,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
@@ -393,13 +438,56 @@ public static class DemoApi
         {
             throw new InvalidOperationException("This flow does not have a customer preview yet.");
         }
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            var state = AiHarnessDemo.Core.Verification.OutcomeVerificationRules
+                .DeserializeAggregate(flow.OutcomeVerificationJson);
+            if (state.Status !=
+                AiHarnessDemo.Core.Verification.OutcomeVerificationStatus.Passed)
+            {
+                throw new InvalidOperationException(
+                    "Customer preview is available only after a current authoritative QA PASS.");
+            }
+            if (!await workflowEngine.EnsureVerifiedCandidateCurrentAsync(
+                    flowId,
+                    cancellationToken))
+            {
+                if (flow.Status != FlowStatus.Approved &&
+                    !flowQueue.Queue(flowId))
+                {
+                    throw new InvalidOperationException(
+                        "Unable to queue stale-candidate refresh.");
+                }
+                throw new InvalidOperationException(
+                    flow.Status == FlowStatus.Approved
+                        ? "The local historical preview no longer matches the approved candidate; the published outcome remains unchanged."
+                        : "The candidate changed after QA; preview access is blocked until refresh and re-verification complete.");
+            }
+        }
 
+        var outcomeState = string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+            ? null
+            : AiHarnessDemo.Core.Verification.OutcomeVerificationRules
+                .DeserializeAggregate(flow.OutcomeVerificationJson);
         var deliveredBy = flow.Steps
             .Where(item => item.Status == StepStatus.Completed)
             .OrderBy(item => item.Iteration)
             .ThenBy(item => item.Sequence)
-            .Select(item => item.ToDto())
+            .Select(item => item.ToDto(outcomeState))
             .ToList();
+        var outcomeVerification = flow.ToOutcomeVerificationDto();
+        var artifacts = artifactCatalog.Discover(flow)
+            .Select(item => new PreviewArtifactDto(
+                item.Id,
+                item.Label,
+                item.Url,
+                item.OpenUrl))
+            .ToList();
+        if (outcomeVerification.PreviewRequired && artifacts.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "The verified customer-visible outcome has no preview artifact.");
+        }
         return Results.Ok(new PreviewDto(
             flow.Id,
             flow.Title,
@@ -408,13 +496,9 @@ public static class DemoApi
             flow.Iteration,
             flow.Status,
             flow.OutcomeLabel,
-            artifactCatalog.Discover(flow)
-                .Select(item => new PreviewArtifactDto(
-                    item.Id,
-                    item.Label,
-                    item.Url))
-                .ToList(),
+            artifacts,
             deliveredBy,
+            outcomeVerification,
             flow.UpdatedAt));
     }
 
@@ -422,8 +506,11 @@ public static class DemoApi
         Guid flowId,
         string artifactId,
         string? path,
+        HttpContext httpContext,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         PreviewArtifactCatalog artifactCatalog,
+        WorkflowEngine workflowEngine,
+        FlowQueue flowQueue,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
@@ -432,6 +519,31 @@ public static class DemoApi
             throw new InvalidOperationException(
                 "This flow does not have a customer preview yet.");
         }
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+            AiHarnessDemo.Core.Verification.OutcomeVerificationRules
+                .DeserializeAggregate(flow.OutcomeVerificationJson)
+                .Status !=
+            AiHarnessDemo.Core.Verification.OutcomeVerificationStatus.Passed)
+        {
+            throw new InvalidOperationException(
+                "Customer preview artifacts are unavailable before a current QA PASS.");
+        }
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+            !await workflowEngine.EnsureVerifiedCandidateCurrentAsync(
+                flowId,
+                cancellationToken))
+        {
+            if (flow.Status != FlowStatus.Approved &&
+                !flowQueue.Queue(flowId))
+            {
+                throw new InvalidOperationException(
+                    "Unable to queue stale-candidate refresh.");
+            }
+            throw new InvalidOperationException(
+                flow.Status == FlowStatus.Approved
+                    ? "The local historical preview artifact no longer matches the approved candidate; the published outcome remains unchanged."
+                    : "The candidate changed after QA; preview artifacts are blocked until refresh and re-verification complete.");
+        }
 
         var filePath = artifactCatalog.ResolveFile(flow, artifactId, path);
         var contentTypes = new FileExtensionContentTypeProvider();
@@ -439,10 +551,79 @@ public static class DemoApi
         {
             contentType = "application/octet-stream";
         }
+        ApplyPreviewArtifactSecurityHeaders(httpContext.Response);
         return Results.File(
             filePath,
             contentType,
             enableRangeProcessing: true);
+    }
+
+    internal static IResult GetIsolatedPreviewView(
+        Guid flowId,
+        string artifactId,
+        HttpContext httpContext)
+    {
+        ApplyIsolatedPreviewViewSecurityHeaders(httpContext.Response);
+        var artifactUrl =
+            $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(artifactId)}/index.html";
+        var document = $$"""
+            <!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Customer preview</title>
+              <style>
+                html,body,iframe{box-sizing:border-box;width:100%;height:100%;margin:0;border:0;background:#fff}
+              </style>
+            </head>
+            <body>
+              <iframe
+                src="{{artifactUrl}}"
+                title="Interactive customer preview"
+                sandbox="allow-scripts"
+                referrerpolicy="no-referrer"></iframe>
+            </body>
+            </html>
+            """;
+        return Results.Content(document, "text/html; charset=utf-8");
+    }
+
+    internal static void ApplyPreviewArtifactSecurityHeaders(
+        HttpResponse response)
+    {
+        response.Headers["Content-Security-Policy"] =
+            "sandbox allow-scripts; default-src 'self' data: blob:; " +
+            "script-src 'self' 'unsafe-inline' blob:; " +
+            "style-src 'self' 'unsafe-inline' data:; " +
+            "img-src 'self' data: blob:; font-src 'self' data:; " +
+            "media-src 'self' data: blob:; connect-src 'none'; " +
+            "form-action 'none'; object-src 'none'; base-uri 'none'; " +
+            "frame-src 'none'; child-src 'none'; worker-src 'none'; " +
+            "manifest-src 'none'; navigate-to 'none'; frame-ancestors 'self'";
+        ApplyCommonPreviewSecurityHeaders(response);
+    }
+
+    internal static void ApplyIsolatedPreviewViewSecurityHeaders(
+        HttpResponse response)
+    {
+        response.Headers["Content-Security-Policy"] =
+            "default-src 'none'; frame-src 'self'; " +
+            "style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; " +
+            "object-src 'none'; base-uri 'none'; navigate-to 'none'; " +
+            "frame-ancestors 'none'";
+        ApplyCommonPreviewSecurityHeaders(response);
+    }
+
+    private static void ApplyCommonPreviewSecurityHeaders(HttpResponse response)
+    {
+        response.Headers["Cross-Origin-Opener-Policy"] = "noopener-allow-popups";
+        response.Headers["Cross-Origin-Resource-Policy"] = "same-origin";
+        response.Headers["Permissions-Policy"] =
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()";
+        response.Headers["Referrer-Policy"] = "no-referrer";
+        response.Headers["X-Content-Type-Options"] = "nosniff";
+        response.Headers.CacheControl = "no-store";
     }
 
     private static async Task<IResult> RefreshRuntimeAsync(
@@ -524,7 +705,9 @@ public static class DemoApi
             status.LastError,
             status.MaxConcurrentAgents,
             status.MaxAttempts,
-            status.WorkspaceRoot);
+            status.WorkspaceRoot,
+            status.OutcomeVerificationEnabled,
+            status.OutcomeVerificationMaxRounds);
 
     private static CopilotCliStatusDto ToDto(CopilotCliRuntimeStatus status) =>
         new(

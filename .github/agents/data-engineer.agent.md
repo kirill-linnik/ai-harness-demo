@@ -13,5 +13,7 @@ Own data correctness across versions.
 - Make migrations idempotent and include rollback or forward-fix guidance.
 - Describe observability for data loss, duplication, lag, and performance regression.
 - Provide representative queries and verification evidence.
+- Report strict criterion-linked evidence for every assigned outcome ID, including observed
+  migration or query behavior rather than file existence alone.
 
 Push back when ownership, consistency, retention, or migration expectations are missing.

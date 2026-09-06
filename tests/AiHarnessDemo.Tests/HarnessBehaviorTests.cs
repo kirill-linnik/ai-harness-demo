@@ -1,13 +1,17 @@
 using AiHarnessDemo.Data;
+using AiHarnessDemo.Api;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Core.Workflow;
 using AiHarnessDemo.Services;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.AspNetCore.Http;
 
 namespace AiHarnessDemo.Tests;
 
@@ -42,11 +46,43 @@ public sealed class FlowPlannerTests
                 "data-engineer",
                 "software-engineer",
                 "security-engineer",
-                "quality-engineer",
-                "release-engineer"
+                "release-engineer",
+                "quality-engineer"
             ],
             plan.Select(item => item.Agent.Role));
         Assert.DoesNotContain(plan, item => item.Agent.Role == "technical-writer");
+    }
+
+    [Theory]
+    [InlineData(
+        "Implement a small behavior change.",
+        "software-engineer")]
+    [InlineData(
+        "Implement and document a public API behavior change.",
+        "technical-writer")]
+    public void GovernedOrder_DrivesReleaseAndQaPushbackOwners(
+        string request,
+        string expectedReleaseOwner)
+    {
+        var planner = new FlowPlanner();
+        var agents = new[]
+        {
+            Agent("qa", "quality-engineer"),
+            Agent("release", "release-engineer"),
+            Agent("writer", "technical-writer"),
+            Agent("engineer", "software-engineer"),
+            Agent("lead", "team-lead")
+        };
+
+        var plan = planner.Plan(request, agents);
+        var owners = WorkflowEngine.BuildUpstreamOwners(plan);
+        var roles = plan.Select(item => item.Agent.Role).ToArray();
+
+        Assert.True(
+            Array.IndexOf(roles, "release-engineer") <
+            Array.IndexOf(roles, "quality-engineer"));
+        Assert.Equal(expectedReleaseOwner, owners["release"].Role);
+        Assert.Equal("release-engineer", owners["qa"].Role);
     }
 
     [Fact]
@@ -402,6 +438,88 @@ public sealed class AgentCatalogTests
 public sealed class PreviewArtifactCatalogTests
 {
     [Fact]
+    public void PreviewResponses_IsolateOnlyTheArtifactAndBlockControlChannels()
+    {
+        var artifactContext = new DefaultHttpContext();
+        var viewContext = new DefaultHttpContext();
+
+        DemoApi.ApplyPreviewArtifactSecurityHeaders(artifactContext.Response);
+        DemoApi.ApplyIsolatedPreviewViewSecurityHeaders(viewContext.Response);
+
+        var artifactPolicy =
+            artifactContext.Response.Headers["Content-Security-Policy"].ToString();
+        var viewPolicy =
+            viewContext.Response.Headers["Content-Security-Policy"].ToString();
+        Assert.Contains("sandbox allow-scripts", artifactPolicy);
+        Assert.DoesNotContain("allow-same-origin", artifactPolicy);
+        Assert.Contains("connect-src 'none'", artifactPolicy);
+        Assert.Contains("form-action 'none'", artifactPolicy);
+        Assert.Contains("frame-src 'none'", artifactPolicy);
+        Assert.DoesNotContain("sandbox", viewPolicy);
+        Assert.Contains("default-src 'none'", viewPolicy);
+        Assert.Contains("style-src 'unsafe-inline'", viewPolicy);
+        Assert.Contains("frame-src 'self'", viewPolicy);
+        Assert.Contains("connect-src 'none'", viewPolicy);
+        Assert.Contains("form-action 'none'", viewPolicy);
+        Assert.Contains("object-src 'none'", viewPolicy);
+        Assert.Contains("base-uri 'none'", viewPolicy);
+        Assert.Contains("navigate-to 'none'", viewPolicy);
+        Assert.Contains("frame-ancestors 'none'", viewPolicy);
+        Assert.Equal(
+            "noopener-allow-popups",
+            artifactContext.Response.Headers["Cross-Origin-Opener-Policy"]);
+        Assert.Equal(
+            "noopener-allow-popups",
+            viewContext.Response.Headers["Cross-Origin-Opener-Policy"]);
+        Assert.Equal(
+            "no-referrer",
+            artifactContext.Response.Headers["Referrer-Policy"]);
+        Assert.Equal(
+            "no-referrer",
+            viewContext.Response.Headers["Referrer-Policy"]);
+        Assert.Equal(
+            "nosniff",
+            viewContext.Response.Headers["X-Content-Type-Options"]);
+        Assert.Equal("no-store", viewContext.Response.Headers.CacheControl);
+    }
+
+    [Fact]
+    public async Task IsolatedPreviewView_RendersAnOpaqueScriptOnlyArtifactFrame()
+    {
+        using var services = new ServiceCollection()
+            .AddLogging()
+            .BuildServiceProvider();
+        var context = new DefaultHttpContext
+        {
+            RequestServices = services
+        };
+        context.Response.Body = new MemoryStream();
+        var flowId = Guid.Parse("af12aca2-0275-4aea-8684-f21375dc3b15");
+
+        var result = DemoApi.GetIsolatedPreviewView(
+            flowId,
+            "eu\"><script>alert(1)</script>",
+            context);
+        await result.ExecuteAsync(context);
+        context.Response.Body.Position = 0;
+        var document = await new StreamReader(context.Response.Body)
+            .ReadToEndAsync();
+
+        Assert.Equal("text/html; charset=utf-8", context.Response.ContentType);
+        Assert.Contains(
+            $"src=\"/api/previews/{flowId:D}/artifacts/eu%22%3E%3Cscript%3Ealert%281%29%3C%2Fscript%3E/index.html\"",
+            document);
+        Assert.Contains("sandbox=\"allow-scripts\"", document);
+        Assert.Contains("referrerpolicy=\"no-referrer\"", document);
+        Assert.DoesNotContain("allow-same-origin", document);
+        Assert.DoesNotContain("allow-forms", document);
+        Assert.DoesNotContain("allow-popups", document);
+        Assert.DoesNotContain("allow-top-navigation", document);
+        Assert.DoesNotContain("<script", document, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(" onload=", document, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void DiscoverAndResolve_StayInsideGeneratedCustomerPreview()
     {
         var workspace = Path.Combine(
@@ -483,7 +601,7 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
-    public void AccountManagerInvocation_IsToolFreeAndPreservesUserConfiguration()
+    public void AccountManagerInvocation_IsReadOnlyAndPreservesUserConfiguration()
     {
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\worktree",
@@ -495,7 +613,7 @@ public sealed class CopilotReasoningHostTests
             Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             "Prompt");
 
-        Assert.Contains("--available-tools", arguments);
+        Assert.Contains("--available-tools=view,grep,glob", arguments);
         Assert.Contains("--disable-builtin-mcps", arguments);
         Assert.Equal(
             ["--effort", "low"],
@@ -526,8 +644,9 @@ public sealed class CopilotReasoningHostTests
             "Investigate.");
 
         Assert.Contains(
-            "--available-tools=view,grep,glob,web_search",
+            "--available-tools=view,grep,glob,web_fetch",
             arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
         Assert.Contains("--deny-tool=write,shell", arguments);
         Assert.Contains("--disallow-temp-dir", arguments);
         Assert.Contains("--no-custom-instructions", arguments);
@@ -598,7 +717,10 @@ public sealed class CopilotReasoningHostTests
                 "release-engineer",
                 allowRemotePublication: false));
 
-        Assert.Equal("customer-approval-required", guarded["GH_TOKEN"]);
+        Assert.Null(guarded["GH_TOKEN"]);
+        Assert.Null(guarded["GITHUB_TOKEN"]);
+        Assert.Equal("0", guarded["GIT_TERMINAL_PROMPT"]);
+        Assert.Equal(string.Empty, guarded["GIT_CONFIG_VALUE_1"]);
         Assert.Equal("remote.origin.pushurl", guarded["GIT_CONFIG_KEY_0"]);
         Assert.Null(CopilotReasoningHost.BuildProcessEnvironment(
             "release-engineer",
@@ -606,6 +728,138 @@ public sealed class CopilotReasoningHostTests
         Assert.Null(CopilotReasoningHost.BuildProcessEnvironment(
             "software-engineer",
             allowRemotePublication: false));
+    }
+
+    [Theory]
+    [InlineData("team-lead")]
+    [InlineData("architect")]
+    [InlineData("software-engineer")]
+    [InlineData("quality-engineer")]
+    [InlineData("product-manager")]
+    public void GovernedNonPublisherTurns_UseExplicitSafeToolPolicyAndCredentials(
+        string role)
+    {
+        var environment =
+            Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
+                CopilotReasoningHost.BuildProcessEnvironment(
+                    role,
+                    allowRemotePublication: true,
+                    isGovernedOutcomeVerification: true));
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            role,
+            role,
+            "model",
+            "high",
+            Guid.Parse("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+            "Execute the governed turn.",
+            isGovernedOutcomeVerification: true,
+            blockRemotePublication: true);
+
+        Assert.Null(environment["GH_TOKEN"]);
+        Assert.Null(environment["GITHUB_TOKEN"]);
+        Assert.Null(environment["SSH_AUTH_SOCK"]);
+        Assert.Equal("0", environment["GIT_TERMINAL_PROMPT"]);
+        Assert.Equal(
+            "disabled://governed-host-publication-only",
+            environment["GIT_CONFIG_VALUE_0"]);
+        AssertGovernedNonPublicationToolPolicy(arguments);
+    }
+
+    [Fact]
+    public void GovernedCorrectionTurn_UsesExplicitSafeToolPolicy()
+    {
+        var arguments = BuildGovernedArguments(
+            "software-engineer",
+            "Revise this role's output after QA feedback.");
+
+        AssertGovernedNonPublicationToolPolicy(arguments);
+    }
+
+    [Fact]
+    public void GovernedCandidatePreparation_UsesExplicitSafeToolPolicy()
+    {
+        var arguments = BuildGovernedArguments(
+            "release-engineer",
+            "Prepare the local candidate.");
+
+        AssertGovernedNonPublicationToolPolicy(arguments);
+    }
+
+    [Fact]
+    public void GovernedCandidateRefresh_UsesExplicitSafeToolPolicy()
+    {
+        var arguments = BuildGovernedArguments(
+            "release-engineer",
+            "Refresh the complete local candidate after corrections.");
+
+        AssertGovernedNonPublicationToolPolicy(arguments);
+    }
+
+    [Fact]
+    public void GovernedQaTurn_UsesExplicitSafeToolPolicy()
+    {
+        var arguments = BuildGovernedArguments(
+            "quality-engineer",
+            "Verify the current candidate.");
+
+        AssertGovernedNonPublicationToolPolicy(arguments);
+    }
+
+    [Fact]
+    public void GovernedProductManagerFeedback_UsesExplicitSafeToolPolicy()
+    {
+        var arguments = BuildGovernedArguments(
+            "product-manager",
+            "Interpret customer feedback against the verified candidate.");
+
+        AssertGovernedNonPublicationToolPolicy(arguments);
+    }
+
+    [Fact]
+    public void HostControlledPublication_DisablesShellAndWriteTools()
+    {
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            "release-engineer",
+            "release-engineer",
+            "model",
+            "high",
+            Guid.Parse("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            "Prepare the publication narrative.",
+            isHostControlledPublication: true,
+            isGovernedOutcomeVerification: true,
+            blockRemotePublication: true);
+
+        Assert.Contains("--available-tools=view,grep,glob", arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.Contains("--deny-tool=write,shell", arguments);
+        Assert.Contains("--deny-tool=shell(git push)", arguments);
+        Assert.Contains("--deny-tool=shell(gh:*)", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+    }
+
+    [Fact]
+    public void CandidatePreparation_DeniesEveryGitPushTarget()
+    {
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            "release-engineer",
+            "release-engineer",
+            "model",
+            "high",
+            Guid.Parse("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+            "Prepare the local candidate.",
+            blockRemotePublication: true);
+
+        Assert.Contains("--allow-all-tools", arguments);
+        Assert.Contains("--deny-tool=shell(git push)", arguments);
+        Assert.Contains("--deny-tool=shell(git send-pack)", arguments);
+        Assert.Contains("--deny-tool=shell(gh:*)", arguments);
+        Assert.Contains("--deny-url=github.com", arguments);
     }
 
     [Fact]
@@ -621,6 +875,79 @@ public sealed class CopilotReasoningHostTests
         Assert.Equal(
             "disabled://pre-mortem-read-only",
             guarded["GIT_CONFIG_VALUE_0"]);
+    }
+
+    private static IReadOnlyList<string> BuildGovernedArguments(
+        string role,
+        string prompt) =>
+        CopilotReasoningHost.BuildCliArguments(
+            @"C:\worktree",
+            @"C:\harness",
+            role,
+            role,
+            "model",
+            "high",
+            Guid.Parse("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            prompt,
+            isGovernedOutcomeVerification: true,
+            blockRemotePublication: true);
+
+    private static void AssertGovernedNonPublicationToolPolicy(
+        IReadOnlyList<string> arguments)
+    {
+        Assert.Contains(
+            $"--available-tools={CopilotReasoningHost.GovernedNonPublicationTools()}",
+            arguments);
+        Assert.Contains("--allow-tool=write", arguments);
+        Assert.Contains("--allow-tool=shell", arguments);
+        Assert.Contains(
+            "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS",
+            arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+        Assert.DoesNotContain("--deny-tool=shell(git:*)", arguments);
+        Assert.Contains("--deny-tool=shell(git.exe:*)", arguments);
+        Assert.Contains("--deny-tool=shell(git commit)", arguments);
+        Assert.Contains("--deny-tool=shell(git.exe commit)", arguments);
+        Assert.Contains("--deny-tool=shell(git merge)", arguments);
+        Assert.Contains("--deny-tool=shell(git rebase)", arguments);
+        Assert.Contains("--deny-tool=shell(git commit-tree)", arguments);
+        Assert.Contains("--deny-tool=shell(git branch)", arguments);
+        Assert.Contains("--deny-tool=shell(git checkout)", arguments);
+        Assert.Contains("--deny-tool=shell(git switch)", arguments);
+        Assert.Contains("--deny-tool=shell(git tag)", arguments);
+        Assert.Contains("--deny-tool=shell(git update-ref)", arguments);
+        Assert.Contains("--deny-tool=shell(git push)", arguments);
+        Assert.Contains("--deny-tool=shell(git send-pack)", arguments);
+        Assert.Contains("--deny-tool=shell(gh:*)", arguments);
+        Assert.Contains("--deny-tool=shell(ssh:*)", arguments);
+        Assert.Contains("--deny-tool=shell(scp:*)", arguments);
+        Assert.Contains("--deny-tool=shell(curl:*)", arguments);
+        Assert.Contains("--deny-tool=shell(wget:*)", arguments);
+        Assert.Contains("--deny-tool=shell(Invoke-WebRequest:*)", arguments);
+        Assert.Contains("--deny-tool=shell(Invoke-RestMethod:*)", arguments);
+        Assert.Contains("--deny-url=github.com", arguments);
+        Assert.Contains("--deny-url=api.github.com", arguments);
+        Assert.Contains("--no-remote", arguments);
+        Assert.Contains("--no-remote-export", arguments);
+        foreach (var readOnlyCommand in new[]
+                 {
+                     "status",
+                     "diff",
+                     "show",
+                     "log",
+                     "rev-parse",
+                     "ls-files",
+                     "cat-file"
+                 })
+        {
+            Assert.DoesNotContain(
+                $"--deny-tool=shell(git {readOnlyCommand})",
+                arguments);
+            Assert.DoesNotContain(
+                $"--deny-tool=shell(git.exe {readOnlyCommand})",
+                arguments);
+        }
     }
 
     [Fact]
@@ -1233,8 +1560,9 @@ public sealed class WorkflowPushbackLoopTests
             var qualityRuns = runner.Contexts
                 .Where(item => item.AgentRole == "quality-engineer")
                 .ToList();
-            var releaseRun = runner.Contexts.Single(item =>
-                item.AgentRole == "release-engineer");
+            var releaseRuns = runner.Contexts
+                .Where(item => item.AgentRole == "release-engineer")
+                .ToList();
 
             Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
             Assert.Equal(4, profiles.Count);
@@ -1245,11 +1573,11 @@ public sealed class WorkflowPushbackLoopTests
                 runner.Contexts,
                 context => Assert.Equal("fixture-effort", context.ModelEffort));
             Assert.Contains(
-                "do not push a branch or create a pull request",
-                releaseRun.Task,
+                "do not create commits, branches, tags, remotes, pushes",
+                releaseRuns[0].Task,
                 StringComparison.OrdinalIgnoreCase);
             Assert.Equal(
-                [StepStatus.Completed, StepStatus.Completed, StepStatus.Completed],
+                [StepStatus.Completed],
                 stored.Steps
                     .Where(item => item.AgentRole == "software-engineer")
                     .OrderBy(item => item.Attempt)
@@ -1262,31 +1590,34 @@ public sealed class WorkflowPushbackLoopTests
                     .OrderBy(item => item.Attempt)
                     .Select(item => item.Status)
                     .ToArray());
-            Assert.Equal(3, engineerRuns.Count);
+            Assert.Single(engineerRuns);
             Assert.Single(engineerRuns.Select(item => item.CopilotSessionId).Distinct());
             Assert.False(engineerRuns[0].ResumeSession);
-            Assert.All(engineerRuns.Skip(1), context => Assert.True(context.ResumeSession));
+            Assert.Equal(3, releaseRuns.Count);
+            Assert.Single(releaseRuns.Select(item => item.CopilotSessionId).Distinct());
+            Assert.False(releaseRuns[0].ResumeSession);
+            Assert.All(releaseRuns.Skip(1), context => Assert.True(context.ResumeSession));
             Assert.Equal(3, qualityRuns.Count);
             Assert.Single(qualityRuns.Select(item => item.CopilotSessionId).Distinct());
             Assert.False(qualityRuns[0].ResumeSession);
             Assert.All(qualityRuns.Skip(1), context => Assert.True(context.ResumeSession));
             Assert.Contains(
                 "Quality Engineer cannot continue",
-                engineerRuns[^1].Task);
+                releaseRuns[^1].Task);
             Assert.Contains(
-                engineerRuns[^1].Learnings,
+                releaseRuns[^1].Learnings,
                 item => item.Category == "Handoff pushback");
             Assert.Contains(
-                "Software Engineer responded to your pushback",
+                "Release Engineer responded to your pushback",
                 qualityRuns[^1].Task);
-            Assert.Equal("software-engineer", learning.AgentId);
+            Assert.Equal("release-engineer", learning.AgentId);
             Assert.Equal(2, learning.TimesObserved);
             Assert.True(learning.TimesApplied >= 2);
             Assert.Contains(
                 stored.Events,
                 item =>
                     item.Type == "agent.session-resumed" &&
-                    item.Message.StartsWith("Software Engineer", StringComparison.Ordinal));
+                    item.Message.StartsWith("Release Engineer", StringComparison.Ordinal));
             Assert.Contains(
                 stored.Events,
                 item => item.Type == "profile.validation-correction");
@@ -1586,6 +1917,10 @@ public sealed class PersistenceTests
         Assert.Contains("PreMortemOriginStepId", columns);
         Assert.Contains("PreMortemTargetStepId", columns);
         Assert.Contains("PreMortemReviewStepId", columns);
+        Assert.Contains("Kind", columns);
+        Assert.Contains("OutcomeQaRound", columns);
+        Assert.Contains("OutcomePlanHash", columns);
+        Assert.Contains("StableSemanticRootId", columns);
         await using var backfillProbe = connection.CreateCommand();
         backfillProbe.CommandText =
             "SELECT RetryOfStepId FROM FlowSteps WHERE Id = 'retry-step';";
@@ -1624,6 +1959,318 @@ public sealed class PersistenceTests
         Assert.Equal(
             "Failed|Failed",
             await correctionProbe.ExecuteScalarAsync());
+        await using var rootProbe = connection.CreateCommand();
+        rootProbe.CommandText =
+            "SELECT StableSemanticRootId FROM FlowSteps WHERE Id = 'manual-handoff-retry';";
+        Assert.Equal(
+            "pushback-step",
+            await rootProbe.ExecuteScalarAsync());
         Assert.Equal(System.Data.ConnectionState.Open, connection.State);
+    }
+
+    [Fact]
+    public async Task FlowStepSchema_BackfillsTypedGovernedMetadataFromOutcomeLedger()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var database = new HarnessDbContext(options);
+        await database.Database.EnsureCreatedAsync();
+
+        var flow = new FlowRun
+        {
+            Title = "Governed backfill",
+            OriginalRequest = "Governed backfill",
+            ConsolidatedRequest = "Governed backfill",
+            Status = FlowStatus.WaitingForFeedback,
+            RepositoryPath = "workspace",
+            RepositoryKnowledge = "Test repository.",
+            WorkspacePath = "workspace",
+            BranchName = "test/outcome"
+        };
+        var now = DateTimeOffset.UtcNow;
+        var planStep = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 10,
+            AgentId = "team-lead",
+            AgentName = "Team Lead",
+            AgentRole = "team-lead",
+            Label = "Define acceptance plan and delivery system",
+            Status = StepStatus.Completed
+        };
+        var deliveryStep = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 20,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Label = "Execute Software Engineer contract",
+            Status = StepStatus.Completed
+        };
+        var releaseStep = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 30,
+            AgentId = "release-engineer",
+            AgentName = "Release Engineer",
+            AgentRole = "release-engineer",
+            Label = WorkflowEngine.ReleaseCandidateLabel,
+            Status = StepStatus.Completed
+        };
+        var qaStep = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 40,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Label = $"{WorkflowEngine.OutcomeQaLabelPrefix}1)",
+            Status = StepStatus.Completed
+        };
+        var qaRetry = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 50,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Label = "Manual restart of Quality Engineer",
+            Status = StepStatus.Pending,
+            RetryOfStepId = qaStep.Id
+        };
+        var planCorrection = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 60,
+            AgentId = "team-lead",
+            AgentName = "Team Lead",
+            AgentRole = "team-lead",
+            Label = $"{WorkflowEngine.OutcomePlanCorrectionLabelPrefix}1",
+            Status = StepStatus.Pending
+        };
+        var ownerCorrection = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 70,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Label = $"{WorkflowEngine.OutcomeCorrectionLabelPrefix}1: Software Engineer",
+            Status = StepStatus.Pending
+        };
+        var candidateRefresh = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 80,
+            AgentId = "release-engineer",
+            AgentName = "Release Engineer",
+            AgentRole = "release-engineer",
+            Label = $"{WorkflowEngine.OutcomeCandidateRefreshLabelPrefix}1",
+            Status = StepStatus.Pending
+        };
+        var publication = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 90,
+            AgentId = "release-engineer",
+            AgentName = "Release Engineer",
+            AgentRole = "release-engineer",
+            Label = WorkflowEngine.ApprovedPublicationLabel,
+            RemotePublicationAllowed = true,
+            Status = StepStatus.Pending
+        };
+        var plan = new OutcomeAcceptancePlan(
+            OutcomeVerificationRules.AcceptanceVersion,
+            [
+                new OutcomeAcceptanceCriterion(
+                    "AC-001",
+                    "The focused product behavior is implemented.",
+                    "Run the focused test and observe that the focused product behavior passes.",
+                    ["software-engineer"],
+                    [OutcomeEvidenceKind.Test],
+                    false)
+            ]);
+        var snapshot = OutcomeVerificationRules.CreateAcceptanceSnapshot(
+            plan,
+            planStep.Id);
+        var repositoryHead = new string('a', 40);
+        var repositoryTree = new string('b', 40);
+        var candidateManifest = new CandidateManifest(
+            OutcomeVerificationRules.CandidateManifestVersion,
+            1,
+            snapshot.Hash,
+            [new CandidateRepositoryManifest(".", repositoryHead, repositoryTree, "example/repository")],
+            [],
+            []);
+        var candidateFingerprint =
+            OutcomeVerificationRules.HashCandidateManifest(candidateManifest);
+        var evidence = new OutcomeEvidence(
+            "E-" + Guid.NewGuid().ToString("D"),
+            "AC-001",
+            OutcomeEvidenceDisposition.Supports,
+            OutcomeEvidenceKind.Test,
+            "dotnet test",
+            "Focused test passed",
+            0,
+            null,
+            "software-engineer",
+            deliveryStep.Id,
+            now);
+        var qaResult = new OutcomeQaResult(
+            OutcomeVerificationRules.QaVersion,
+            snapshot.Hash,
+            candidateFingerprint,
+            OutcomeQaVerdict.PASS,
+            [
+                new OutcomeQaCriterionResult(
+                    "AC-001",
+                    OutcomeCriterionStatus.PASS,
+                    [],
+                    [
+                        new OutcomeQaCheck(
+                            OutcomeEvidenceKind.Test,
+                            "dotnet test",
+                            "Focused test passed",
+                            0)
+                    ],
+                    "The focused behavior was independently checked.",
+                    [],
+                    null)
+            ],
+            []);
+        var state = OutcomeVerificationRules.CreateInitialState(1, 3);
+        state.Status = OutcomeVerificationStatus.Passed;
+        state.TrustedRepositories =
+            [new OutcomeTrustedRepository(".", "example/repository")];
+        state.PlannedRoles =
+            ["software-engineer", "quality-engineer", "release-engineer"];
+        state.AcceptancePlan = snapshot;
+        state.Evidence.Add(evidence);
+        state.EvidenceProcessing.Add(new OutcomeEvidenceProcessing(
+            deliveryStep.Id,
+            snapshot.Hash,
+            "software-engineer",
+            ["AC-001"],
+            now));
+        state.CurrentCandidate = new OutcomeCandidateSnapshot(
+            candidateManifest,
+            candidateFingerprint,
+            releaseStep.Id,
+            now);
+        state.Rounds.Add(new OutcomeQaRound
+        {
+            Round = 1,
+            QaStepId = qaStep.Id,
+            AcceptancePlanHash = snapshot.Hash,
+            CandidateFingerprint = candidateFingerprint,
+            ContextHash = "sha256:" + new string('d', 64),
+            Verdict = OutcomeQaVerdict.PASS,
+            Result = qaResult,
+            CompletedAt = now
+        });
+        state.Publication = new OutcomePublicationJournal
+        {
+            StepId = publication.Id,
+            CandidateFingerprint = candidateFingerprint,
+            Status = OutcomePublicationStatus.Published,
+            Repositories =
+            [
+                new OutcomeRepositoryPublication
+                {
+                    RelativePath = ".",
+                    Head = repositoryHead,
+                    Tree = repositoryTree,
+                    RemoteRepository = "example/repository",
+                    PullRequestUrl = "https://github.com/example/repository/pull/42",
+                    Status = OutcomeRepositoryPublicationStatus.Published
+                }
+            ]
+        };
+        state.VerifiedCandidateFingerprint = candidateFingerprint;
+        state.VerifiedAt = now;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+
+        database.Flows.Add(flow);
+        database.FlowSteps.AddRange(
+            planStep,
+            deliveryStep,
+            releaseStep,
+            qaStep,
+            qaRetry,
+            planCorrection,
+            ownerCorrection,
+            candidateRefresh,
+            publication);
+        await database.SaveChangesAsync();
+
+        await database.Database.ExecuteSqlRawAsync(
+            "UPDATE FlowSteps SET Kind = 'Standard', OutcomeQaRound = NULL, OutcomePlanHash = '', StableSemanticRootId = NULL;");
+
+        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
+        database.ChangeTracker.Clear();
+
+        var reloaded = await database.FlowSteps
+            .AsNoTracking()
+            .OrderBy(item => item.Sequence)
+            .ToDictionaryAsync(item => item.Label);
+
+        Assert.Equal(FlowStepKind.OutcomePlan, reloaded[planStep.Label].Kind);
+        Assert.Equal(snapshot.Hash, reloaded[planStep.Label].OutcomePlanHash);
+        Assert.NotNull(reloaded[planStep.Label].StableSemanticRootId);
+
+        Assert.Equal(
+            FlowStepKind.OutcomeDelivery,
+            reloaded[deliveryStep.Label].Kind);
+        Assert.Equal(
+            FlowStepKind.OutcomeLocalReleaseCandidate,
+            reloaded[releaseStep.Label].Kind);
+        Assert.Equal(snapshot.Hash, reloaded[releaseStep.Label].OutcomePlanHash);
+
+        Assert.Equal(FlowStepKind.OutcomeQa, reloaded[qaStep.Label].Kind);
+        Assert.Equal(1, reloaded[qaStep.Label].OutcomeQaRound);
+        Assert.Equal(snapshot.Hash, reloaded[qaStep.Label].OutcomePlanHash);
+
+        Assert.Equal(FlowStepKind.OutcomeQa, reloaded[qaRetry.Label].Kind);
+        Assert.Equal(1, reloaded[qaRetry.Label].OutcomeQaRound);
+        Assert.Equal(
+            reloaded[qaStep.Label].StableSemanticRootId,
+            reloaded[qaRetry.Label].StableSemanticRootId);
+
+        Assert.Equal(
+            FlowStepKind.OutcomePlanCorrection,
+            reloaded[planCorrection.Label].Kind);
+        Assert.Equal(1, reloaded[planCorrection.Label].OutcomeQaRound);
+        Assert.Equal(snapshot.Hash, reloaded[planCorrection.Label].OutcomePlanHash);
+
+        Assert.Equal(
+            FlowStepKind.OutcomeOwnerCorrection,
+            reloaded[ownerCorrection.Label].Kind);
+        Assert.Equal(1, reloaded[ownerCorrection.Label].OutcomeQaRound);
+        Assert.Equal(snapshot.Hash, reloaded[ownerCorrection.Label].OutcomePlanHash);
+
+        Assert.Equal(
+            FlowStepKind.OutcomeCandidateRefresh,
+            reloaded[candidateRefresh.Label].Kind);
+        Assert.Equal(1, reloaded[candidateRefresh.Label].OutcomeQaRound);
+
+        Assert.Equal(
+            FlowStepKind.OutcomeApprovedPublication,
+            reloaded[publication.Label].Kind);
+        Assert.Equal(1, reloaded[publication.Label].OutcomeQaRound);
+        Assert.Equal(snapshot.Hash, reloaded[publication.Label].OutcomePlanHash);
     }
 }

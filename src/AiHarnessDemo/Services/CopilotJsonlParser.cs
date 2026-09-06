@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -11,12 +12,25 @@ namespace AiHarnessDemo.Services;
 /// </summary>
 public static partial class CopilotJsonlParser
 {
+    private const int MaximumResultSummaryCharacters = 1_000;
+
     [GeneratedRegex(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.CultureInvariant)]
     private static partial Regex AnsiEscapePattern();
 
+    [GeneratedRegex(
+        @"(?i)(?<name>(?:--)?(?:token|password|secret|api[_-]?key|authorization))\s*(?<separator>[:=]|\s)\s*(?:bearer\s+)?(?<value>[""']?[^\s,;""']+)",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex SensitiveValuePattern();
+
+    [GeneratedRegex(
+        @"(?i)\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+\b",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex TokenValuePattern();
+
     public static AgentRunResult Parse(
         string standardOutput,
-        string standardError = "")
+        string standardError = "",
+        string workingDirectory = "")
     {
         var toolCalls = new List<ToolCallRecord>();
         var lastAssistantMessage = string.Empty;
@@ -102,9 +116,10 @@ public static partial class CopilotJsonlParser
                         if (!string.IsNullOrWhiteSpace(startCallId) &&
                             !string.IsNullOrWhiteSpace(startToolName))
                         {
-                            pendingTools[startCallId] = new PendingToolCall(
+                            pendingTools[startCallId] = CreatePendingToolCall(
                                 startToolName,
-                                ScrubArguments(payload));
+                                payload,
+                                workingDirectory);
                         }
                         break;
 
@@ -117,13 +132,29 @@ public static partial class CopilotJsonlParser
                             pendingTools.TryGetValue(completeCallId, out pending);
                         }
 
-                        var succeeded =
-                            !payload.TryGetProperty("success", out var successElement) ||
-                            successElement.ValueKind != JsonValueKind.False;
+                        var completionExitCode = ReadToolExitCode(payload);
+                        var succeeded = IsSuccessfulToolCompletion(
+                            payload,
+                            completionExitCode);
+                        var resultEvidence = ReadResultEvidence(payload);
+                        var completedToolName =
+                            toolName ?? pending?.ToolName ?? "unknown";
+                        var completionArguments = pending ??
+                            CreatePendingToolCall(
+                                completedToolName,
+                                payload,
+                                workingDirectory);
                         toolCalls.Add(new ToolCallRecord(
-                            toolName ?? pending?.ToolName ?? "unknown",
-                            pending?.ArgumentsSummary ?? ScrubArguments(payload),
-                            succeeded));
+                            completedToolName,
+                            completionArguments.ArgumentsSummary,
+                            succeeded,
+                            completionArguments.ToolType,
+                            completionArguments.NormalizedCommand,
+                            completionArguments.NormalizedArguments,
+                            completionArguments.WorkingDirectory,
+                            completionExitCode,
+                            resultEvidence.Digest,
+                            resultEvidence.Summary));
                         if (!string.IsNullOrWhiteSpace(completeCallId))
                         {
                             pendingTools.Remove(completeCallId);
@@ -490,10 +521,286 @@ public static partial class CopilotJsonlParser
             .Select(property => property.Name)
             .Take(20)
             .ToList();
-        return names.Count == 0
+        var scrubbed = names.Count == 0
             ? "No structured arguments recorded."
             : $"Argument values redacted; fields: {string.Join(", ", names)}";
+        return HostObservedToolLocator.AppendDigests(scrubbed, arguments);
     }
 
-    private sealed record PendingToolCall(string ToolName, string ArgumentsSummary);
+    private static PendingToolCall CreatePendingToolCall(
+        string toolName,
+        JsonElement payload,
+        string defaultWorkingDirectory)
+    {
+        var arguments = payload.TryGetProperty("arguments", out var value) &&
+                        value.ValueKind == JsonValueKind.Object
+            ? value
+            : default;
+        return new PendingToolCall(
+            toolName,
+            ScrubArguments(payload),
+            ClassifyTool(toolName),
+            ReadNormalizedCommand(arguments),
+            NormalizeArguments(arguments),
+            ResolveWorkingDirectory(arguments, defaultWorkingDirectory));
+    }
+
+    private static string ClassifyTool(string toolName)
+    {
+        var normalized = toolName.Trim().ToLowerInvariant();
+        if (normalized.Contains("browser", StringComparison.Ordinal) ||
+            normalized.Contains("playwright", StringComparison.Ordinal))
+        {
+            return "Browser";
+        }
+        if (normalized is "shell" or "bash" or "powershell" or "pwsh" or
+            "command" or "terminal" or "task" ||
+            normalized.Contains("shell", StringComparison.Ordinal) ||
+            normalized.Contains("powershell", StringComparison.Ordinal))
+        {
+            return "Command";
+        }
+        if (normalized is "view" or "read" or "read_file" or "grep" or "rg" or
+            "glob" or "find" ||
+            normalized.Contains("read", StringComparison.Ordinal) ||
+            normalized.Contains("view", StringComparison.Ordinal))
+        {
+            return "Read";
+        }
+        return "Other";
+    }
+
+    private static string ReadNormalizedCommand(JsonElement arguments)
+    {
+        if (arguments.ValueKind != JsonValueKind.Object)
+        {
+            return string.Empty;
+        }
+        foreach (var property in arguments.EnumerateObject())
+        {
+            if (property.Name is not ("command" or "script") ||
+                property.Value.ValueKind != JsonValueKind.String)
+            {
+                continue;
+            }
+            return RedactSensitiveText(
+                HostObservedToolLocator.Normalize(
+                    property.Value.GetString() ?? string.Empty));
+        }
+        return string.Empty;
+    }
+
+    private static string NormalizeArguments(JsonElement arguments)
+    {
+        if (arguments.ValueKind != JsonValueKind.Object)
+        {
+            return "{}";
+        }
+
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            WriteNormalizedJson(writer, arguments, propertyName: null);
+        }
+        var normalized = Encoding.UTF8.GetString(stream.ToArray());
+        return normalized;
+    }
+
+    private static void WriteNormalizedJson(
+        Utf8JsonWriter writer,
+        JsonElement value,
+        string? propertyName)
+    {
+        var sensitive = propertyName is not null &&
+                        IsSensitiveArgumentName(propertyName);
+        if (sensitive)
+        {
+            writer.WriteStringValue("<redacted>");
+            return;
+        }
+
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject()
+                             .OrderBy(item => item.Name, StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteNormalizedJson(writer, property.Value, property.Name);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray())
+                {
+                    WriteNormalizedJson(writer, item, propertyName);
+                }
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                writer.WriteStringValue(
+                    RedactSensitiveText(
+                        HostObservedToolLocator.Normalize(
+                            value.GetString() ?? string.Empty)));
+                break;
+            default:
+                value.WriteTo(writer);
+                break;
+        }
+    }
+
+    private static bool IsSensitiveArgumentName(string name) =>
+        name.Contains("token", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("password", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("secret", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("authorization", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("credential", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("apiKey", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("api_key", StringComparison.OrdinalIgnoreCase);
+
+    private static string ResolveWorkingDirectory(
+        JsonElement arguments,
+        string defaultWorkingDirectory)
+    {
+        var supplied = arguments.ValueKind == JsonValueKind.Object
+            ? arguments.EnumerateObject()
+                .FirstOrDefault(property =>
+                    property.Name.Equals("cwd", StringComparison.OrdinalIgnoreCase) ||
+                    property.Name.Equals(
+                        "workingDirectory",
+                        StringComparison.OrdinalIgnoreCase) ||
+                    property.Name.Equals(
+                        "workdir",
+                        StringComparison.OrdinalIgnoreCase))
+                .Value
+            : default;
+        var candidate = supplied.ValueKind == JsonValueKind.String
+            ? supplied.GetString()
+            : defaultWorkingDirectory;
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return string.Empty;
+        }
+        try
+        {
+            return Path.GetFullPath(
+                Path.IsPathRooted(candidate)
+                    ? candidate
+                    : Path.Combine(defaultWorkingDirectory, candidate));
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or
+                NotSupportedException or
+                PathTooLongException)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static int? ReadToolExitCode(JsonElement payload)
+    {
+        if (ReadInt32(payload, "exitCode") is { } exitCode)
+        {
+            return exitCode;
+        }
+        return payload.TryGetProperty("result", out var result) &&
+               result.ValueKind == JsonValueKind.Object
+            ? ReadInt32(result, "exitCode")
+            : null;
+    }
+
+    private static ToolResultEvidence ReadResultEvidence(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("result", out var result) ||
+            result.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return new ToolResultEvidence(string.Empty, string.Empty);
+        }
+
+        var serialized = result.GetRawText();
+        var digest = "sha256:" + Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes(serialized)))
+            .ToLowerInvariant();
+        var summary = ExtractResultSummary(result);
+        return new ToolResultEvidence(digest, summary);
+    }
+
+    private static string ExtractResultSummary(JsonElement result)
+    {
+        string? value = null;
+        if (result.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var name in new[]
+                     {
+                         "content",
+                         "standardOutput",
+                         "stdout",
+                         "output",
+                         "message",
+                         "text"
+                     })
+            {
+                if (result.TryGetProperty(name, out var candidate) &&
+                    candidate.ValueKind == JsonValueKind.String)
+                {
+                    value = candidate.GetString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        else if (result.ValueKind == JsonValueKind.String)
+        {
+            value = result.GetString();
+        }
+
+        value ??= result.GetRawText();
+        var normalized = RedactSensitiveText(
+            HostObservedToolLocator.Normalize(value));
+        return normalized.Length <= MaximumResultSummaryCharacters
+            ? normalized
+            : normalized[..MaximumResultSummaryCharacters];
+    }
+
+    private static string RedactSensitiveText(string value) =>
+        TokenValuePattern().Replace(
+            SensitiveValuePattern().Replace(
+                value,
+                match =>
+                    $"{match.Groups["name"].Value}" +
+                    $"{match.Groups["separator"].Value}<redacted>"),
+            "<redacted>");
+
+    private static bool IsSuccessfulToolCompletion(
+        JsonElement payload,
+        int? exitCode)
+    {
+        bool? explicitSuccess = null;
+        if (payload.TryGetProperty("success", out var successElement) &&
+            successElement.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            explicitSuccess = successElement.GetBoolean();
+        }
+        if (exitCode is { } observedExitCode)
+        {
+            return observedExitCode == 0 && explicitSuccess != false;
+        }
+        return explicitSuccess == true;
+    }
+
+    private sealed record PendingToolCall(
+        string ToolName,
+        string ArgumentsSummary,
+        string ToolType,
+        string NormalizedCommand,
+        string NormalizedArguments,
+        string WorkingDirectory);
+
+    private readonly record struct ToolResultEvidence(
+        string Digest,
+        string Summary);
 }

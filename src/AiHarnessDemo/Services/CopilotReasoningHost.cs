@@ -1,6 +1,10 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Core.Workflow;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace AiHarnessDemo.Services;
@@ -20,6 +24,111 @@ public sealed partial class CopilotReasoningHost(
     private const int AccountManagerRepositoryKnowledgeCharacters = 1_000;
     private const int DeliveryRepositoryKnowledgeCharacters = 2_000;
     private const int ProductManagerLedgerCharacters = 6_000;
+    private const string AccountManagerTools = "view,grep,glob";
+    private const string PreMortemTools = "view,grep,glob,web_fetch";
+    private const string HostControlledPublicationTools = "view,grep,glob";
+    internal static readonly string[] GovernedGitMutationSubcommands =
+    [
+        "add",
+        "am",
+        "apply",
+        "branch",
+        "checkout",
+        "checkout-index",
+        "cherry-pick",
+        "clean",
+        "clone",
+        "commit",
+        "commit-tree",
+        "config",
+        "daemon",
+        "fast-import",
+        "fetch",
+        "gc",
+        "hash-object",
+        "index-pack",
+        "init",
+        "imap-send",
+        "http-fetch",
+        "http-push",
+        "ls-remote",
+        "maintenance",
+        "merge",
+        "mergetool",
+        "mktag",
+        "mktree",
+        "mv",
+        "notes",
+        "pack-objects",
+        "p4",
+        "prune",
+        "pull",
+        "push",
+        "read-tree",
+        "receive-pack",
+        "rebase",
+        "reflog",
+        "remote",
+        "replace",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "send-pack",
+        "svn",
+        "sparse-checkout",
+        "stash",
+        "submodule",
+        "switch",
+        "symbolic-ref",
+        "tag",
+        "unpack-objects",
+        "upload-archive",
+        "upload-pack",
+        "update-index",
+        "update-ref",
+        "update-server-info",
+        "worktree",
+        "write-tree"
+    ];
+
+    private static readonly string[] GovernedLocalMutationDenials =
+        GovernedGitMutationSubcommands
+            .SelectMany(command => new[]
+            {
+                $"--deny-tool=shell(git {command})",
+                $"--deny-tool=shell(git.exe {command})"
+            })
+            .ToArray();
+
+    private static readonly string[] GovernedGitIsolationBypassDenials =
+    [
+        "--deny-tool=shell(git.exe:*)",
+        "--deny-tool=shell(git --git-dir)",
+        "--deny-tool=shell(git --git-dir:*)",
+        "--deny-tool=shell(git --work-tree)",
+        "--deny-tool=shell(git --work-tree:*)",
+        "--deny-tool=shell(git --namespace)",
+        "--deny-tool=shell(git --namespace:*)",
+        "--deny-tool=shell(git --config-env)",
+        "--deny-tool=shell(git --config-env:*)",
+        "--deny-tool=shell(git -c)"
+    ];
+
+    private static readonly string[] RemoteMutationDenials =
+    [
+        "--deny-tool=shell(git push)",
+        "--deny-tool=shell(git send-pack)",
+        "--deny-tool=shell(gh:*)",
+        "--deny-tool=shell(ssh:*)",
+        "--deny-tool=shell(scp:*)",
+        "--deny-tool=shell(curl:*)",
+        "--deny-tool=shell(wget:*)",
+        "--deny-tool=shell(Invoke-WebRequest:*)",
+        "--deny-tool=shell(Invoke-RestMethod:*)",
+        "--deny-url=github.com",
+        "--deny-url=api.github.com"
+    ];
 
     [GeneratedRegex(
         @"(?im)^- \*\*Location:\*\*\s*`[^`\r\n]+`\s*$",
@@ -96,12 +205,16 @@ public sealed partial class CopilotReasoningHost(
             AgentRunPhase.BuildingPrompt,
             "Rendering WORKFLOW.md with role-focused task context."));
         var renderedPrompt = Clip(
-            promptRenderer.Render(
-                workflow.PromptTemplate,
-                BuildPromptValues(
-                    context,
-                    manifest.Instructions,
-                    request.WorkingDirectory)),
+            string.IsNullOrWhiteSpace(context.DirectPrompt)
+                ? promptRenderer.Render(
+                    workflow.PromptTemplate,
+                    BuildPromptValues(
+                        context,
+                        manifest.Instructions,
+                        request.WorkingDirectory))
+                : $"{context.DirectPrompt.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+                  $"## Quality Engineer role contract{Environment.NewLine}{Environment.NewLine}" +
+                  manifest.Instructions.Trim(),
             MaximumPromptCharacters);
         var prompt = context.RecoverInterruptedSession
             ? RestartContinuationPrompt(renderedPrompt)
@@ -117,9 +230,19 @@ public sealed partial class CopilotReasoningHost(
             manifest.SourcePath,
             request.CopilotSessionId,
             cancellationToken);
-        var environmentVariables = BuildProcessEnvironment(
-            context.AgentRole,
-            context.AllowRemotePublication);
+        using var governedGitIsolation = context.IsGovernedOutcomeVerification
+            ? GovernedGitIsolationScope.Create(
+                request.WorkingDirectory,
+                context.GovernedRepositoryRelativePaths ??
+                throw new InvalidOperationException(
+                    "Governed execution has no trusted repository mapping."))
+            : null;
+        var environmentVariables = MergeProcessEnvironment(
+            BuildProcessEnvironment(
+                context.AgentRole,
+                context.AllowRemotePublication,
+                context.IsGovernedOutcomeVerification),
+            governedGitIsolation?.EnvironmentVariables);
         var arguments = BuildCliArguments(
             request.WorkingDirectory,
             agentAccess.Root,
@@ -129,7 +252,22 @@ public sealed partial class CopilotReasoningHost(
             request.Effort,
             request.CopilotSessionId,
             prompt,
-            context.ResumeSession || context.RecoverInterruptedSession);
+            context.ResumeSession || context.RecoverInterruptedSession,
+            context.IsHostControlledPublication,
+            context.IsGovernedOutcomeVerification,
+            (string.Equals(
+                 context.AgentRole,
+                 "release-engineer",
+                 StringComparison.Ordinal) &&
+             !context.AllowRemotePublication) ||
+            context.IsGovernedOutcomeVerification).ToList();
+        if (governedGitIsolation is not null)
+        {
+            arguments.Insert(
+                Math.Max(0, arguments.Count - 2),
+                $"--deny-tool=write({Path.GetFullPath(
+                    governedGitIsolation.RootPath).Replace('\\', '/')})");
+        }
         ProcessResult result;
         var timeouts = ResolveExecutionTimeouts(
             workflow.Config.Copilot,
@@ -196,10 +334,25 @@ public sealed partial class CopilotReasoningHost(
         }
         finally
         {
-            await hookRunner.RunAsync(
-                WorkspaceHookStage.AfterRun,
-                request.WorkingDirectory,
-                CancellationToken.None);
+            try
+            {
+                await hookRunner.RunAsync(
+                    WorkspaceHookStage.AfterRun,
+                    request.WorkingDirectory,
+                    CancellationToken.None);
+            }
+            finally
+            {
+                governedGitIsolation?.RestoreAndValidate();
+            }
+        }
+
+        if (governedGitIsolation?.UnauthorizedMetadataMutationDetected == true)
+        {
+            return Failure(
+                "Governed execution modified disposable Git metadata.",
+                "The host rejected and cleaned a .git mutation; authoritative Git metadata was restored unchanged.",
+                AgentRunFailureKind.InvalidOutput);
         }
 
         if (result.ExitCode != 0)
@@ -218,7 +371,8 @@ public sealed partial class CopilotReasoningHost(
 
         return CopilotJsonlParser.Parse(
             result.StandardOutput,
-            result.StandardError);
+            result.StandardError,
+            request.WorkingDirectory);
     }
 
     internal static IReadOnlyList<string> BuildCliArguments(
@@ -230,7 +384,10 @@ public sealed partial class CopilotReasoningHost(
         string effort,
         Guid copilotSessionId,
         string prompt,
-        bool resumeSession = false)
+        bool resumeSession = false,
+        bool isHostControlledPublication = false,
+        bool isGovernedOutcomeVerification = false,
+        bool blockRemotePublication = false)
     {
         var arguments = new List<string>
         {
@@ -254,35 +411,167 @@ public sealed partial class CopilotReasoningHost(
 
         if (IsAccountManager(agentRole))
         {
-            arguments.AddRange(
-            [
-                "--available-tools",
+            ApplyToolPolicy(
+                arguments,
+                $"--available-tools={AccountManagerTools}",
                 "--disable-builtin-mcps",
                 "--no-custom-instructions",
-                "--no-eager-powershell-resolution"
-            ]);
+                "--no-eager-powershell-resolution");
         }
         else if (string.Equals(
                      agentRole,
                      "pre-mortem-sceptic",
                      StringComparison.Ordinal))
         {
-            arguments.AddRange(
-            [
-                "--available-tools=view,grep,glob,web_search",
+            ApplyToolPolicy(
+                arguments,
+                $"--available-tools={PreMortemTools}",
+                "--disable-builtin-mcps",
                 "--deny-tool=write,shell",
                 "--disallow-temp-dir",
                 "--no-custom-instructions",
-                "--no-eager-powershell-resolution"
-            ]);
+                "--no-eager-powershell-resolution");
+        }
+        else if (isHostControlledPublication)
+        {
+            ApplyToolPolicy(
+                arguments,
+                $"--available-tools={HostControlledPublicationTools}",
+                "--disable-builtin-mcps",
+                "--deny-tool=write,shell",
+                "--disallow-temp-dir",
+                "--no-custom-instructions",
+                "--no-eager-powershell-resolution");
+        }
+        else if (isGovernedOutcomeVerification)
+        {
+            ApplyToolPolicy(
+                arguments,
+                $"--available-tools={GovernedNonPublicationTools()}",
+                "--disable-builtin-mcps",
+                "--allow-tool=write",
+                "--allow-tool=shell",
+                "--disallow-temp-dir",
+                "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS");
+            ApplyToolPolicyRange(arguments, GovernedLocalMutationDenials);
+            ApplyToolPolicyRange(arguments, GovernedGitIsolationBypassDenials);
+            ApplyToolPolicy(
+                arguments,
+                "--no-eager-powershell-resolution");
         }
         else
         {
             arguments.Add("--allow-all-tools");
         }
+        if (isGovernedOutcomeVerification)
+        {
+            ApplyToolPolicyRange(
+                arguments,
+                GovernedGitMarkerWriteDenials(workingDirectory));
+            ApplyToolPolicy(
+                arguments,
+                $"--deny-tool=write({Path.GetFullPath(Path.Combine(
+                    workingDirectory,
+                    ".ai-harness",
+                    "outcome-verification")).Replace('\\', '/')})");
+            ApplyToolPolicy(
+                arguments,
+                "--no-remote",
+                "--no-remote-export");
+        }
+        if (blockRemotePublication)
+        {
+            ApplyToolPolicyRange(arguments, RemoteMutationDenials);
+        }
 
         arguments.AddRange(["-p", prompt]);
         return arguments;
+    }
+
+    internal static string GovernedNonPublicationTools() =>
+        OperatingSystem.IsWindows()
+            ? "view,grep,glob,create,edit,powershell"
+            : "view,grep,glob,create,edit,bash";
+
+    private static IReadOnlyList<string> GovernedGitMarkerWriteDenials(
+        string workingDirectory)
+    {
+        if (!Directory.Exists(workingDirectory))
+        {
+            return [];
+        }
+
+        var denials = new List<string>();
+        foreach (var repository in CandidateFingerprintService.DiscoverRepositories(
+                     workingDirectory))
+        {
+            var marker = Path.Combine(repository, ".git");
+            if (Directory.Exists(marker))
+            {
+                denials.Add(
+                    $"--deny-tool=write({Path.GetFullPath(marker).Replace('\\', '/')})");
+                continue;
+            }
+            if (File.Exists(marker))
+            {
+                denials.Add(
+                    $"--deny-tool=write({Path.GetFullPath(marker).Replace('\\', '/')})");
+            }
+        }
+        return denials;
+    }
+
+    private static void ApplyToolPolicy(
+        List<string> arguments,
+        params string[] additions)
+    {
+        foreach (var addition in additions)
+        {
+            if (!arguments.Contains(addition, StringComparer.Ordinal))
+            {
+                arguments.Add(addition);
+            }
+        }
+    }
+
+    private static void ApplyToolPolicyRange(
+        List<string> arguments,
+        IEnumerable<string> additions)
+    {
+        foreach (var addition in additions)
+        {
+            if (!arguments.Contains(addition, StringComparer.Ordinal))
+            {
+                arguments.Add(addition);
+            }
+        }
+    }
+
+    private static IReadOnlyDictionary<string, string?>? MergeProcessEnvironment(
+            IReadOnlyDictionary<string, string?>? first,
+            IReadOnlyDictionary<string, string?>? second)
+    {
+        if (first is null && second is null)
+        {
+            return null;
+        }
+
+        var merged = new Dictionary<string, string?>(StringComparer.Ordinal);
+        if (first is not null)
+        {
+            foreach (var (key, value) in first)
+            {
+                merged[key] = value;
+            }
+        }
+        if (second is not null)
+        {
+            foreach (var (key, value) in second)
+            {
+                merged[key] = value;
+            }
+        }
+        return merged;
     }
 
     internal static async Task<RestrictedAgentAccess>
@@ -434,7 +723,8 @@ public sealed partial class CopilotReasoningHost(
             IsRecoverableCompletedOutput(
                 context.AgentRole,
                 recovered.OutputSummary,
-                context.IsPreMortemRevision) &&
+                context.IsPreMortemRevision,
+                context.IsOutcomeQa) &&
             IsRecoveryCurrent(
                 context.InvocationStartedAt,
                 snapshot.CompletedAt))
@@ -458,8 +748,13 @@ public sealed partial class CopilotReasoningHost(
     internal static bool IsRecoverableCompletedOutput(
         string agentRole,
         string output,
-        bool isPreMortemRevision = false)
+        bool isPreMortemRevision = false,
+        bool isOutcomeQa = false)
     {
+        if (isOutcomeQa)
+        {
+            return HasOutcomeQaMarkers(output);
+        }
         if (isPreMortemRevision)
         {
             try
@@ -517,6 +812,22 @@ public sealed partial class CopilotReasoningHost(
         {
             return false;
         }
+    }
+
+    private static bool HasOutcomeQaMarkers(string output)
+    {
+        var lines = output.ReplaceLineEndings("\n")
+            .Split('\n')
+            .Select(line => line.Trim())
+            .ToArray();
+        return lines.Count(line => string.Equals(
+                   line,
+                   OutcomeVerificationRules.QaBeginMarker,
+                   StringComparison.Ordinal)) == 1 &&
+               lines.Count(line => string.Equals(
+                   line,
+                   OutcomeVerificationRules.QaEndMarker,
+                   StringComparison.Ordinal)) == 1;
     }
 
     internal static IReadOnlyDictionary<string, string> BuildPromptValues(
@@ -602,6 +913,8 @@ public sealed partial class CopilotReasoningHost(
             ["response.contract"] = context.IsPreMortemRevision
                 ? PreMortemRevisionResponseContract()
                 : ResponseContract(context.AgentRole),
+            ["outcome.context"] = context.OutcomeContext,
+            ["outcome.contract"] = context.OutcomeContract,
             // Retain legacy variables so a hot-reloaded older WORKFLOW.md remains valid.
             ["repository.knowledge"] = string.IsNullOrWhiteSpace(repositoryFacts)
                 ? workspace
@@ -777,18 +1090,16 @@ public sealed partial class CopilotReasoningHost(
 
     internal static IReadOnlyDictionary<string, string?>? BuildProcessEnvironment(
         string agentRole,
-        bool allowRemotePublication)
+        bool allowRemotePublication,
+        bool isGovernedOutcomeVerification = false)
     {
+        if (isGovernedOutcomeVerification)
+        {
+            return BuildGuardedEnvironment("governed-host-publication-only");
+        }
         if (agentRole == "pre-mortem-sceptic")
         {
-            var preMortemEnvironment = new Dictionary<string, string?>(
-                PushGuard("pre-mortem-read-only"),
-                StringComparer.Ordinal)
-            {
-                ["GH_TOKEN"] = null,
-                ["GITHUB_TOKEN"] = null
-            };
-            return preMortemEnvironment;
+            return BuildGuardedEnvironment("pre-mortem-read-only");
         }
         if (agentRole != "release-engineer" ||
             allowRemotePublication)
@@ -796,23 +1107,46 @@ public sealed partial class CopilotReasoningHost(
             return null;
         }
 
-        var environment = new Dictionary<string, string?>(
-            PushGuard("customer-approval-required"),
+        return BuildGuardedEnvironment("customer-approval-required");
+    }
+
+    private static IReadOnlyDictionary<string, string?> BuildGuardedEnvironment(
+        string marker)
+    {
+        return new Dictionary<string, string?>(
+            PushGuard(marker),
             StringComparer.Ordinal)
         {
-            ["GH_TOKEN"] = "customer-approval-required",
-            ["GITHUB_TOKEN"] = "customer-approval-required"
+            ["GH_TOKEN"] = null,
+            ["GITHUB_TOKEN"] = null,
+            ["SSH_AUTH_SOCK"] = null,
+            ["GIT_TERMINAL_PROMPT"] = "0",
+            ["GCM_INTERACTIVE"] = "Never",
+            ["GIT_ASKPASS"] = "echo",
+            ["SSH_ASKPASS"] = "echo",
+            ["GIT_SSH_COMMAND"] = OperatingSystem.IsWindows()
+                ? "cmd /c exit 1"
+                : "false"
         };
-        return environment;
     }
 
     private static IReadOnlyDictionary<string, string?> PushGuard(
         string marker) =>
         new Dictionary<string, string?>(StringComparer.Ordinal)
         {
-            ["GIT_CONFIG_COUNT"] = "1",
+            ["GIT_CONFIG_COUNT"] = "5",
             ["GIT_CONFIG_KEY_0"] = "remote.origin.pushurl",
-            ["GIT_CONFIG_VALUE_0"] = $"disabled://{marker}"
+            ["GIT_CONFIG_VALUE_0"] = $"disabled://{marker}",
+            ["GIT_CONFIG_KEY_1"] = "credential.helper",
+            ["GIT_CONFIG_VALUE_1"] = string.Empty,
+            ["GIT_CONFIG_KEY_2"] = "core.sshCommand",
+            ["GIT_CONFIG_VALUE_2"] = OperatingSystem.IsWindows()
+                ? "cmd /c exit 1"
+                : "false",
+            ["GIT_CONFIG_KEY_3"] = $"url.disabled://{marker}/.insteadOf",
+            ["GIT_CONFIG_VALUE_3"] = "https://github.com/",
+            ["GIT_CONFIG_KEY_4"] = $"url.disabled://{marker}/.insteadOf",
+            ["GIT_CONFIG_VALUE_4"] = "git@github.com:"
         };
 
     internal static string PrepareRepositoryKnowledge(
@@ -970,5 +1304,1171 @@ public sealed partial class CopilotReasoningHost(
         var available = maxCharacters - marker.Length;
         var headLength = available * 2 / 3;
         return value[..headLength] + marker + value[^(available - headLength)..];
+    }
+
+    internal sealed class GovernedGitIsolationScope : IDisposable
+    {
+        private const string RecoveryJournalName = "recovery.json";
+        private static readonly Lock ActiveWorkspaceLock = new();
+        private static readonly HashSet<string> ActiveWorkspaces =
+            new(PathComparer);
+        private readonly string _workspace;
+        private readonly string _stateRootPath;
+        private readonly IReadOnlyList<GovernedGitMarkerState> _markerStates;
+        private readonly IReadOnlySet<string> _initialForeignGitEntries;
+        private bool _restored;
+
+        private GovernedGitIsolationScope(
+            string workspace,
+            string rootPath,
+            string stateRootPath,
+            IReadOnlyDictionary<string, string?> environmentVariables,
+            IReadOnlyList<GovernedGitMarkerState> markerStates,
+            IReadOnlySet<string> initialForeignGitEntries)
+        {
+            _workspace = workspace;
+            RootPath = rootPath;
+            _stateRootPath = stateRootPath;
+            EnvironmentVariables = environmentVariables;
+            _markerStates = markerStates;
+            _initialForeignGitEntries = initialForeignGitEntries;
+        }
+
+        public string RootPath { get; }
+
+        public IReadOnlyDictionary<string, string?> EnvironmentVariables { get; }
+
+        public bool UnauthorizedMetadataMutationDetected { get; private set; }
+
+        public static GovernedGitIsolationScope Create(
+            string workingDirectory,
+            IReadOnlyCollection<string>? trustedRelativePaths = null)
+        {
+            var worktree = Path.GetFullPath(workingDirectory);
+            RecoverInterrupted(worktree);
+            var rootPath = Path.Combine(
+                Path.GetTempPath(),
+                $"ai-harness-governed-git-{Guid.NewGuid():N}");
+            var stateRootPath = GetStateRootPath(worktree);
+            var shadowStagingRoot = Path.Combine(
+                Path.GetDirectoryName(worktree)
+                ?? throw new InvalidOperationException(
+                    "Governed workspace has no parent directory."),
+                $".ai-harness-git-shadow-{Guid.NewGuid():N}");
+            RegisterActiveWorkspace(worktree);
+            try
+            {
+                Directory.CreateDirectory(rootPath);
+                Directory.CreateDirectory(stateRootPath);
+                Directory.CreateDirectory(shadowStagingRoot);
+                var repositories = trustedRelativePaths is null
+                    ? CandidateFingerprintService.DiscoverRepositories(worktree)
+                    : ResolveTrustedRepositories(
+                        worktree,
+                        trustedRelativePaths);
+                if (repositories.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        "Governed Copilot Git isolation requires a Git repository.");
+                }
+                var trustedMarkerPaths = repositories
+                    .Select(repository =>
+                        Path.GetFullPath(Path.Combine(repository, ".git")))
+                    .ToHashSet(PathComparer);
+                var initialForeignGitEntries = DiscoverGitEntries(worktree)
+                    .Where(path => !trustedMarkerPaths.Contains(path))
+                    .ToHashSet(PathComparer);
+                var mappings = new List<GovernedGitMapping>(repositories.Count);
+                var markerStates = new List<GovernedGitMarkerState>(
+                    repositories.Count);
+                for (var index = 0; index < repositories.Count; index++)
+                {
+                    var repository = repositories[index];
+                    var markerPath = Path.Combine(repository, ".git");
+                    if (!File.Exists(markerPath) || Directory.Exists(markerPath))
+                    {
+                        throw new InvalidOperationException(
+                            "Governed Copilot Git isolation requires isolated worktrees whose .git metadata is an external pointer.");
+                    }
+                    var shadowGitDirectory = Path.Combine(
+                        shadowStagingRoot,
+                        $"repository-{index:D3}.git");
+                    InitializeShadowRepository(
+                        repository,
+                        markerPath,
+                        shadowGitDirectory);
+                    var markerState = new GovernedGitMarkerState(
+                        Path.GetFullPath(repository),
+                        Convert.ToBase64String(File.ReadAllBytes(markerPath)),
+                        Path.Combine(
+                            stateRootPath,
+                            $"repository-{index:D3}.pointer"),
+                        CaptureMetadataManifest(shadowGitDirectory),
+                        (int)File.GetAttributes(markerPath));
+                    markerStates.Add(markerState);
+                    mappings.Add(new GovernedGitMapping(
+                        Path.GetFullPath(repository),
+                        Path.GetFullPath(markerPath)));
+                }
+
+                WriteRecoveryJournal(
+                    worktree,
+                    stateRootPath,
+                    markerStates);
+                for (var index = 0; index < markerStates.Count; index++)
+                {
+                    var markerState = markerStates[index];
+                    var markerPath = Path.Combine(
+                        markerState.Repository,
+                        ".git");
+                    File.Move(markerPath, markerState.BackupPointerPath);
+                    Directory.Move(
+                        Path.Combine(
+                            shadowStagingRoot,
+                            $"repository-{index:D3}.git"),
+                        markerPath);
+                }
+                DeleteDirectoryBestEffort(shadowStagingRoot);
+
+                var globalConfigPath = Path.Combine(rootPath, "global.gitconfig");
+                File.WriteAllText(globalConfigPath, string.Empty);
+                var realGit = ResolveGitExecutable();
+                CreateGitDispatcher(rootPath, realGit, mappings);
+                var primary = mappings
+                    .OrderBy(mapping =>
+                        Path.GetRelativePath(worktree, mapping.Repository).Length)
+                    .First();
+                var environment = new Dictionary<string, string?>(StringComparer.Ordinal)
+                {
+                    ["PATH"] = rootPath + Path.PathSeparator +
+                               Environment.GetEnvironmentVariable("PATH"),
+                    ["GIT_DIR"] = primary.GitDirectory,
+                    ["GIT_WORK_TREE"] = primary.Repository,
+                    ["GIT_INDEX_FILE"] = Path.Combine(
+                        primary.GitDirectory,
+                        "index"),
+                    ["GIT_COMMON_DIR"] = null,
+                    ["GIT_OBJECT_DIRECTORY"] = Path.Combine(
+                        primary.GitDirectory,
+                        "objects"),
+                    ["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = null,
+                    ["GIT_OPTIONAL_LOCKS"] = "0",
+                    ["GIT_ALLOW_PROTOCOL"] = "file",
+                    ["GIT_PROTOCOL_FROM_USER"] = "0",
+                    ["GIT_CONFIG_NOSYSTEM"] = "1",
+                    ["GIT_CONFIG_SYSTEM"] = null,
+                    ["GIT_CONFIG_GLOBAL"] = globalConfigPath
+                };
+                return new GovernedGitIsolationScope(
+                    worktree,
+                    rootPath,
+                    stateRootPath,
+                    environment,
+                    markerStates,
+                    initialForeignGitEntries);
+            }
+            catch
+            {
+                RecoverFromStateRoot(worktree, stateRootPath);
+                DeleteDirectoryBestEffort(shadowStagingRoot);
+                DeleteDirectoryBestEffort(rootPath);
+                UnregisterActiveWorkspace(worktree);
+                throw;
+            }
+        }
+
+        public void RestoreAndValidate()
+        {
+            if (_restored)
+            {
+                return;
+            }
+            _restored = true;
+            var trustedMarkerPaths = _markerStates
+                .Select(state =>
+                    Path.GetFullPath(Path.Combine(state.Repository, ".git")))
+                .ToHashSet(PathComparer);
+            foreach (var entry in DiscoverGitEntries(_workspace).Where(path =>
+                         !trustedMarkerPaths.Contains(path) &&
+                         !_initialForeignGitEntries.Contains(path)))
+            {
+                UnauthorizedMetadataMutationDetected = true;
+                DeleteGitEntry(entry);
+            }
+            foreach (var markerState in _markerStates)
+            {
+                var markerPath = Path.Combine(markerState.Repository, ".git");
+                if (!Directory.Exists(markerPath) ||
+                    !MetadataManifestEquals(
+                        markerState.InitialShadowManifest,
+                        CaptureMetadataManifest(markerPath)))
+                {
+                    UnauthorizedMetadataMutationDetected = true;
+                }
+            }
+            RecoverFromStateRoot(
+                Path.GetFullPath(
+                    JsonSerializer.Deserialize<GovernedGitRecoveryJournal>(
+                        File.ReadAllText(
+                            Path.Combine(_stateRootPath, RecoveryJournalName)))
+                    ?.Workspace ??
+                    throw new InvalidOperationException(
+                        "Governed Git recovery journal is invalid.")),
+                _stateRootPath);
+            DeleteDirectoryBestEffort(RootPath);
+            UnregisterActiveWorkspace(_workspace);
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                RestoreAndValidate();
+            }
+            finally
+            {
+                DeleteDirectoryBestEffort(RootPath);
+                if (_restored)
+                {
+                    UnregisterActiveWorkspace(_workspace);
+                }
+            }
+        }
+
+        internal void LeaveInterruptedForRecoveryTest()
+        {
+            _restored = true;
+            DeleteDirectoryBestEffort(RootPath);
+            UnregisterActiveWorkspace(_workspace);
+        }
+
+        internal static void RecoverInterrupted(string workingDirectory)
+        {
+            var workspace = Path.GetFullPath(workingDirectory);
+            lock (ActiveWorkspaceLock)
+            {
+                if (ActiveWorkspaces.Contains(workspace))
+                {
+                    throw new InvalidOperationException(
+                        "Governed Git metadata is currently owned by a live execution in this workspace.");
+                }
+            }
+            RecoverFromStateRoot(workspace, GetStateRootPath(workspace));
+        }
+
+        private static void RegisterActiveWorkspace(string workspace)
+        {
+            lock (ActiveWorkspaceLock)
+            {
+                if (!ActiveWorkspaces.Add(Path.GetFullPath(workspace)))
+                {
+                    throw new InvalidOperationException(
+                        "A governed execution already owns this workspace.");
+                }
+            }
+        }
+
+        private static void UnregisterActiveWorkspace(string workspace)
+        {
+            lock (ActiveWorkspaceLock)
+            {
+                ActiveWorkspaces.Remove(Path.GetFullPath(workspace));
+            }
+        }
+
+        private static string GetStateRootPath(string workspace)
+        {
+            var normalized = Path.GetFullPath(workspace)
+                .TrimEnd(
+                    Path.DirectorySeparatorChar,
+                    Path.AltDirectorySeparatorChar)
+                .Normalize(NormalizationForm.FormKC);
+            if (OperatingSystem.IsWindows())
+            {
+                normalized = normalized.ToUpperInvariant();
+            }
+            var key = Convert.ToHexString(
+                    SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))
+                .ToLowerInvariant();
+            return Path.Combine(
+                Path.GetTempPath(),
+                "ai-harness-governed-git-state",
+                key);
+        }
+
+        private static void WriteRecoveryJournal(
+            string workspace,
+            string stateRootPath,
+            IReadOnlyList<GovernedGitMarkerState> markerStates)
+        {
+            var journal = new GovernedGitRecoveryJournal(
+                Path.GetFullPath(workspace),
+                markerStates.Select(state =>
+                    new GovernedGitRecoveryEntry(
+                        state.Repository,
+                        state.OriginalPointerBase64,
+                        state.BackupPointerPath,
+                        state.OriginalAttributes)).ToArray());
+            var journalPath = Path.Combine(
+                stateRootPath,
+                RecoveryJournalName);
+            var temporaryPath = journalPath + ".tmp";
+            File.WriteAllText(
+                temporaryPath,
+                JsonSerializer.Serialize(journal),
+                Encoding.UTF8);
+            File.Move(temporaryPath, journalPath, overwrite: true);
+        }
+
+        private static void RecoverFromStateRoot(
+            string workspace,
+            string stateRootPath)
+        {
+            if (!Directory.Exists(stateRootPath))
+            {
+                return;
+            }
+            var journalPath = Path.Combine(
+                stateRootPath,
+                RecoveryJournalName);
+            if (!File.Exists(journalPath))
+            {
+                DeleteDirectoryBestEffort(stateRootPath);
+                return;
+            }
+
+            GovernedGitRecoveryJournal journal;
+            try
+            {
+                journal = JsonSerializer.Deserialize<GovernedGitRecoveryJournal>(
+                              File.ReadAllText(journalPath))
+                          ?? throw new InvalidOperationException(
+                              "Governed Git recovery journal is empty.");
+            }
+            catch (JsonException exception)
+            {
+                throw new InvalidOperationException(
+                    "Governed Git recovery journal is corrupt; authoritative metadata was not touched.",
+                    exception);
+            }
+
+            if (!PathsEqual(journal.Workspace, workspace))
+            {
+                throw new InvalidOperationException(
+                    "Governed Git recovery journal belongs to a different workspace.");
+            }
+            foreach (var entry in journal.Repositories)
+            {
+                var repository = Path.GetFullPath(entry.Repository);
+                if (!IsContainedOrEqual(workspace, repository))
+                {
+                    throw new InvalidOperationException(
+                        "Governed Git recovery journal contains an out-of-workspace repository.");
+                }
+                var markerPath = Path.Combine(repository, ".git");
+                var pointerBytes = File.Exists(entry.BackupPointerPath)
+                    ? File.ReadAllBytes(entry.BackupPointerPath)
+                    : Convert.FromBase64String(entry.OriginalPointerBase64);
+                DeleteGitEntry(markerPath);
+                Directory.CreateDirectory(repository);
+                var temporaryMarker = Path.Combine(
+                    repository,
+                    $".git.restore-{Guid.NewGuid():N}");
+                File.WriteAllBytes(temporaryMarker, pointerBytes);
+                File.SetAttributes(
+                    temporaryMarker,
+                    (FileAttributes)entry.OriginalAttributes);
+                File.Move(temporaryMarker, markerPath);
+            }
+            DeleteDirectoryBestEffort(stateRootPath);
+        }
+
+        private static IReadOnlyList<string> CaptureMetadataManifest(
+            string gitDirectory)
+        {
+            if (!Directory.Exists(gitDirectory))
+            {
+                return [];
+            }
+            var result = new List<string>();
+            foreach (var directory in Directory.EnumerateDirectories(
+                         gitDirectory,
+                         "*",
+                         SearchOption.AllDirectories))
+            {
+                result.Add(
+                    "D:" + Path.GetRelativePath(gitDirectory, directory)
+                        .Replace('\\', '/'));
+            }
+            foreach (var file in Directory.EnumerateFiles(
+                         gitDirectory,
+                         "*",
+                         SearchOption.AllDirectories))
+            {
+                var bytes = File.ReadAllBytes(file);
+                result.Add(
+                    "F:" +
+                    Path.GetRelativePath(gitDirectory, file)
+                        .Replace('\\', '/') +
+                    ":" +
+                    bytes.LongLength +
+                    ":" +
+                    Convert.ToHexString(SHA256.HashData(bytes))
+                        .ToLowerInvariant());
+            }
+            return result.Order(StringComparer.Ordinal).ToArray();
+        }
+
+        private static IReadOnlyList<string> DiscoverGitEntries(string workspace)
+        {
+            var result = new List<string>();
+            var pending = new Stack<string>();
+            pending.Push(Path.GetFullPath(workspace));
+            while (pending.Count > 0)
+            {
+                var directory = pending.Pop();
+                foreach (var entry in Directory.EnumerateFileSystemEntries(directory))
+                {
+                    if (string.Equals(
+                            Path.GetFileName(entry),
+                            ".git",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Add(Path.GetFullPath(entry));
+                        continue;
+                    }
+                    if (Directory.Exists(entry) &&
+                        (File.GetAttributes(entry) & FileAttributes.ReparsePoint) == 0)
+                    {
+                        pending.Push(entry);
+                    }
+                }
+            }
+            return result;
+        }
+
+        private static bool MetadataManifestEquals(
+            IReadOnlyList<string> expected,
+            IReadOnlyList<string> actual) =>
+            expected.SequenceEqual(actual, StringComparer.Ordinal);
+
+        private static void DeleteGitEntry(string markerPath)
+        {
+            if (File.Exists(markerPath))
+            {
+                File.SetAttributes(markerPath, FileAttributes.Normal);
+                File.Delete(markerPath);
+                return;
+            }
+            if (!Directory.Exists(markerPath))
+            {
+                return;
+            }
+            var attributes = File.GetAttributes(markerPath);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                Directory.Delete(markerPath);
+                return;
+            }
+            DeleteDirectoryBestEffort(markerPath);
+            if (Directory.Exists(markerPath))
+            {
+                throw new IOException(
+                    $"Could not remove disposable governed Git metadata '{markerPath}'.");
+            }
+        }
+
+        private static bool IsContainedOrEqual(string root, string path)
+        {
+            var relative = Path.GetRelativePath(
+                Path.GetFullPath(root),
+                Path.GetFullPath(path));
+            return !Path.IsPathRooted(relative) &&
+                   !relative.Equals("..", StringComparison.Ordinal) &&
+                   !relative.StartsWith(
+                       ".." + Path.DirectorySeparatorChar,
+                       StringComparison.Ordinal) &&
+                   !relative.StartsWith(
+                       ".." + Path.AltDirectorySeparatorChar,
+                       StringComparison.Ordinal);
+        }
+
+        private static bool PathsEqual(string left, string right) =>
+            string.Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(left)),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(right)),
+                PathComparison);
+
+        private static IReadOnlyList<string> ResolveTrustedRepositories(
+            string workspace,
+            IReadOnlyCollection<string> relativePaths)
+        {
+            if (relativePaths.Count == 0 ||
+                relativePaths.Count !=
+                relativePaths.Distinct(StringComparer.Ordinal).Count())
+            {
+                throw new InvalidOperationException(
+                    "Governed execution requires a non-empty unique trusted repository mapping.");
+            }
+            var repositories = new List<string>(relativePaths.Count);
+            foreach (var relativePath in relativePaths)
+            {
+                if (string.IsNullOrWhiteSpace(relativePath) ||
+                    Path.IsPathRooted(relativePath))
+                {
+                    throw new InvalidOperationException(
+                        $"Trusted repository path '{relativePath}' is invalid.");
+                }
+                var repository = Path.GetFullPath(
+                    Path.Combine(
+                        workspace,
+                        relativePath.Replace(
+                            '/',
+                            Path.DirectorySeparatorChar)));
+                var relative = Path.GetRelativePath(workspace, repository);
+                if (Path.IsPathRooted(relative) ||
+                    relative.Equals("..", StringComparison.Ordinal) ||
+                    relative.StartsWith(
+                        ".." + Path.DirectorySeparatorChar,
+                        StringComparison.Ordinal) ||
+                    relative.StartsWith(
+                        ".." + Path.AltDirectorySeparatorChar,
+                        StringComparison.Ordinal) ||
+                    !RepositoryAnalyzer.IsGitRepository(repository))
+                {
+                    throw new InvalidOperationException(
+                        $"Trusted repository '{relativePath}' is outside the governed workspace or is no longer a Git repository.");
+                }
+                repositories.Add(repository);
+            }
+            return repositories
+                .OrderBy(
+                    path => Path.GetRelativePath(workspace, path),
+                    StringComparer.Ordinal)
+                .ToArray();
+        }
+
+        private static void InitializeShadowRepository(
+            string repository,
+            string markerPath,
+            string shadowGitDirectory)
+        {
+            var gitDirectory = ResolveGitDirectory(repository, markerPath);
+            var commonDirectory = ResolveCommonGitDirectory(gitDirectory);
+            var objectFormat = ReadObjectFormat(gitDirectory, commonDirectory);
+            Directory.CreateDirectory(Path.Combine(shadowGitDirectory, "objects", "info"));
+            Directory.CreateDirectory(Path.Combine(shadowGitDirectory, "objects", "pack"));
+            Directory.CreateDirectory(Path.Combine(shadowGitDirectory, "refs", "heads"));
+            File.WriteAllText(
+                Path.Combine(shadowGitDirectory, "config"),
+                objectFormat == "sha256"
+                    ? """
+                      [core]
+                          repositoryformatversion = 1
+                          bare = false
+                          filemode = true
+                          logallrefupdates = false
+                      [extensions]
+                          objectformat = sha256
+                      """
+                    : """
+                [core]
+                    repositoryformatversion = 0
+                    bare = false
+                    filemode = true
+                    logallrefupdates = false
+                """);
+            SeedReadOnlyIdentity(repository, markerPath, shadowGitDirectory);
+        }
+
+        private static void CreateGitDispatcher(
+            string rootPath,
+            string realGit,
+            IReadOnlyList<GovernedGitMapping> mappings)
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                var scriptPath = Path.Combine(rootPath, "git-dispatch.ps1");
+                var mappingEntries = string.Join(
+                    "," + Environment.NewLine,
+                    mappings
+                        .OrderByDescending(item => item.Repository.Length)
+                        .Select(item =>
+                            "    [pscustomobject]@{ Repository = '" +
+                            PowerShellQuote(item.Repository) +
+                            "'; GitDirectory = '" +
+                            PowerShellQuote(item.GitDirectory) +
+                            "' }"));
+                var blockedCommands = string.Join(
+                    ", ",
+                    GovernedGitMutationSubcommands.Select(command =>
+                        $"'{PowerShellQuote(command)}'"));
+                File.WriteAllText(
+                    scriptPath,
+                    $$"""
+                      $ErrorActionPreference = 'Stop'
+                      $target = [IO.Path]::GetFullPath((Get-Location).Path)
+                      $expectDirectory = $false
+                      $forwarded = @()
+                      foreach ($rawArgument in $args) {
+                          $argument = $rawArgument.Trim('"')
+                          if (
+                              $argument -ceq '-c' -or
+                              $argument -ceq '--git-dir' -or
+                              $argument.StartsWith('--git-dir=') -or
+                              $argument -ceq '--work-tree' -or
+                              $argument.StartsWith('--work-tree=') -or
+                              $argument -ceq '--namespace' -or
+                              $argument.StartsWith('--namespace=') -or
+                              $argument -ceq '--config-env' -or
+                              $argument.StartsWith('--config-env=')
+                          ) {
+                              [Console]::Error.WriteLine('Git repository-selection and config override flags are disabled.')
+                              exit 126
+                          }
+                          $forwarded += $argument
+                          if ($expectDirectory) {
+                              $target = if ([IO.Path]::IsPathRooted($argument)) {
+                                  [IO.Path]::GetFullPath($argument)
+                              } else {
+                                  [IO.Path]::GetFullPath([IO.Path]::Combine($target, $argument))
+                              }
+                              $expectDirectory = $false
+                              continue
+                          }
+                          if ($argument -eq '-C') {
+                              $expectDirectory = $true
+                          }
+                      }
+                      $blockedCommands = @({{blockedCommands}})
+                      $subcommand = $null
+                      for ($index = 0; $index -lt $forwarded.Count; $index++) {
+                          if ($forwarded[$index] -ceq '-C') {
+                              $index++
+                              continue
+                          }
+                          if ($forwarded[$index].StartsWith('-')) {
+                              continue
+                          }
+                          $subcommand = $forwarded[$index]
+                          break
+                      }
+                      if ($null -eq $subcommand -or $blockedCommands -contains $subcommand) {
+                          [Console]::Error.WriteLine('This Git subcommand is not permitted in a governed turn.')
+                          exit 126
+                      }
+                      $mappings = @(
+                      {{mappingEntries}}
+                      )
+                      $mapping = $mappings | Where-Object {
+                          $target -eq $_.Repository -or
+                          $target.StartsWith(
+                              $_.Repository + [IO.Path]::DirectorySeparatorChar,
+                              [StringComparison]::OrdinalIgnoreCase)
+                      } | Select-Object -First 1
+                      if ($null -eq $mapping) {
+                          [Console]::Error.WriteLine('Git access is outside the governed repository set.')
+                          exit 128
+                      }
+                      $env:GIT_DIR = $mapping.GitDirectory
+                      $env:GIT_WORK_TREE = $mapping.Repository
+                      $env:GIT_INDEX_FILE = [IO.Path]::Combine($mapping.GitDirectory, 'index')
+                      $env:GIT_OBJECT_DIRECTORY = [IO.Path]::Combine($mapping.GitDirectory, 'objects')
+                      Remove-Item Env:GIT_COMMON_DIR -ErrorAction SilentlyContinue
+                      Remove-Item Env:GIT_ALTERNATE_OBJECT_DIRECTORIES -ErrorAction SilentlyContinue
+                      & '{{PowerShellQuote(realGit)}}' @forwarded
+                      exit $LASTEXITCODE
+                      """.ReplaceLineEndings(Environment.NewLine));
+                File.WriteAllText(
+                    Path.Combine(rootPath, "git.cmd"),
+                    "@echo off\r\n" +
+                    "powershell.exe -NoLogo -NoProfile -NonInteractive " +
+                    "-ExecutionPolicy Bypass -File \"%~dp0git-dispatch.ps1\" %*\r\n" +
+                    "exit /b %ERRORLEVEL%\r\n");
+                return;
+            }
+
+            var cases = string.Join(
+                Environment.NewLine,
+                mappings
+                    .OrderByDescending(item => item.Repository.Length)
+                    .Select(item =>
+                        $"  {ShellQuote(item.Repository)}|{ShellQuote(item.Repository)}/*) " +
+                        $"git_dir={ShellQuote(item.GitDirectory)}; " +
+                        $"work_tree={ShellQuote(item.Repository)} ;;"));
+            var blockedCase = string.Join(
+                "|",
+                GovernedGitMutationSubcommands);
+            var dispatcher = Path.Combine(rootPath, "git");
+            File.WriteAllText(
+                dispatcher,
+                $$"""
+                  #!/bin/sh
+                  target=$PWD
+                  expect_directory=0
+                  subcommand=
+                  for argument in "$@"; do
+                    case "$argument" in
+                      -c|--git-dir|--git-dir=*|--work-tree|--work-tree=*|--namespace|--namespace=*|--config-env|--config-env=*)
+                        echo "Git repository-selection and config override flags are disabled." >&2
+                        exit 126
+                        ;;
+                    esac
+                    if [ "$expect_directory" -eq 1 ]; then
+                      case "$argument" in
+                        /*) target=$argument ;;
+                        *) target=$target/$argument ;;
+                      esac
+                      target=$(cd "$target" 2>/dev/null && pwd -P) || exit 128
+                      expect_directory=0
+                    elif [ "$argument" = "-C" ]; then
+                      expect_directory=1
+                    elif [ -z "$subcommand" ]; then
+                      case "$argument" in
+                        -*) ;;
+                        *) subcommand=$argument ;;
+                      esac
+                    fi
+                  done
+                  case "$subcommand" in
+                    ""|{{blockedCase}})
+                      echo "This Git subcommand is not permitted in a governed turn." >&2
+                      exit 126
+                      ;;
+                  esac
+                  case "$target" in
+                  {{cases}}
+                    *) echo "Git access is outside the governed repository set." >&2; exit 128 ;;
+                  esac
+                  export GIT_DIR="$git_dir"
+                  export GIT_WORK_TREE="$work_tree"
+                  export GIT_INDEX_FILE="$git_dir/index"
+                  export GIT_OBJECT_DIRECTORY="$git_dir/objects"
+                  unset GIT_COMMON_DIR GIT_ALTERNATE_OBJECT_DIRECTORIES
+                  exec {{ShellQuote(realGit)}} "$@"
+                  """.ReplaceLineEndings("\n"));
+            File.SetUnixFileMode(
+                dispatcher,
+                UnixFileMode.UserRead |
+                UnixFileMode.UserWrite |
+                UnixFileMode.UserExecute);
+        }
+
+        private static string ResolveGitExecutable()
+        {
+            var fileName = OperatingSystem.IsWindows() ? "git.exe" : "git";
+            foreach (var entry in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
+                         .Split(
+                             Path.PathSeparator,
+                             StringSplitOptions.RemoveEmptyEntries |
+                             StringSplitOptions.TrimEntries))
+            {
+                var candidate = Path.Combine(entry.Trim('"'), fileName);
+                if (File.Exists(candidate))
+                {
+                    return Path.GetFullPath(candidate);
+                }
+            }
+            throw new InvalidOperationException(
+                "Governed Git isolation could not resolve the host Git executable.");
+        }
+
+        private static string PowerShellQuote(string value) =>
+            value.Replace("'", "''", StringComparison.Ordinal);
+
+        private static string ShellQuote(string value) =>
+            "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
+
+        private static string ResolveGitDirectory(
+            string repository,
+            string markerPath)
+        {
+            var markerLine = File.ReadLines(markerPath).FirstOrDefault()?.Trim();
+            if (markerLine is null ||
+                !markerLine.StartsWith("gitdir:", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "The governed workspace has an invalid .git pointer file.");
+            }
+            return ResolveGitPath(
+                repository,
+                markerLine["gitdir:".Length..].Trim());
+        }
+
+        private static string ReadObjectFormat(
+            string gitDirectory,
+            string commonDirectory)
+        {
+            foreach (var configPath in new[]
+                     {
+                         Path.Combine(gitDirectory, "config.worktree"),
+                         Path.Combine(gitDirectory, "config"),
+                         Path.Combine(commonDirectory, "config")
+                     }.Distinct(PathComparer))
+            {
+                if (!File.Exists(configPath))
+                {
+                    continue;
+                }
+                var inExtensions = false;
+                foreach (var rawLine in File.ReadLines(configPath))
+                {
+                    var line = rawLine.Trim();
+                    if (line.StartsWith("[", StringComparison.Ordinal))
+                    {
+                        inExtensions = string.Equals(
+                            line,
+                            "[extensions]",
+                            StringComparison.OrdinalIgnoreCase);
+                        continue;
+                    }
+                    if (!inExtensions)
+                    {
+                        continue;
+                    }
+                    var separator = line.IndexOf('=');
+                    if (separator > 0 &&
+                        string.Equals(
+                            line[..separator].Trim(),
+                            "objectformat",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        var value = line[(separator + 1)..].Trim();
+                        if (value is "sha1" or "sha256")
+                        {
+                            return value;
+                        }
+                    }
+                }
+            }
+            return "sha1";
+        }
+
+        private static void DeleteDirectoryBestEffort(string path)
+        {
+            if (!Directory.Exists(path))
+            {
+                return;
+            }
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(
+                             path,
+                             "*",
+                             SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                foreach (var directory in Directory.EnumerateDirectories(
+                             path,
+                             "*",
+                             SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(directory, FileAttributes.Directory);
+                }
+                Directory.Delete(path, recursive: true);
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException)
+            {
+                // The isolated Git metadata is non-authoritative and cleanup is best effort.
+            }
+        }
+
+        private static void SeedReadOnlyIdentity(
+            string repository,
+            string markerPath,
+            string shadowGitDirectory)
+        {
+            var markerLine = File.ReadLines(markerPath).FirstOrDefault()?.Trim();
+            if (markerLine is null ||
+                !markerLine.StartsWith("gitdir:", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "The governed workspace has an invalid .git pointer file.");
+            }
+            var gitDirectory = ResolveGitPath(
+                repository,
+                markerLine["gitdir:".Length..].Trim());
+            var commonDirectory = ResolveCommonGitDirectory(gitDirectory);
+            var headText = File.ReadAllText(Path.Combine(gitDirectory, "HEAD"))
+                .ReplaceLineEndings("\n");
+            File.WriteAllText(
+                Path.Combine(shadowGitDirectory, "HEAD"),
+                headText);
+
+            if (headText.Trim().StartsWith("ref:", StringComparison.Ordinal))
+            {
+                var reference = headText.Trim()["ref:".Length..].Trim();
+                var objectId = ReadReference(gitDirectory, commonDirectory, reference);
+                if (!string.IsNullOrWhiteSpace(objectId))
+                {
+                    var shadowReference = Path.Combine(
+                        shadowGitDirectory,
+                        reference.Replace('/', Path.DirectorySeparatorChar));
+                    Directory.CreateDirectory(Path.GetDirectoryName(shadowReference)!);
+                    File.WriteAllText(shadowReference, objectId + "\n");
+                }
+            }
+
+            var sourceIndex = Path.Combine(gitDirectory, "index");
+            if (File.Exists(sourceIndex))
+            {
+                File.Copy(
+                    sourceIndex,
+                    Path.Combine(shadowGitDirectory, "index"),
+                    overwrite: true);
+            }
+
+            CopyReferenceSnapshot(
+                gitDirectory,
+                commonDirectory,
+                shadowGitDirectory);
+            CopyImmutableObjectDatabase(
+                gitDirectory,
+                commonDirectory,
+                shadowGitDirectory);
+        }
+
+        private static void CopyReferenceSnapshot(
+            string gitDirectory,
+            string commonDirectory,
+            string shadowGitDirectory)
+        {
+            foreach (var root in new[] { commonDirectory, gitDirectory }.Distinct(PathComparer))
+            {
+                CopyDirectorySnapshot(
+                    Path.Combine(root, "refs"),
+                    Path.Combine(shadowGitDirectory, "refs"));
+                CopyFileIfExists(
+                    Path.Combine(root, "packed-refs"),
+                    Path.Combine(shadowGitDirectory, "packed-refs"));
+                CopyFileIfExists(
+                    Path.Combine(root, "shallow"),
+                    Path.Combine(shadowGitDirectory, "shallow"));
+            }
+        }
+
+        private static void CopyImmutableObjectDatabase(
+            string gitDirectory,
+            string commonDirectory,
+            string shadowGitDirectory)
+        {
+            foreach (var objectDirectory in DiscoverObjectDatabaseRoots(
+                         gitDirectory,
+                         commonDirectory))
+            {
+                CopyDirectorySnapshot(
+                    objectDirectory,
+                    Path.Combine(shadowGitDirectory, "objects"),
+                    ShouldSkipShadowObjectEntry);
+            }
+        }
+
+        private static IReadOnlyList<string> DiscoverObjectDatabaseRoots(
+            string gitDirectory,
+            string commonDirectory)
+        {
+            var roots = new List<string>();
+            var visited = new HashSet<string>(PathComparer);
+            var pending = new Stack<string>(
+                new[] { commonDirectory, gitDirectory }
+                    .Distinct(PathComparer)
+                    .Select(root => Path.Combine(root, "objects")));
+            while (pending.Count > 0)
+            {
+                var objectDirectory = Path.GetFullPath(pending.Pop());
+                if (!visited.Add(objectDirectory) ||
+                    !Directory.Exists(objectDirectory))
+                {
+                    continue;
+                }
+
+                roots.Add(objectDirectory);
+                var alternatesPath = Path.Combine(
+                    objectDirectory,
+                    "info",
+                    "alternates");
+                if (!File.Exists(alternatesPath))
+                {
+                    continue;
+                }
+
+                foreach (var alternate in File.ReadLines(alternatesPath)
+                             .Select(line => line.Trim())
+                             .Where(line => line.Length > 0))
+                {
+                    var alternateDirectory = ResolveGitPath(
+                        objectDirectory,
+                        alternate);
+                    if (!Directory.Exists(alternateDirectory))
+                    {
+                        throw new InvalidOperationException(
+                            $"The governed workspace references a missing alternate object directory '{alternateDirectory}'.");
+                    }
+
+                    pending.Push(alternateDirectory);
+                }
+            }
+
+            return roots;
+        }
+
+        private static void CopyDirectorySnapshot(
+            string sourceDirectory,
+            string destinationDirectory,
+            Func<string, bool>? skipRelativePath = null)
+        {
+            if (!Directory.Exists(sourceDirectory))
+            {
+                return;
+            }
+
+            Directory.CreateDirectory(destinationDirectory);
+            foreach (var directory in Directory.EnumerateDirectories(
+                         sourceDirectory,
+                         "*",
+                         SearchOption.AllDirectories))
+            {
+                var relativePath = Path.GetRelativePath(sourceDirectory, directory)
+                    .Replace('\\', '/');
+                if (skipRelativePath?.Invoke(relativePath) == true)
+                {
+                    continue;
+                }
+
+                Directory.CreateDirectory(Path.Combine(
+                    destinationDirectory,
+                    relativePath.Replace('/', Path.DirectorySeparatorChar)));
+            }
+
+            foreach (var file in Directory.EnumerateFiles(
+                         sourceDirectory,
+                         "*",
+                         SearchOption.AllDirectories))
+            {
+                var relativePath = Path.GetRelativePath(sourceDirectory, file)
+                    .Replace('\\', '/');
+                if (skipRelativePath?.Invoke(relativePath) == true)
+                {
+                    continue;
+                }
+
+                var destinationPath = Path.Combine(
+                    destinationDirectory,
+                    relativePath.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+                File.Copy(file, destinationPath, overwrite: true);
+            }
+        }
+
+        private static bool ShouldSkipShadowObjectEntry(string relativePath) =>
+            relativePath.Equals("info/alternates", PathComparison) ||
+            relativePath.Equals("info/http-alternates", PathComparison);
+
+        private static void CopyFileIfExists(
+            string sourcePath,
+            string destinationPath)
+        {
+            if (!File.Exists(sourcePath))
+            {
+                return;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+            File.Copy(sourcePath, destinationPath, overwrite: true);
+        }
+
+        private static string ResolveCommonGitDirectory(string gitDirectory)
+        {
+            var commonPointer = Path.Combine(gitDirectory, "commondir");
+            if (!File.Exists(commonPointer))
+            {
+                return gitDirectory;
+            }
+            return ResolveGitPath(
+                gitDirectory,
+                File.ReadAllText(commonPointer).Trim());
+        }
+
+        private static string ResolveGitPath(
+            string baseDirectory,
+            string path) =>
+            Path.GetFullPath(
+                Path.IsPathRooted(path)
+                    ? path
+                    : Path.Combine(baseDirectory, path));
+
+        private static StringComparer PathComparer =>
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+
+        private static StringComparison PathComparison =>
+            OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+
+        private static string? ReadReference(
+            string gitDirectory,
+            string commonDirectory,
+            string reference)
+        {
+            foreach (var root in new[] { gitDirectory, commonDirectory })
+            {
+                var loosePath = Path.Combine(
+                    root,
+                    reference.Replace('/', Path.DirectorySeparatorChar));
+                if (File.Exists(loosePath))
+                {
+                    return File.ReadAllText(loosePath).Trim();
+                }
+            }
+
+            var packedRefs = Path.Combine(commonDirectory, "packed-refs");
+            if (!File.Exists(packedRefs))
+            {
+                return null;
+            }
+            foreach (var line in File.ReadLines(packedRefs))
+            {
+                if (line.Length == 0 ||
+                    line[0] is '#' or '^')
+                {
+                    continue;
+                }
+                var separator = line.IndexOf(' ');
+                if (separator > 0 &&
+                    string.Equals(
+                        line[(separator + 1)..].Trim(),
+                        reference,
+                        StringComparison.Ordinal))
+                {
+                    return line[..separator].Trim();
+                }
+            }
+            return null;
+        }
+
+        private sealed record GovernedGitMapping(
+            string Repository,
+            string GitDirectory);
+
+        private sealed record GovernedGitMarkerState(
+            string Repository,
+            string OriginalPointerBase64,
+            string BackupPointerPath,
+            IReadOnlyList<string> InitialShadowManifest,
+            int OriginalAttributes);
+
+        private sealed record GovernedGitRecoveryJournal(
+            string Workspace,
+            IReadOnlyList<GovernedGitRecoveryEntry> Repositories);
+
+        private sealed record GovernedGitRecoveryEntry(
+            string Repository,
+            string OriginalPointerBase64,
+            string BackupPointerPath,
+            int OriginalAttributes);
     }
 }

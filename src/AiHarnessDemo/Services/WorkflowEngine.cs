@@ -5,6 +5,7 @@ using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
 using Microsoft.EntityFrameworkCore;
 
 namespace AiHarnessDemo.Services;
@@ -22,16 +23,30 @@ public sealed class WorkflowEngine(
     CopilotSessionJournal sessionJournal,
     WorkflowDefinitionProvider workflowProvider,
     ILogger<WorkflowEngine> logger,
-    IPublishedOutcomeVerifier? publicationVerifier = null)
+    IPublishedOutcomeVerifier? publicationVerifier = null,
+    CandidateFingerprintService? candidateFingerprintService = null,
+    OutcomeVerificationContextBuilder? outcomeContextBuilder = null,
+    IVerifiedCandidatePublisher? candidatePublisher = null)
 {
     internal const string ReleaseCandidateLabel = "Prepare customer release candidate";
     internal const string ApprovedPublicationLabel = "Publish customer-approved outcome";
+    internal const string OutcomeCorrectionLabelPrefix = "Correct outcome after QA round ";
+    internal const string OutcomePlanCorrectionLabelPrefix =
+        "Correct outcome acceptance plan after QA round ";
+    internal const string OutcomeCandidateRefreshLabelPrefix =
+        "Refresh outcome candidate after QA round ";
+    internal const string OutcomeQaLabelPrefix = "Verify outcome candidate (round ";
     internal const string PreMortemRole = "pre-mortem-sceptic";
+    internal const int MaximumQaContractErrorCharacters = 4_000;
     private const string ManualRestartLabelPrefix = "Manual restart of ";
     internal const string ReleaseCandidateAssignment =
-        "Prepare the verified outcome for customer review. Commit intended changes locally and " +
-        "generate every browser artifact under .customer-preview, but do not push a branch or " +
-        "create a pull request before explicit customer approval.";
+        "Prepare the local outcome candidate for independent QA. Generate every browser artifact " +
+        "under .customer-preview, leave every repository ready for host sealing from the actual " +
+        "working-tree product bytes, and do not create commits, branches, tags, remotes, pushes, " +
+        "or pull requests before explicit customer approval. Exclude " +
+        ".ai-harness\\outcome-verification from product commits, rerun release-critical checks, " +
+        "and report the repository scope plus release evidence. The harness records the final " +
+        "sealed HEAD and tree identity for every repository.";
     internal static string ApprovedPublicationAssignment(OutcomeType outcome) =>
         outcome == OutcomeType.PullRequest
             ? "Customer approval is recorded. Publish the already-verified outcome now: push the " +
@@ -39,6 +54,11 @@ public sealed class WorkflowEngine(
               "product behavior unless publication itself requires a narrowly scoped correction."
             : "Customer approval is recorded. Finalize the already-verified local commit outcome " +
               "without pushing a branch or creating a pull request. Report the exact commit SHA.";
+    internal const string HostControlledPublicationAssignment =
+        "Customer approval is recorded. Inspect the already-verified candidate and prepare the " +
+        "final release narrative, but do not modify product files, push, or create a pull request. " +
+        "The harness will publish only the immutable verified commit and tree identities after " +
+        "this Copilot CLI turn completes.";
 
     private readonly Lock _concurrencyLock = new();
     private readonly SemaphoreSlim _learningGate = new(1, 1);
@@ -113,6 +133,30 @@ public sealed class WorkflowEngine(
             {
                 return;
             }
+            if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+            {
+                var outcome = OutcomeVerificationRules.DeserializeAggregate(
+                    flow.OutcomeVerificationJson);
+                if (outcome.Iteration != flow.Iteration)
+                {
+                    throw new InvalidOperationException(
+                        "The outcome-verification aggregate does not match the active flow iteration.");
+                }
+                if (outcome.Status == OutcomeVerificationStatus.NotStarted)
+                {
+                    outcome.Status = OutcomeVerificationStatus.Planning;
+                    outcome.UpdatedAt = DateTimeOffset.UtcNow;
+                    flow.OutcomeVerificationJson =
+                        OutcomeVerificationRules.SerializeAggregate(outcome);
+                    database.FlowEvents.Add(new FlowEvent
+                    {
+                        FlowRunId = flow.Id,
+                        Type = "outcome.planning",
+                        Message =
+                            "Team Lead is converting the confirmed brief into independently verifiable acceptance criteria."
+                    });
+                }
+            }
             flow.Status = FlowStatus.Running;
             flow.FailureReason = string.Empty;
             flow.UpdatedAt = DateTimeOffset.UtcNow;
@@ -133,6 +177,26 @@ public sealed class WorkflowEngine(
         var planSummary = string.Join(
             " -> ",
             plan.Select(item => item.Agent.Name));
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            foreach (var requiredRole in new[]
+                     {
+                         "team-lead",
+                         "release-engineer",
+                         "quality-engineer"
+                     })
+            {
+                if (!plan.Any(item =>
+                        string.Equals(
+                            item.Agent.Role,
+                            requiredRole,
+                            StringComparison.Ordinal)))
+                {
+                    throw new InvalidOperationException(
+                        $"Outcome verification requires an enabled {requiredRole} agent.");
+                }
+            }
+        }
         var upstreamOwners = BuildUpstreamOwners(plan);
         var maxPreMortemRounds = await GetMaxHandoffRetriesAsync(cancellationToken);
         var preMortemAgent = availableAgents.SingleOrDefault(
@@ -140,13 +204,27 @@ public sealed class WorkflowEngine(
         var preMortemAvailable = preMortemAgent is not null && maxPreMortemRounds > 0;
 
         var lead = plan.FirstOrDefault(item => item.Agent.Role == "team-lead");
-        if (lead is not null)
+        if (lead is null)
         {
+            throw new InvalidOperationException(
+                "Team Lead must be enabled because downstream task profiles cannot be silently synthesized.");
+        }
+        var materializeInitialGraph =
+            string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) ||
+            !await HasCompleteInitialOutcomeGraphAsync(
+                flow.Id,
+                flow.Iteration,
+                cancellationToken);
+        if (materializeInitialGraph)
+        {
+            var initialDeliveryStepIds = new List<Guid>();
             var leadStepId = await AddStepAsync(
                 flow,
                 lead,
                 sequence: 10,
-                label: "Plan the delivery system",
+                label: string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+                    ? "Plan the delivery system"
+                    : "Define acceptance plan and delivery system",
                 cancellationToken,
                 inputSummary:
                     "Plan delivery for the fixed downstream role sequence and emit one validated " +
@@ -160,7 +238,10 @@ public sealed class WorkflowEngine(
                         ? $"The Pre-mortem Sceptic is available. Select any justified checkpoints " +
                           $"for {flow.ModelSelectionStrategy}; each selected checkpoint permits at most " +
                           $"{maxPreMortemRounds} total sceptic round(s)."
-                        : "The Pre-mortem Sceptic is unavailable because it is disabled or the configured round limit is zero. Return an empty AfterRoles array."));
+                        : "The Pre-mortem Sceptic is unavailable because it is disabled or the configured round limit is zero. Return an empty AfterRoles array."),
+                kind: string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+                    ? FlowStepKind.Standard
+                    : FlowStepKind.OutcomePlan);
             leadStepId = await ResolveEffectiveManualRetryStepIdAsync(
                 leadStepId,
                 cancellationToken);
@@ -204,7 +285,12 @@ public sealed class WorkflowEngine(
                 preMortemAvailable,
                 cancellationToken);
 
-            var deliveryPlan = plan.Where(item => item.Agent.Role != "team-lead").ToList();
+            var orderedDeliveryPlan = plan
+                .Where(item => item.Agent.Role != "team-lead")
+                .ToList();
+            var activeOutcomePlanHash = string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+                ? null
+                : await GetActiveOutcomePlanHashAsync(flow.Id, cancellationToken);
             var latestTeamLeadSequence =
                 await GetLatestCompletedAgentSequenceAsync(
                     flow.Id,
@@ -212,7 +298,8 @@ public sealed class WorkflowEngine(
                     lead.Agent.Id,
                     cancellationToken);
             var sequence = FirstDeliverySequence(latestTeamLeadSequence);
-            foreach (var planned in deliveryPlan)
+            var dependencyStepId = leadResult.Id;
+            foreach (var planned in orderedDeliveryPlan)
             {
                 var preparesReleaseCandidate =
                     planned.Agent.Role == "release-engineer";
@@ -231,11 +318,34 @@ public sealed class WorkflowEngine(
                     sequence,
                     preparesReleaseCandidate
                         ? ReleaseCandidateLabel
+                        : planned.Agent.Role == "quality-engineer" &&
+                          !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+                        ? "Verify outcome candidate (round 1)"
                         : $"Execute {planned.Agent.Name} contract",
                     cancellationToken,
-                    inputSummary: preparesReleaseCandidate
-                        ? ReleaseCandidateAssignment
-                        : null);
+                    inputSummary: AppendOutcomeAssignment(
+                        preparesReleaseCandidate
+                            ? ReleaseCandidateAssignment
+                            : planned.Reason,
+                        await BuildOutcomeAssignmentAsync(
+                            flow.Id,
+                            planned.Agent.Role,
+                            cancellationToken)),
+                    kind: !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+                        ? preparesReleaseCandidate
+                            ? FlowStepKind.OutcomeLocalReleaseCandidate
+                            : planned.Agent.Role == "quality-engineer"
+                                ? FlowStepKind.OutcomeQa
+                                : FlowStepKind.OutcomeDelivery
+                        : FlowStepKind.Standard,
+                    outcomeQaRound: !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+                        planned.Agent.Role == "quality-engineer"
+                        ? 1
+                        : null,
+                    outcomePlanHash: activeOutcomePlanHash,
+                    dependsOnStepId: dependencyStepId);
+                initialDeliveryStepIds.Add(deliveryStepId);
+                dependencyStepId = deliveryStepId;
                 sequence += 10;
 
                 if (!preMortemCheckpoints.Contains(planned.Agent.Role))
@@ -247,7 +357,7 @@ public sealed class WorkflowEngine(
                     throw new InvalidOperationException(
                         "Team Lead selected a pre-mortem checkpoint without an enabled Pre-mortem Sceptic.");
                 }
-                await AddPreMortemReviewStepAsync(
+                dependencyStepId = await AddPreMortemReviewStepAsync(
                     flow,
                     preMortemAgent,
                     deliveryStepId,
@@ -257,11 +367,14 @@ public sealed class WorkflowEngine(
                     cancellationToken);
                 sequence += 10;
             }
-        }
-        else
-        {
-            throw new InvalidOperationException(
-                "Team Lead must be enabled because downstream task profiles cannot be silently synthesized.");
+            if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+            {
+                await RecordInitialOutcomeGraphAsync(
+                    flow.Id,
+                    leadResult,
+                    initialDeliveryStepIds,
+                    cancellationToken);
+            }
         }
 
         await AddEventAsync(
@@ -291,29 +404,223 @@ public sealed class WorkflowEngine(
         await RecoverUnresolvedPreMortemsAsync(
             flow,
             cancellationToken);
+        await ReconcileCompletedOutcomeArtifactsAsync(
+            flow.Id,
+            cancellationToken);
 
-        while (await GetNextPendingStepIdAsync(
-                   flowId,
-                   flow.Iteration,
-                   cancellationToken) is { } stepId)
+        while (true)
         {
-            if (!await ShouldExecuteStepAsync(stepId, cancellationToken))
+            while (await GetNextPendingStepIdAsync(
+                       flowId,
+                       flow.Iteration,
+                       cancellationToken) is { } stepId)
             {
-                continue;
+                if (!await ShouldExecuteStepAsync(stepId, cancellationToken))
+                {
+                    continue;
+                }
+
+                await HydrateRetryAssignmentAsync(stepId, cancellationToken);
+                await ExecutePendingStepAsync(
+                    flow,
+                    stepId,
+                    workspace.Path,
+                    planSummary,
+                    complexity,
+                    upstreamOwners,
+                    cancellationToken);
             }
 
-            await HydrateRetryAssignmentAsync(stepId, cancellationToken);
-            await ExecutePendingStepAsync(
-                flow,
-                stepId,
-                workspace.Path,
-                planSummary,
-                complexity,
-                upstreamOwners,
+            await ThrowIfUnresolvedFailureAsync(
+                flow.Id,
+                flow.Iteration,
                 cancellationToken);
+            if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) ||
+                !await ReconcileOutcomeVerificationAsync(
+                    flow,
+                    plan,
+                    cancellationToken))
+            {
+                break;
+            }
         }
 
         await MarkWaitingForFeedbackAsync(flowId, cancellationToken);
+    }
+
+    internal async Task ReconcileCompletedOutcomeArtifactsAsync(
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var flow = await database.Flows
+            .SingleAsync(item => item.Id == flowId, cancellationToken);
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            return;
+        }
+
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var steps = await database.FlowSteps
+            .Include(item => item.ToolCalls)
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration)
+            .OrderBy(item => item.Sequence)
+            .ThenBy(item => item.Attempt)
+            .ToListAsync(cancellationToken);
+        foreach (var step in steps.Where(item =>
+                     item.Status == StepStatus.Completed &&
+                     IsGovernedOutcomeEvidenceStep(item)))
+        {
+            try
+            {
+                CollectOutcomeEvidence(
+                    database,
+                    flow,
+                    step,
+                    step.OutputSummary,
+                    step.CompletedAt ?? DateTimeOffset.UtcNow);
+                CompleteOutcomeCorrection(
+                    database,
+                    flow,
+                    step,
+                    step.CompletedAt ?? DateTimeOffset.UtcNow);
+            }
+            catch (OutcomeVerificationValidationException exception)
+            {
+                ApplyContractValidationFailure(step);
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = step.Id,
+                    Type = "outcome.evidence.recovery-failed",
+                    Message =
+                        "Could not recover strict delivery evidence: " +
+                        string.Join("; ", exception.Errors)
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                throw;
+            }
+        }
+
+        state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var expectedPlanGapRound = state.Status ==
+                                   OutcomeVerificationStatus.Correcting
+            ? state.Rounds
+                .Where(round =>
+                    !round.Stale &&
+                    round.Result?.PlanGaps.Count > 0 &&
+                    string.Equals(
+                        round.AcceptancePlanHash,
+                        state.AcceptancePlan?.Hash,
+                        StringComparison.Ordinal))
+                .OrderByDescending(round => round.Round)
+                .FirstOrDefault()
+            : null;
+        var planGapCorrection = expectedPlanGapRound is null
+            ? null
+            : steps
+                .Where(item =>
+                    item.Status == StepStatus.Completed &&
+                    IsOutcomePlanCorrectionStep(item) &&
+                    item.OutcomeQaRound == expectedPlanGapRound.Round &&
+                    string.Equals(
+                        item.OutcomePlanHash,
+                        expectedPlanGapRound.AcceptancePlanHash,
+                        StringComparison.Ordinal) &&
+                    !state.ProcessedSemanticRootIds.Contains(
+                        GetStableSemanticRootId(item)))
+                .OrderBy(item => item.Sequence)
+                .ThenBy(item => item.Attempt)
+                .FirstOrDefault();
+        if (planGapCorrection is not null)
+        {
+            await ApplyAcceptancePlanReplacementAsync(
+                database,
+                flow,
+                planGapCorrection,
+                planGapCorrection.OutputSummary,
+                planGapCorrection.CompletedAt ?? DateTimeOffset.UtcNow,
+                cancellationToken);
+        }
+
+        state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (state.Status is
+                OutcomeVerificationStatus.CollectingEvidence or
+                OutcomeVerificationStatus.PreparingCandidate or
+                OutcomeVerificationStatus.AwaitingCandidateRefresh)
+        {
+            var expectedCandidateKind =
+                state.Status == OutcomeVerificationStatus.AwaitingCandidateRefresh
+                    ? FlowStepKind.OutcomeCandidateRefresh
+                    : FlowStepKind.OutcomeLocalReleaseCandidate;
+            int? expectedRound = state.Status ==
+                                 OutcomeVerificationStatus.AwaitingCandidateRefresh
+                ? state.Rounds.OrderByDescending(round => round.Round)
+                    .Select(round => (int?)round.Round)
+                    .FirstOrDefault() ?? 0
+                : null;
+            var release = steps
+                .Where(item =>
+                    item.Status == StepStatus.Completed &&
+                    item.Kind == expectedCandidateKind &&
+                    item.OutcomeQaRound == expectedRound &&
+                    string.Equals(
+                        item.OutcomePlanHash,
+                        state.AcceptancePlan?.Hash,
+                        StringComparison.Ordinal) &&
+                    !state.ProcessedSemanticRootIds.Contains(
+                        GetStableSemanticRootId(item)))
+                .OrderByDescending(item => item.Sequence)
+                .ThenByDescending(item => item.Attempt)
+                .FirstOrDefault();
+            if (release is not null)
+            {
+                await PrepareOutcomeCandidateAsync(
+                    database,
+                    flow,
+                    release,
+                    cancellationToken);
+            }
+        }
+
+        state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (state.ActiveQaStepId is { } activeQaStepId &&
+            !state.Rounds.Any(round => round.QaStepId == activeQaStepId))
+        {
+            var completedQa = steps.SingleOrDefault(item =>
+                item.Id == activeQaStepId &&
+                item.Status == StepStatus.Completed);
+            if (completedQa is not null)
+            {
+                await ProcessOutcomeQaCompletionAsync(
+                    database,
+                    flow,
+                    completedQa,
+                    completedQa.OutputSummary,
+                    completedQa.CompletedAt ?? DateTimeOffset.UtcNow,
+                    completedQa.ToolCalls.Select(call => new ToolCallRecord(
+                        call.ToolName,
+                        call.ArgumentsSummary,
+                        call.Succeeded,
+                        call.ToolType,
+                        call.NormalizedCommand,
+                        call.NormalizedArguments,
+                        call.WorkingDirectory,
+                        call.ExitCode,
+                        call.ResultDigest,
+                        call.ResultSummary)).ToArray(),
+                    cancellationToken);
+            }
+        }
+
+        await database.SaveChangesAsync(cancellationToken);
     }
 
     private async Task ExecutePendingCausalRetriesAsync(
@@ -400,8 +707,7 @@ public sealed class WorkflowEngine(
             item =>
                 item.FlowRunId == flowId &&
                 item.Iteration == iteration &&
-                item.AgentRole == "release-engineer" &&
-                item.Label != ApprovedPublicationLabel &&
+                item.Kind == FlowStepKind.OutcomeLocalReleaseCandidate &&
                 item.Status == StepStatus.Completed,
             cancellationToken);
     }
@@ -431,18 +737,38 @@ public sealed class WorkflowEngine(
         string label,
         CancellationToken cancellationToken,
         int attempt = 1,
-        string? inputSummary = null)
+        string? inputSummary = null,
+        FlowStepKind kind = FlowStepKind.Standard,
+        int? outcomeQaRound = null,
+        string? outcomePlanHash = null,
+        Guid? retryOfStepId = null,
+        Guid? stableSemanticRootId = null,
+        Guid? dependsOnStepId = null)
     {
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
-        var existing = await database.FlowSteps
+        var existingQuery = database.FlowSteps
             .AsNoTracking()
-            .SingleOrDefaultAsync(
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration &&
+                item.AgentId == planned.Agent.Id &&
+                item.Attempt == attempt);
+        var existing = kind == FlowStepKind.Standard &&
+                       outcomeQaRound is null &&
+                       string.IsNullOrWhiteSpace(outcomePlanHash) &&
+                       retryOfStepId is null
+            ? await existingQuery.SingleOrDefaultAsync(
+                item => item.Label == label,
+                cancellationToken)
+            : await existingQuery.SingleOrDefaultAsync(
                 item =>
-                    item.FlowRunId == flow.Id &&
-                    item.Iteration == flow.Iteration &&
-                    item.AgentId == planned.Agent.Id &&
-                    item.Attempt == attempt &&
-                    item.Label == label,
+                    item.Kind == kind &&
+                    item.OutcomeQaRound == outcomeQaRound &&
+                    item.RetryOfStepId == retryOfStepId &&
+                    item.OutcomePlanHash ==
+                    (string.IsNullOrWhiteSpace(outcomePlanHash)
+                        ? string.Empty
+                        : outcomePlanHash),
                 cancellationToken);
         if (existing is not null)
         {
@@ -458,13 +784,123 @@ public sealed class WorkflowEngine(
             AgentName = planned.Agent.Name,
             AgentRole = planned.Agent.Role,
             Label = label,
+            Kind = kind,
             Status = StepStatus.Pending,
             Attempt = attempt,
-            InputSummary = inputSummary ?? planned.Reason
+            InputSummary = inputSummary ?? planned.Reason,
+            RetryOfStepId = retryOfStepId,
+            DependsOnStepId = dependsOnStepId,
+            OutcomeQaRound = outcomeQaRound,
+            OutcomePlanHash = outcomePlanHash ?? string.Empty,
+            StableSemanticRootId = stableSemanticRootId
         };
+        step.StableSemanticRootId ??= retryOfStepId ?? step.Id;
         database.FlowSteps.Add(step);
         await database.SaveChangesAsync(cancellationToken);
         return step.Id;
+    }
+
+    private async Task<string?> GetActiveOutcomePlanHashAsync(
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var json = await database.Flows
+            .AsNoTracking()
+            .Where(item => item.Id == flowId)
+            .Select(item => item.OutcomeVerificationJson)
+            .SingleAsync(cancellationToken);
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        return OutcomeVerificationRules.DeserializeAggregate(json)
+            .AcceptancePlan?.Hash;
+    }
+
+    private async Task<bool> HasCompleteInitialOutcomeGraphAsync(
+        Guid flowId,
+        int iteration,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var json = await database.Flows
+            .AsNoTracking()
+            .Where(item => item.Id == flowId)
+            .Select(item => item.OutcomeVerificationJson)
+            .SingleAsync(cancellationToken);
+        var state = OutcomeVerificationRules.DeserializeAggregate(json);
+        if (state.AcceptancePlan is null ||
+            state.InitialPlanSemanticRootId is null ||
+            state.PlannedRoles.Count == 0 ||
+            state.InitialDeliverySemanticRootIds.Count != state.PlannedRoles.Count)
+        {
+            return false;
+        }
+
+        var expectedRoots = state.InitialDeliverySemanticRootIds
+            .Append(state.InitialPlanSemanticRootId.Value)
+            .ToHashSet();
+        var persistedRoots = await database.FlowSteps
+            .AsNoTracking()
+            .Where(step =>
+                step.FlowRunId == flowId &&
+                step.Iteration == iteration &&
+                step.StableSemanticRootId != null &&
+                expectedRoots.Contains(step.StableSemanticRootId.Value))
+            .Select(step => step.StableSemanticRootId!.Value)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+        return persistedRoots.Count == expectedRoots.Count;
+    }
+
+    private async Task RecordInitialOutcomeGraphAsync(
+        Guid flowId,
+        FlowStep leadStep,
+        IReadOnlyCollection<Guid> deliveryStepIds,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var flow = await database.Flows.SingleAsync(
+            item => item.Id == flowId,
+            cancellationToken);
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var requestedIds = deliveryStepIds.ToHashSet();
+        var deliveryRoots = await database.FlowSteps
+            .AsNoTracking()
+            .Where(step => requestedIds.Contains(step.Id))
+            .OrderBy(step => step.Sequence)
+            .Select(step => step.StableSemanticRootId ?? step.Id)
+            .ToListAsync(cancellationToken);
+        var leadRoot = leadStep.StableSemanticRootId ??
+                       leadStep.RetryOfStepId ??
+                       leadStep.Id;
+        if (state.InitialPlanSemanticRootId is { } existingLeadRoot &&
+            existingLeadRoot != leadRoot)
+        {
+            throw new InvalidOperationException(
+                "The initial outcome graph cannot change its Team Lead semantic root.");
+        }
+        if (deliveryRoots.Count != state.PlannedRoles.Count)
+        {
+            throw new InvalidOperationException(
+                "The initial outcome graph does not contain one immutable delivery root per planned role.");
+        }
+
+        state.InitialPlanSemanticRootId = leadRoot;
+        state.InitialDeliverySemanticRootIds = deliveryRoots
+            .Distinct()
+            .ToList();
+        MarkSemanticRootProcessed(state, leadRoot);
+        state.UpdatedAt = DateTimeOffset.UtcNow;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        await database.SaveChangesAsync(cancellationToken);
     }
 
     private async Task<Guid> AddPreMortemReviewStepAsync(
@@ -591,7 +1027,7 @@ public sealed class WorkflowEngine(
         FlowRun flow,
         PlannedAgent lead,
         FlowStep leadResult,
-        IReadOnlyCollection<string> expectedRoles,
+        IReadOnlyList<string> expectedRoles,
         string workspacePath,
         string planSummary,
         int complexity,
@@ -599,6 +1035,7 @@ public sealed class WorkflowEngine(
         bool preMortemAvailable,
         CancellationToken cancellationToken)
     {
+        var governed = !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson);
         await using (var check =
                      await databaseFactory.CreateDbContextAsync(cancellationToken))
         {
@@ -612,7 +1049,19 @@ public sealed class WorkflowEngine(
             var existingRoleSet = existingProfiles
                 .Select(item => item.Role)
                 .ToHashSet(StringComparer.Ordinal);
-            if (existingRoleSet.SetEquals(expectedRoles))
+            var hasAcceptancePlan = !governed;
+            if (governed)
+            {
+                var storedOutcomeJson = await check.Flows
+                    .AsNoTracking()
+                    .Where(item => item.Id == flow.Id)
+                    .Select(item => item.OutcomeVerificationJson)
+                    .SingleAsync(cancellationToken);
+                hasAcceptancePlan = OutcomeVerificationRules
+                    .DeserializeAggregate(storedOutcomeJson)
+                    .AcceptancePlan is not null;
+            }
+            if (existingRoleSet.SetEquals(expectedRoles) && hasAcceptancePlan)
             {
                 return SelectEnabledPreMortemCheckpoints(
                     existingProfiles,
@@ -621,6 +1070,7 @@ public sealed class WorkflowEngine(
         }
 
         TeamLeadContract contract;
+        var contractSource = leadResult;
         try
         {
             contract = ParseTeamLeadContract(
@@ -628,7 +1078,8 @@ public sealed class WorkflowEngine(
                 expectedRoles,
                 flow.Id,
                 flow.Iteration,
-                preMortemAvailable);
+                preMortemAvailable,
+                governed);
         }
         catch (TaskProfileValidationException firstFailure)
         {
@@ -651,9 +1102,18 @@ public sealed class WorkflowEngine(
                 attempt: 2,
                 inputSummary:
                     "Your previous Team Lead contract was invalid. Resume the same session and " +
-                    "return both corrected sentinel-delimited JSON documents. Exact validation errors:" +
+                    "return every corrected sentinel-delimited JSON document. Exact validation errors:" +
                     Environment.NewLine +
-                    validationErrors);
+                    validationErrors,
+                kind: governed
+                    ? FlowStepKind.OutcomePlan
+                    : FlowStepKind.Standard,
+                retryOfStepId: governed
+                    ? GetRetryRootId(leadResult)
+                    : null,
+                stableSemanticRootId: governed
+                    ? GetStableSemanticRootId(leadResult)
+                    : null);
             correctionStepId = await ResolveEffectiveManualRetryStepIdAsync(
                 correctionStepId,
                 cancellationToken);
@@ -692,7 +1152,9 @@ public sealed class WorkflowEngine(
                     expectedRoles,
                     flow.Id,
                     flow.Iteration,
-                    preMortemAvailable);
+                    preMortemAvailable,
+                    governed);
+                contractSource = correction;
             }
             catch (TaskProfileValidationException secondFailure)
             {
@@ -705,7 +1167,7 @@ public sealed class WorkflowEngine(
                     cancellationToken);
                 await MarkContractValidationFailedAsync(
                     correction.Id,
-                    "Team Lead returned an invalid corrected profile or pre-mortem contract.",
+                    "Team Lead returned an invalid corrected profile, pre-mortem, or acceptance contract.",
                     cancellationToken);
                 await AddEventAsync(
                     flow.Id,
@@ -723,11 +1185,81 @@ public sealed class WorkflowEngine(
 
         await using var database =
             await databaseFactory.CreateDbContextAsync(cancellationToken);
-        database.TaskProfiles.AddRange(contract.Profiles);
+        var existingProfileRoles = await database.TaskProfiles
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration &&
+                expectedRoles.Contains(item.Role))
+            .Select(item => item.Role)
+            .ToListAsync(cancellationToken);
+        database.TaskProfiles.AddRange(contract.Profiles.Where(
+            profile => !existingProfileRoles.Contains(
+                profile.Role,
+                StringComparer.Ordinal)));
+        if (governed)
+        {
+            var storedFlow = await database.Flows.SingleAsync(
+                item => item.Id == flow.Id,
+                cancellationToken);
+            var contractStep = await database.FlowSteps.SingleAsync(
+                item => item.Id == contractSource.Id,
+                cancellationToken);
+            var state = OutcomeVerificationRules.DeserializeAggregate(
+                storedFlow.OutcomeVerificationJson);
+            state.MaxRounds = workflowProvider
+                .GetValidated()
+                .Config
+                .OutcomeVerification
+                .MaxRounds;
+            state.PlannedRoles = expectedRoles.ToList();
+            state.AcceptancePlan = OutcomeVerificationRules.CreateAcceptanceSnapshot(
+                contract.AcceptancePlan ??
+                throw new InvalidOperationException(
+                    "A governed Team Lead contract has no acceptance plan."),
+                contractSource.Id);
+            state.Status = OutcomeVerificationStatus.CollectingEvidence;
+            state.Evidence.Clear();
+            state.EvidenceProcessing.Clear();
+            state.Rounds.Clear();
+            state.CurrentCandidate = null;
+            state.Publication = null;
+            state.VerifiedCandidateFingerprint = null;
+            state.VerifiedAt = null;
+            state.PendingOwnerRoles.Clear();
+            state.Stale = false;
+            state.UpdatedAt = DateTimeOffset.UtcNow;
+            storedFlow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+            contractStep.Kind = FlowStepKind.OutcomePlan;
+            contractStep.OutcomePlanHash = state.AcceptancePlan.Hash;
+            contractStep.StableSemanticRootId ??=
+                GetStableSemanticRootId(contractSource);
+            var initialPlanRoot = GetStableSemanticRootId(contractStep);
+            if (state.InitialPlanSemanticRootId is { } existingInitialRoot &&
+                existingInitialRoot != initialPlanRoot)
+            {
+                throw new InvalidOperationException(
+                    "The initial acceptance-plan semantic root cannot change.");
+            }
+            state.InitialPlanSemanticRootId = initialPlanRoot;
+            MarkSemanticRootProcessed(state, initialPlanRoot);
+            storedFlow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = contractSource.Id,
+                Type = "outcome.plan.accepted",
+                Message =
+                    $"Accepted {state.AcceptancePlan.Criteria.Count} outcome criteria " +
+                    $"with plan hash {PrefixDigest(state.AcceptancePlan.Hash)} and a " +
+                    $"{state.MaxRounds}-round QA budget."
+            });
+        }
         database.FlowEvents.Add(new FlowEvent
         {
             FlowRunId = flow.Id,
-            FlowStepId = leadResult.Id,
+            FlowStepId = contractSource.Id,
             Type = "profile.validated",
             Message =
                 $"Validated router-v1 task profiles for {contract.Profiles.Count} downstream roles " +
@@ -737,15 +1269,17 @@ public sealed class WorkflowEngine(
         return contract.PreMortemAfterRoles;
     }
 
-    private static TeamLeadContract ParseTeamLeadContract(
+    internal static TeamLeadContract ParseTeamLeadContract(
         string output,
-        IReadOnlyCollection<string> expectedRoles,
+        IReadOnlyList<string> expectedRoles,
         Guid flowId,
         int iteration,
-        bool preMortemAvailable)
+        bool preMortemAvailable,
+        bool outcomeVerificationEnabled)
     {
         IReadOnlyList<TaskProfile>? profiles = null;
         IReadOnlySet<string>? checkpoints = null;
+        OutcomeAcceptancePlan? acceptancePlan = null;
         var errors = new List<string>();
         try
         {
@@ -770,6 +1304,26 @@ public sealed class WorkflowEngine(
         {
             errors.AddRange(exception.Errors.Select(error => $"pre-mortem plan: {error}"));
         }
+        if (outcomeVerificationEnabled &&
+            checkpoints?.Contains("quality-engineer") == true)
+        {
+            errors.Add(
+                "pre-mortem plan: quality-engineer cannot be a checkpoint because outcome QA is already independent and authoritative");
+        }
+        if (outcomeVerificationEnabled)
+        {
+            try
+            {
+                acceptancePlan = OutcomeVerificationRules.ParseAcceptancePlan(
+                    output,
+                    expectedRoles);
+            }
+            catch (OutcomeVerificationValidationException exception)
+            {
+                errors.AddRange(exception.Errors.Select(
+                    error => $"acceptance plan: {error}"));
+            }
+        }
         if (errors.Count > 0)
         {
             throw new TaskProfileValidationException(errors);
@@ -783,7 +1337,10 @@ public sealed class WorkflowEngine(
         {
             profile.PreMortemAfter = validatedCheckpoints.Contains(profile.Role);
         }
-        return new TeamLeadContract(validatedProfiles, validatedCheckpoints);
+        return new TeamLeadContract(
+            validatedProfiles,
+            validatedCheckpoints,
+            acceptancePlan);
     }
 
     private async Task<bool> ShouldExecuteStepAsync(
@@ -807,7 +1364,7 @@ public sealed class WorkflowEngine(
         var source = await database.FlowSteps
             .AsNoTracking()
             .SingleAsync(item => item.Id == stepId, cancellationToken);
-        var retryRootId = source.RetryOfStepId ?? source.Id;
+        var retryRootId = GetStableSemanticRootId(source);
         var candidates = await database.FlowSteps
             .AsNoTracking()
             .Where(item =>
@@ -815,7 +1372,7 @@ public sealed class WorkflowEngine(
                 item.Iteration == source.Iteration &&
                 item.AgentId == source.AgentId &&
                 (item.Id == source.Id ||
-                 item.RetryOfStepId == retryRootId))
+                 item.StableSemanticRootId == retryRootId))
             .ToListAsync(cancellationToken);
         return SelectEffectiveManualRetryStep(source, candidates).Id;
     }
@@ -878,6 +1435,797 @@ public sealed class WorkflowEngine(
                    cancellationToken);
     }
 
+    private async Task<bool> ReconcileOutcomeVerificationAsync(
+        FlowRun flow,
+        IReadOnlyList<PlannedAgent> plan,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var storedFlow = await database.Flows.SingleAsync(
+            item => item.Id == flow.Id,
+            cancellationToken);
+        if (string.IsNullOrWhiteSpace(storedFlow.OutcomeVerificationJson))
+        {
+            return false;
+        }
+
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            storedFlow.OutcomeVerificationJson);
+        var steps = await database.FlowSteps
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration)
+            .OrderBy(item => item.Sequence)
+            .ThenBy(item => item.Attempt)
+            .ToListAsync(cancellationToken);
+        var latestRound = state.Rounds
+            .OrderByDescending(item => item.Round)
+            .FirstOrDefault();
+
+        if (state.Status == OutcomeVerificationStatus.Correcting)
+        {
+            if (latestRound?.Result?.PlanGaps.Count > 0 &&
+                string.Equals(
+                    latestRound.AcceptancePlanHash,
+                    state.AcceptancePlan?.Hash,
+                    StringComparison.Ordinal))
+            {
+                return await EnsurePlanGapCorrectionAsync(
+                    database,
+                    storedFlow,
+                    state,
+                    steps,
+                    plan,
+                    latestRound,
+                    cancellationToken);
+            }
+
+            if (latestRound?.Result is null &&
+                state.PendingOwnerRoles.Count == 0)
+            {
+                state.Status = OutcomeVerificationStatus.AwaitingQa;
+                state.UpdatedAt = DateTimeOffset.UtcNow;
+                storedFlow.OutcomeVerificationJson =
+                    OutcomeVerificationRules.SerializeAggregate(state);
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = latestRound?.QaStepId,
+                    Type = "outcome.qa.retry-required",
+                    Message =
+                        "The invalid QA contract consumed a round; Quality Engineer must return a fresh strict result."
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                return await EnsureQaRoundAsync(
+                    database,
+                    storedFlow,
+                    state,
+                    steps,
+                    plan,
+                    cancellationToken);
+            }
+
+            if (state.PendingOwnerRoles.Count > 0)
+            {
+                var correctionRound = latestRound
+                ?? throw new InvalidOperationException(
+                    "Outcome correction requires a persisted QA round.");
+                var correctionPlanHash = state.AcceptancePlan?.Hash
+                ?? throw new InvalidOperationException(
+                    "Outcome correction requires an active acceptance plan.");
+                var orderedRoles = OrderRolesByPlan(
+                plan.Select(item => item.Agent.Role),
+                state.PendingOwnerRoles)
+                .ToArray();
+                if (orderedRoles.Length != state.PendingOwnerRoles.Count)
+                {
+                throw new InvalidOperationException(
+                    "A responsible QA role is not present in the original Team Lead plan.");
+                }
+
+                var dependencyId = correctionRound.QaStepId;
+                var sequence = steps.Select(item => item.Sequence).DefaultIfEmpty(0).Max() + 10;
+                var created = false;
+                var expectedCorrections = new List<FlowStep>(orderedRoles.Length);
+                foreach (var role in orderedRoles)
+                {
+                    var agent = plan
+                        .Select(item => item.Agent)
+                        .Single(item => string.Equals(
+                            item.Role,
+                            role,
+                            StringComparison.Ordinal));
+                    var label =
+                        $"{OutcomeCorrectionLabelPrefix}{correctionRound.Round}: {agent.Name}";
+                    var correction = steps
+                        .Where(item =>
+                            item.AgentRole == role &&
+                            IsOutcomeOwnerCorrectionStep(item) &&
+                            item.OutcomeQaRound == correctionRound.Round &&
+                            string.Equals(
+                                item.OutcomePlanHash,
+                                correctionPlanHash,
+                                StringComparison.Ordinal))
+                        .OrderByDescending(item => item.Sequence)
+                        .ThenByDescending(item => item.Attempt)
+                        .FirstOrDefault();
+                    if (correction is null)
+                    {
+                        correction = new FlowStep
+                        {
+                            FlowRunId = flow.Id,
+                            Iteration = flow.Iteration,
+                            Sequence = sequence,
+                            AgentId = agent.Id,
+                            AgentName = agent.Name,
+                            AgentRole = agent.Role,
+                            Label = label,
+                            Kind = FlowStepKind.OutcomeOwnerCorrection,
+                            Status = StepStatus.Pending,
+                            Attempt = steps
+                                .Where(item => item.AgentId == agent.Id)
+                                .Select(item => item.Attempt)
+                                .DefaultIfEmpty(0)
+                                .Max() + 1,
+                            DependsOnStepId = dependencyId,
+                            OutcomeQaRound = correctionRound.Round,
+                            OutcomePlanHash = correctionPlanHash,
+                            InputSummary = BuildOutcomeCorrectionAssignment(
+                                state,
+                                correctionRound,
+                                role)
+                        };
+                        correction.StableSemanticRootId = correction.Id;
+                        database.FlowSteps.Add(correction);
+                        steps.Add(correction);
+                        database.FlowEvents.Add(new FlowEvent
+                        {
+                            FlowRunId = flow.Id,
+                            FlowStepId = correction.Id,
+                            Type = "outcome.correction.scheduled",
+                            Message =
+                                $"{agent.Name} must correct its failed outcome criteria from QA round {correctionRound.Round}."
+                        });
+                        created = true;
+                        sequence += 10;
+                    }
+                    EnsureCorrectionRegistration(
+                        correctionRound,
+                        correction,
+                        correctionPlanHash);
+                    expectedCorrections.Add(correction);
+                    dependencyId = correction.Id;
+                    if (!correctionRound.CorrectionStepIds.Contains(correction.Id))
+                    {
+                        correctionRound.CorrectionStepIds.Add(correction.Id);
+                    }
+                }
+
+                foreach (var completed in expectedCorrections.Where(
+                             step => step.Status == StepStatus.Completed))
+                {
+                    ApplyOutcomeCorrection(
+                        database,
+                        state,
+                        completed,
+                        completed.CompletedAt ?? DateTimeOffset.UtcNow);
+                }
+
+                state.UpdatedAt = DateTimeOffset.UtcNow;
+                storedFlow.OutcomeVerificationJson =
+                    OutcomeVerificationRules.SerializeAggregate(state);
+                await database.SaveChangesAsync(cancellationToken);
+                if (state.PendingOwnerRoles.Count > 0)
+                {
+                    return created || expectedCorrections.Any(item =>
+                        item.Status == StepStatus.Pending);
+                }
+            }
+
+            state.Status = OutcomeVerificationStatus.AwaitingCandidateRefresh;
+            state.UpdatedAt = DateTimeOffset.UtcNow;
+            storedFlow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = latestRound?.QaStepId,
+                Type = "outcome.corrections.completed",
+                Message =
+                    "All responsible roles completed their corrections; the local candidate must be refreshed."
+            });
+            await database.SaveChangesAsync(cancellationToken);
+        }
+
+        if (state.Status == OutcomeVerificationStatus.AwaitingCandidateRefresh)
+        {
+            return await EnsureCandidateRefreshAsync(
+                database,
+                storedFlow,
+                state,
+                steps,
+                plan,
+                cancellationToken);
+        }
+        if (state.Status == OutcomeVerificationStatus.AwaitingQa)
+        {
+            return await EnsureQaRoundAsync(
+                database,
+                storedFlow,
+                state,
+                steps,
+                plan,
+                cancellationToken);
+        }
+        if (state.Status == OutcomeVerificationStatus.AwaitingHumanResolution)
+        {
+            await EnsureOutcomeResolutionGateAsync(
+                database,
+                storedFlow,
+                state,
+                steps,
+                cancellationToken);
+            return false;
+        }
+        if (state.Status == OutcomeVerificationStatus.NotStarted)
+        {
+            state.Status = OutcomeVerificationStatus.Planning;
+            state.UpdatedAt = DateTimeOffset.UtcNow;
+            storedFlow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                Type = "outcome.planning",
+                Message =
+                    "Restart reconciliation resumed acceptance-plan creation."
+            });
+            await database.SaveChangesAsync(cancellationToken);
+            return false;
+        }
+        if (state.Status == OutcomeVerificationStatus.Passed)
+        {
+            if (!await EnsurePassedReleaseGateAsync(
+                database,
+                storedFlow,
+                state,
+                steps,
+                cancellationToken))
+            {
+                return await EnsureCandidateRefreshAsync(
+                    database,
+                    storedFlow,
+                    state,
+                    steps,
+                    plan,
+                    cancellationToken);
+            }
+            return false;
+        }
+        if (state.Status is
+            OutcomeVerificationStatus.CollectingEvidence or
+            OutcomeVerificationStatus.PreparingCandidate or
+            OutcomeVerificationStatus.Planning)
+        {
+            if (state.Status == OutcomeVerificationStatus.Planning)
+            {
+                var lead = steps
+                    .Where(item =>
+                        item.AgentRole == "team-lead" &&
+                        item.Status == StepStatus.Completed)
+                    .OrderByDescending(item => item.Sequence)
+                    .ThenByDescending(item => item.Attempt)
+                    .FirstOrDefault();
+                if (lead is not null)
+                {
+                    throw new InvalidOperationException(
+                        "Completed Team Lead planning has no persisted acceptance plan.");
+                }
+                return false;
+            }
+            throw new InvalidOperationException(
+                $"Outcome verification stopped in '{state.Status}' without pending work.");
+        }
+        return false;
+    }
+
+    private async Task<bool> EnsurePlanGapCorrectionAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        OutcomeVerificationState state,
+        List<FlowStep> steps,
+        IReadOnlyList<PlannedAgent> plan,
+        OutcomeQaRound round,
+        CancellationToken cancellationToken)
+    {
+        var lead = plan.Single(item =>
+            string.Equals(
+                item.Agent.Role,
+                "team-lead",
+                StringComparison.Ordinal));
+        var label = $"{OutcomePlanCorrectionLabelPrefix}{round.Round}";
+        var existing = steps
+            .Where(item =>
+                IsOutcomePlanCorrectionStep(item) &&
+                item.OutcomeQaRound == round.Round &&
+                string.Equals(
+                    item.OutcomePlanHash,
+                    round.AcceptancePlanHash,
+                    StringComparison.Ordinal))
+            .OrderByDescending(item => item.Sequence)
+            .ThenByDescending(item => item.Attempt)
+            .FirstOrDefault();
+        if (existing is not null)
+        {
+            if (existing.Status == StepStatus.Skipped &&
+                existing.CopilotSessionId is null)
+            {
+                ResetSkippedStep(existing);
+                existing.DependsOnStepId = state.CurrentCandidate?.PreparedByStepId;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = existing.Id,
+                    Type = "outcome.qa.rescheduled",
+                    Message =
+                        $"QA round {round} was rescheduled after candidate refresh."
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                return true;
+            }
+            return existing.Status == StepStatus.Pending;
+        }
+
+        var sequence = steps.Select(item => item.Sequence).DefaultIfEmpty(0).Max() + 10;
+        var gapSummary = string.Join(
+            Environment.NewLine,
+            round.Result!.PlanGaps.Select(gap =>
+                $"- {gap.Requirement} ({gap.Rationale})"));
+        var step = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = sequence,
+            AgentId = lead.Agent.Id,
+            AgentName = lead.Agent.Name,
+            AgentRole = lead.Agent.Role,
+            Label = label,
+            Kind = FlowStepKind.OutcomePlanCorrection,
+            Status = StepStatus.Pending,
+            Attempt = steps
+                .Where(item => item.AgentRole == "team-lead")
+                .Select(item => item.Attempt)
+                .DefaultIfEmpty(0)
+                .Max() + 1,
+            DependsOnStepId = round.QaStepId,
+            OutcomeQaRound = round.Round,
+            OutcomePlanHash = round.AcceptancePlanHash,
+            InputSummary =
+                "QA found confirmed requirements missing from the acceptance plan. Resume the " +
+                "original Team Lead session and return a complete replacement acceptance plan. " +
+                "Preserve every existing criterion ID and append sequential IDs for new criteria." +
+                $"{Environment.NewLine}{Environment.NewLine}{gapSummary}"
+        };
+        step.StableSemanticRootId = step.Id;
+        database.FlowSteps.Add(step);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = "outcome.plan-correction.scheduled",
+            Message =
+                $"Team Lead must correct {round.Result.PlanGaps.Count} acceptance-plan gap(s)."
+        });
+        state.UpdatedAt = DateTimeOffset.UtcNow;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        await database.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    private async Task<bool> EnsureCandidateRefreshAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        OutcomeVerificationState state,
+        List<FlowStep> steps,
+        IReadOnlyList<PlannedAgent> plan,
+        CancellationToken cancellationToken)
+    {
+        var round = state.Rounds
+            .OrderByDescending(item => item.Round)
+            .FirstOrDefault();
+        var roundNumber = round?.Round ?? 0;
+        if (!state.Stale &&
+            state.CurrentCandidate is not null &&
+            state.CurrentCandidate.PreparedAt >= (round?.CompletedAt ?? DateTimeOffset.MinValue) &&
+            state.CurrentCandidate.PreparedByStepId != round?.QaStepId)
+        {
+            state.Status = OutcomeVerificationStatus.AwaitingQa;
+            state.Stale = false;
+            state.UpdatedAt = DateTimeOffset.UtcNow;
+            flow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+            await database.SaveChangesAsync(cancellationToken);
+            return await EnsureQaRoundAsync(
+                database,
+                flow,
+                state,
+                steps,
+                plan,
+                cancellationToken);
+        }
+
+        var release = plan.Single(item =>
+            string.Equals(
+                item.Agent.Role,
+                "release-engineer",
+                StringComparison.Ordinal));
+        var baseLabel = $"{OutcomeCandidateRefreshLabelPrefix}{roundNumber}";
+        var existingRefreshes = steps
+            .Where(item =>
+                IsOutcomeCandidateRefreshStep(item) &&
+                item.OutcomeQaRound == roundNumber &&
+                string.Equals(
+                    item.OutcomePlanHash,
+                    state.AcceptancePlan?.Hash,
+                    StringComparison.Ordinal))
+            .OrderBy(item => item.Sequence)
+            .ToArray();
+        var existing = existingRefreshes.LastOrDefault();
+        if (existing?.Status is StepStatus.Pending or StepStatus.Running)
+        {
+            return true;
+        }
+        var label = existingRefreshes.Length == 0
+            ? baseLabel
+            : $"{baseLabel} (attempt {existingRefreshes.Length + 1})";
+
+        var dependency = round?.CorrectionStepIds
+            .Select(id => steps.SingleOrDefault(step => step.Id == id))
+            .Where(step => step is not null)
+            .OrderBy(step => step!.Sequence)
+            .LastOrDefault()?.Id ?? round?.QaStepId;
+        var step = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = steps.Select(item => item.Sequence).DefaultIfEmpty(0).Max() + 10,
+            AgentId = release.Agent.Id,
+            AgentName = release.Agent.Name,
+            AgentRole = release.Agent.Role,
+            Label = label,
+            Kind = FlowStepKind.OutcomeCandidateRefresh,
+            Status = StepStatus.Pending,
+            Attempt = steps
+                .Where(item => item.AgentRole == "release-engineer")
+                .Select(item => item.Attempt)
+                .DefaultIfEmpty(0)
+                .Max() + 1,
+            RetryOfStepId = existing is null
+                ? null
+                : GetRetryRootId(existing),
+            DependsOnStepId = dependency,
+            OutcomeQaRound = roundNumber,
+            OutcomePlanHash = state.AcceptancePlan?.Hash ?? string.Empty,
+            InputSummary = AppendOutcomeAssignment(
+                ReleaseCandidateAssignment +
+                " Refresh the complete local candidate after the latest corrections.",
+                BuildCriterionAssignment(state, release.Agent.Role))
+        };
+        step.StableSemanticRootId = existing is null
+            ? step.Id
+            : GetStableSemanticRootId(existing);
+        database.FlowSteps.Add(step);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = "outcome.candidate-refresh.scheduled",
+            Message =
+                $"Release Engineer must refresh the local candidate after QA round {roundNumber}."
+        });
+        await database.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    private async Task<bool> EnsureQaRoundAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        OutcomeVerificationState state,
+        List<FlowStep> steps,
+        IReadOnlyList<PlannedAgent> plan,
+        CancellationToken cancellationToken)
+    {
+        if (state.Rounds.Count >= state.MaxRounds)
+        {
+            state.Status = OutcomeVerificationStatus.AwaitingHumanResolution;
+            state.UpdatedAt = DateTimeOffset.UtcNow;
+            flow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+            await database.SaveChangesAsync(cancellationToken);
+            await EnsureOutcomeResolutionGateAsync(
+                database,
+                flow,
+                state,
+                steps,
+                cancellationToken);
+            return false;
+        }
+        if (state.ActiveQaStepId is { } activeStepId)
+        {
+            var active = steps.SingleOrDefault(item => item.Id == activeStepId);
+            return active?.Status is StepStatus.Pending or StepStatus.Running;
+        }
+
+        var round = state.Rounds.Count + 1;
+        var label = $"{OutcomeQaLabelPrefix}{round})";
+        var existing = steps
+            .Where(item =>
+                IsOutcomeQaStep(item) &&
+                item.OutcomeQaRound == round &&
+                string.Equals(
+                    item.OutcomePlanHash,
+                    state.AcceptancePlan?.Hash,
+                    StringComparison.Ordinal))
+            .OrderByDescending(item => item.Sequence)
+            .ThenByDescending(item => item.Attempt)
+            .FirstOrDefault();
+        if (existing is not null)
+        {
+            if (existing.Status == StepStatus.Skipped &&
+                !state.Rounds.Any(item => item.QaStepId == existing.Id))
+            {
+                ResetSkippedStep(existing);
+                existing.DependsOnStepId =
+                    state.CurrentCandidate?.PreparedByStepId;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = existing.Id,
+                    Type = "outcome.qa.rescheduled",
+                    Message =
+                        $"QA round {round} was rescheduled after the stale candidate was refreshed."
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                return true;
+            }
+            if (existing.Status == StepStatus.Completed &&
+                !state.Rounds.Any(item => item.QaStepId == existing.Id))
+            {
+                throw new InvalidOperationException(
+                    $"Completed QA step '{existing.Id}' has no durable round result.");
+            }
+            return existing.Status is StepStatus.Pending or StepStatus.Running;
+        }
+        var qa = plan.Single(item =>
+            string.Equals(
+                item.Agent.Role,
+                "quality-engineer",
+                StringComparison.Ordinal));
+        var dependency = state.CurrentCandidate?.PreparedByStepId;
+        var step = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = steps.Select(item => item.Sequence).DefaultIfEmpty(0).Max() + 10,
+            AgentId = qa.Agent.Id,
+            AgentName = qa.Agent.Name,
+            AgentRole = qa.Agent.Role,
+            Label = label,
+            Kind = FlowStepKind.OutcomeQa,
+            Status = StepStatus.Pending,
+            Attempt = round,
+            DependsOnStepId = dependency,
+            OutcomeQaRound = round,
+            OutcomePlanHash = state.AcceptancePlan?.Hash ?? string.Empty,
+            InputSummary =
+                $"Independently verify every criterion against candidate " +
+                $"{state.CurrentCandidate?.Fingerprint}. This is QA round {round} of " +
+                $"{state.MaxRounds}."
+        };
+        step.StableSemanticRootId = step.Id;
+        database.FlowSteps.Add(step);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = "outcome.qa.scheduled",
+            Message = $"Quality Engineer QA round {round}/{state.MaxRounds} was scheduled."
+        });
+        await database.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    private async Task EnsureOutcomeResolutionGateAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        OutcomeVerificationState state,
+        IReadOnlyList<FlowStep> steps,
+        CancellationToken cancellationToken)
+    {
+        var existing = await database.GateRecords.AnyAsync(
+            item =>
+                item.FlowRunId == flow.Id &&
+                item.ActionType == HandoffActionType.OutcomeResolution &&
+                !item.Resolved,
+            cancellationToken);
+        if (!existing)
+        {
+            var source = state.Rounds
+                .OrderByDescending(item => item.Round)
+                .Select(round => steps.SingleOrDefault(step =>
+                    step.Id == round.QaStepId))
+                .FirstOrDefault(step => step is not null)
+                ?? steps.LastOrDefault(step => step.Status == StepStatus.Completed)
+                ?? throw new InvalidOperationException(
+                    "Outcome resolution requires a completed semantic step.");
+            var gate = handoffGate.SubmitProposal(new HandoffProposal
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = source.Id,
+                ActionType = HandoffActionType.OutcomeResolution,
+                Summary =
+                    $"Outcome verification did not pass after {state.Rounds.Count} round(s).",
+                Evidence = state.Rounds.LastOrDefault()?.ContractError ??
+                           state.Rounds.LastOrDefault()?.Result?.Verdict.ToString() ??
+                           "No valid QA result.",
+                BlastRadius = HandoffBlastRadius.High
+            });
+            database.GateRecords.Add(gate);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = source.Id,
+                Type = "gate.outcome-resolution-created",
+                Message =
+                    "Outcome verification requires Continue, Replan, or Abandon; no release bypass is available."
+            });
+        }
+        flow.Status = FlowStatus.WaitingForFeedback;
+        flow.OutcomeUrl = string.Empty;
+        flow.OutcomeLabel = "Outcome verification needs resolution";
+        flow.UpdatedAt = DateTimeOffset.UtcNow;
+        await database.SaveChangesAsync(cancellationToken);
+    }
+
+    private async Task<bool> EnsurePassedReleaseGateAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        OutcomeVerificationState state,
+        IReadOnlyList<FlowStep> steps,
+        CancellationToken cancellationToken)
+    {
+        if (state.CurrentCandidate is null ||
+            !string.Equals(
+                state.CurrentCandidate.Fingerprint,
+                state.VerifiedCandidateFingerprint,
+                StringComparison.Ordinal) ||
+            state.Stale)
+        {
+            throw new InvalidOperationException(
+                "A release gate cannot be created for a stale or unverified candidate.");
+        }
+        try
+        {
+            if (!await (candidateFingerprintService
+                    ?? throw new InvalidOperationException(
+                        "No candidate fingerprint service is configured."))
+                .IsCurrentAsync(
+                    flow,
+                    state.CurrentCandidate,
+                    CandidateFingerprintService.RequiresPreview(
+                        state.AcceptancePlan),
+                    cancellationToken))
+            {
+                await MarkCandidateStaleAsync(
+                    database,
+                    flow,
+                    state,
+                    null,
+                    "Candidate content changed before release-gate reconciliation.",
+                    cancellationToken);
+                return false;
+            }
+        }
+        catch (CandidateValidationException exception)
+        {
+            await MarkCandidateStaleAsync(
+                database,
+                flow,
+                state,
+                null,
+                "Candidate validation failed before release-gate reconciliation: " +
+                exception.Message,
+                cancellationToken);
+            return false;
+        }
+        var qaStep = state.Rounds
+            .Where(round =>
+                round.Result?.Verdict == OutcomeQaVerdict.PASS &&
+                !round.Stale &&
+                string.Equals(
+                    round.CandidateFingerprint,
+                    state.VerifiedCandidateFingerprint,
+                    StringComparison.Ordinal))
+            .OrderByDescending(round => round.Round)
+            .Select(round => steps.Single(step => step.Id == round.QaStepId))
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                "A current PASS has no persisted Quality Engineer step.");
+        var hasApprovedGate = await database.GateRecords.AnyAsync(
+            gate =>
+                gate.FlowRunId == flow.Id &&
+                gate.ActionType == HandoffActionType.Release &&
+                gate.Resolved &&
+                gate.Approved == true &&
+                gate.FlowStepId == qaStep.Id,
+            cancellationToken);
+        if (hasApprovedGate)
+        {
+            return true;
+        }
+        var hasGate = await database.GateRecords.AnyAsync(
+            gate =>
+                gate.FlowRunId == flow.Id &&
+                gate.ActionType == HandoffActionType.Release &&
+                !gate.Resolved &&
+                gate.FlowStepId == qaStep.Id,
+            cancellationToken);
+        if (hasGate)
+        {
+            return true;
+        }
+
+        var gate = handoffGate.SubmitProposal(new HandoffProposal
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = qaStep.Id,
+            ActionType = HandoffActionType.Release,
+            Summary =
+                $"Independent QA passed every criterion for candidate " +
+                $"{PrefixDigest(state.CurrentCandidate.Fingerprint)}.",
+            Evidence = qaStep.OutputSummary,
+            BlastRadius = HandoffBlastRadius.High
+        });
+        database.GateRecords.Add(gate);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = qaStep.Id,
+            Type = "gate.release-created",
+            Message =
+                "Current all-criteria QA PASS created the customer release gate."
+        });
+        await database.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    private static string BuildOutcomeCorrectionAssignment(
+        OutcomeVerificationState state,
+        OutcomeQaRound round,
+        string role)
+    {
+        var ownedCriterionIds = state.AcceptancePlan?.Criteria
+            .Where(item => item.OwnerRoles.Contains(role, StringComparer.Ordinal))
+            .Select(item => item.Id)
+            .ToHashSet(StringComparer.Ordinal) ?? [];
+        var failures = round.Result?.Criteria
+            .Where(item =>
+                item.Status != OutcomeCriterionStatus.PASS &&
+                ownedCriterionIds.Contains(item.CriterionId))
+            .Select(item =>
+                $"- {item.CriterionId}: {item.Rationale}{Environment.NewLine}" +
+                $"  Required remediation: {item.Remediation}")
+            .ToArray() ?? [];
+        return
+            $"Resume the original {role} session. Correct every assigned failed criterion and " +
+            $"return a complete replacement handoff with updated evidence.{Environment.NewLine}" +
+            string.Join(Environment.NewLine, failures) +
+            $"{Environment.NewLine}{Environment.NewLine}" +
+            BuildCriterionAssignment(state, role);
+    }
+
     internal async Task<FlowStep> ExecuteStepAsync(
         Guid flowId,
         Guid stepId,
@@ -900,6 +2248,31 @@ public sealed class WorkflowEngine(
                 var step = await database.FlowSteps.SingleAsync(
                     item => item.Id == stepId,
                     cancellationToken);
+                if (step.RemotePublicationAllowed &&
+                    !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+                    !await ValidatePublicationCandidateAsync(
+                        database,
+                        flow,
+                        step,
+                        cancellationToken))
+                {
+                    stopwatch.Stop();
+                    return step;
+                }
+                OutcomeQaContext? qaContext = null;
+                if (IsOutcomeQaStep(step))
+                {
+                    qaContext = await PrepareOutcomeQaDispatchAsync(
+                        database,
+                        flow,
+                        step,
+                        cancellationToken);
+                    if (qaContext is null)
+                    {
+                        stopwatch.Stop();
+                        return step;
+                    }
+                }
                 string? excludedModelFamily = null;
                 string? evaluatedModel = null;
                 if (step.AgentRole == PreMortemRole)
@@ -947,7 +2320,9 @@ public sealed class WorkflowEngine(
                             item.Id != step.Id &&
                             item.CopilotSessionId != null &&
                             (item.Status == StepStatus.Completed ||
-                             item.Status == StepStatus.Pushback))
+                             item.Status == StepStatus.Pushback ||
+                             (step.AgentRole == "quality-engineer" &&
+                              item.Status == StepStatus.Failed)))
                         .OrderByDescending(item => item.StartedAt)
                         .Select(item => new
                         {
@@ -983,6 +2358,7 @@ public sealed class WorkflowEngine(
                 step.CopilotSessionId = copilotSessionId;
                 step.CopilotSessionHome = copilotSessionHome;
                 flow.UpdatedAt = DateTimeOffset.UtcNow;
+                MarkOutcomeStepStarted(database, flow, step);
                 database.FlowEvents.Add(new FlowEvent
                 {
                     FlowRunId = flowId,
@@ -1054,6 +2430,8 @@ public sealed class WorkflowEngine(
                     learning.TimesApplied++;
                 }
 
+                var (outcomeContext, outcomeContract) =
+                    BuildOutcomePrompt(flow, step);
                 await database.SaveChangesAsync(cancellationToken);
                 executionContext = new AgentExecutionContext(
                     flow.Id,
@@ -1083,7 +2461,9 @@ public sealed class WorkflowEngine(
                     learnings,
                     ModelSelectionStrategy: flow.ModelSelectionStrategy,
                     ExpectedAcceptedTimeSeconds: decision.PredictedAcceptedTimeSeconds,
-                    AllowRemotePublication: step.RemotePublicationAllowed,
+                    AllowRemotePublication:
+                        step.RemotePublicationAllowed &&
+                        string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson),
                     ResumeSession: resumesSession,
                     RecoverInterruptedSession: recoversInterruptedSession,
                     Progress: progress =>
@@ -1095,7 +2475,29 @@ public sealed class WorkflowEngine(
                             .GetAwaiter()
                             .GetResult(),
                     IsPreMortemRevision: step.PreMortemReviewStepId is not null,
-                    InvocationStartedAt: step.StartedAt);
+                    InvocationStartedAt: step.StartedAt,
+                    OutcomeContext: outcomeContext,
+                    OutcomeContract: outcomeContract,
+                    DirectPrompt: qaContext is null
+                        ? string.Empty
+                        : $"{qaContext.PromptSummary}{Environment.NewLine}{Environment.NewLine}" +
+                          QaOutcomeContract(),
+                    IsOutcomeQa: qaContext is not null,
+                    IsHostControlledPublication:
+                        step.RemotePublicationAllowed &&
+                        !string.IsNullOrWhiteSpace(
+                            flow.OutcomeVerificationJson),
+                    IsGovernedOutcomeVerification:
+                        !string.IsNullOrWhiteSpace(
+                            flow.OutcomeVerificationJson),
+                    GovernedRepositoryRelativePaths:
+                        string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+                            ? null
+                            : OutcomeVerificationRules.DeserializeAggregate(
+                                    flow.OutcomeVerificationJson)
+                                .TrustedRepositories
+                                .Select(repository => repository.RelativePath)
+                                .ToArray());
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1776,7 +3178,15 @@ public sealed class WorkflowEngine(
         Guid? recoveredSessionId,
         CancellationToken cancellationToken)
     {
-        await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var governedPublicationOutput = await PrepareGovernedPublicationIfNeededAsync(
+            flowId,
+            stepId,
+            result,
+            cancellationToken);
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        await using var transaction =
+            await database.Database.BeginTransactionAsync(cancellationToken);
         var completion = await StageCompletedStepAsync(
             database,
             flowId,
@@ -1785,14 +3195,72 @@ public sealed class WorkflowEngine(
             completedAt,
             durationMilliseconds,
             recoveredSessionId,
+            governedPublicationOutput,
             cancellationToken);
         await database.SaveChangesAsync(cancellationToken);
-        await RecordCompletionObservationAsync(completion, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        if (completion.PreparedGateUpdates.Count > 0)
+        {
+            handoffGate.RestoreHistory(completion.PreparedGateUpdates);
+        }
+        try
+        {
+            await RecordCompletionObservationAsync(
+                completion,
+                CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(
+                exception,
+                "Completion telemetry failed after durable commit for step {StepId}",
+                completion.Step.Id);
+        }
         ThrowIfCompletionBlocked(completion.GateRecord);
         return completion.Step;
     }
 
-    private async Task SupersedePendingReleaseGatesAsync(
+    private async Task<string?> PrepareGovernedPublicationIfNeededAsync(
+        Guid flowId,
+        Guid stepId,
+        AgentExecutionResult result,
+        CancellationToken cancellationToken)
+    {
+        if (AgentHandoffInspector.GetPushbackReason(result.Output) is not null)
+        {
+            return null;
+        }
+
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var publication = await (
+                from step in database.FlowSteps.AsNoTracking()
+                join flow in database.Flows.AsNoTracking()
+                    on step.FlowRunId equals flow.Id
+                where step.Id == stepId && flow.Id == flowId
+                select new
+                {
+                    step.RemotePublicationAllowed,
+                    flow
+                })
+            .SingleAsync(cancellationToken);
+        if (!publication.RemotePublicationAllowed ||
+            string.IsNullOrWhiteSpace(publication.flow.OutcomeVerificationJson))
+        {
+            return null;
+        }
+
+        return await (candidatePublisher
+            ?? throw new InvalidOperationException(
+                "No verified candidate publisher is configured."))
+            .PublishAsync(
+                publication.flow,
+                stepId,
+                cancellationToken);
+    }
+
+    private async Task<IReadOnlyList<HandoffGateRecord>>
+        SupersedePendingReleaseGatesAsync(
         HarnessDbContext database,
         Guid flowId,
         Guid effectiveStepId,
@@ -1810,17 +3278,20 @@ public sealed class WorkflowEngine(
                     step.Id == gate.FlowStepId &&
                     step.Iteration == iteration))
             .ToListAsync(cancellationToken);
+        var preparedUpdates = new List<HandoffGateRecord>(pending.Count);
         foreach (var gate in pending)
         {
-            var resolved = handoffGate.SupersedeProposal(
-                gate.Id,
+            var resolved = handoffGate.PrepareSupersession(
+                gate,
                 "harness",
-                "Superseded by a revised release candidate.");
-            gate.Resolved = true;
-            gate.Approved = false;
+                "Superseded by a revised release candidate.",
+                resolvedAt);
+            gate.Resolved = resolved.Resolved;
+            gate.Approved = resolved.Approved;
             gate.ResolvedBy = resolved.ResolvedBy;
             gate.ResolutionNote = resolved.ResolutionNote;
             gate.ResolvedAt = resolved.ResolvedAt ?? resolvedAt;
+            preparedUpdates.Add(resolved);
             database.FlowEvents.Add(new FlowEvent
             {
                 FlowRunId = flowId,
@@ -1828,6 +3299,381 @@ public sealed class WorkflowEngine(
                 Type = "gate.release-superseded",
                 Message = "An earlier release gate was superseded by a revised candidate."
             });
+        }
+        return preparedUpdates;
+    }
+
+    private static bool IsOutcomeQaStep(FlowStep step) =>
+        step.Kind == FlowStepKind.OutcomeQa;
+
+    private static bool IsOutcomePlanCorrectionStep(FlowStep step) =>
+        step.Kind == FlowStepKind.OutcomePlanCorrection;
+
+    private static bool IsOutcomeOwnerCorrectionStep(FlowStep step) =>
+        step.Kind == FlowStepKind.OutcomeOwnerCorrection;
+
+    private static bool IsOutcomeCandidateRefreshStep(FlowStep step) =>
+        step.Kind == FlowStepKind.OutcomeCandidateRefresh;
+
+    private static bool IsOutcomeLocalReleaseCandidateStep(FlowStep step) =>
+        step.Kind == FlowStepKind.OutcomeLocalReleaseCandidate;
+
+    private static bool IsOutcomeApprovedPublicationStep(FlowStep step) =>
+        step.Kind == FlowStepKind.OutcomeApprovedPublication;
+
+    private static bool IsGovernedOutcomeEvidenceStep(FlowStep step) =>
+        step.Kind is FlowStepKind.OutcomeDelivery or FlowStepKind.OutcomeOwnerCorrection ||
+        (!step.RemotePublicationAllowed &&
+         step.AgentRole is not (
+             "team-lead" or
+             "quality-engineer" or
+             "product-manager" or
+             PreMortemRole));
+
+    private static Guid GetStableSemanticRootId(FlowStep step) =>
+        step.StableSemanticRootId ?? step.RetryOfStepId ?? step.Id;
+
+    private static Guid GetRetryRootId(FlowStep step) =>
+        step.RetryOfStepId ?? GetStableSemanticRootId(step);
+
+    private static void MarkSemanticRootProcessed(
+        OutcomeVerificationState state,
+        Guid semanticRootId)
+    {
+        if (semanticRootId == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                "A processed outcome semantic root cannot be empty.");
+        }
+        if (!state.ProcessedSemanticRootIds.Contains(semanticRootId))
+        {
+            state.ProcessedSemanticRootIds.Add(semanticRootId);
+        }
+    }
+
+    private static void RebindActiveQaRetry(
+        FlowRun flow,
+        FlowStep priorStep,
+        FlowStep retryStep)
+    {
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) ||
+            !IsOutcomeQaStep(priorStep) ||
+            !IsOutcomeQaStep(retryStep))
+        {
+            return;
+        }
+
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (state.ActiveQaStepId != priorStep.Id)
+        {
+            return;
+        }
+
+        var expectedRound = priorStep.OutcomeQaRound ?? retryStep.OutcomeQaRound;
+        if (state.ActiveQaRound != expectedRound)
+        {
+            return;
+        }
+
+        state.ActiveQaStepId = retryStep.Id;
+        state.UpdatedAt = DateTimeOffset.UtcNow;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+    }
+
+    private static List<string> OrderRolesByPlan(
+        IEnumerable<string> plannedRoles,
+        IEnumerable<string> roles)
+    {
+        var requested = roles
+            .Where(role => !string.IsNullOrWhiteSpace(role))
+            .Distinct(StringComparer.Ordinal)
+            .ToHashSet(StringComparer.Ordinal);
+        return plannedRoles
+            .Where(role => requested.Remove(role))
+            .Distinct(StringComparer.Ordinal)
+            .Concat(requested.Order(StringComparer.Ordinal))
+            .ToList();
+    }
+
+    private static List<string> DerivePendingOwnerRoles(
+        OutcomeVerificationState state,
+        IEnumerable<string> criterionIds) =>
+        state.AcceptancePlan is null
+            ? []
+            : OrderRolesByPlan(
+                state.PlannedRoles,
+                state.AcceptancePlan.Criteria
+                    .Where(item =>
+                        criterionIds.Contains(
+                            item.Id,
+                            StringComparer.Ordinal))
+                    .SelectMany(item => item.OwnerRoles));
+
+    private async Task<bool> ValidatePublicationCandidateAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        CancellationToken cancellationToken)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (state.Status != OutcomeVerificationStatus.Passed ||
+            state.CurrentCandidate is null ||
+            state.Stale ||
+            !string.Equals(
+                state.CurrentCandidate.Fingerprint,
+                state.VerifiedCandidateFingerprint,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Publication cannot start without a current authoritative QA PASS.");
+        }
+        var current = false;
+        string? reason = null;
+        try
+        {
+            current = await (candidateFingerprintService
+                ?? throw new InvalidOperationException(
+                    "No candidate fingerprint service is configured."))
+                .IsCurrentAsync(
+                    flow,
+                    state.CurrentCandidate,
+                    CandidateFingerprintService.RequiresPreview(
+                        state.AcceptancePlan),
+                    cancellationToken);
+        }
+        catch (CandidateValidationException exception)
+        {
+            reason = exception.Message;
+        }
+        if (current)
+        {
+            return true;
+        }
+
+        step.Status = StepStatus.Skipped;
+        step.Phase = AgentRunPhase.Succeeded;
+        step.CompletedAt = DateTimeOffset.UtcNow;
+        await MarkCandidateStaleAsync(
+            database,
+            flow,
+            state,
+            step.Id,
+            "Candidate changed before publication; nothing was published. " +
+            (reason ?? string.Empty),
+            cancellationToken);
+        return false;
+    }
+
+    private async Task<OutcomeQaContext?> PrepareOutcomeQaDispatchAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        CancellationToken cancellationToken)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var candidate = state.CurrentCandidate
+            ?? throw new InvalidOperationException(
+                "Quality Engineer cannot run before local candidate preparation.");
+        var fingerprintService = candidateFingerprintService
+            ?? throw new InvalidOperationException(
+                "No candidate fingerprint service is configured.");
+        OutcomeCandidateSnapshot current;
+        try
+        {
+            current = await fingerprintService.PrepareAsync(
+                flow,
+                state.AcceptancePlan?.Hash ??
+                throw new InvalidOperationException(
+                    "Quality Engineer cannot run without an acceptance plan."),
+                candidate.PreparedByStepId,
+                CandidateFingerprintService.RequiresPreview(
+                    state.AcceptancePlan),
+                cancellationToken);
+        }
+        catch (CandidateValidationException exception)
+        {
+            step.Status = StepStatus.Skipped;
+            step.Phase = AgentRunPhase.Succeeded;
+            step.CompletedAt = DateTimeOffset.UtcNow;
+            await MarkCandidateStaleAsync(
+                database,
+                flow,
+                state,
+                step.Id,
+                exception.Message,
+                cancellationToken);
+            return null;
+        }
+        if (!string.Equals(
+                current.Fingerprint,
+                candidate.Fingerprint,
+                StringComparison.Ordinal))
+        {
+            step.Status = StepStatus.Skipped;
+            step.Phase = AgentRunPhase.Succeeded;
+            step.CompletedAt = DateTimeOffset.UtcNow;
+            await MarkCandidateStaleAsync(
+                database,
+                flow,
+                state,
+                step.Id,
+                "Candidate content changed after local preparation.",
+                cancellationToken);
+            return null;
+        }
+
+        var round = state.ActiveQaStepId == step.Id
+            ? state.ActiveQaRound!.Value
+            : step.OutcomeQaRound ?? state.ActiveQaRound ?? state.Rounds.Count + 1;
+        if (round > state.MaxRounds)
+        {
+            throw new InvalidOperationException(
+                "The outcome-verification QA round budget is exhausted.");
+        }
+        if (state.ActiveQaStepId is not null &&
+            state.ActiveQaStepId != step.Id)
+        {
+            var activeStep = await database.FlowSteps
+                .AsNoTracking()
+                .SingleOrDefaultAsync(
+                    item => item.Id == state.ActiveQaStepId,
+                    cancellationToken);
+            var canReplaceActiveStep = activeStep is not null &&
+                                       IsOutcomeQaStep(activeStep) &&
+                                       GetStableSemanticRootId(activeStep) ==
+                                       GetStableSemanticRootId(step) &&
+                                       activeStep.OutcomeQaRound == round &&
+                                       string.Equals(
+                                           activeStep.OutcomePlanHash,
+                                           step.OutcomePlanHash,
+                                           StringComparison.Ordinal);
+            if (!canReplaceActiveStep ||
+                state.ActiveQaRound != round)
+            {
+                throw new InvalidOperationException(
+                    "A different QA step already owns the active verification round.");
+            }
+        }
+
+        var context = await (outcomeContextBuilder
+            ?? throw new InvalidOperationException(
+                "No outcome verification context builder is configured."))
+            .BuildAsync(flow.Id, round, cancellationToken);
+        step.Kind = FlowStepKind.OutcomeQa;
+        step.OutcomeQaRound = round;
+        step.OutcomePlanHash = state.AcceptancePlan?.Hash ?? string.Empty;
+        step.StableSemanticRootId ??= GetStableSemanticRootId(step);
+        state.ActiveQaRound = round;
+        state.ActiveQaStepId = step.Id;
+        state.ActiveQaContextPath = context.Path;
+        state.ActiveQaContextHash = context.Hash;
+        state.Status = OutcomeVerificationStatus.AwaitingQa;
+        state.UpdatedAt = DateTimeOffset.UtcNow;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        if (!await database.FlowEvents.AnyAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.FlowStepId == step.Id &&
+                    item.Type == "outcome.qa.dispatched",
+                cancellationToken))
+        {
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = step.Id,
+                Type = "outcome.qa.dispatched",
+                Message =
+                    $"Quality Engineer received round {round}/{state.MaxRounds} for " +
+                    $"{PrefixDigest(candidate.Fingerprint)} with context " +
+                    $"{PrefixDigest(context.Hash)}."
+            });
+        }
+        await database.SaveChangesAsync(cancellationToken);
+        return context;
+    }
+
+    private async Task MarkCandidateStaleAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        OutcomeVerificationState state,
+        Guid? stepId,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        state.Stale = true;
+        state.VerifiedCandidateFingerprint = null;
+        state.VerifiedAt = null;
+        state.Status = OutcomeVerificationStatus.AwaitingCandidateRefresh;
+        state.ActiveQaRound = null;
+        state.ActiveQaStepId = null;
+        state.ActiveQaContextPath = null;
+        state.ActiveQaContextHash = null;
+        foreach (var round in state.Rounds.Where(round =>
+                     string.Equals(
+                         round.CandidateFingerprint,
+                         state.CurrentCandidate?.Fingerprint,
+                         StringComparison.Ordinal)))
+        {
+            round.Stale = true;
+        }
+        var staleQaStepIds = state.Rounds
+            .Where(round => round.Stale)
+            .Select(round => round.QaStepId)
+            .ToArray();
+        var staleApprovedGates = await database.GateRecords
+            .Where(gate =>
+                gate.FlowRunId == flow.Id &&
+                gate.ActionType == HandoffActionType.Release &&
+                gate.Resolved &&
+                gate.Approved == true &&
+                staleQaStepIds.Contains(gate.FlowStepId))
+            .ToListAsync(cancellationToken);
+        foreach (var gate in staleApprovedGates)
+        {
+            var alreadyRecorded = await database.FlowEvents.AnyAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.FlowStepId == gate.FlowStepId &&
+                    item.Type == "gate.release-approval-stale",
+                cancellationToken);
+            if (!alreadyRecorded)
+            {
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = gate.FlowStepId,
+                    Type = "gate.release-approval-stale",
+                    Message =
+                        "The historical customer approval remains in the audit record but does not authorize a refreshed candidate."
+                });
+            }
+        }
+        state.UpdatedAt = DateTimeOffset.UtcNow;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        var preparedGateUpdates = await SupersedePendingReleaseGatesAsync(
+            database,
+            flow.Id,
+            stepId ?? Guid.Empty,
+            flow.Iteration,
+            DateTimeOffset.UtcNow,
+            cancellationToken);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = stepId,
+            Type = "outcome.candidate.stale",
+            Message = reason
+        });
+        await database.SaveChangesAsync(cancellationToken);
+        if (preparedGateUpdates.Count > 0)
+        {
+            handoffGate.RestoreHistory(preparedGateUpdates);
         }
     }
 
@@ -1839,23 +3685,15 @@ public sealed class WorkflowEngine(
         DateTimeOffset completedAt,
         long? durationMilliseconds,
         Guid? recoveredSessionId,
+        string? governedPublicationOutput,
         CancellationToken cancellationToken)
     {
         var step = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
-        if (step.RemotePublicationAllowed)
-        {
-            var flow = await database.Flows.SingleAsync(
-                item => item.Id == flowId,
-                cancellationToken);
-            var published = await (publicationVerifier
-                ?? throw new InvalidOperationException(
-                    "No published outcome verifier is configured."))
-                .VerifyAsync(flow, result.Output, cancellationToken);
-            flow.OutcomeUrl = published.Url;
-            flow.OutcomeLabel = published.Label;
-        }
+        var flow = await database.Flows.SingleAsync(
+            item => item.Id == flowId,
+            cancellationToken);
         if (step.AgentRole == PreMortemRole)
         {
             _ = PreMortemRules.ParseReview(result.Output);
@@ -1868,13 +3706,85 @@ public sealed class WorkflowEngine(
             ? null
             : AgentHandoffInspector.GetPushbackReason(result.Output);
         var pushedBack = pushbackReason is not null;
+        if (step.RemotePublicationAllowed && !pushedBack)
+        {
+            var verificationOutput = result.Output;
+            if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+            {
+                verificationOutput = governedPublicationOutput
+                    ?? throw new InvalidOperationException(
+                        "Governed publication finalization requires a durable host publication record.");
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = step.Id,
+                    Type = "outcome.candidate.published",
+                    Message =
+                        "The harness published the immutable verified commit/tree identities after the guarded Release Engineer turn."
+                });
+            }
+            var published = await (publicationVerifier
+                ?? throw new InvalidOperationException(
+                    "No published outcome verifier is configured."))
+                .VerifyAsync(flow, verificationOutput, cancellationToken);
+            if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+            {
+                MarkPublicationVerified(flow, step, completedAt);
+            }
+            flow.OutcomeUrl = published.Url;
+            flow.OutcomeLabel = published.Label;
+        }
+        if (!pushedBack)
+        {
+            if (step.AgentRole == "team-lead" &&
+                IsOutcomePlanCorrectionStep(step))
+            {
+                await ApplyAcceptancePlanReplacementAsync(
+                    database,
+                    flow,
+                    step,
+                    result.Output,
+                    completedAt,
+                    cancellationToken);
+            }
+            CollectOutcomeEvidence(
+                database,
+                flow,
+                step,
+                result.Output,
+                completedAt);
+            CompleteOutcomeCorrection(database, flow, step, completedAt);
+            if ((IsOutcomeLocalReleaseCandidateStep(step) ||
+                 IsOutcomeCandidateRefreshStep(step)) &&
+                !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+            {
+                await PrepareOutcomeCandidateAsync(
+                    database,
+                    flow,
+                    step,
+                    cancellationToken);
+            }
+        }
+        QaCompletion? qaCompletion = null;
+        if (!pushedBack && IsOutcomeQaStep(step))
+        {
+            qaCompletion = await ProcessOutcomeQaCompletionAsync(
+                database,
+                flow,
+                step,
+                result.Output,
+                completedAt,
+                result.ToolCalls,
+                cancellationToken);
+        }
         var publishesApprovedOutcome =
             step.AgentRole == "release-engineer" &&
             step.RemotePublicationAllowed;
+        IReadOnlyList<HandoffGateRecord> preparedGateUpdates = [];
         if (step.AgentRole == "release-engineer" &&
             !publishesApprovedOutcome)
         {
-            await SupersedePendingReleaseGatesAsync(
+            preparedGateUpdates = await SupersedePendingReleaseGatesAsync(
                 database,
                 flowId,
                 step.Id,
@@ -1884,7 +3794,11 @@ public sealed class WorkflowEngine(
         }
         var actionType = pushedBack
             ? HandoffActionType.RequestRevision
-            : step.AgentRole == "release-engineer" && !publishesApprovedOutcome
+            : qaCompletion?.ReleaseReady == true
+            ? HandoffActionType.Release
+            : step.AgentRole == "release-engineer" &&
+              !publishesApprovedOutcome &&
+              string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
             ? HandoffActionType.Release
             : HandoffActionType.Advance;
         var gateRecord = handoffGate.SubmitProposal(new HandoffProposal
@@ -1908,7 +3822,14 @@ public sealed class WorkflowEngine(
                 FlowStepId = stepId,
                 ToolName = toolCall.ToolName,
                 ArgumentsSummary = toolCall.ArgumentsSummary,
-                Succeeded = toolCall.Succeeded
+                Succeeded = toolCall.Succeeded,
+                ToolType = toolCall.ToolType,
+                NormalizedCommand = toolCall.NormalizedCommand,
+                NormalizedArguments = toolCall.NormalizedArguments,
+                WorkingDirectory = toolCall.WorkingDirectory,
+                ExitCode = toolCall.ExitCode,
+                ResultDigest = toolCall.ResultDigest,
+                ResultSummary = toolCall.ResultSummary
             });
         }
 
@@ -1916,7 +3837,9 @@ public sealed class WorkflowEngine(
             1,
             (long)(completedAt - (step.StartedAt ?? completedAt)).TotalMilliseconds);
         step.Status = pushedBack ? StepStatus.Pushback : StepStatus.Completed;
-        step.Phase = pushedBack ? AgentRunPhase.Failed : AgentRunPhase.Succeeded;
+        step.Phase = pushedBack
+            ? AgentRunPhase.Failed
+            : AgentRunPhase.Succeeded;
         step.OutputSummary = result.Output;
         step.PushbackReason = pushbackReason ?? string.Empty;
         step.ExecutionAttempts = Math.Max(step.ExecutionAttempts, result.ExecutionAttempts);
@@ -1994,21 +3917,738 @@ public sealed class WorkflowEngine(
             step,
             gateRecord,
             pushedBack,
+            qaCompletion?.ContractInvalid == true,
             elapsedMilliseconds,
-            step.ExecutionAttempts);
+            step.ExecutionAttempts,
+            preparedGateUpdates);
+    }
+
+    private static void MarkPublicationVerified(
+        FlowRun flow,
+        FlowStep publicationStep,
+        DateTimeOffset verifiedAt)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var journal = state.Publication
+            ?? throw new InvalidOperationException(
+                "Published outcome verification has no durable publication journal.");
+        if (journal.StepId != GetStableSemanticRootId(publicationStep) ||
+            journal.Status != OutcomePublicationStatus.Published)
+        {
+            throw new InvalidOperationException(
+                "Published outcome verification does not match a completed publication journal.");
+        }
+        journal.Status = OutcomePublicationStatus.Verified;
+        journal.UpdatedAt = verifiedAt;
+        state.UpdatedAt = verifiedAt;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+    }
+
+    private async Task<QaCompletion> ProcessOutcomeQaCompletionAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        string output,
+        DateTimeOffset completedAt,
+        IReadOnlyCollection<ToolCallRecord> hostToolCalls,
+        CancellationToken cancellationToken)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var plan = state.AcceptancePlan
+            ?? throw new InvalidOperationException(
+                "QA cannot complete without an acceptance plan.");
+        var candidate = state.CurrentCandidate
+            ?? throw new InvalidOperationException(
+                "QA cannot complete without a candidate.");
+        if (state.Rounds.Any(round => round.QaStepId == step.Id))
+        {
+            var existing = state.Rounds.Single(round => round.QaStepId == step.Id);
+            return new QaCompletion(
+                !string.IsNullOrWhiteSpace(existing.ContractError),
+                existing.Result?.Verdict == OutcomeQaVerdict.PASS &&
+                !existing.Stale);
+        }
+        if (state.ActiveQaStepId != step.Id ||
+            state.ActiveQaRound is null ||
+            string.IsNullOrWhiteSpace(state.ActiveQaContextHash))
+        {
+            throw new InvalidOperationException(
+                "QA completion does not match the persisted active round.");
+        }
+        step.Kind = FlowStepKind.OutcomeQa;
+        step.OutcomeQaRound = state.ActiveQaRound.Value;
+        step.OutcomePlanHash = plan.Hash;
+        step.StableSemanticRootId ??= GetStableSemanticRootId(step);
+        OutcomeQaResult? qaResult = null;
+        string contractError = string.Empty;
+        try
+        {
+            if (!await OutcomeVerificationContextBuilder.MatchesPersistedHashAsync(
+                    state.ActiveQaContextPath!,
+                    state.ActiveQaContextHash!,
+                    cancellationToken))
+            {
+                throw new OutcomeVerificationValidationException(
+                    [
+                        "the persisted QA context no longer matches its host-recorded dispatch hash"
+                    ]);
+            }
+            qaResult = OutcomeVerificationRules.ParseQaResult(
+                output,
+                plan,
+                candidate.Fingerprint,
+                state.Evidence.Select(item => item.EvidenceId).ToArray(),
+                state.PlannedRoles);
+            var hostObservationErrors =
+                HostObservedQaEvidence.ValidatePassChecks(
+                    qaResult,
+                    hostToolCalls,
+                    string.IsNullOrWhiteSpace(flow.WorkspacePath)
+                        ? flow.RepositoryPath
+                        : flow.WorkspacePath,
+                    candidate.Manifest.Repositories
+                        .Select(repository => repository.RelativePath)
+                        .ToArray());
+            if (hostObservationErrors.Count > 0)
+            {
+                throw new OutcomeVerificationValidationException(
+                    hostObservationErrors);
+            }
+        }
+        catch (OutcomeVerificationValidationException exception)
+        {
+            qaResult = null;
+            contractError = SummarizeQaContractErrors(exception.Errors);
+        }
+
+        var stale = false;
+        string? staleReason = null;
+        try
+        {
+            var current = await (candidateFingerprintService
+                ?? throw new InvalidOperationException(
+                    "No candidate fingerprint service is configured."))
+                .PrepareAsync(
+                    flow,
+                    plan.Hash,
+                    candidate.PreparedByStepId,
+                    CandidateFingerprintService.RequiresPreview(plan),
+                    cancellationToken);
+            stale = !string.Equals(
+                current.Fingerprint,
+                candidate.Fingerprint,
+                StringComparison.Ordinal);
+            if (stale)
+            {
+                staleReason = "Quality Engineer changed candidate content during verification.";
+            }
+        }
+        catch (CandidateValidationException exception)
+        {
+            stale = true;
+            staleReason =
+                "The candidate became invalid during QA: " + exception.Message;
+        }
+
+        var round = new OutcomeQaRound
+        {
+            Round = state.ActiveQaRound.Value,
+            QaStepId = step.Id,
+            AcceptancePlanHash = plan.Hash,
+            CandidateFingerprint = candidate.Fingerprint,
+            ContextHash = state.ActiveQaContextHash!,
+            Verdict = qaResult?.Verdict ?? OutcomeQaVerdict.FAIL,
+            Result = qaResult,
+            ContractError = contractError,
+            Stale = stale,
+            CompletedAt = completedAt
+        };
+        state.Rounds.Add(round);
+        MarkSemanticRootProcessed(state, GetStableSemanticRootId(step));
+        state.ActiveQaRound = null;
+        state.ActiveQaStepId = null;
+        state.ActiveQaContextPath = null;
+        state.ActiveQaContextHash = null;
+        var correctableCriterionIds = qaResult?.Criteria
+            .Where(item =>
+                item.Status != OutcomeCriterionStatus.PASS &&
+                item.ResponsibleRoles.Count > 0)
+            .Select(item => item.CriterionId)
+            .ToHashSet(StringComparer.Ordinal) ?? [];
+        state.PendingOwnerRoles = DerivePendingOwnerRoles(
+            state,
+            correctableCriterionIds);
+        var releaseReady =
+            qaResult?.Verdict == OutcomeQaVerdict.PASS &&
+            !stale &&
+            qaResult.PlanGaps.Count == 0;
+        if (releaseReady)
+        {
+            state.Status = OutcomeVerificationStatus.Passed;
+            state.VerifiedCandidateFingerprint = candidate.Fingerprint;
+            state.VerifiedAt = completedAt;
+            state.PendingOwnerRoles.Clear();
+            state.Stale = false;
+        }
+        else if (stale)
+        {
+            state.Status = OutcomeVerificationStatus.AwaitingCandidateRefresh;
+            state.VerifiedCandidateFingerprint = null;
+            state.VerifiedAt = null;
+            state.Stale = true;
+        }
+        else
+        {
+            var hasPlanGaps = qaResult?.PlanGaps.Count > 0;
+            var externalBlocker =
+                !hasPlanGaps &&
+                qaResult?.Verdict == OutcomeQaVerdict.BLOCKED &&
+                qaResult.Criteria
+                    .Where(item => item.Status != OutcomeCriterionStatus.PASS)
+                    .All(item => item.ResponsibleRoles.Count == 0);
+            state.Status = externalBlocker ||
+                           state.Rounds.Count >= state.MaxRounds
+                ? OutcomeVerificationStatus.AwaitingHumanResolution
+                : OutcomeVerificationStatus.Correcting;
+            state.VerifiedCandidateFingerprint = null;
+            state.VerifiedAt = null;
+            state.Stale = false;
+        }
+        state.UpdatedAt = completedAt;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = stale
+                ? "outcome.candidate.stale"
+                : !string.IsNullOrWhiteSpace(contractError)
+                    ? "outcome.qa.contract-invalid"
+                    : releaseReady
+                        ? "outcome.qa.passed"
+                        : qaResult?.Verdict == OutcomeQaVerdict.BLOCKED
+                            ? "outcome.qa.blocked"
+                            : "outcome.qa.failed",
+            Message = stale
+                ? staleReason!
+                : !string.IsNullOrWhiteSpace(contractError)
+                    ? $"QA round {round.Round} returned an invalid strict contract: {contractError}"
+                    : $"QA round {round.Round} completed with {qaResult!.Verdict}."
+        });
+        return new QaCompletion(
+            !string.IsNullOrWhiteSpace(contractError),
+            releaseReady);
+    }
+
+    internal static string SummarizeQaContractErrors(
+        IReadOnlyList<string> errors)
+    {
+        ArgumentNullException.ThrowIfNull(errors);
+        var normalized = errors
+            .Select(error => error?.Trim() ?? string.Empty)
+            .Where(error => error.Length > 0)
+            .ToArray();
+        var summary = normalized.Length == 0
+            ? "The QA result violated the strict contract."
+            : string.Join("; ", normalized);
+        if (summary.Length <= MaximumQaContractErrorCharacters)
+        {
+            return summary;
+        }
+
+        var suffix =
+            $" … [{normalized.Length} diagnostics; {OutcomeVerificationRules.ComputeSha256(summary)}]";
+        var prefixLength = MaximumQaContractErrorCharacters - suffix.Length;
+        if (prefixLength < 1)
+        {
+            return suffix[^MaximumQaContractErrorCharacters..];
+        }
+        if (prefixLength < summary.Length &&
+            prefixLength > 0 &&
+            char.IsHighSurrogate(summary[prefixLength - 1]))
+        {
+            prefixLength--;
+        }
+        return summary[..prefixLength] + suffix;
+    }
+
+    private static void CompleteOutcomeCorrection(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        DateTimeOffset completedAt)
+    {
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) ||
+            !IsOutcomeOwnerCorrectionStep(step))
+        {
+            return;
+        }
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (!ApplyOutcomeCorrection(database, state, step, completedAt))
+        {
+            return;
+        }
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+    }
+
+    private static bool ApplyOutcomeCorrection(
+        HarnessDbContext database,
+        OutcomeVerificationState state,
+        FlowStep step,
+        DateTimeOffset completedAt)
+    {
+        if (step.OutcomeQaRound is not { } qaRound ||
+            string.IsNullOrWhiteSpace(step.OutcomePlanHash) ||
+            step.StableSemanticRootId is not { } semanticRootId ||
+            semanticRootId == Guid.Empty)
+        {
+            return false;
+        }
+        var round = state.Rounds.SingleOrDefault(item =>
+            item.Round == qaRound);
+        if (round is null)
+        {
+            return false;
+        }
+        var registration = round.CorrectionRegistrations.SingleOrDefault(item =>
+            item.QaRound == qaRound &&
+            string.Equals(
+                item.OutcomePlanHash,
+                step.OutcomePlanHash,
+                StringComparison.Ordinal) &&
+            string.Equals(item.Role, step.AgentRole, StringComparison.Ordinal) &&
+            item.SemanticRootId == semanticRootId);
+        if (registration is null ||
+            round.ProcessedCorrectionRootIds.Contains(semanticRootId))
+        {
+            return false;
+        }
+        if (!state.PendingOwnerRoles.Remove(step.AgentRole))
+        {
+            throw new InvalidOperationException(
+                $"Correction root '{semanticRootId:D}' was registered for QA round {qaRound}, " +
+                $"but role '{step.AgentRole}' is not pending.");
+        }
+
+        round.ProcessedCorrectionRootIds.Add(semanticRootId);
+        if (!round.CorrectionStepIds.Contains(step.Id))
+        {
+            round.CorrectionStepIds.Add(step.Id);
+        }
+        MarkSemanticRootProcessed(state, semanticRootId);
+        if (state.PendingOwnerRoles.Count == 0)
+        {
+            state.Status = OutcomeVerificationStatus.AwaitingCandidateRefresh;
+        }
+        state.UpdatedAt = completedAt;
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = step.FlowRunId,
+            FlowStepId = step.Id,
+            Type = "outcome.correction.completed",
+            Message =
+                $"{step.AgentName} completed its assigned outcome corrections."
+        });
+        return true;
+    }
+
+    private static void EnsureCorrectionRegistration(
+        OutcomeQaRound round,
+        FlowStep correction,
+        string outcomePlanHash)
+    {
+        if (correction.OutcomeQaRound != round.Round ||
+            !string.Equals(
+                correction.OutcomePlanHash,
+                outcomePlanHash,
+                StringComparison.Ordinal) ||
+            correction.StableSemanticRootId is not { } semanticRootId ||
+            semanticRootId == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                "A correction step does not carry the expected typed QA round identity.");
+        }
+        var existing = round.CorrectionRegistrations.SingleOrDefault(item =>
+            string.Equals(item.Role, correction.AgentRole, StringComparison.Ordinal));
+        if (existing is not null)
+        {
+            if (existing.QaRound != round.Round ||
+                !string.Equals(
+                    existing.OutcomePlanHash,
+                    outcomePlanHash,
+                    StringComparison.Ordinal) ||
+                existing.SemanticRootId != semanticRootId)
+            {
+                throw new InvalidOperationException(
+                    $"QA round {round.Round} has a conflicting correction registration for '{correction.AgentRole}'.");
+            }
+            return;
+        }
+        round.CorrectionRegistrations.Add(new OutcomeCorrectionRegistration(
+            round.Round,
+            outcomePlanHash,
+            correction.AgentRole,
+            correction.Id,
+            semanticRootId));
+    }
+
+    private static async Task ApplyAcceptancePlanReplacementAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        string output,
+        DateTimeOffset completedAt,
+        CancellationToken cancellationToken)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (!IsOutcomePlanCorrectionStep(step))
+        {
+            throw new InvalidOperationException(
+                "Only an outcome plan-correction step can replace the acceptance plan.");
+        }
+        var prior = state.AcceptancePlan
+            ?? throw new InvalidOperationException(
+                "An acceptance-plan correction requires the prior plan.");
+        var plannedRoles = await database.FlowSteps
+            .AsNoTracking()
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration &&
+                item.AgentRole != "team-lead" &&
+                item.AgentRole != PreMortemRole)
+            .OrderBy(item => item.Sequence)
+            .Select(item => item.AgentRole)
+            .ToListAsync(cancellationToken);
+        plannedRoles = plannedRoles
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var replacement = OutcomeVerificationRules.ParseAcceptancePlan(
+            output,
+            plannedRoles);
+        var replacementIds = replacement.Criteria
+            .Select(item => item.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        var omittedIds = prior.Criteria
+            .Select(item => item.Id)
+            .Where(id => !replacementIds.Contains(id))
+            .ToArray();
+        if (omittedIds.Length > 0)
+        {
+            throw new OutcomeVerificationValidationException(
+                [
+                    "A replacement acceptance plan must preserve existing criterion IDs: " +
+                    string.Join(", ", omittedIds)
+                ]);
+        }
+
+        var priorById = prior.Criteria.ToDictionary(
+            item => item.Id,
+            StringComparer.Ordinal);
+        var changedCriteria = replacement.Criteria
+            .Where(criterion =>
+                !priorById.TryGetValue(criterion.Id, out var oldCriterion) ||
+                !string.Equals(
+                    OutcomeVerificationRules.SerializeCanonical(oldCriterion),
+                    OutcomeVerificationRules.SerializeCanonical(criterion),
+                    StringComparison.Ordinal))
+            .ToArray();
+        if (changedCriteria.Length == 0)
+        {
+            throw new OutcomeVerificationValidationException(
+                ["A plan-gap correction must add or change at least one criterion"]);
+        }
+
+        var changedIds = changedCriteria
+            .Select(item => item.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        var triggeringRound = step.OutcomeQaRound is { } roundNumber
+            ? state.Rounds.FirstOrDefault(item =>
+                item.Round == roundNumber &&
+                string.Equals(
+                    item.AcceptancePlanHash,
+                    step.OutcomePlanHash,
+                    StringComparison.Ordinal))
+            : state.Rounds
+                .OrderByDescending(item => item.Round)
+                .FirstOrDefault();
+        var unresolvedExistingCriterionIds = triggeringRound?.Result?.Criteria
+            .Where(item => item.Status != OutcomeCriterionStatus.PASS)
+            .Select(item => item.CriterionId)
+            .ToHashSet(StringComparer.Ordinal) ?? [];
+        var pendingCriterionIds = unresolvedExistingCriterionIds
+            .Union(changedIds, StringComparer.Ordinal)
+            .ToHashSet(StringComparer.Ordinal);
+        state.AcceptancePlan =
+            OutcomeVerificationRules.CreateAcceptanceSnapshot(
+                replacement,
+                step.Id);
+        state.PlannedRoles = plannedRoles;
+        foreach (var round in state.Rounds)
+        {
+            round.Stale = true;
+        }
+        state.Evidence = state.Evidence
+            .Where(item => !changedIds.Contains(item.CriterionId))
+            .ToList();
+        state.CurrentCandidate = null;
+        state.Publication = null;
+        state.VerifiedCandidateFingerprint = null;
+        state.VerifiedAt = null;
+        state.Stale = true;
+        state.PendingOwnerRoles = OrderRolesByPlan(
+            plannedRoles,
+            replacement.Criteria
+                .Where(item => pendingCriterionIds.Contains(item.Id))
+                .SelectMany(item => item.OwnerRoles));
+        state.Status = OutcomeVerificationStatus.Correcting;
+        MarkSemanticRootProcessed(state, GetStableSemanticRootId(step));
+        state.UpdatedAt = completedAt;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = "outcome.plan.replaced",
+            Message =
+                $"Team Lead replaced the acceptance plan after QA identified a gap. " +
+                $"The new hash is {PrefixDigest(state.AcceptancePlan.Hash)}."
+        });
+    }
+
+    private async Task PrepareOutcomeCandidateAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep releaseStep,
+        CancellationToken cancellationToken)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var plan = state.AcceptancePlan
+            ?? throw new InvalidOperationException(
+                "A release candidate cannot be prepared before the acceptance plan.");
+        if (state.CurrentCandidate?.PreparedByStepId == releaseStep.Id &&
+            state.Status == OutcomeVerificationStatus.AwaitingQa)
+        {
+            return;
+        }
+        var previousFingerprint = state.CurrentCandidate?.Fingerprint;
+        var missingEvidence = plan.Criteria
+            .Where(criterion => !state.Evidence.Any(evidence =>
+                string.Equals(
+                    evidence.CriterionId,
+                    criterion.Id,
+                    StringComparison.Ordinal)))
+            .Select(criterion => criterion.Id)
+            .ToArray();
+        if (missingEvidence.Length > 0)
+        {
+            throw new OutcomeVerificationValidationException(
+                [
+                    "Every criterion requires concrete delivery evidence before candidate " +
+                    $"preparation. Missing: {string.Join(", ", missingEvidence)}"
+                ]);
+        }
+
+        var fingerprintService = candidateFingerprintService
+            ?? throw new InvalidOperationException(
+                "No candidate fingerprint service is configured.");
+        _ = await fingerprintService.SealAsync(flow, cancellationToken);
+        var candidate = await fingerprintService.PrepareAsync(
+            flow,
+            plan.Hash,
+            releaseStep.Id,
+            CandidateFingerprintService.RequiresPreview(plan),
+            cancellationToken);
+        releaseStep.OutcomePlanHash = plan.Hash;
+        releaseStep.StableSemanticRootId ??= GetStableSemanticRootId(releaseStep);
+        if (releaseStep.Kind == FlowStepKind.Standard)
+        {
+            releaseStep.Kind = state.CurrentCandidate is null
+                ? FlowStepKind.OutcomeLocalReleaseCandidate
+                : FlowStepKind.OutcomeCandidateRefresh;
+        }
+        state.CurrentCandidate = candidate;
+        state.Publication = null;
+        state.VerifiedCandidateFingerprint = null;
+        state.VerifiedAt = null;
+        state.Stale = false;
+        state.Status = OutcomeVerificationStatus.AwaitingQa;
+        MarkSemanticRootProcessed(
+            state,
+            GetStableSemanticRootId(releaseStep));
+        state.UpdatedAt = DateTimeOffset.UtcNow;
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        var pendingQaSteps = await database.FlowSteps
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration &&
+                item.Kind == FlowStepKind.OutcomeQa &&
+                item.Status == StepStatus.Pending)
+            .ToListAsync(cancellationToken);
+        foreach (var qaStep in pendingQaSteps)
+        {
+            qaStep.DependsOnStepId = releaseStep.Id;
+        }
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = releaseStep.Id,
+            Type = "outcome.candidate.prepared",
+            Message =
+                $"Release Engineer {(previousFingerprint is null ? "prepared" : "refreshed")} " +
+                $"unpublished candidate " +
+                $"{PrefixDigest(candidate.Fingerprint)} across " +
+                $"{candidate.Manifest.Repositories.Count} repository/repositories."
+        });
+    }
+
+    private static void MarkOutcomeStepStarted(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step)
+    {
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) ||
+            step.RemotePublicationAllowed)
+        {
+            return;
+        }
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if ((IsOutcomeLocalReleaseCandidateStep(step) ||
+             IsOutcomeCandidateRefreshStep(step)) &&
+            state.Status is
+                OutcomeVerificationStatus.CollectingEvidence or
+                OutcomeVerificationStatus.AwaitingCandidateRefresh)
+        {
+            state.Status = OutcomeVerificationStatus.PreparingCandidate;
+            state.UpdatedAt = DateTimeOffset.UtcNow;
+            flow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = step.Id,
+                Type = "outcome.candidate.preparing",
+                Message =
+                    "Release Engineer started local candidate preparation; remote publication remains disabled."
+            });
+        }
+    }
+
+    internal static void CollectOutcomeEvidence(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        string output,
+        DateTimeOffset completedAt)
+    {
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) ||
+            step.RemotePublicationAllowed ||
+            !IsGovernedOutcomeEvidenceStep(step))
+        {
+            return;
+        }
+
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        if (state.AcceptancePlan is null)
+        {
+            throw new OutcomeVerificationValidationException(
+                ["delivery evidence cannot be accepted before the acceptance plan"]);
+        }
+        if (state.EvidenceProcessing.Any(item =>
+                item.ProducerStepId == step.Id))
+        {
+            return;
+        }
+
+        var assignedCriteria = state.AcceptancePlan.Criteria
+            .Where(criterion =>
+                criterion.OwnerRoles.Contains(
+                    step.AgentRole,
+                    StringComparer.Ordinal))
+            .Select(criterion => criterion.Id)
+            .ToArray();
+        if (assignedCriteria.Length == 0)
+        {
+            return;
+        }
+
+        var evidence = OutcomeVerificationRules.ParseDeliveryEvidence(
+            output,
+            state.AcceptancePlan,
+            step.AgentRole,
+            step.Id,
+            completedAt);
+        var evidencedCriteria = evidence
+            .Select(item => item.CriterionId)
+            .ToHashSet(StringComparer.Ordinal);
+        var missing = assignedCriteria
+            .Where(criterionId => !evidencedCriteria.Contains(criterionId))
+            .ToArray();
+        if (missing.Length > 0)
+        {
+            throw new OutcomeVerificationValidationException(
+                [
+                    $"{step.AgentRole} must provide concrete evidence for assigned criteria: " +
+                    string.Join(", ", missing)
+                ]);
+        }
+
+        state.EvidenceProcessing.Add(new OutcomeEvidenceProcessing(
+            step.Id,
+            state.AcceptancePlan.Hash,
+            step.AgentRole,
+            evidencedCriteria.Order(StringComparer.Ordinal).ToArray(),
+            completedAt));
+        MarkSemanticRootProcessed(state, GetStableSemanticRootId(step));
+        OutcomeVerificationRules.MergeEvidence(state, evidence);
+        flow.OutcomeVerificationJson =
+            OutcomeVerificationRules.SerializeAggregate(state);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = "outcome.evidence.collected",
+            Message =
+                $"Recorded {evidence.Count} validated evidence item(s) from " +
+                $"{step.AgentName} for {string.Join(", ", evidencedCriteria.Order())}."
+        });
     }
 
     private async Task RecordCompletionObservationAsync(
         StagedStepCompletion completion,
         CancellationToken cancellationToken)
     {
-        if (completion.PushedBack)
+        if (completion.PushedBack || completion.ContractInvalid)
         {
-            await observationRecorder.RecordPushbackDetectionAsync(
-            completion.Step.Id,
-            completion.ElapsedMilliseconds,
-            completion.ExecutionAttempts,
-            cancellationToken);
+            if (completion.PushedBack)
+            {
+                await observationRecorder.RecordPushbackDetectionAsync(
+                    completion.Step.Id,
+                    completion.ElapsedMilliseconds,
+                    completion.ExecutionAttempts,
+                    cancellationToken);
+            }
+            else
+            {
+                await observationRecorder.RecordCompletionAsync(
+                    completion.Step.Id,
+                    accepted: false,
+                    completion.ElapsedMilliseconds,
+                    completion.ExecutionAttempts,
+                    "invalid-outcome-qa",
+                    cancellationToken);
+            }
         }
         else
         {
@@ -2164,7 +4804,8 @@ public sealed class WorkflowEngine(
                         step.StartedAt,
                         step.CopilotSessionId,
                         step.CopilotSessionHome,
-                        step.PreMortemReviewStepId != null))
+                        step.PreMortemReviewStepId != null,
+                        step.Kind == FlowStepKind.OutcomeQa))
                 .ToListAsync(cancellationToken);
             failedStalledSteps = await (
                     from step in database.FlowSteps.AsNoTracking()
@@ -2179,8 +4820,10 @@ public sealed class WorkflowEngine(
                               retry.Iteration == step.Iteration &&
                               retry.AgentId == step.AgentId &&
                               retry.Sequence > step.Sequence &&
-                              retry.RetryOfStepId ==
-                              (step.RetryOfStepId ?? step.Id) &&
+                              retry.StableSemanticRootId ==
+                              (step.StableSemanticRootId ??
+                               step.RetryOfStepId ??
+                               step.Id) &&
                               retry.Status == StepStatus.Completed &&
                               (step.AgentRole != PreMortemRole ||
                                retry.PreMortemOriginStepId ==
@@ -2194,7 +4837,8 @@ public sealed class WorkflowEngine(
                         step.StartedAt,
                         step.CopilotSessionId,
                         step.CopilotSessionHome,
-                        step.PreMortemReviewStepId != null))
+                        step.PreMortemReviewStepId != null,
+                        step.Kind == FlowStepKind.OutcomeQa))
                 .ToListAsync(cancellationToken);
         }
 
@@ -2277,11 +4921,82 @@ public sealed class WorkflowEngine(
         }
         await flowDatabase.SaveChangesAsync(cancellationToken);
 
+        var resumedFlowIds = interruptedFlows
+            .Select(flow => flow.Id)
+            .ToHashSet();
+        var waitingGovernedFlows = await flowDatabase.Flows
+            .Where(flow =>
+                flow.Status == FlowStatus.WaitingForFeedback &&
+                flow.OutcomeVerificationJson != string.Empty)
+            .ToListAsync(cancellationToken);
+        foreach (var waitingFlow in waitingGovernedFlows)
+        {
+            try
+            {
+                var state = OutcomeVerificationRules.DeserializeAggregate(
+                    waitingFlow.OutcomeVerificationJson);
+                var steps = await flowDatabase.FlowSteps
+                    .Where(step =>
+                        step.FlowRunId == waitingFlow.Id &&
+                        step.Iteration == waitingFlow.Iteration)
+                    .ToListAsync(cancellationToken);
+                if (state.Status == OutcomeVerificationStatus.Passed)
+                {
+                    var current = await EnsurePassedReleaseGateAsync(
+                        flowDatabase,
+                        waitingFlow,
+                        state,
+                        steps,
+                        cancellationToken);
+                    if (!current)
+                    {
+                        waitingFlow.Status = FlowStatus.Queued;
+                        resumedFlowIds.Add(waitingFlow.Id);
+                    }
+                }
+                else if (state.Status ==
+                         OutcomeVerificationStatus.AwaitingHumanResolution)
+                {
+                    await EnsureOutcomeResolutionGateAsync(
+                        flowDatabase,
+                        waitingFlow,
+                        state,
+                        steps,
+                        cancellationToken);
+                }
+                else
+                {
+                    waitingFlow.Status = FlowStatus.Queued;
+                    waitingFlow.UpdatedAt = DateTimeOffset.UtcNow;
+                    resumedFlowIds.Add(waitingFlow.Id);
+                }
+            }
+            catch (Exception exception) when (
+                exception is
+                    OutcomeVerificationValidationException or
+                    CandidateValidationException or
+                    InvalidOperationException)
+            {
+                waitingFlow.Status = FlowStatus.Failed;
+                waitingFlow.FailureReason =
+                    "Outcome-verification restart reconciliation failed: " +
+                    exception.Message;
+                waitingFlow.UpdatedAt = DateTimeOffset.UtcNow;
+                flowDatabase.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = waitingFlow.Id,
+                    Type = "outcome.reconciliation.failed",
+                    Message = waitingFlow.FailureReason
+                });
+            }
+        }
+        await flowDatabase.SaveChangesAsync(cancellationToken);
+
         logger.LogInformation(
             "Reconciled {StepCount} interrupted step(s) across {FlowCount} flow(s).",
             interruptedSteps.Count + failedStalledSteps.Count,
-            interruptedFlows.Count);
-        return interruptedFlows.Select(flow => flow.Id).ToList();
+            resumedFlowIds.Count);
+        return resumedFlowIds.ToList();
     }
 
     private async Task<bool> TryRecoverCompletedFailedStepAsync(
@@ -2297,7 +5012,8 @@ public sealed class WorkflowEngine(
                 sessionId,
                 cancellationToken)
             : null;
-        if (snapshot is null || snapshot.State == CopilotSessionJournalState.Missing)
+        if (!candidate.IsOutcomeQa &&
+            (snapshot is null || snapshot.State == CopilotSessionJournalState.Missing))
         {
             snapshot = await sessionJournal.DiscoverLatestAsync(
                 copilotHome,
@@ -2311,10 +5027,11 @@ public sealed class WorkflowEngine(
                 State: CopilotSessionJournalState.Completed,
                 Result: { Success: true } recoveredResult
             } ||
-            !CopilotReasoningHost.IsRecoverableCompletedOutput(
-                candidate.AgentRole,
-                recoveredResult.OutputSummary,
-                candidate.IsPreMortemRevision) ||
+            !(candidate.IsOutcomeQa ||
+              CopilotReasoningHost.IsRecoverableCompletedOutput(
+                  candidate.AgentRole,
+                  recoveredResult.OutputSummary,
+                  candidate.IsPreMortemRevision)) ||
             !CopilotReasoningHost.IsRecoveryCurrent(
                 candidate.StartedAt,
                 snapshot.CompletedAt))
@@ -2322,6 +5039,14 @@ public sealed class WorkflowEngine(
             return false;
         }
 
+        var recoveredExecution = ToRecoveredExecutionResult(
+            recoveredResult,
+            snapshot.SessionId);
+        var governedPublicationOutput = await PrepareGovernedPublicationIfNeededAsync(
+            candidate.FlowId,
+            candidate.StepId,
+            recoveredExecution,
+            cancellationToken);
         StagedStepCompletion completion;
         await using (var database =
                      await databaseFactory.CreateDbContextAsync(cancellationToken))
@@ -2342,10 +5067,11 @@ public sealed class WorkflowEngine(
                 database,
                 flow.Id,
                 failedStep.Id,
-                ToRecoveredExecutionResult(recoveredResult, snapshot.SessionId),
+                recoveredExecution,
                 snapshot.CompletedAt ?? DateTimeOffset.UtcNow,
                 durationMilliseconds: null,
                 snapshot.SessionId,
+                governedPublicationOutput,
                 cancellationToken);
             ThrowIfCompletionBlocked(completion.GateRecord);
             RetargetSupersededRetryLinks(flow.Steps, failedStep);
@@ -2379,6 +5105,258 @@ public sealed class WorkflowEngine(
 
         await RecordCompletionObservationAsync(completion, cancellationToken);
         return true;
+    }
+
+    internal async Task<FlowRun> ResolveOutcomeAsync(
+        Guid flowId,
+        Guid gateId,
+        OutcomeResolutionAction action,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(reason) || reason.Trim().Length > 1_000)
+        {
+            throw new ArgumentException(
+                "Outcome resolution requires a reason containing 1-1000 characters.",
+                nameof(reason));
+        }
+
+        await _manualRestartGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var database =
+                await databaseFactory.CreateDbContextAsync(cancellationToken);
+            await using var transaction =
+                await database.Database.BeginTransactionAsync(cancellationToken);
+            var flow = await database.Flows
+                .AsSplitQuery()
+                .Include(item => item.Steps)
+                .ThenInclude(step => step.ToolCalls)
+                .Include(item => item.Steps)
+                .ThenInclude(step => step.RoutingDecisions)
+                .ThenInclude(decision => decision.TaskProfile)
+                .Include(item => item.Messages)
+                .Include(item => item.Events)
+                .Include(item => item.GateRecords)
+                .SingleOrDefaultAsync(item => item.Id == flowId, cancellationToken)
+                ?? throw new KeyNotFoundException(
+                    $"Factory flow '{flowId}' was not found.");
+            if (flow.Status != FlowStatus.WaitingForFeedback ||
+                string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+            {
+                throw new InvalidOperationException(
+                    "Only a governed flow awaiting outcome resolution can be continued or replanned.");
+            }
+            var state = OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson);
+            if (state.Status != OutcomeVerificationStatus.AwaitingHumanResolution)
+            {
+                throw new InvalidOperationException(
+                    "The flow is not awaiting an outcome-resolution decision.");
+            }
+            var gate = flow.GateRecords.SingleOrDefault(item =>
+                item.Id == gateId &&
+                item.ActionType == HandoffActionType.OutcomeResolution &&
+                !item.Resolved)
+                ?? throw new InvalidOperationException(
+                    "The requested outcome-resolution gate is not current.");
+            if (action == OutcomeResolutionAction.Continue &&
+                state.ManualRoundsGranted >= 10)
+            {
+                throw new InvalidOperationException(
+                    "This iteration already used the maximum ten manually added QA rounds.");
+            }
+            if (!Enum.IsDefined(action))
+            {
+                throw new ArgumentOutOfRangeException(nameof(action), action, null);
+            }
+            var resolved = handoffGate.PrepareResolution(
+                gate,
+                approved: true,
+                "operator",
+                $"{action}: {reason.Trim()}");
+
+            if (action == OutcomeResolutionAction.Continue)
+            {
+                state.ManualRoundsGranted++;
+                state.MaxRounds++;
+                var latest = state.Rounds
+                    .OrderByDescending(item => item.Round)
+                    .FirstOrDefault();
+                if (state.Stale)
+                {
+                    state.Status = OutcomeVerificationStatus.AwaitingCandidateRefresh;
+                }
+                else if (latest?.Result?.PlanGaps.Count > 0 &&
+                         string.Equals(
+                             latest.AcceptancePlanHash,
+                             state.AcceptancePlan?.Hash,
+                             StringComparison.Ordinal))
+                {
+                    state.Status = OutcomeVerificationStatus.Correcting;
+                }
+                else if (latest?.Result is not null)
+                {
+                    var correctableIds = latest.Result.Criteria
+                        .Where(item => item.Status != OutcomeCriterionStatus.PASS)
+                        .Where(item => item.ResponsibleRoles.Count > 0)
+                        .Select(item => item.CriterionId)
+                        .ToHashSet(StringComparer.Ordinal);
+                    state.PendingOwnerRoles = DerivePendingOwnerRoles(
+                        state,
+                        correctableIds);
+                    state.Status = state.PendingOwnerRoles.Count > 0
+                        ? OutcomeVerificationStatus.Correcting
+                        : OutcomeVerificationStatus.AwaitingQa;
+                }
+                else
+                {
+                    state.Status = OutcomeVerificationStatus.AwaitingQa;
+                }
+                state.UpdatedAt = DateTimeOffset.UtcNow;
+                flow.OutcomeVerificationJson =
+                    OutcomeVerificationRules.SerializeAggregate(state);
+                flow.Status = FlowStatus.Queued;
+                flow.FailureReason = string.Empty;
+                flow.OutcomeLabel = string.Empty;
+                flow.OutcomeUrl = string.Empty;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = gate.FlowStepId,
+                    Type = "outcome.resolution.continued",
+                    Message =
+                        $"Operator granted exactly one additional QA round. Reason: {reason.Trim()}"
+                });
+            }
+            else if (action == OutcomeResolutionAction.Replan)
+            {
+                flow.Iteration++;
+                state = OutcomeVerificationRules.StartNextIteration(
+                    state,
+                    flow.Iteration,
+                    workflowProvider.GetValidated()
+                        .Config.OutcomeVerification.MaxRounds);
+                flow.OutcomeVerificationJson =
+                    OutcomeVerificationRules.SerializeAggregate(state);
+                flow.Status = FlowStatus.Queued;
+                flow.FailureReason = string.Empty;
+                flow.CompletedAt = null;
+                flow.OutcomeLabel = string.Empty;
+                flow.OutcomeUrl = string.Empty;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = gate.FlowStepId,
+                    Type = "outcome.resolution.replanned",
+                    Message =
+                        $"Operator began iteration {flow.Iteration} with a new acceptance plan. " +
+                        $"Reason: {reason.Trim()}"
+                });
+            }
+            else
+            {
+                throw new ArgumentOutOfRangeException(nameof(action), action, null);
+            }
+
+            gate.Resolved = resolved.Resolved;
+            gate.Approved = resolved.Approved;
+            gate.ResolvedBy = resolved.ResolvedBy;
+            gate.ResolutionNote = resolved.ResolutionNote;
+            gate.ResolvedAt = resolved.ResolvedAt;
+            await database.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            handoffGate.RestoreHistory([resolved]);
+            return flow;
+        }
+        finally
+        {
+            _manualRestartGate.Release();
+        }
+    }
+
+    internal async Task<bool> EnsureVerifiedCandidateCurrentAsync(
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await _manualRestartGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var database =
+                await databaseFactory.CreateDbContextAsync(cancellationToken);
+            var flow = await database.Flows.SingleOrDefaultAsync(
+                item => item.Id == flowId,
+                cancellationToken)
+                ?? throw new KeyNotFoundException(
+                    $"Factory flow '{flowId}' was not found.");
+            if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+            {
+                return true;
+            }
+            var state = OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson);
+            if (state.Status != OutcomeVerificationStatus.Passed ||
+                state.CurrentCandidate is null ||
+                state.Stale ||
+                !string.Equals(
+                    state.CurrentCandidate.Fingerprint,
+                    state.VerifiedCandidateFingerprint,
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var current = false;
+            string? staleReason = null;
+            try
+            {
+                current = await (candidateFingerprintService
+                    ?? throw new InvalidOperationException(
+                        "No candidate fingerprint service is configured."))
+                    .IsCurrentAsync(
+                        flow,
+                        state.CurrentCandidate,
+                        CandidateFingerprintService.RequiresPreview(
+                            state.AcceptancePlan),
+                        cancellationToken);
+            }
+            catch (CandidateValidationException exception)
+            {
+                staleReason = exception.Message;
+            }
+            if (current)
+            {
+                return true;
+            }
+            if (flow.Status == FlowStatus.Approved)
+            {
+                return false;
+            }
+
+            await using var transaction =
+                await database.Database.BeginTransactionAsync(cancellationToken);
+            await MarkCandidateStaleAsync(
+                database,
+                flow,
+                state,
+                null,
+                "Candidate changed before customer preview access; unverified content was not served. " +
+                (staleReason ?? string.Empty),
+                cancellationToken);
+            flow.Status = FlowStatus.Queued;
+            flow.OutcomeUrl = string.Empty;
+            flow.OutcomeLabel = string.Empty;
+            flow.UpdatedAt = DateTimeOffset.UtcNow;
+            await database.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return false;
+        }
+        finally
+        {
+            _manualRestartGate.Release();
+        }
     }
 
     internal async Task<FlowRun> RestartFailedFlowAsync(
@@ -2426,7 +5404,9 @@ public sealed class WorkflowEngine(
                     AgentRunPhase.Stalled or
                     AgentRunPhase.TimedOut or
                     AgentRunPhase.CanceledByReconciliation;
-            if ((snapshot is null || snapshot.State == CopilotSessionJournalState.Missing) &&
+            var isOutcomeQa = IsOutcomeQaStep(failedStep);
+            if (!isOutcomeQa &&
+                (snapshot is null || snapshot.State == CopilotSessionJournalState.Missing) &&
                 canHaveRecoverableJournal)
             {
                 snapshot = await sessionJournal.DiscoverLatestAsync(
@@ -2457,24 +5437,35 @@ public sealed class WorkflowEngine(
                 failedStep.Status == StepStatus.Failed &&
                 (failedStep.AgentRole == PreMortemRole ||
                  failedStep.Phase is AgentRunPhase.Stalled or AgentRunPhase.TimedOut) &&
-                CopilotReasoningHost.IsRecoverableCompletedOutput(
-                    failedStep.AgentRole,
-                    recoveredResult.OutputSummary,
-                    failedStep.PreMortemReviewStepId is not null) &&
+                (isOutcomeQa ||
+                 CopilotReasoningHost.IsRecoverableCompletedOutput(
+                     failedStep.AgentRole,
+                     recoveredResult.OutputSummary,
+                     failedStep.PreMortemReviewStepId is not null)) &&
                 CopilotReasoningHost.IsRecoveryCurrent(
                     failedStep.StartedAt,
                     snapshot.CompletedAt))
             {
+                var recoveredExecution = ToRecoveredExecutionResult(
+                    recoveredResult,
+                    snapshot.SessionId);
+                var governedPublicationOutput =
+                    await PrepareGovernedPublicationIfNeededAsync(
+                        flow.Id,
+                        failedStep.Id,
+                        recoveredExecution,
+                        cancellationToken);
                 await using var transaction =
                     await database.Database.BeginTransactionAsync(cancellationToken);
                 var completion = await StageCompletedStepAsync(
                     database,
                     flow.Id,
                     failedStep.Id,
-                    ToRecoveredExecutionResult(recoveredResult, snapshot.SessionId),
+                    recoveredExecution,
                     snapshot.CompletedAt ?? DateTimeOffset.UtcNow,
                     durationMilliseconds: null,
                     snapshot.SessionId,
+                    governedPublicationOutput,
                     cancellationToken);
                 ThrowIfCompletionBlocked(completion.GateRecord);
                 RetargetSupersededRetryLinks(flow.Steps, failedStep);
@@ -2552,6 +5543,7 @@ public sealed class WorkflowEngine(
                     AgentName = failedStep.AgentName,
                     AgentRole = failedStep.AgentRole,
                     Label = $"{ManualRestartLabelPrefix}{failedStep.AgentName}",
+                    Kind = failedStep.Kind,
                     Status = StepStatus.Pending,
                     Phase = canResume
                         ? AgentRunPhase.CanceledByReconciliation
@@ -2571,9 +5563,12 @@ public sealed class WorkflowEngine(
                         ? snapshot!.CopilotHome
                         : string.Empty,
                     RemotePublicationAllowed = failedStep.RemotePublicationAllowed,
-                    RetryOfStepId = failedStep.RetryOfStepId ?? failedStep.Id,
+                    RetryOfStepId = GetRetryRootId(failedStep),
                     DependsOnStepId = failedStep.DependsOnStepId,
                     PushbackRootStepId = failedStep.PushbackRootStepId,
+                    OutcomeQaRound = failedStep.OutcomeQaRound,
+                    OutcomePlanHash = failedStep.OutcomePlanHash,
+                    StableSemanticRootId = GetStableSemanticRootId(failedStep),
                     PreMortemOriginStepId = failedStep.PreMortemOriginStepId,
                     PreMortemTargetStepId = failedStep.PreMortemTargetStepId,
                     PreMortemReviewStepId = failedStep.PreMortemReviewStepId
@@ -2596,6 +5591,10 @@ public sealed class WorkflowEngine(
                 retryStep.Phase = canResume
                     ? AgentRunPhase.CanceledByReconciliation
                     : AgentRunPhase.PreparingWorkspace;
+                retryStep.Kind = failedStep.Kind;
+                retryStep.OutcomeQaRound = failedStep.OutcomeQaRound;
+                retryStep.OutcomePlanHash = failedStep.OutcomePlanHash;
+                retryStep.StableSemanticRootId = GetStableSemanticRootId(failedStep);
                 if (retryStep.DependsOnStepId is null)
                 {
                     retryStep.InputSummary = priorAssignment;
@@ -2621,6 +5620,7 @@ public sealed class WorkflowEngine(
             {
                 review.PreMortemTargetStepId = retryStep.Id;
             }
+            RebindActiveQaRetry(flow, failedStep, retryStep);
 
             var failureReason = flow.FailureReason;
             flow.Status = FlowStatus.Queued;
@@ -2709,7 +5709,8 @@ public sealed class WorkflowEngine(
                 cancellationToken)
             : null;
         var discovered = false;
-        if (snapshot is null || snapshot.State == CopilotSessionJournalState.Missing)
+        if (!candidate.IsOutcomeQa &&
+            (snapshot is null || snapshot.State == CopilotSessionJournalState.Missing))
         {
             snapshot = await sessionJournal.DiscoverLatestAsync(
                 copilotHome,
@@ -2722,10 +5723,11 @@ public sealed class WorkflowEngine(
 
         if (snapshot?.State == CopilotSessionJournalState.Completed &&
             snapshot.Result is { Success: true } recoveredResult &&
-            CopilotReasoningHost.IsRecoverableCompletedOutput(
-                candidate.AgentRole,
-                recoveredResult.OutputSummary,
-                candidate.IsPreMortemRevision) &&
+            (candidate.IsOutcomeQa ||
+             CopilotReasoningHost.IsRecoverableCompletedOutput(
+                 candidate.AgentRole,
+                 recoveredResult.OutputSummary,
+                 candidate.IsPreMortemRevision)) &&
             CopilotReasoningHost.IsRecoveryCurrent(
                 candidate.StartedAt,
                 snapshot.CompletedAt))
@@ -2968,6 +5970,10 @@ public sealed class WorkflowEngine(
                             retry.FlowRunId == step.FlowRunId &&
                             retry.Iteration == step.Iteration &&
                             retry.AgentId == step.AgentId &&
+                            retry.StableSemanticRootId ==
+                            (step.StableSemanticRootId ??
+                             step.RetryOfStepId ??
+                             step.Id) &&
                             retry.Attempt > step.Attempt &&
                             retry.Sequence > step.Sequence &&
                             retry.Status != StepStatus.Skipped))
@@ -3031,6 +6037,13 @@ public sealed class WorkflowEngine(
             upstreamOwner,
             revisionAttempt);
         database.FlowSteps.AddRange(revisionStep, retryStep);
+        if (IsOutcomeQaStep(blockedStep))
+        {
+            var storedFlow = await database.Flows.SingleAsync(
+                item => item.Id == flow.Id,
+                cancellationToken);
+            RebindActiveQaRetry(storedFlow, blockedStep, retryStep);
+        }
         database.FlowEvents.Add(new FlowEvent
         {
             FlowRunId = flow.Id,
@@ -3087,6 +6100,7 @@ public sealed class WorkflowEngine(
             AgentName = blockedStep.AgentName,
             AgentRole = blockedStep.AgentRole,
             Label = $"Retry after {upstreamOwner.Name} revision",
+            Kind = blockedStep.Kind,
             RemotePublicationAllowed = blockedStep.RemotePublicationAllowed,
             Status = StepStatus.Pending,
             Attempt = blockedStep.Attempt + 1,
@@ -3094,10 +6108,13 @@ public sealed class WorkflowEngine(
                 $"{upstreamOwner.Name} is revising the rejected handoff. " +
                 "Resume this role after the corrected handoff is attached to the retry.",
             RetryOfStepId =
-                blockedStep.RetryOfStepId ?? blockedStep.Id,
+                GetRetryRootId(blockedStep),
             DependsOnStepId = revisionStep.Id,
             PushbackRootStepId =
                 blockedStep.PushbackRootStepId ?? blockedStep.Id,
+            OutcomeQaRound = blockedStep.OutcomeQaRound,
+            OutcomePlanHash = blockedStep.OutcomePlanHash,
+            StableSemanticRootId = GetStableSemanticRootId(blockedStep),
             PreMortemOriginStepId = blockedStep.PreMortemOriginStepId,
             PreMortemTargetStepId = blockedStep.PreMortemTargetStepId,
             PreMortemReviewStepId = blockedStep.PreMortemReviewStepId
@@ -3291,6 +6308,21 @@ public sealed class WorkflowEngine(
         var flow = await database.Flows.SingleAsync(item => item.Id == flowId, cancellationToken);
         flow.WorkspacePath = workspace.Path;
         flow.BranchName = workspace.BranchName;
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+            workspace.TrustedRepositories is { Count: > 0 })
+        {
+            var state = OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson);
+            state.TrustedRepositories = workspace.TrustedRepositories
+                .Select(item => new OutcomeTrustedRepository(
+                    item.RelativePath,
+                    item.RemoteRepository))
+                .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+                .ToList();
+            state.UpdatedAt = DateTimeOffset.UtcNow;
+            flow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(state);
+        }
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);
     }
@@ -3298,13 +6330,164 @@ public sealed class WorkflowEngine(
     internal static IReadOnlyDictionary<string, AgentRecord> BuildUpstreamOwners(
         IReadOnlyList<PlannedAgent> plan)
     {
+        var orderedPlan = FlowPlanner.OrderGovernedRoles(plan);
         var owners = new Dictionary<string, AgentRecord>(StringComparer.Ordinal);
-        for (var index = 1; index < plan.Count; index++)
+        for (var index = 1; index < orderedPlan.Count; index++)
         {
-            owners[plan[index].Agent.Id] = plan[index - 1].Agent;
+            owners[orderedPlan[index].Agent.Id] =
+                orderedPlan[index - 1].Agent;
         }
         return owners;
     }
+
+    private async Task<string> BuildOutcomeAssignmentAsync(
+        Guid flowId,
+        string role,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var json = await database.Flows
+            .AsNoTracking()
+            .Where(item => item.Id == flowId)
+            .Select(item => item.OutcomeVerificationJson)
+            .SingleAsync(cancellationToken);
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return string.Empty;
+        }
+
+        var state = OutcomeVerificationRules.DeserializeAggregate(json);
+        return BuildCriterionAssignment(state, role);
+    }
+
+    private static string AppendOutcomeAssignment(
+        string assignment,
+        string outcomeAssignment) =>
+        string.IsNullOrWhiteSpace(outcomeAssignment)
+            ? assignment
+            : $"{assignment}{Environment.NewLine}{Environment.NewLine}" +
+              outcomeAssignment;
+
+    private static (string Context, string Contract) BuildOutcomePrompt(
+        FlowRun flow,
+        FlowStep step)
+    {
+        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            return (
+                "This is a legacy flow without an outcome-verification cycle.",
+                "No outcome-verification machine document is required for this legacy flow.");
+        }
+
+        var state = OutcomeVerificationRules.DeserializeAggregate(
+            flow.OutcomeVerificationJson);
+        var context = BuildCriterionAssignment(state, step.AgentRole);
+        if (step.AgentRole == "team-lead")
+        {
+            return (context, TeamLeadOutcomeContract());
+        }
+        if (IsOutcomeQaStep(step))
+        {
+            return (context, QaOutcomeContract());
+        }
+        if (step.AgentRole is "pre-mortem-sceptic" or "product-manager")
+        {
+            return (context, "No outcome-verification machine document is required in this turn.");
+        }
+        if (step.RemotePublicationAllowed)
+        {
+            return (
+                context,
+                "Publish only the already verified candidate. Do not change product files. " +
+                "Report the exact published commit and tree identities.");
+        }
+
+        var assigned = state.AcceptancePlan?.Criteria.Any(criterion =>
+            criterion.OwnerRoles.Contains(step.AgentRole, StringComparer.Ordinal)) == true;
+        return (
+            context,
+            assigned
+                ? DeliveryEvidenceOutcomeContract()
+                : "No acceptance criterion is assigned to this role; no outcome-evidence document is required.");
+    }
+
+    internal static string BuildCriterionAssignment(
+        OutcomeVerificationState state,
+        string role)
+    {
+        if (state.AcceptancePlan is null)
+        {
+            var previous = state.PriorIterations
+                .OrderByDescending(item => item.Iteration)
+                .FirstOrDefault();
+            return previous is null
+                ?
+                $"Outcome verification status: {state.Status}. " +
+                "Create the acceptance plan for the confirmed brief before delivery begins."
+                :
+                $"Outcome verification status: {state.Status}. Create a complete acceptance " +
+                $"plan for iteration {state.Iteration}. Preserve criterion IDs for unchanged " +
+                $"requirement lineage and append IDs for new requirements.{Environment.NewLine}" +
+                $"Previous plan:{Environment.NewLine}" +
+                OutcomeVerificationRules.SerializeCanonical(new
+                {
+                    previous.AcceptancePlan,
+                    previous.Rounds
+                });
+        }
+
+        var criteria = string.Equals(role, "quality-engineer", StringComparison.Ordinal)
+            ? state.AcceptancePlan.Criteria
+            : state.AcceptancePlan.Criteria
+                .Where(criterion =>
+                    criterion.OwnerRoles.Contains(role, StringComparer.Ordinal))
+                .ToArray();
+        var lines = new List<string>
+        {
+            $"Acceptance plan: {state.AcceptancePlan.Hash}",
+            $"Outcome status: {state.Status}",
+            $"QA rounds used: {state.Rounds.Count}/{state.MaxRounds}"
+        };
+        if (criteria.Count == 0)
+        {
+            lines.Add($"Assigned criteria for {role}: none.");
+        }
+        else
+        {
+            lines.Add($"Assigned criteria for {role}:");
+            lines.AddRange(criteria.Select(criterion =>
+                $"- {criterion.Id}: {criterion.Requirement}{Environment.NewLine}" +
+                $"  Verification: {criterion.Verification}{Environment.NewLine}" +
+                $"  Allowed evidence: {string.Join(", ", criterion.EvidenceKinds)}"));
+        }
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    internal static string TeamLeadOutcomeContract() => $$"""
+        After the task-profile and pre-mortem documents, output exactly one acceptance plan between these standalone markers:
+        {{OutcomeVerificationRules.AcceptanceBeginMarker}}
+        {"Version":"outcome-acceptance-v1","Criteria":[{"Id":"AC-001","Requirement":"observable customer or system outcome","Verification":"Run or inspect a concrete check and state the observable expected result.","OwnerRoles":["software-engineer"],"EvidenceKinds":["Test"],"CustomerVisible":true}]}
+        {{OutcomeVerificationRules.AcceptanceEndMarker}}
+        Property names and enum casing are exact. Define 1-12 criteria with IDs sequentially from AC-001. Each criterion must be an observable outcome, not an activity; name 1-3 unique owners from the supplied downstream plan; never assign quality-engineer; assign release-engineer only to packaging, preview, publication, or release outcomes; and select 1-4 evidence kinds from Test, Command, Artifact, Observation, and SourceInspection. Set CustomerVisible true only when the customer must inspect a generated preview; every such criterion requires a .customer-preview artifact. File existence alone is not verification. Do not emit any marker more than once or inside a Markdown fence.
+        Do not select quality-engineer as a pre-mortem checkpoint in a governed flow; the outcome QA round is the independent authoritative verification.
+        """;
+
+    internal static string DeliveryEvidenceOutcomeContract() => $$"""
+        After the normal handoff, output exactly one evidence document between these standalone markers:
+        {{OutcomeVerificationRules.EvidenceBeginMarker}}
+        {"Version":"outcome-evidence-v1","Items":[{"CriterionId":"AC-001","Disposition":"Supports","Kind":"Test","Locator":"exact command, artifact, observation, or source location","ObservedResult":"concrete observed result","ExitCode":0,"ContentDigest":null}]}
+        {{OutcomeVerificationRules.EvidenceEndMarker}}
+        Report evidence only for criterion IDs assigned to this role. Include at least one concrete item for every assigned criterion. Disposition is Supports, Contradicts, or Inconclusive. Kind must be allowed by that criterion. ContentDigest is null or sha256 followed by 64 lowercase hexadecimal characters. Evidence is a claim for independent QA to verify; it never marks a criterion PASS.
+        """;
+
+    internal static string QaOutcomeContract() => $$"""
+        Inspect the actual candidate and independently verify every acceptance criterion. Upstream evidence is context, never proof by itself. Output exactly one result document between these standalone markers:
+        {{OutcomeVerificationRules.QaBeginMarker}}
+        {"Version":"outcome-qa-v1","AcceptancePlanHash":"sha256:...","CandidateFingerprint":"sha256:...","Verdict":"FAIL","Criteria":[{"CriterionId":"AC-001","Status":"FAIL","EvidenceIds":[],"ChecksPerformed":[{"Kind":"Command","Locator":"exact check","ObservedResult":"observed result","ExitCode":1}],"Rationale":"bounded evidence-based rationale","ResponsibleRoles":["software-engineer"],"Remediation":"specific correction"}],"PlanGaps":[]}
+        {{OutcomeVerificationRules.QaEndMarker}}
+        Return exactly one criterion result in plan order. PASS has checks, no responsible roles, and no remediation. FAIL names only criterion owners and requires remediation. BLOCKED clearly identifies the blocker. Report up to three confirmed-requirement omissions in PlanGaps. Never infer PASS from prose or artifact existence.
+        """;
 
     internal static string BuildStepTask(string customerTask, string inputSummary)
     {
@@ -3377,8 +6560,8 @@ public sealed class WorkflowEngine(
                     retry.Iteration == step.Iteration &&
                     retry.AgentId == step.AgentId &&
                     retry.Sequence > step.Sequence &&
-                    retry.RetryOfStepId ==
-                    (step.RetryOfStepId ?? step.Id) &&
+                    GetStableSemanticRootId(retry) ==
+                    GetStableSemanticRootId(step) &&
                     (retry.Status is
                         StepStatus.Pending or
                         StepStatus.Running or
@@ -3402,6 +6585,8 @@ public sealed class WorkflowEngine(
                     retry.FlowRunId == step.FlowRunId &&
                     retry.Iteration == step.Iteration &&
                     retry.AgentId == step.AgentId &&
+                    GetStableSemanticRootId(retry) ==
+                    GetStableSemanticRootId(step) &&
                     retry.Sequence > step.Sequence &&
                     retry.Attempt > step.Attempt &&
                     retry.Status != StepStatus.Skipped))
@@ -3413,14 +6598,13 @@ public sealed class WorkflowEngine(
         FlowStep failedStep,
         IEnumerable<FlowStep> steps)
     {
-        var retryRootStepId =
-            failedStep.RetryOfStepId ?? failedStep.Id;
+        var retryRootStepId = GetStableSemanticRootId(failedStep);
         return steps
             .Where(step =>
                 step.FlowRunId == failedStep.FlowRunId &&
                 step.Iteration == failedStep.Iteration &&
                 step.AgentId == failedStep.AgentId &&
-                step.RetryOfStepId == retryRootStepId &&
+                GetStableSemanticRootId(step) == retryRootStepId &&
                 step.Sequence > failedStep.Sequence &&
                 step.Status == StepStatus.Skipped &&
                 step.Phase != AgentRunPhase.Succeeded)
@@ -3451,8 +6635,9 @@ public sealed class WorkflowEngine(
     internal static bool IsSupersededRetry(
         FlowStep candidate,
         FlowStep recoveredStep) =>
-        candidate.RetryOfStepId ==
-        (recoveredStep.RetryOfStepId ?? recoveredStep.Id);
+        candidate.Id != recoveredStep.Id &&
+        GetStableSemanticRootId(candidate) ==
+        GetStableSemanticRootId(recoveredStep);
 
     internal static int RetargetSupersededRetryLinks(
         IEnumerable<FlowStep> steps,
@@ -3496,7 +6681,7 @@ public sealed class WorkflowEngine(
                 item.AgentId == source.AgentId &&
                 item.Status != StepStatus.Skipped &&
                 (item.Id == source.Id ||
-                 item.RetryOfStepId == (source.RetryOfStepId ?? source.Id)))
+                 GetStableSemanticRootId(item) == GetStableSemanticRootId(source)))
             .OrderByDescending(item => item.Sequence)
             .ThenByDescending(item => item.StartedAt)
             .FirstOrDefault()
@@ -3564,6 +6749,17 @@ public sealed class WorkflowEngine(
             ? value
             : value[..maxCharacters] + "...";
 
+    private static string PrefixDigest(string digest) =>
+        digest[..Math.Min(digest.Length, 19)];
+
+    internal static bool IsPublishedPullRequestLabel(string label) =>
+        label.StartsWith(
+            "Published pull request #",
+            StringComparison.Ordinal) ||
+        label.StartsWith(
+            "Published pull requests · ",
+            StringComparison.Ordinal);
+
     private async Task AddEventAsync(
         Guid flowId,
         Guid? stepId,
@@ -3625,6 +6821,36 @@ public sealed class WorkflowEngine(
     {
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var flow = await database.Flows.SingleAsync(item => item.Id == flowId, cancellationToken);
+        var governed = !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson);
+        var outcome = governed
+            ? OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson)
+            : null;
+        if (outcome?.Status == OutcomeVerificationStatus.AwaitingHumanResolution)
+        {
+            var hasResolutionGate = await database.GateRecords.AnyAsync(
+                item =>
+                    item.FlowRunId == flowId &&
+                    item.ActionType == HandoffActionType.OutcomeResolution &&
+                    !item.Resolved,
+                cancellationToken);
+            if (!hasResolutionGate)
+            {
+                throw new InvalidOperationException(
+                    "Outcome verification requires a persisted human-resolution gate.");
+            }
+            flow.Status = FlowStatus.WaitingForFeedback;
+            flow.OutcomeUrl = string.Empty;
+            flow.OutcomeLabel = "Outcome verification needs resolution";
+            flow.UpdatedAt = DateTimeOffset.UtcNow;
+            await database.SaveChangesAsync(cancellationToken);
+            return;
+        }
+        if (governed && outcome?.Status != OutcomeVerificationStatus.Passed)
+        {
+            throw new InvalidOperationException(
+                $"A governed flow cannot enter customer review while outcome verification is '{outcome?.Status}'.");
+        }
         var latestReleaseGate = await database.GateRecords
             .Where(item =>
                 item.FlowRunId == flowId &&
@@ -3653,10 +6879,15 @@ public sealed class WorkflowEngine(
                     "Customer approval was recorded, but the approved release publication did not complete.");
             if (flow.Outcome == OutcomeType.PullRequest)
             {
+                var publicationVerified =
+                    string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) ||
+                    OutcomeVerificationRules
+                        .DeserializeAggregate(flow.OutcomeVerificationJson)
+                        .Publication?.Status ==
+                    OutcomePublicationStatus.Verified;
                 if (string.IsNullOrWhiteSpace(flow.OutcomeUrl) ||
-                    !flow.OutcomeLabel.StartsWith(
-                        "Published pull request #",
-                        StringComparison.Ordinal))
+                    !publicationVerified ||
+                    !IsPublishedPullRequestLabel(flow.OutcomeLabel))
                 {
                     throw new InvalidOperationException(
                         "The customer-approved pull request publication was not verified.");
@@ -3706,6 +6937,11 @@ public sealed class WorkflowEngine(
         }
         if (!hasReleaseGate)
         {
+            if (governed)
+            {
+                throw new InvalidOperationException(
+                    "A governed flow has a current PASS but no authoritative QA release gate.");
+            }
             var lastCompletedStep = await database.FlowSteps
                 .Where(item =>
                     item.FlowRunId == flowId &&
@@ -3830,18 +7066,26 @@ public sealed class WorkflowEngine(
         DateTimeOffset? StartedAt,
         Guid? CopilotSessionId,
         string CopilotSessionHome,
-        bool IsPreMortemRevision);
+        bool IsPreMortemRevision,
+        bool IsOutcomeQa);
 
     private sealed record StagedStepCompletion(
         FlowStep Step,
         HandoffGateRecord GateRecord,
         bool PushedBack,
+        bool ContractInvalid,
         long ElapsedMilliseconds,
-        int ExecutionAttempts);
+        int ExecutionAttempts,
+        IReadOnlyList<HandoffGateRecord> PreparedGateUpdates);
 
-    private sealed record TeamLeadContract(
+    private sealed record QaCompletion(
+        bool ContractInvalid,
+        bool ReleaseReady);
+
+    internal sealed record TeamLeadContract(
         IReadOnlyList<TaskProfile> Profiles,
-        IReadOnlySet<string> PreMortemAfterRoles);
+        IReadOnlySet<string> PreMortemAfterRoles,
+        OutcomeAcceptancePlan? AcceptancePlan);
 }
 
 public interface IFlowExecutionController

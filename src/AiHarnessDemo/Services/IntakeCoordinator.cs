@@ -5,6 +5,7 @@ using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Data;
 using Microsoft.EntityFrameworkCore;
 
@@ -20,7 +21,8 @@ public sealed partial class IntakeCoordinator(
     IWorkspaceManager workspaceManager,
     HandoffGateEngine handoffGate,
     RepositoryContextGate contextGate,
-    FlowQueue flowQueue)
+    FlowQueue flowQueue,
+    WorkflowDefinitionProvider workflowProvider)
 {
     [GeneratedRegex(
         @"(?im)^\s*(?:\*\*)?INTAKE_STATUS(?:\*\*)?\s*:\s*(NEEDS_CLARIFICATION|AWAITING_CONFIRMATION|CONFIRMED)\s*$")]
@@ -99,13 +101,34 @@ public sealed partial class IntakeCoordinator(
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);
 
-        var workspace = string.IsNullOrWhiteSpace(flow.WorkspacePath)
-            ? await workspaceManager.PrepareAsync(flow, cancellationToken)
-            : new WorkspaceInfo(flow.WorkspacePath, flow.BranchName, CreatedNow: false);
+        var workspace = await workspaceManager.PrepareAsync(
+            flow,
+            cancellationToken);
+        var workspaceStateChanged = false;
         if (string.IsNullOrWhiteSpace(flow.WorkspacePath))
         {
             flow.WorkspacePath = workspace.Path;
             flow.BranchName = workspace.BranchName;
+            workspaceStateChanged = true;
+        }
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+            workspace.TrustedRepositories is { Count: > 0 })
+        {
+            var outcomeState = OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson);
+            outcomeState.TrustedRepositories = workspace.TrustedRepositories
+                .Select(item => new OutcomeTrustedRepository(
+                    item.RelativePath,
+                    item.RemoteRepository))
+                .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+                .ToList();
+            outcomeState.UpdatedAt = DateTimeOffset.UtcNow;
+            flow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(outcomeState);
+            workspaceStateChanged = true;
+        }
+        if (workspaceStateChanged)
+        {
             await database.SaveChangesAsync(cancellationToken);
         }
 
@@ -185,6 +208,18 @@ public sealed partial class IntakeCoordinator(
                     learnings,
                     ModelSelectionStrategy: settings.ModelSelectionStrategy,
                     ExpectedAcceptedTimeSeconds: routing.PredictedAcceptedTimeSeconds,
+                    IsGovernedOutcomeVerification:
+                        !string.IsNullOrWhiteSpace(
+                            flow.OutcomeVerificationJson),
+                    GovernedRepositoryRelativePaths:
+                        string.IsNullOrWhiteSpace(
+                            flow.OutcomeVerificationJson)
+                            ? null
+                            : OutcomeVerificationRules.DeserializeAggregate(
+                                    flow.OutcomeVerificationJson)
+                                .TrustedRepositories
+                                .Select(repository => repository.RelativePath)
+                                .ToArray(),
                     Progress: progress =>
                     {
                         if (progress.ExecutionPrompt is not null)
@@ -288,7 +323,14 @@ public sealed partial class IntakeCoordinator(
                 FlowStepId = intakeStep.Id,
                 ToolName = toolCall.ToolName,
                 ArgumentsSummary = toolCall.ArgumentsSummary,
-                Succeeded = toolCall.Succeeded
+                Succeeded = toolCall.Succeeded,
+                ToolType = toolCall.ToolType,
+                NormalizedCommand = toolCall.NormalizedCommand,
+                NormalizedArguments = toolCall.NormalizedArguments,
+                WorkingDirectory = toolCall.WorkingDirectory,
+                ExitCode = toolCall.ExitCode,
+                ResultDigest = toolCall.ResultDigest,
+                ResultSummary = toolCall.ResultSummary
             };
             intakeStep.ToolCalls.Add(storedCall);
             database.Entry(storedCall).State = EntityState.Added;
@@ -454,7 +496,16 @@ public sealed partial class IntakeCoordinator(
         return queuedEvent;
     }
 
-    private static FlowRun CreateFlow(string message, HarnessSettings settings) =>
+    private FlowRun CreateFlow(string message, HarnessSettings settings)
+    {
+        var outcomeConfig = workflowProvider.GetValidated().Config.OutcomeVerification;
+        var outcomeState = outcomeConfig.Enabled
+            ? OutcomeVerificationRules.SerializeAggregate(
+                OutcomeVerificationRules.CreateInitialState(
+                    iteration: 1,
+                    outcomeConfig.MaxRounds))
+            : string.Empty;
+        return
         new()
         {
             Title = BuildTitle(message),
@@ -464,8 +515,10 @@ public sealed partial class IntakeCoordinator(
             RepositoryKnowledge = settings.RepositoryKnowledge,
             Outcome = settings.Outcome,
             ModelSelectionStrategy = settings.ModelSelectionStrategy,
-            RuntimeMarker = "LiveCopilot"
+            RuntimeMarker = "LiveCopilot",
+            OutcomeVerificationJson = outcomeState
         };
+    }
 
     private static async Task<FlowRun> LoadFlowAsync(
         HarnessDbContext database,

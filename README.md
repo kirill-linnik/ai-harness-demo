@@ -36,6 +36,7 @@ contract:
 | Handoff trust gates | Shadow, gated, and automatic decisions are recorded by action and blast radius. Release always requires a customer decision, and a kill switch dominates configured trust. |
 | Bounded pushback and feedback loops | A downstream `PUSHBACK` resumes the responsible upstream Copilot session, retries the blocked handoff in place, and stores a reusable learning. Product Manager can close the flow or send the same flow through another iteration with its ledger intact. |
 | Evidence-based pre-mortems | Team Lead can place independent Pre-mortem Sceptic checkpoints after any planned delivery role. Each review uses a different model family and an enforced read-only research toolset, reports at most five evidence-backed findings, and feeds findings into the original agent session before the flow advances. |
+| Outcome Verification Loop | Team Lead emits a strict acceptance plan; assigned roles emit criterion-linked evidence; Release Engineer commits an unpublished local candidate; and Quality Engineer independently verifies the exact candidate fingerprint before any customer release gate can exist. Failed criteria return only to their responsible original sessions, followed by candidate refresh and another bounded QA round. |
 | Durable product state | SQLite persists settings, intake dialogue, flows, steps, gates, events, tool calls, model catalogs, routing evidence, outcomes, and cross-flow learnings. Symphony's core recovery does not require a durable orchestration database. |
 | Copilot-native model routing | A dedicated Copilot ACP process discovers enabled model and reasoning-effort candidates. Each step is profiled and routed immediately before execution using the selected quality, speed, or cost strategy plus normalized historical evidence. |
 | Repository study and multi-repository Git isolation | The harness can run `copilot init`, persist editable shared knowledge, discover every Git repository in a project folder, and create the same flow branch in an isolated worktree for each repository. Symphony leaves VCS workspace population implementation-defined. |
@@ -109,7 +110,8 @@ Open `http://localhost:5283`.
 2. Leave **Run Copilot init** selected, then choose **Initialize and study repository**. Review and edit the generated shared knowledge.
 3. Open **AI Factory**, click **Listen to the next task**, and speak the idea.
 4. Correct or confirm Account Manager's understanding. Confirmation sends the brief straight to Team Lead so you can watch the execution graph.
-5. Open the customer preview, speak feedback, then approve the result or start another iteration.
+5. Watch the local candidate and independent QA rounds. Open the customer preview only after the
+   current candidate receives an all-criteria PASS, then approve it or start another iteration.
 6. Show **Execution history** and **Harness memory** to explain model routing and cross-flow learning.
 
 The AI Factory and every new-assignment control remain locked until Settings contains a studied project folder with at least one Git repository.
@@ -120,6 +122,9 @@ The AI Factory and every new-assignment control remain locked until Settings con
 - Model catalogs, normalized task profiles, routing decisions/alternatives, and normalized outcome
   evidence are stored in SQLite. Prompts and repository content are not copied into routing evidence.
 - `WORKFLOW.md` is the hot-reloadable, version-controlled Symphony policy and prompt contract.
+- `WORKFLOW.md` also owns `outcome_verification.enabled` and `max_rounds` (`1-10`, default `3`).
+  The effective limit is snapshotted when Team Lead's acceptance plan is accepted, so reloads affect
+  only new cycles.
 - Agent prompts lead with the role-specific assignment and include only compact repository facts, relevant immediate handoffs, applicable learned constraints, and the completion contract; retry diagnostics remain in the execution ledger.
 - Agent definitions are loaded from `.github\agents\*.agent.md`.
 - Copilot CLI receives explicit project access to `data\worktrees\<flow-id>`; each Git repository discovered in the selected project is materialized there as an isolated worktree, and source-folder paths remain intentionally inaccessible.
@@ -130,7 +135,56 @@ The AI Factory and every new-assignment control remain locked until Settings con
 - The quiet-process watchdog is strategy-aware: Maximum quality scales its quiet window from 5 to 15 minutes using the router's predicted accepted time, while other strategies retain the five-minute bound. The 20-minute hard turn limit and configured retry count still cap each attempt.
 - If Copilot writes a valid final handoff but hangs before clean shutdown, the harness recovers that handoff from the session journal instead of failing the flow. Confirmed interrupted sessions resume on bounded runtime retries, and each recovery transition remains visible in the event ledger.
 - Browser-clickable deliveries publish validated per-variant builds from `.customer-preview\<variant>` into the customer acceptance page, where the customer can inspect the real result and approve it or request another iteration with feedback.
-- Release preparation before the customer gate is local-only: commits and preview artifacts may be created, but branches are not pushed and pull requests are not opened. Explicit customer approval queues a separate Release turn that publishes the PR; rejection queues rework instead.
+- Each governed flow persists a bounded `outcome-verification-state-v1` proof ledger in SQLite.
+  Strict, case-sensitive acceptance, evidence, and QA JSON contracts reject unknown fields, invalid
+  marker placement, bad hashes, missing criteria, and oversized documents.
+- Release preparation before QA and the customer gate is local-only: intended changes must be
+  committed, every repository must be clean, and preview files are byte-hashed into a deterministic
+  multi-repository candidate fingerprint together with the repository/remote mapping snapshotted
+  by workspace creation. For project workspaces, the exact trusted top-level scaffold path set,
+  lengths, and source digests are also part of the manifest. Added repositories, deleted scaffold,
+  changed scaffold, or changed live origins invalidate the candidate;
+  mutable Git config never authorizes publication. Customer-visible criteria require a servable
+  `.customer-preview\<variant>\index.html` (or `browser\index.html`). `.ai-harness\outcome-verification` contains derived,
+  read-only QA context and is excluded from candidate identity and commits.
+- Ignored candidate paths are rejected unless they are derived QA/preview content or documented
+  transient output. The transient directory policy is: `bin`, `obj`, `node_modules`, `dist`,
+  `build`, `coverage`, `TestResults`, `.next`, `.vite`, `.vs`, `.idea`, `.venv`, `venv`,
+  `__pycache__`, `packages`, and generated `wwwroot`; `.log`, `.suo`, `.user`, `.DS_Store`, and
+  `Thumbs.db` are the only ignored transient files allowed outside those directories.
+- Quality Engineer receives the confirmed brief, normalized plan and evidence, prior findings,
+  workspace locations, and exact candidate identity from SQLite. Only a current all-criteria PASS
+  creates the customer Release gate. PASS checks are bound to persisted host observations containing
+  tool type, normalized safe arguments/command, working directory, exit status, and a bounded result
+  summary plus digest. Commands must be real test/assertion/inspection commands executed from the
+  candidate workspace; reads of QA context/evidence or paths outside candidate repositories and
+  previews cannot authorize PASS. One real suite may support several criteria. Runtime retries do
+  not consume QA rounds.
+- Governed turns keep credentials and MCP integrations disabled, expose read-only Git inspection,
+  and route each repository through disposable shadow metadata. Before the child process starts, the
+  host durably journals and removes each authoritative worktree `.git` pointer, installs the shadow
+  `.git`, and restores the original pointer after validating and discarding every shadow mutation.
+  A restart recovery pass restores interrupted swaps before workspace or candidate inspection.
+  This is deterministic same-user process isolation, not a kernel security boundary: on platforms
+  without a separate sandbox identity, a hostile process that already knows an authoritative
+  metadata path could still address it directly, but that path and credentials are not exposed
+  through the governed cwd, prompt, Git environment, or normal Git discovery.
+- Failed criteria resume only their responsible original role sessions, corrections run serially in
+  Team Lead order, and each expected correction is bound to one plan hash, QA round, role, and
+  semantic root and is applied once. Release Engineer refreshes the candidate, and the same QA
+  session continues with a fresh complete context. Exhaustion creates an `OutcomeResolution` gate with Continue (one extra
+  round, at most ten), Replan, or the existing Abandon path; there is no force-pass or waiver.
+- Customer approval rechecks the fingerprint before queuing publication. A stale candidate
+  supersedes the gate and publishes nothing. For governed flows the Release Engineer publication
+  turn remains push-guarded; afterward the host publishes the exact immutable manifest SHAs,
+  journals each repository side effect for restart recovery, and verifies every resulting PR
+  commit/tree before approval becomes terminal.
+- Release decisions carry the exact unresolved gate ID and full reviewed candidate fingerprint.
+  Stale-tab conflicts return HTTP 409 without resolving the current gate or queuing publication;
+  detected on-disk drift returns `RefreshQueued`, never an approval-shaped response. Rejection
+  feedback is persisted atomically with the identity-bound decision.
+- Existing flows without an outcome ledger remain visible as **Legacy unverified** and keep their
+  unresolved legacy release gates. No historical PASS or acceptance criteria are inferred from prose.
 - **Abandon** is the third customer decision. It cancels active execution, stops workspace-owned applications and listening ports, removes Copilot sessions, preview artifacts, worktrees, and local/remote flow branches, then marks the flow abandoned. The durable execution ledger, harness learnings, and model-routing evidence remain available for future decisions.
 - Each step is routed immediately before execution across the currently discovered model + reasoning
   effort candidates. The step detail explains predictions, confidence, exploration, and rejected

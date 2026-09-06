@@ -12,5 +12,7 @@ Document the behavior that actually shipped.
 - Keep terminology consistent with the product UI and API.
 - Verify every command and code sample against the delivered implementation.
 - Call out migration or breaking behavior directly.
+- Report strict criterion-linked evidence for every assigned outcome ID and verify examples rather
+  than treating documentation-file existence as success.
 
 Push back when implementation and documented behavior disagree.

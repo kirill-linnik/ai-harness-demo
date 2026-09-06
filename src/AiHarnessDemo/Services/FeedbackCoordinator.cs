@@ -3,6 +3,7 @@ using AiHarnessDemo.Data;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
 using Microsoft.EntityFrameworkCore;
 using System.Text.RegularExpressions;
 
@@ -16,7 +17,9 @@ public sealed partial class FeedbackCoordinator(
     IAgentRunner agentRunner,
     HandoffGateEngine gateEngine,
     FlowQueue flowQueue,
-    FlowLifecycleCoordinator lifecycle)
+    FlowLifecycleCoordinator lifecycle,
+    CandidateFingerprintService? candidateFingerprintService = null,
+    WorkflowDefinitionProvider? workflowProvider = null)
 {
     [GeneratedRegex(
         @"(?im)^\s*REWORK_TARGET_ROLES\s*:\s*(?<roles>NONE|[a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)\s*$")]
@@ -27,6 +30,8 @@ public sealed partial class FeedbackCoordinator(
         string feedback,
         CancellationToken cancellationToken = default)
     {
+        await using var lifecycleLease =
+            await lifecycle.EnterAsync(flowId, cancellationToken);
         var message = feedback.Trim();
         if (string.IsNullOrWhiteSpace(message))
         {
@@ -51,6 +56,14 @@ public sealed partial class FeedbackCoordinator(
             {
                 throw new InvalidOperationException(
                     "Customer feedback is accepted only when a preview is ready.");
+            }
+            if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+                OutcomeVerificationRules
+                    .DeserializeAggregate(flow.OutcomeVerificationJson)
+                    .Status == OutcomeVerificationStatus.AwaitingHumanResolution)
+            {
+                throw new InvalidOperationException(
+                    "Resolve outcome verification before collecting customer release feedback.");
             }
 
             var customerMessage = new FlowMessage
@@ -161,6 +174,18 @@ public sealed partial class FeedbackCoordinator(
                         message,
                         ModelSelectionStrategy: flow.ModelSelectionStrategy,
                         ExpectedAcceptedTimeSeconds: expectedAcceptedTimeSeconds,
+                        IsGovernedOutcomeVerification:
+                            !string.IsNullOrWhiteSpace(
+                                flow.OutcomeVerificationJson),
+                        GovernedRepositoryRelativePaths:
+                            string.IsNullOrWhiteSpace(
+                                flow.OutcomeVerificationJson)
+                                ? null
+                                : OutcomeVerificationRules.DeserializeAggregate(
+                                        flow.OutcomeVerificationJson)
+                                    .TrustedRepositories
+                                    .Select(repository => repository.RelativePath)
+                                    .ToArray(),
                         Progress: progress =>
                             RecordProgressAsync(
                                     flow.Id,
@@ -204,7 +229,14 @@ public sealed partial class FeedbackCoordinator(
                     FlowStepId = storedStep.Id,
                     ToolName = toolCall.ToolName,
                     ArgumentsSummary = toolCall.ArgumentsSummary,
-                    Succeeded = toolCall.Succeeded
+                    Succeeded = toolCall.Succeeded,
+                    ToolType = toolCall.ToolType,
+                    NormalizedCommand = toolCall.NormalizedCommand,
+                    NormalizedArguments = toolCall.NormalizedArguments,
+                    WorkingDirectory = toolCall.WorkingDirectory,
+                    ExitCode = toolCall.ExitCode,
+                    ResultDigest = toolCall.ResultDigest,
+                    ResultSummary = toolCall.ResultSummary
                 });
             }
             storedStep.Status = StepStatus.Completed;
@@ -263,9 +295,12 @@ public sealed partial class FeedbackCoordinator(
         }
     }
 
-    public async Task<FlowDetailDto> DecideAsync(
+    public async Task<FlowDecisionResponse> DecideAsync(
         Guid flowId,
         bool approve,
+        Guid gateId,
+        string candidateFingerprint,
+        string feedback,
         CancellationToken cancellationToken = default)
     {
         await using var lifecycleLease =
@@ -290,6 +325,14 @@ public sealed partial class FeedbackCoordinator(
         {
             throw new InvalidOperationException("This flow is not waiting for a customer decision.");
         }
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
+            OutcomeVerificationRules
+            .DeserializeAggregate(flow.OutcomeVerificationJson)
+            .Status == OutcomeVerificationStatus.AwaitingHumanResolution)
+        {
+            throw new InvalidOperationException(
+            "This flow is awaiting outcome resolution, not customer release approval.");
+        }
 
         var currentStepIds = flow.Steps
             .Where(step => step.Iteration == flow.Iteration)
@@ -304,16 +347,135 @@ public sealed partial class FeedbackCoordinator(
             .FirstOrDefault()
             ?? throw new InvalidOperationException(
                 "The flow has no unresolved release gate for the customer to decide.");
-        var resolvedGate = gateEngine.ResolveProposal(
-            pendingReleaseGate.Id,
+        if (gateId != pendingReleaseGate.Id)
+        {
+            return new FlowDecisionResponse(
+                ReleaseDecisionOutcome.Conflict,
+                flow.ToDetailDto(),
+                "The reviewed release gate is stale. Refresh before making a decision.");
+        }
+
+        OutcomeVerificationState? governedState = null;
+        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            governedState = OutcomeVerificationRules.DeserializeAggregate(
+                flow.OutcomeVerificationJson);
+            if (governedState.Status != OutcomeVerificationStatus.Passed ||
+                governedState.CurrentCandidate is null ||
+                governedState.Stale ||
+                !string.Equals(
+                    governedState.CurrentCandidate.Fingerprint,
+                    governedState.VerifiedCandidateFingerprint,
+                    StringComparison.Ordinal))
+            {
+                return new FlowDecisionResponse(
+                    ReleaseDecisionOutcome.Conflict,
+                    flow.ToDetailDto(),
+                    "The reviewed candidate no longer has a current authoritative QA PASS.");
+            }
+            if (!string.Equals(
+                    candidateFingerprint,
+                    governedState.VerifiedCandidateFingerprint,
+                    StringComparison.Ordinal))
+            {
+                return new FlowDecisionResponse(
+                    ReleaseDecisionOutcome.Conflict,
+                    flow.ToDetailDto(),
+                    "The reviewed candidate fingerprint is stale. Refresh before making a decision.");
+            }
+        }
+        else if (!string.IsNullOrEmpty(candidateFingerprint))
+        {
+            return new FlowDecisionResponse(
+                ReleaseDecisionOutcome.Conflict,
+                flow.ToDetailDto(),
+                "Legacy release decisions do not accept a candidate fingerprint.");
+        }
+
+        var rejectionFeedback = feedback?.Trim() ?? string.Empty;
+
+        if (approve && governedState is not null)
+        {
+            var state = governedState;
+            var candidate = state.CurrentCandidate
+                ?? throw new InvalidOperationException(
+                    "A current governed approval has no candidate.");
+            var candidateCurrent = false;
+            string? staleReason = null;
+            try
+            {
+                candidateCurrent = await (candidateFingerprintService
+                    ?? throw new InvalidOperationException(
+                        "No candidate fingerprint service is configured."))
+                    .IsCurrentAsync(
+                    flow,
+                        candidate,
+                    CandidateFingerprintService.RequiresPreview(
+                        state.AcceptancePlan),
+                    cancellationToken);
+            }
+            catch (CandidateValidationException exception)
+            {
+                staleReason = exception.Message;
+            }
+            if (!candidateCurrent)
+            {
+                var superseded = gateEngine.PrepareSupersession(
+                    pendingReleaseGate,
+                    "harness",
+                    "Candidate changed before customer approval.");
+                state.Status = OutcomeVerificationStatus.AwaitingCandidateRefresh;
+                state.Stale = true;
+                state.VerifiedCandidateFingerprint = null;
+                state.VerifiedAt = null;
+                foreach (var round in state.Rounds.Where(round =>
+                             string.Equals(
+                                 round.CandidateFingerprint,
+                                 candidate.Fingerprint,
+                                 StringComparison.Ordinal)))
+                {
+                    round.Stale = true;
+                }
+                state.UpdatedAt = DateTimeOffset.UtcNow;
+                var nextOutcomeJson =
+                    OutcomeVerificationRules.SerializeAggregate(state);
+                await using var staleTransaction =
+                    await database.Database.BeginTransactionAsync(
+                        cancellationToken);
+                ApplyPreparedGate(superseded, pendingReleaseGate);
+                flow.OutcomeVerificationJson = nextOutcomeJson;
+                flow.Status = FlowStatus.Queued;
+                flow.OutcomeUrl = string.Empty;
+                flow.OutcomeLabel = string.Empty;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = pendingReleaseGate.FlowStepId,
+                    Type = "outcome.candidate.stale",
+                    Message =
+                        "Candidate changed before customer approval; publication was not queued. " +
+                        (staleReason ?? string.Empty)
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                await staleTransaction.CommitAsync(cancellationToken);
+                gateEngine.RestoreHistory([superseded]);
+                if (!flowQueue.Queue(flow.Id))
+                {
+                    throw new InvalidOperationException(
+                        "Unable to queue stale-candidate refresh.");
+                }
+                return new FlowDecisionResponse(
+                    ReleaseDecisionOutcome.RefreshQueued,
+                    flow.ToDetailDto(),
+                    "The candidate changed after review. Refresh and re-verification were queued; approval was not recorded.");
+            }
+        }
+        var resolvedGate = gateEngine.PrepareResolution(
+            pendingReleaseGate,
             approve,
             "customer",
             approve ? "Customer accepted the outcome." : "Customer requested another iteration.");
-        pendingReleaseGate.Resolved = resolvedGate.Resolved;
-        pendingReleaseGate.Approved = resolvedGate.Approved;
-        pendingReleaseGate.ResolvedBy = resolvedGate.ResolvedBy;
-        pendingReleaseGate.ResolutionNote = resolvedGate.ResolutionNote;
-        pendingReleaseGate.ResolvedAt = resolvedGate.ResolvedAt;
 
         var rejectedIteration = flow.Iteration;
         IReadOnlyList<string> targetedReworkRoles = [];
@@ -341,10 +503,85 @@ public sealed partial class FeedbackCoordinator(
             }
         }
 
+        string? nextIterationOutcomeJson = null;
+        if (!approve)
+        {
+            if (governedState is not null)
+            {
+                nextIterationOutcomeJson =
+                    OutcomeVerificationRules.SerializeAggregate(
+                        OutcomeVerificationRules.StartNextIteration(
+                            governedState,
+                            flow.Iteration + 1,
+                            (workflowProvider
+                                ?? throw new InvalidOperationException(
+                                    "No workflow provider is configured."))
+                            .GetValidated()
+                            .Config.OutcomeVerification.MaxRounds));
+            }
+            else if (workflowProvider?.GetValidated().Config.OutcomeVerification is
+                     { Enabled: true } outcomeConfig)
+            {
+                var state = OutcomeVerificationRules.CreateInitialState(
+                    flow.Iteration + 1,
+                    outcomeConfig.MaxRounds);
+                state.Status = OutcomeVerificationStatus.Planning;
+                nextIterationOutcomeJson =
+                    OutcomeVerificationRules.SerializeAggregate(state);
+            }
+        }
+        else if (governedState is not null)
+        {
+            flow.OutcomeVerificationJson =
+                OutcomeVerificationRules.SerializeAggregate(governedState);
+        }
+
+        await using var decisionTransaction =
+            await database.Database.BeginTransactionAsync(cancellationToken);
+        ApplyPreparedGate(resolvedGate, pendingReleaseGate);
+        if (!approve && rejectionFeedback.Length > 0)
+        {
+            var customerMessage = new FlowMessage
+            {
+                FlowRunId = flow.Id,
+                Role = ConversationRole.Customer,
+                Content = rejectionFeedback
+            };
+            flow.Messages.Add(customerMessage);
+            database.Entry(customerMessage).State = EntityState.Added;
+        }
+
         if (approve)
         {
+            var governed = !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson);
+            var publicationRound = default(int?);
+            var publicationPlanHash = string.Empty;
+            if (governed)
+            {
+                var state = OutcomeVerificationRules.DeserializeAggregate(
+                    flow.OutcomeVerificationJson);
+                publicationRound = state.Rounds
+                    .Where(round =>
+                        !round.Stale &&
+                        round.Result?.Verdict == OutcomeQaVerdict.PASS &&
+                        string.Equals(
+                            round.CandidateFingerprint,
+                            state.VerifiedCandidateFingerprint,
+                            StringComparison.Ordinal))
+                    .OrderByDescending(round => round.Round)
+                    .Select(round => (int?)round.Round)
+                    .FirstOrDefault();
+                publicationPlanHash = state.AcceptancePlan?.Hash ?? string.Empty;
+            }
             var releaseStep = flow.Steps
-                .Where(item => item.AgentRole == "release-engineer")
+                .Where(item =>
+                    item.Iteration == flow.Iteration &&
+                    item.AgentRole == "release-engineer" &&
+                    (!governed
+                        ? !item.RemotePublicationAllowed
+                        : item.Kind is
+                            FlowStepKind.OutcomeLocalReleaseCandidate or
+                            FlowStepKind.OutcomeCandidateRefresh))
                 .OrderByDescending(item => item.Sequence)
                 .FirstOrDefault()
                 ?? throw new InvalidOperationException(
@@ -362,6 +599,9 @@ public sealed partial class FeedbackCoordinator(
                 AgentName = releaseStep.AgentName,
                 AgentRole = releaseStep.AgentRole,
                 Label = WorkflowEngine.ApprovedPublicationLabel,
+                Kind = governed
+                    ? FlowStepKind.OutcomeApprovedPublication
+                    : FlowStepKind.Standard,
                 RemotePublicationAllowed = true,
                 Status = StepStatus.Pending,
                 Phase = AgentRunPhase.PreparingWorkspace,
@@ -372,8 +612,13 @@ public sealed partial class FeedbackCoordinator(
                     .Select(item => item.Attempt)
                     .DefaultIfEmpty()
                     .Max() + 1,
-                InputSummary = WorkflowEngine.ApprovedPublicationAssignment(flow.Outcome)
+                OutcomeQaRound = publicationRound,
+                OutcomePlanHash = publicationPlanHash,
+                InputSummary = string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
+                    ? WorkflowEngine.ApprovedPublicationAssignment(flow.Outcome)
+                    : WorkflowEngine.HostControlledPublicationAssignment
             };
+            publicationStep.StableSemanticRootId = publicationStep.Id;
             flow.Steps.Add(publicationStep);
             database.Entry(publicationStep).State = EntityState.Added;
             flow.Status = FlowStatus.Queued;
@@ -391,13 +636,19 @@ public sealed partial class FeedbackCoordinator(
         }
         else
         {
-            var latestFeedback = flow.Messages
+            var latestFeedback = rejectionFeedback.Length > 0
+                ? rejectionFeedback
+                : flow.Messages
                 .Where(item => item.Role == ConversationRole.Customer)
                 .OrderByDescending(item => item.CreatedAt)
                 .FirstOrDefault()?.Content
-                ?? "Customer requested another iteration.";
+                  ?? "Customer requested another iteration.";
             flow.ConsolidatedRequest +=
                 $"{Environment.NewLine}Customer feedback after iteration {flow.Iteration}: {latestFeedback}";
+            if (nextIterationOutcomeJson is not null)
+            {
+                flow.OutcomeVerificationJson = nextIterationOutcomeJson;
+            }
             flow.Iteration++;
             flow.Status = FlowStatus.Queued;
             flow.OutcomeUrl = string.Empty;
@@ -414,18 +665,8 @@ public sealed partial class FeedbackCoordinator(
 
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);
-        if (approve)
-        {
-            await observationRecorder.RecordFinalApprovalAsync(flow.Id, cancellationToken);
-        }
-        else if (targetedReworkRoles.Count > 0)
-        {
-            await observationRecorder.RecordTargetedReworkAsync(
-                flow.Id,
-                rejectedIteration,
-                targetedReworkRoles,
-                cancellationToken);
-        }
+        await decisionTransaction.CommitAsync(cancellationToken);
+        gateEngine.RestoreHistory([resolvedGate]);
 
         if (!flowQueue.Queue(flow.Id))
         {
@@ -434,8 +675,29 @@ public sealed partial class FeedbackCoordinator(
                     ? "Unable to queue the customer-approved release publication."
                     : "Unable to queue the revised factory flow.");
         }
+        if (approve)
+        {
+            await observationRecorder.RecordFinalApprovalAsync(
+                flow.Id,
+                CancellationToken.None);
+        }
+        else if (targetedReworkRoles.Count > 0)
+        {
+            await observationRecorder.RecordTargetedReworkAsync(
+                flow.Id,
+                rejectedIteration,
+                targetedReworkRoles,
+                CancellationToken.None);
+        }
 
-        return flow.ToDetailDto();
+        return new FlowDecisionResponse(
+            approve
+                ? ReleaseDecisionOutcome.Approved
+                : ReleaseDecisionOutcome.Rejected,
+            flow.ToDetailDto(),
+            approve
+                ? "Customer approval was recorded and publication was queued."
+                : "Customer feedback was retained and a revised iteration was queued.");
     }
 
     internal static bool TryParseReworkTargets(
@@ -476,6 +738,31 @@ public sealed partial class FeedbackCoordinator(
 
     internal static bool HasReworkTargetMarker(string output) =>
         ReworkTargetRolesPattern().Matches(output).Count == 1;
+
+    private static void ApplyPreparedGate(
+        HandoffGateRecord prepared,
+        HandoffGateRecord tracked)
+    {
+        if (prepared.Id != tracked.Id ||
+            prepared.FlowRunId != tracked.FlowRunId ||
+            prepared.FlowStepId != tracked.FlowStepId ||
+            prepared.ActionType != tracked.ActionType)
+        {
+            throw new InvalidOperationException(
+                "The prepared gate decision does not match the persisted release gate.");
+        }
+        tracked.Decision = prepared.Decision;
+        tracked.TrustLevelAtDecision = prepared.TrustLevelAtDecision;
+        tracked.Summary = prepared.Summary;
+        tracked.Evidence = prepared.Evidence;
+        tracked.Reason = prepared.Reason;
+        tracked.DecidedAt = prepared.DecidedAt;
+        tracked.Resolved = prepared.Resolved;
+        tracked.Approved = prepared.Approved;
+        tracked.ResolvedBy = prepared.ResolvedBy;
+        tracked.ResolutionNote = prepared.ResolutionNote;
+        tracked.ResolvedAt = prepared.ResolvedAt;
+    }
 
     private async Task RecordProgressAsync(
         Guid flowId,

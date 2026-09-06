@@ -7,9 +7,11 @@ public sealed record PreviewArtifact(
     string Id,
     string Label,
     string RootPath,
-    string Url);
+    string Url,
+    string OpenUrl);
 
-public sealed partial class PreviewArtifactCatalog
+public sealed partial class PreviewArtifactCatalog(
+    WorkflowDefinitionProvider? workflowProvider = null)
 {
     private const string ArtifactDirectoryName = ".customer-preview";
 
@@ -23,8 +25,13 @@ public sealed partial class PreviewArtifactCatalog
             return [];
         }
 
+        var workspaceRoot = WorkspacePathGuard.ValidateExistingRoot(
+            flow.WorkspacePath,
+            workflowProvider?.GetValidated().Config.Workspace.ResolvedRoot,
+            "Customer preview");
+        CandidateFingerprintService.ValidateLinksStayInside(workspaceRoot);
         var artifactRoot = Path.Combine(
-            Path.GetFullPath(flow.WorkspacePath),
+            workspaceRoot,
             ArtifactDirectoryName);
         if (!Directory.Exists(artifactRoot))
         {
@@ -111,6 +118,7 @@ public sealed partial class PreviewArtifactCatalog
                 _ => id.Replace('-', ' ')
             },
             root,
-            $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(id)}/index.html");
+            $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(id)}/index.html",
+            $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(id)}/view");
     }
 }

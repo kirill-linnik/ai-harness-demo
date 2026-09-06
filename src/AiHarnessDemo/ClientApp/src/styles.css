@@ -1214,6 +1214,40 @@ select:focus-visible {
   gap: 6px;
 }
 
+.outcome-verification {
+  margin-top: 18px;
+}
+
+.outcome-criteria {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.outcome-criterion {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.outcome-criterion small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.outcome-evidence-list {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .progress-line {
   height: 3px;
   overflow: hidden;
@@ -1223,10 +1257,12 @@ select:focus-visible {
 
 .progress-line span {
   display: block;
+  width: 100%;
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--violet), var(--blue), var(--cyan));
-  transition: width 380ms ease;
+  transform-origin: left center;
+  transition: transform 380ms ease;
 }
 
 .lane-card {
@@ -1862,6 +1898,9 @@ select:focus-visible {
 }
 
 .preview-shell {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: clip;
   min-height: 100vh;
   background:
     radial-gradient(circle at 70% 0, rgba(65, 217, 232, 0.12), transparent 28rem),
@@ -1881,14 +1920,42 @@ select:focus-visible {
 
 .preview-brand {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 10px;
+  overflow-wrap: anywhere;
   font-weight: 650;
 }
 
 .preview-main {
+  min-width: 0;
   max-width: 1120px;
   margin: 70px auto;
+}
+
+.preview-main > *,
+.outcome-verification,
+.outcome-verification .card-header > div,
+.outcome-criterion,
+.outcome-evidence-list {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.preview-responsibilities {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.preview-responsibilities strong {
+  display: inline;
+}
+
+.outcome-verification .card-header p,
+.outcome-criterion,
+.outcome-evidence-list,
+.outcome-verification .flow-meta > span {
+  overflow-wrap: anywhere;
 }
 
 .preview-hero {
@@ -1912,6 +1979,7 @@ select:focus-visible {
 .preview-hero h1 {
   max-width: 850px;
   margin: 0 auto;
+  overflow-wrap: anywhere;
   letter-spacing: -0.05em;
   font-size: clamp(36px, 5vw, 62px);
   font-weight: 620;
@@ -1921,6 +1989,7 @@ select:focus-visible {
 .preview-hero p {
   max-width: 680px;
   margin: 18px auto 0;
+  overflow-wrap: anywhere;
   color: var(--muted);
   font-size: 16px;
 }
@@ -1990,6 +2059,8 @@ select:focus-visible {
 }
 
 .preview-artifact-tabs {
+  max-width: 100%;
+  overflow-x: auto;
   width: fit-content;
   margin-top: 18px;
 }
@@ -2024,6 +2095,10 @@ select:focus-visible {
 
   .preview-deliverable-head {
     align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .outcome-verification .card-header {
     flex-direction: column;
   }
 
@@ -2281,4 +2356,25 @@ select:focus-visible {
   .composer-row .button { grid-column: 1 / -1; }
   .message { max-width: 94%; }
   .feedback-layout { grid-template-columns: 1fr; }
+  .preview-shell { padding: 12px; }
+  .preview-topbar {
+    min-width: 0;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .preview-brand {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .preview-topbar .button,
+  .preview-deliverable-head .button {
+    max-width: 100%;
+    white-space: normal;
+  }
+  .preview-main { margin: 32px auto; }
+  .preview-deliverable,
+  .preview-decision { padding: 16px; }
+  .outcome-verification .card-header,
+  .outcome-verification .card-body { padding: 16px; }
+  .outcome-evidence-list { padding-left: 16px; }
 }

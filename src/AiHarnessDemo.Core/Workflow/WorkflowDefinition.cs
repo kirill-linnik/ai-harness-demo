@@ -22,6 +22,8 @@ public sealed class WorkflowConfig
     public AgentConfig Agent { get; set; } = new();
 
     public CopilotConfig Copilot { get; set; } = new();
+
+    public OutcomeVerificationConfig OutcomeVerification { get; set; } = new();
 }
 
 public sealed class TrackerConfig
@@ -78,6 +80,13 @@ public sealed class CopilotConfig
     public int MaximumQualityStallTimeoutMs { get; set; } = 900_000;
 }
 
+public sealed class OutcomeVerificationConfig
+{
+    public bool Enabled { get; set; } = true;
+
+    public int MaxRounds { get; set; } = 3;
+}
+
 public sealed class WorkflowConfigurationException(string message, Exception? innerException = null)
     : Exception(message, innerException);
 
@@ -119,7 +128,9 @@ public sealed class WorkflowLoader
         {
             config = string.IsNullOrWhiteSpace(frontMatter)
                 ? new WorkflowConfig()
-                : _deserializer.Deserialize<WorkflowConfig>(frontMatter) ?? new WorkflowConfig();
+                : _deserializer.Deserialize<WorkflowConfig>(frontMatter)
+                  ?? throw new WorkflowConfigurationException(
+                      "Symphony workflow front matter must be a YAML mapping, not null.");
         }
         catch (YamlException exception)
         {
@@ -128,6 +139,7 @@ public sealed class WorkflowLoader
                 exception);
         }
 
+        ValidateRequiredSections(config);
         var workflowDirectory = Path.GetDirectoryName(fullPath)
             ?? throw new WorkflowConfigurationException(
                 $"Symphony workflow path has no parent directory: {fullPath}");
@@ -187,6 +199,50 @@ public sealed class WorkflowLoader
                 : Path.Combine(workflowDirectory, expanded));
     }
 
+    private static void ValidateRequiredSections(WorkflowConfig config)
+    {
+        if (config.Tracker is null)
+        {
+            throw new WorkflowConfigurationException(
+                "tracker must be a YAML mapping and cannot be null.");
+        }
+        if (config.Workspace is null)
+        {
+            throw new WorkflowConfigurationException(
+                "workspace must be a YAML mapping and cannot be null.");
+        }
+        if (config.Hooks is null)
+        {
+            throw new WorkflowConfigurationException(
+                "hooks must be a YAML mapping and cannot be null.");
+        }
+        if (config.Agent is null)
+        {
+            throw new WorkflowConfigurationException(
+                "agent must be a YAML mapping and cannot be null.");
+        }
+        if (config.Copilot is null)
+        {
+            throw new WorkflowConfigurationException(
+                "copilot must be a YAML mapping and cannot be null.");
+        }
+        if (config.OutcomeVerification is null)
+        {
+            throw new WorkflowConfigurationException(
+                "outcome_verification must be a YAML mapping and cannot be null.");
+        }
+        if (config.Tracker.ActiveStates is null)
+        {
+            throw new WorkflowConfigurationException(
+                "tracker.active_states must be a YAML sequence and cannot be null.");
+        }
+        if (config.Tracker.TerminalStates is null)
+        {
+            throw new WorkflowConfigurationException(
+                "tracker.terminal_states must be a YAML sequence and cannot be null.");
+        }
+    }
+
     private static void Validate(WorkflowConfig config, string prompt)
     {
         if (string.IsNullOrWhiteSpace(config.Tracker.Kind))
@@ -235,6 +291,11 @@ public sealed class WorkflowLoader
         {
             throw new WorkflowConfigurationException(
                 "copilot.maximum_quality_stall_timeout_ms cannot be smaller than stall_timeout_ms or exceed turn_timeout_ms.");
+        }
+        if (config.OutcomeVerification.MaxRounds is < 1 or > 10)
+        {
+            throw new WorkflowConfigurationException(
+                "outcome_verification.max_rounds must be an integer from 1 through 10.");
         }
         if (string.IsNullOrWhiteSpace(prompt))
         {
