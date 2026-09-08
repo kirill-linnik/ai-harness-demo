@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Verification;
 
 namespace AiHarnessDemo.Services;
 
@@ -42,6 +43,71 @@ public sealed partial class PreviewArtifactCatalog(
             .Select(directory => CreateArtifact(flow.Id, directory))
             .Where(artifact => artifact is not null)
             .Cast<PreviewArtifact>()
+            .OrderBy(artifact => artifact.Id switch
+            {
+                "eu" => 0,
+                "ee" => 1,
+                _ => 2
+            })
+            .ThenBy(artifact => artifact.Id, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    public IReadOnlyList<PreviewArtifact> DiscoverVerified(
+        FlowRun flow,
+        IReadOnlyList<CandidatePreviewArtifact> previewManifest)
+    {
+        ArgumentNullException.ThrowIfNull(previewManifest);
+        if (string.IsNullOrWhiteSpace(flow.WorkspacePath))
+        {
+            return [];
+        }
+
+        var workspaceRoot = WorkspacePathGuard.ValidateExistingRoot(
+            flow.WorkspacePath,
+            workflowProvider?.GetValidated().Config.Workspace.ResolvedRoot,
+            "Verified customer preview");
+        return previewManifest
+            .Select(item => item.RelativePath.Replace('\\', '/'))
+            .Select(path => path.Split(
+                '/',
+                StringSplitOptions.RemoveEmptyEntries))
+            .Where(segments =>
+                segments.Length >= 3 &&
+                string.Equals(
+                    segments[0],
+                    ArtifactDirectoryName,
+                    StringComparison.Ordinal) &&
+                ArtifactIdPattern().IsMatch(segments[1]) &&
+                (segments.Length == 3 &&
+                 string.Equals(
+                     segments[2],
+                     "index.html",
+                     StringComparison.Ordinal) ||
+                 segments.Length == 4 &&
+                 string.Equals(
+                     segments[2],
+                     "browser",
+                     StringComparison.Ordinal) &&
+                 string.Equals(
+                     segments[3],
+                     "index.html",
+                     StringComparison.Ordinal)))
+            .GroupBy(segments => segments[1], StringComparer.Ordinal)
+            .Select(group =>
+            {
+                var browser = group.Any(segments =>
+                    segments.Length == 4);
+                var root = Path.Combine(
+                    workspaceRoot,
+                    ArtifactDirectoryName,
+                    group.Key);
+                if (browser)
+                {
+                    root = Path.Combine(root, "browser");
+                }
+                return CreateArtifact(flow.Id, group.Key, root);
+            })
             .OrderBy(artifact => artifact.Id switch
             {
                 "eu" => 0,
@@ -109,7 +175,14 @@ public sealed partial class PreviewArtifactCatalog(
             return null;
         }
 
-        return new PreviewArtifact(
+        return CreateArtifact(flowId, id, root);
+    }
+
+    private static PreviewArtifact CreateArtifact(
+        Guid flowId,
+        string id,
+        string root) =>
+        new(
             id,
             id.ToLowerInvariant() switch
             {
@@ -120,5 +193,4 @@ public sealed partial class PreviewArtifactCatalog(
             root,
             $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(id)}/index.html",
             $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(id)}/view");
-    }
 }

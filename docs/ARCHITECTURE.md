@@ -1,169 +1,356 @@
 # Architecture
 
-## Symphony conformance map
+## Product boundary
 
-| Symphony core | AI Harness Studio implementation |
+AI Harness Studio is an independent .NET adaptation of selected orchestration behaviors described
+by OpenAI Symphony. It is not a full Symphony implementation and does not claim conformance with
+Symphony's tracker, runtime, or deployment model.
+
+| Symphony-derived behavior | Studio implementation |
 | --- | --- |
-| Repository-owned workflow contract | Root `WORKFLOW.md`, parsed strictly by `WorkflowLoader` and hot-reloaded with last-known-good behavior by `WorkflowDefinitionProvider`. |
-| Policy / coordination / execution / integration / observability layers | `AiHarnessDemo.Core`, `WorkflowEngine`, reasoning hosts and workspaces, voice/Copilot adapters, API and browser dashboard. |
-| Single scheduling authority | `FlowQueue`, `FlowWorker`, and `WorkflowEngine`; duplicate dispatch is rejected by the active-run map. |
-| Bounded concurrency | Dynamic `agent.max_concurrent_agents` from `WORKFLOW.md`. |
-| Transient recovery | Fresh-per-dispatch Polly retry pipeline with exponential backoff and jitter; dependency circuit breaker; completed-session journal recovery and explicit interrupted-session resume after restart. |
-| Per-work-item workspace | One collision-resistant flow ID directory containing a matching branch and worktree for every project repository; preserved between turns and iterations. |
-| Workspace safety invariants | Absolute root containment check, sanitized key, and Copilot `cwd` equal to the flow workspace. |
-| Workspace lifecycle hooks | `after_create`, `before_run`, `after_run`, and `before_remove` contracts in `WORKFLOW.md`. |
-| Coding-agent runtime | `CopilotReasoningHost` runs every selected role through GitHub Copilot CLI. |
-| Role-focused prompting | The hot-reloaded workflow renders the current assignment first, compact repository facts, at most two immediate upstream handoffs for delivery roles, applicable learned constraints, and the role's completion contract. Retry diagnostics remain in durable events rather than agent prompts. |
-| Observable run state | SQLite step attempts, events, gate history, models, durations, prompt refinements, `/api/v1/state`, and per-flow routes. |
-| Human handoff state | Release proposals stop at a customer gate; approval and execution state are intentionally separate. |
-| Outcome proof ledger | `FlowRun.OutcomeVerificationJson` stores the bounded, versioned acceptance plan, normalized evidence, candidate identity, QA rounds, and restart cursor. |
+| Repository-owned workflow | Strict YAML and prompt template in `WORKFLOW.md`. |
+| Atomic last-known-good reload | `WorkflowDefinitionProvider` separates current-file validity from the effective LKG definition. |
+| One work item per workspace | A `FlowRun` owns one contained `WorkspaceManager` workspace. |
+| Authoritative orchestrator | `FlowQueue`, `FlowWorker`, `WorkflowEngine`, and guarded `FlowLifecycleCoordinator` transitions. |
+| Attempt/session recovery | `FlowStep`, deterministic session identity, `CopilotSessionJournal`, and restart reconciliation. |
+| Bounded concurrency | `agent.max_concurrent_agents` limits concurrently executing flows, not plan steps. |
+| Hooks | `after_create`, `before_run`, `after_run`, and `before_remove` retain explicit failure behavior. |
+| Durable human handoff | A persisted review gate replaces any agent process waiting for a person. |
+| Non-authoritative status view | ASP.NET API and React render SQLite state; they do not advance it independently. |
 
-## Product flow
+| Studio-only extension | Architectural consequence |
+| --- | --- |
+| Advisory and Delivery kinds | The flow kind determines workspace mode, duty validation, review actions, and publication eligibility. |
+| Account Manager intake | `intake-v2` and explicit confirmation precede dispatch. |
+| Dynamic Team Lead plan | `team-plan-v1` selects arbitrary enabled snapshot agents; v2 never calls `FlowPlanner`. |
+| Immutable definition snapshots | `FlowAgentSnapshot` is the sole execution source after flow creation. |
+| Duties, stages, and outcome owner | Permission and lifecycle decisions use plan metadata rather than fixed role names. |
+| Missing qualification | A structured blocker and one customer-safe explanation end in `Blocked` without a timer. |
+| Generic customer review | `CustomerReview` supports acceptance, refinement, and Advisory promotion. |
+| Linked flows | Promotion, roster repair, and scope revision create constrained successors with new workspaces and snapshots. |
+| Permission profiles | The host—not manifest prose—derives and persists the effective tool and publication policy. |
+| SQLite orchestration ledger | Plans, snapshots, attempts, events, reviews, links, and publication authorization survive restart. |
+
+## Agent catalog
+
+`AgentCatalogLoader` parses `.github\agents\*.agent.md` into an in-memory candidate. `AgentCatalog`
+publishes it atomically only after required-definition validation succeeds and exposes both catalog
+readiness and the last error through the API.
+
+| Agent | Definition rule | Runtime rule |
+| --- | --- | --- |
+| Account Manager | Required | Non-switchable; handles intake, refinement normalization, and customer-safe blocker explanations. |
+| Team Lead | Required | Non-switchable; creates every v2 downstream plan. |
+| Pre-mortem Sceptic | Required definition | Execution is optional/switchable; when selected, strict output, model-family separation, and round bounds apply. |
+| Analyst and every other agent | Optional | Arbitrary IDs are selectable only when valid and enabled in the captured flow snapshot. |
+
+Malformed optional definitions remain visible with diagnostics but are not selectable. Missing,
+empty, or malformed required definitions make the current catalog unready. Operators can call the
+explicit `/api/agent-catalog/reload` route after repairing files. A failed reload leaves the prior
+effective catalog available only to already-snapshotted work; new-flow admission remains closed.
+
+Creating a `studio-v2` flow captures name, description, role, instructions, definition hash, enabled
+state, required/switchable policy, source filename, timestamp, and catalog revision. Later file
+edits, deletion, reloads, and toggles never refresh that flow. An active `legacy-v1` row receives a
+one-time startup snapshot with an event documenting that historical limitation; terminal legacy
+rows remain readable without one.
+If a failed terminal legacy flow is explicitly restarted, Studio captures the then-effective
+catalog once, records that migration limitation, and still executes the legacy planner; it never
+converts or replans the row as `studio-v2`.
+
+## Workflow contract
+
+Root `WORKFLOW.md` is a strict Studio extension of the Symphony-style contract:
+
+- YAML is typed; unknown `studio` fields and invalid policy combinations are rejected.
+- Prompt variables are strict and missing values fail closed.
+- File reload is atomic. `CurrentFileValid` describes the file now on disk;
+  `HasEffectiveDefinition` and `EffectiveRevision` describe the last valid definition retained in
+  memory.
+- Current invalidity blocks new-flow admission. Existing snapshotted attempts may continue against
+  the effective LKG.
+- Every `FlowStep` stores `WorkflowRevision`, `PermissionProfile`, and the serialized
+  `EffectivePermissionJson` before Copilot CLI launch.
+- A resumed attempt reuses that exact permission document and revision. A newly-created retry starts
+  from the prior attempt's policy and may intersect it with a current valid policy only when the
+  result is stricter. It never gains a tool, URL, credential, write, or publish capability silently.
+- `agent.max_concurrent_agents` is retained for compatibility but means concurrent `FlowRun`
+  workers. Steps within one flow remain sequential.
+
+## Lifecycle ownership
+
+`FlowLifecycleCoordinator` serializes mutation commands per flow and validates state edges. Invalid
+edges throw `FlowLifecycleException`; `ApiExceptionHandler` maps it to HTTP 409.
+
+Principal transitions are:
+
+```text
+Intake -> Queued
+Queued | Reworking -> Running
+Running | Reworking -> WaitingForFeedback | Blocked | Failed
+WaitingForFeedback -> Queued | Reworking | Approved
+Failed -> Queued                  (explicit manual restart only)
+active or Blocked -> Abandoning -> Abandoned
+Running -> Approved               (verified post-approval publication)
+```
+
+Restart has one additional guarded operation, `Running | Reworking -> Queued`, used only after
+interrupted attempts have been reconciled. API handlers and coordinators do not assign
+`FlowRun.Status` directly. Step state plus append-only `FlowEvent` entries make execution,
+materialization, recovery, review, failure, and cleanup visible.
+
+### Advisory lifecycle
 
 ```mermaid
-flowchart LR
-    C[Customer voice or text] --> AM[Account Manager]
-    AM -->|clarification or proposed understanding| C
-    C -->|correction| AM
-    C -->|explicit confirmation| AM
-    AM -->|customer-confirmed brief| TL[Team Lead]
-    TL --> P[Dynamic agent plan]
-    P --> A[Architecture and design]
-    A -. optional Team Lead checkpoint .-> S[Pre-mortem Sceptic]
-    S -->|evidence-backed findings| A
-    S -->|clear or round cap| E
-    A --> E[Engineering]
-    E --> R[Release Engineer local candidate]
-    R --> Q[Independent QA]
-    Q -->|failed criteria| E
-    E -->|correction complete| R
-    Q -->|current all-criteria PASS| V[Customer preview and release gate]
-    Q -->|budget exhausted| H[Outcome resolution]
-    H -->|Continue one round| Q
-    H -->|Replan| TL
-    V --> PM[Product Manager]
-    PM -->|rework with retained context| TL
-    PM -->|approve| X[Closed flow]
+flowchart TD
+    A[Request] --> B[Account Manager intake-v2]
+    B --> C{Explicit confirmation}
+    C -->|Correction| B
+    C -->|Advisory confirmed| D[Queued]
+    D --> E[Team Lead team-plan-v1]
+    E -->|MissingQualification| F[Account Manager explains once]
+    F --> G[Blocked]
+    G -->|Scope revision or roster repair| H[Linked flow with fresh snapshot]
+    E -->|Planned| I[Sequential optional workers]
+    I --> J[Final outcome owner: flow-outcome-v1]
+    J --> K[Generic CustomerReview]
+    K -->|Refinement| L[Same workspace and snapshot, next iteration]
+    L --> E
+    K -->|Accept| M[Approved and idle]
+    M -->|Promote later| N[One linked Delivery with clean seed]
 ```
+
+Advisory uses a guarded copied source snapshot. Snapshot ownership is journaled before the atomic
+final move, so restart can adopt only a matching flow/source-baseline orphan and never arbitrary
+content. Abandonment repeats the metadata/nonce/marker/baseline ownership check before recursive
+deletion; an unowned or changed deterministic-path collision is preserved and recorded as a
+cleanup diagnostic. Hooks, source mutation, shell tools, publication credentials, and remote publication are
+disabled. Declared text/Markdown/CSV/JSON artifacts are host-materialized only after a byte-for-byte
+baseline check. Each materialization uses an iteration/outcome-hash-specific directory and persists
+its directory, limits, outcome hash, and per-file identity; discovery never reinterprets an accepted
+outcome with the current `WORKFLOW.md`. Historical `advisory-artifacts-v1` events are adapted only
+as typed read-only policies, preserving their legacy artifact-root layout without allowing new v2
+materializations to use that layout.
+
+### Delivery lifecycle
+
+```mermaid
+flowchart TD
+    A[Request] --> B[Account Manager intake-v2]
+    B --> C{Explicit confirmation}
+    C -->|Correction| B
+    C -->|Delivery confirmed| D[Queued]
+    D --> E[Team Lead team-plan-v1]
+    E -->|MissingQualification| F[Blocked; slot released]
+    E -->|Planned| G[Sequential pre-review workers]
+    G --> H[Final outcome owner: flow-outcome-v1]
+    H --> S[Host seals exact reviewed candidate identity]
+    S --> I[Generic CustomerReview]
+    I -->|Refinement| J[Account Manager normalizes]
+    J --> K[New iteration, same workspace and snapshot]
+    K --> E
+    I -->|Accept| L[Persist publication authorization]
+    L --> M[Materialize read/shell-only Publish semantic root; skip hooks]
+    M --> P[Host publishes sealed commit/tree identities]
+    P -->|Remote and local identity verified| N[Approved]
+    P -->|Failed or bytes changed| O[Failed; authorization retained]
+    O -->|Manual restart| M
+```
+
+There is no v2 lifecycle dependency on `software-engineer`, `quality-engineer`,
+`release-engineer`, or `product-manager`. Those names remain legitimate optional catalog entries
+and remain part of the `legacy-v1` pipeline, prompts, and historical records.
+
+## Dynamic contracts
+
+### `team-plan-v1`
+
+Team Lead receives the confirmed brief and the exact enabled optional snapshot roster as `Id`,
+`Name`, and `Description`. The strict document contains:
+
+- one or more ordered `BeforeReview` steps for a valid plan;
+- exact snapshot `AgentId` values, with repeated agent IDs allowed under distinct step IDs;
+- canonical lowercase kebab-case plan-step IDs with case-insensitive uniqueness; `team-plan`,
+  `account-manager:...`, and `pre-mortem:...` are host-reserved and rejected;
+- acyclic dependencies on lower-order steps;
+- bounded assignment and justification text;
+- `PlanDuty` values (`Analyze`, `Design`, `Implement`, `Verify`, `PrepareOutcome`, `Publish`);
+- `PlanStage` (`BeforeReview` or `AfterApproval`);
+- one final pre-review outcome owner with `PrepareOutcome`;
+- bounded task profiles and optional pre-mortem checkpoints; and
+- either `Planned` or an exact `MissingQualification` document.
+
+Delivery requires implementation, verification, outcome preparation, and exactly one
+`AfterApproval` Publish-only step. Advisory forbids Implement, Publish, and AfterApproval. Only
+pre-review steps are initially materialized. Execution follows the deterministic order one step at
+a time; fan-out/fan-in and an integration join are explicitly deferred. Before each v2 worker
+attempt, the engine resolves the accepted plan's declared dependency graph and selects the latest
+effective completed attempt for every direct dependency, including retries and revisions. The
+prompt host gives every direct result a fair bounded allocation with an explicit clipping marker,
+adds ancestors only when space remains, and never substitutes unrelated recent output.
+
+### `flow-outcome-v1`
+
+The declared outcome owner returns one normalized customer-facing goal, summary, and bounded
+implementation-detail list. Advisory may declare bounded safe artifacts. The result is the durable
+source for `CustomerReview` and for the clean promotion seed.
+
+`MissingQualification` persists an operator-facing summary, exact gaps, rationale, and suggested
+agent. Account Manager runs once to create a distinct customer-safe message. The parent then remains
+immutable and `Blocked`; repair actions create a linked flow rather than mutating or retrying it.
+
+## Review, refinement, and links
+
+`HandoffGateRecord` stores the generic review and typed `ReviewDecision`.
+
+- Direct buttons are already typed and never invoke Copilot. Free-text feedback is request-hashed
+  against the current gate/iteration and classified once by the snapshotted Account Manager in the
+  existing isolated workspace. The visible step has the host-owned `ReviewClassification`
+  invocation and `ReadOnlySource`; malformed `review-feedback-v1` receives one bounded correction
+  before failing closed. An ambiguous result persists only the safe clarification and leaves the
+  gate, status, and iteration unchanged.
+- Advisory acceptance ends the flow without publication.
+- Advisory refinement increments the same flow iteration and reuses its workspace and snapshot.
+- Advisory promotion atomically accepts the reviewed result and creates at most one linked Delivery
+  for `(parent, iteration, AdvisoryPromotion)`.
+- Delivery refinement also reuses the flow workspace and snapshot.
+- Delivery acceptance is durable authorization; only then is the one planned Publish semantic root
+  materialized.
+- The exact candidate is sealed before the review gate: all repository HEAD/tree identities plus
+  bounded scaffold/preview identity are persisted as `reviewed-candidate-v1`, tied to flow,
+  iteration, outcome owner, plan-step key, and outcome-contract hash.
+- Delivery preview metadata is projected from the verified preview manifest, and file responses
+  recheck the requested length and digest before serving an in-memory copy. Missing, stale, or
+  mutated reviewed-candidate identity returns a conflict without file bytes.
+- While a studio Delivery is awaiting its unresolved review, the detail projection exposes a
+  distinct `ReviewedPreviewUrl` only after current seal verification finds a renderable preview.
+  The UI labels it **Open reviewed preview**. After approval it disappears; the separately verified
+  published `OutcomeUrl` remains labelled as the published outcome.
+- The studio-v2 Publish Copilot turn has no create/edit tools, receives only read plus the local
+  shell needed for packaging inspection, denies supported source-mutating commands, receives no
+  publication credentials, and runs no workspace hooks. Free-text review classification likewise
+  suppresses every workspace hook and verifies the reviewed candidate before and after its
+  read-only turn. The trusted host—not the agent—pushes the sealed commits and creates PR metadata,
+  then rechecks the same candidate bytes.
+- Failed publication retains authorization and is retried only through explicit manual restart.
+
+Promotion transfers only a bounded `advisory-promotion-seed-v1` containing the accepted goal and
+implementation details. It does not copy messages, tools, sessions, steps, plan documents, events,
+or the parent workspace. The child runs normal Account Manager and Team Lead stages with a fresh
+snapshot and workspace. On the first promoted-child turn only, Account Manager may confirm directly
+when the host validates Delivery kind, exact goal, and the complete normalized implementation-detail
+ordered list against the durable seed; any one-character or ordering drift fails closed. The
+canonical seed accepts the complete bounded `flow-outcome-v1` goal plus all 24 implementation
+details. To stay within the Copilot CLI command-line envelope, the host stages that canonical JSON
+once in the session's read-only context root and places only its path and SHA-256 identity in the
+prompt; model output is still parsed and host-validated, so the file is never a success fallback.
+Startup reconciliation finds a linked Intake child with no attempt or with its canonical initial
+Account Manager step still `Pending`/`Running`. It creates no replacement step: pending work follows
+normal intake, a valid completed journal is applied, an interrupted deterministic session is
+resumed, and missing/invalid journal state becomes a visible manual-retry failure. Qualification
+roster repair and scope revision use the same clean-successor rule. SQLite uniqueness constraints
+and guarded coordinators make repeated requests idempotent. A scope revision child additionally
+stores the normalized request hash; an identical replay returns that child, while a materially
+different request conflicts because the parent iteration can have only one successor of that link
+kind.
+
+The old `/feedback` and `/decision` routes and legacy DTO fields remain. For `studio-v2` they are
+compatibility wrappers over generic review behavior; for `legacy-v1` they retain Product Manager and
+`Release`-gate semantics.
+
+## Permission boundary
+
+| Profile | Allowed purpose | Important denials |
+| --- | --- | --- |
+| `ReadOnlySource` | Intake, planning, review classification, blocker explanation, Advisory workers, read-only analysis | No writes, shell, publication tools, custom MCPs, or publication credentials. |
+| `WorkspaceWrite` | Delivery implementation, verification, local outcome preparation | Isolated-workspace write/shell only; supported remote-publish commands, destinations, and credentials denied. |
+| `Publish` | One accepted Delivery's planned Publish step | Requires a durable accepted `CustomerReview`, exact plan-step key, AfterApproval stage, Publish-only duty, and matching `reviewed-candidate-v1`; create/edit, supported mutation commands, credentials, remote tools, and workspace hooks are withheld from Copilot while the host performs exact-object publication. |
+| `PreMortemReadOnly` | Optional pre-mortem | Read/search/research only, no write/shell/publish, and a different model family from the reviewed step. |
+
+Manifest frontmatter and instructions cannot grant capabilities. The host persists an explicit
+`ExecutionInvocationKind` (`Intake`, `Planning`, `Worker`, `PreMortem`,
+`ReviewClassification`, `BlockerExplanation`, or `Publication`) and derives policy from that
+host-owned lifecycle value plus flow kind, stage, duties, and durable review state. Agent IDs and
+display names remain audit/session identity only and are never authorization inputs. The host then
+applies workflow ceilings and additional deny rules.
+Publication credentials are separated from all non-publish turns. Deny-by-default CLI arguments,
+workspace containment, guarded Git metadata, immutable candidate identity, and exact-target host
+publication provide strong enforcement on supported paths.
+
+This remains a trusted-host design, **not** kernel or adversarial OS sandbox isolation. Without a
+separate OS identity or sandbox, a hostile same-user process that already knows an authoritative
+absolute path may bypass application-level path discovery controls.
+
+## Durable state and restart reconciliation
+
+SQLite runs in write-ahead logging mode. Core durable tables are:
+
+- `Flows`: lifecycle, kind, contract version, lineage, blockers, workspace, outcome, and timestamps.
+- `FlowAgentSnapshots`: immutable per-flow execution definitions.
+- `FlowPlanDocuments`: one accepted plan per flow iteration.
+- `FlowSteps`: sequential attempts, stable semantic roots, sessions, workflow revisions, effective
+  permissions, status, evidence, and retry links.
+- `GateRecords`: generic customer review, legacy release, and outcome-resolution decisions.
+- `ReviewedPublicationRecords`: one row per reviewed studio-v2 publication repository, holding the
+  publication root, reviewed fingerprint, remote repository, branch, head/tree, pull request URL,
+  and the stage reached (`Intent`, `BranchPublished`, `PullRequestOpened`, `Completed`).
+- `FlowEvents`: append-only status, materialization, recovery, and failure evidence.
+- `FlowMessages`, `TaskProfiles`, routing tables, tool calls, outcomes, and learnings.
+
+At startup, `CopilotSessionJournal` and `WorkflowEngine` reconcile:
+
+| Durable case | Recovery action |
+| --- | --- |
+| Completed valid journal attempt | Complete the existing `FlowStep` once and continue downstream. |
+| Interrupted resumable attempt | Stop only a verified orphan process, retain the session ID, reset the same attempt to pending, and queue it once. |
+| Linked Intake with a pending initial Account Manager step | Execute that exact durable step once through the normal intake coordinator. |
+| Linked Intake with a running initial Account Manager step | Apply a current valid journal result, resume the verified interrupted session, or record a visible manual-retry failure. |
+| Failed attempt | Stay `Failed` until explicit manual restart. |
+| Open MissingQualification | Stay `Blocked`; do not run Account Manager again and do not schedule a timer. |
+| Open customer review | Stay `WaitingForFeedback`; do not recreate or enqueue the review. |
+| Accepted Delivery without publication materialization | Recreate the one planned publication root from the durable review and queue it. |
+| Failed accepted publication | Stay `Failed`; preserve authorization and semantic root for manual restart. |
+| Interrupted reviewed publication | Re-read `ReviewedPublicationRecords` and the publication events first, reconcile the remote branch head with `git ls-remote` and the pull request identity across open, closed, and merged states, then finish only the repositories that are not yet `Completed`. |
+| Accepted Advisory | Stay idle and keep idempotent promotion available. |
+| Active `legacy-v1` | Requeue on its static planner/release path using its migration-time snapshot. |
+| Terminal `legacy-v1` | Remain readable without requiring a snapshot. |
+
+Reconciliation never refreshes a v2 snapshot, invents historical instructions, creates another
+accepted plan, review, publication root, or linked successor, retries missing qualification, or
+runs two attempts for one flow. `FlowWorker` and `WorkflowEngine` both deduplicate execution claims.
+A blocked flow returns from `RunAsync`, releasing its concurrent-flow slot.
 
 ## Runtime components
 
 | Component | Responsibility |
 | --- | --- |
-| `AgentCatalog` | Discovers valid Copilot agent definitions from `.github\agents`, synchronizes display metadata, and preserves enabled state in SQLite. |
-| `RepositoryAnalyzer` | Runs `copilot init`, discovers repository boundaries inside the selected project, performs a bounded static study, and persists editable shared knowledge. |
-| `IntakeCoordinator` | Persists customer dialogue, separates clarification from confirmation, and queues only a customer-confirmed brief. |
-| `FlowPlanner` | Uses task complexity and domain signals to select only enabled specialists in dependency order. |
-| `ModelCatalogDiscovery` | Uses a dedicated bidirectional Copilot ACP process at startup to discover enabled explicit model + effort candidates and persist an audit snapshot. Current discovery is mandatory for readiness. |
-| `BootstrapTaskProfileFactory` / Team Lead profiles | Create strictly validated, normalized `task-profile-v1` routing inputs. Team Lead gets one visible correction turn for an invalid downstream profile contract. |
-| `PreMortemRules` / Pre-mortem Sceptic | Validate Team Lead's checkpoint plan, strict `CLEAR` or evidence-backed finding output, the five-finding cap, and the evaluated agent's adjustment disposition. |
-| `OutcomeVerificationRules` | Strictly parses versioned acceptance, delivery-evidence, and QA contracts; canonicalizes JSON; hashes plans; derives the global verdict; and validates the 128 KiB aggregate. |
-| `CandidateFingerprintService` | Rejects dirty or unsafe local candidates, added repositories, live-origin drift from the workspace-authorized repository map, and ignored paths outside the documented transient-output policy; it hashes deterministic trusted repository commit/tree/target identities plus bounded, servable `.customer-preview` files. |
-| `OutcomeVerificationContextBuilder` | Reconstructs the complete QA assignment from SQLite, writes `.ai-harness\outcome-verification\<fingerprint>\qa-context.json`, and verifies its content hash without deciding success. |
-| `AdaptiveModelRouter` | Applies router-v1 recency-weighted Bayesian evidence, risk quality floors, lexicographic strategy objectives, and bounded deterministic exploration immediately before execution. |
-| `RoutingObservationRecorder` | Records normalized handoff quality, duration/retry, estimated premium use, availability failures, downstream pushback and targeted customer-rework attribution, and weak final approval evidence. |
-| `PreviewArtifactCatalog` | Resolves validated per-variant static builds from the isolated flow workspace and exposes them only after the customer release gate is ready. |
-| `FlowQueue` / `FlowWorker` | Reconcile persisted Copilot sessions before re-queuing work after restart, then execute multiple independent flows concurrently. |
-| `WorkflowEngine` | Drives the durable state machine, pre-creates visible pending stages, records every transition, enforces handoff gates, and learns from pushbacks. |
-| `AgentRunner` | Runs every selected role through Copilot CLI with model routing, bounded session-aware retries, progress events, and scrubbed tool-call audit. |
-| `CopilotSessionJournal` | Reads Copilot CLI session journals, discovers legacy in-flight sessions by workspace and agent, and distinguishes completed, active, and interrupted turns. |
-| `WorkspaceManager` | Creates one project workspace per flow, with an isolated worktree on the flow branch for every discovered repository. |
-| `FlowAbandonmentService` | Blocks/cancels flow execution, stops workspace-owned processes, removes Copilot sessions, worktrees, previews, and flow branches, then retains the durable ledger as an abandoned learning record. |
-| `FeedbackCoordinator` | Grounds Product Manager in the original request and full ledger, then closes or requeues the same flow with retained context. |
-| `HarnessDbContext` | Persists settings, agents, flows, dialogue, steps, events, catalogs, profiles, routing decisions, normalized evidence, durations, outcomes, and prompt refinements. |
+| `NewWorkAdmissionService` | Requires current workflow/catalog readiness and a configured studied project before creating work. |
+| `AgentCatalog` / `FlowAgentSnapshotService` | Atomic definitions, diagnostics, explicit reload, and immutable per-flow execution source. |
+| `IntakeCoordinator` | Executes Account Manager intake and applies the confirmation gate. |
+| `TeamPlanValidator` | Strict plan parsing, roster/dependency/duty/stage/outcome-owner validation, and MissingQualification validation. |
+| `FlowLifecycleCoordinator` | Per-flow mutation lock plus typed transition guard. |
+| `WorkflowEngine` | Sequential orchestration, materialization, execution, handoffs, review readiness, recovery, and legacy routing. |
+| `FlowQueue` / `FlowWorker` | Dispatch independent flows and deduplicate queued/running work. |
+| `ReviewCoordinator` | Generic acceptance, same-flow refinement, publication materialization, and Advisory promotion. |
+| `MissingQualificationCoordinator` | One explanation attempt and durable blocking. |
+| `LinkedFlowCoordinator` | Clean, uniquely linked successors and normal child intake. |
+| `CopilotReasoningHost` | Snapshot instructions, strict workflow prompt, persisted permissions, CLI execution, and session recovery. |
+| `WorkspaceManager` | Deterministic guarded snapshots or Delivery worktrees, containment, recovery, hooks, and cleanup. |
+| `FlowAbandonmentService` | Guarded `Abandoning` transition, process/session/workspace cleanup, then durable `Abandoned`. |
 
-## Durable state
+## Local commands
 
-SQLite uses write-ahead logging for concurrent readers and short concurrent writes.
+Run from the repository root on Windows:
 
-- `Settings`: selected project folder, editable repository knowledge, outcome, retry bound, and model-selection strategy.
-- `Agents`: discovered role metadata and enabled state.
-- `Flows`: one durable customer workflow per shareable URL, including its queued strategy snapshot
-  and the versioned outcome-verification proof ledger. Empty ledgers identify legacy/unverified flows.
-- `FlowSteps`: agent, model + effort, attempt, state, duration, output, pushback reason, and durable pre-mortem origin/target/revision links.
-- `FlowMessages`: voice/text dialogue with Account Manager and Product Manager.
-- `FlowEvents`: append-only observable execution ledger.
-- `Learnings`: cross-flow prompt refinements created from failed handoff contracts.
-- `ModelCatalogSnapshots` / `ModelCatalogCandidates`: ACP discovery audit history.
-- `TaskProfiles`, `RoutingDecisions`, `RoutingAlternatives`, `RoutingObservations`: normalized router-v1 state and evidence; no raw task or repository content.
+```powershell
+dotnet restore .\AiHarnessDemo.slnx
+dotnet build .\AiHarnessDemo.slnx --no-restore
+dotnet test .\AiHarnessDemo.slnx --no-build
 
-## Copilot CLI execution
-
-- Requires Git and a selected project folder containing at least one Git work tree.
-- Resolves native and npm-installed Copilot CLI commands, skipping interactive Windows bootstrap
-  shims and falling back to the latest app-managed native CLI when available.
-- Creates the same `ai-harness/<task>-<flow-id>` branch in an isolated worktree for each project repository.
-- Grants the flow workspace explicitly with `--add-dir`, sets it as Copilot's working directory, and tells agents that original source-folder paths are metadata rather than work targets.
-- Loads the generic agents from this project with a separate `--add-dir`.
-- Selects a discovered model + effort per step, always passes `--model`, and passes `--effort` when that model advertises configurable reasoning levels.
-- Gives delivery agents only the two most recent completed handoffs in the current iteration; Product Manager receives the execution ledger required by its role.
-- Gives each agent project access inside the isolated workspace; use only with repositories you trust.
-- Classifies an explicit `PUSHBACK` before advance gating, records a revision request and reusable prompt refinement, resumes the responsible upstream Copilot session, then resumes the blocked agent with the corrected handoff.
-- Interleaves Team Lead-selected pre-mortem checkpoints with delivery steps. A review excludes the evaluated step's model family, receives an enforced read-only source/web research toolset with publication credentials removed, and fails closed when the discovered catalog has no different enabled family.
-- Feeds each evidence-backed pre-mortem result to the evaluated agent's original session. The agent returns a complete handoff plus an explicit adjusted/unchanged disposition; only adjusted results schedule another review.
-- Applies the hot-reloadable five-minute quiet watchdog to Fastest response and Lowest cost. Maximum quality scales that window up to the configured fifteen-minute cap using predicted accepted time while retaining the hard per-turn timeout.
-- Recovers a contract-valid final handoff from the Copilot session journal when the CLI does not shut down cleanly; otherwise only a confirmed interrupted journal is resumed on the next bounded runtime attempt.
-- Keeps release preparation local until the customer resolves the release gate. Approval queues a
-  distinct Release Engineer publication step; no remote publication is possible before that gate.
-- For governed publication, the Release Engineer's Copilot process remains push-guarded. After its
-  successful turn, `VerifiedCandidatePublisher` compares the live repository to the immutable
-  workspace-authorized mapping, pushes exact manifest SHAs to the trusted target URL rather than a
-  mutable remote alias, and creates/reuses only same-target PRs. Per-repository
-  `Publishing`/`Published` state is persisted before and after side effects, and
-  `PublishedOutcomeVerifier` confirms every remote head before the journal becomes `Verified`.
-  Legacy publication retains the original agent-driven behavior.
-- Runs local Release Engineer candidate preparation before independent QA. Candidate preparation is
-  an `Advance` handoff and never opens a customer gate.
-- Uses one governed role order for profile contracts, displayed plans, step dependencies, execution,
-  and pushback ownership. Optional Technical Writer work precedes Release candidate preparation;
-  Release pushback returns to its actual predecessor and QA pushback returns to Release.
-- Gives each QA round a complete database-derived context packet rather than the ordinary two-handoff
-  prompt. QA reuses its exact persisted Copilot session but treats SQLite and the current fingerprint
-  as authoritative.
-- Persists structured host tool observations and accepts QA PASS checks only when command, scope,
-  exit status, and captured result agree. Context/evidence reads and out-of-candidate paths are not
-  verification.
-- Protects authoritative worktree metadata during governed turns with a crash-journaled pointer
-  swap: the child sees a disposable `.git` snapshot, while the host restores the original pointer
-  and rejects any shadow metadata mutation. Recovery runs before workspace reuse and candidate
-  inspection. This is the strongest deterministic same-user boundary used when an OS sandbox
-  identity is unavailable; it does not claim to stop a process that independently knows an
-  authoritative absolute path.
-- Counts valid terminal QA results and persisted invalid QA contracts against the independent
-  snapshotted round budget. Agent runtime retries, pre-mortems, and correction turns do not consume
-  that budget.
-- Reconciles plan, evidence, candidate, QA, correction, PASS, and gate transitions idempotently after
-  restart. Outcome QA never uses workspace/agent “latest session” discovery.
-- Applies the persisted Settings limit (`0-10`, default `2`) independently to each blocked handoff and each Team Lead-selected pre-mortem checkpoint. Pushback exhaustion is terminal; pre-mortem exhaustion advances with the latest complete adjusted result.
-
-## API shape
-
-The browser uses a same-origin minimal API:
-
-- `/api/bootstrap`, `/api/settings`, `/api/agents`
-- `/api/directories`, `/api/repositories/analyze`
-- `/api/intake`
-- `/api/flows`, `/api/flows/{id}`, `/start`, `/restart`, `/feedback`, `/decision`,
-  `/outcome-resolution`, `/abandon`
-- `/api/history`, `/api/learnings`, `/api/previews/{id}`
-- `/api/previews/{id}/artifacts/{variant}/{path}` serves the real isolated browser build used by the customer acceptance page.
-
-The UI polls only active flows. Completed flows remain static and independently addressable through `#/factory/{id}`.
-
-`POST /api/flows/{id}/decision` binds the decision to `{ approve, gateId,
-candidateFingerprint, feedback }`. Governed decisions must match the current unresolved Release
-gate and full verified fingerprint. The response outcome is `Approved`, `Rejected`,
-`RefreshQueued`, or `Conflict`; conflicts return HTTP 409 and leave the current gate unresolved.
-
-## Browser client
-
-`src\AiHarnessDemo\ClientApp` is a React + TypeScript + Vite single-page app organized by feature page
-(`factory`, `intake`, `flow`, `settings`, `history`, `memory`, `preview`) under `src\pages`, with a typed
-API client/contracts layer in `src\api` and shared shell/utility code in `src\components`/`src\lib`.
-[TanStack Query](https://tanstack.com/query) owns all server state, including the active-flow poll
-(`useFlowQuery`'s `refetchInterval`, gated on flow status exactly like the original `scheduleFlowPoll`).
-Routing uses React Router's `HashRouter` so that server-issued links such as `flow.outcomeUrl`
-(`#/preview/{id}`) and every other shareable `#/...` URL keep working unchanged. Vite builds directly
-into `wwwroot` (`vite.config.ts`: `build.outDir = "../wwwroot"`), and `AiHarnessDemo.csproj` runs
-`npm ci`/`npm run build` before `Build`/`Publish` so `wwwroot` is always regenerated from
-`ClientApp\src` — it is not hand-edited.
+Push-Location .\src\AiHarnessDemo\ClientApp
+if (-not (Test-Path .\node_modules)) { npm ci }
+npm run typecheck
+npm test
+npm run build
+Pop-Location
+```

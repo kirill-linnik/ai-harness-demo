@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ApiError } from "../../api/client";
 import { api } from "../../api/endpoints";
 import { queryKeys } from "../../api/queries";
 import type { BootstrapDto, FlowDetailDto, IntakeResponse } from "../../api/types";
@@ -44,7 +45,12 @@ const bootstrap: BootstrapDto = {
   },
   workflow: {
     ready: true,
+    currentFileValid: true,
+    hasEffectiveDefinition: true,
     sourcePath: "E:\\projects\\demo\\WORKFLOW.md",
+    effectiveLoadedAt: "2026-09-02T12:00:00Z",
+    effectiveRevision: "workflow-test",
+    currentFileError: null,
     loadedAt: "2026-09-02T12:00:00Z",
     lastError: null,
     maxConcurrentAgents: 1,
@@ -52,6 +58,20 @@ const bootstrap: BootstrapDto = {
     workspaceRoot: "E:\\projects\\demo\\.workspaces",
     outcomeVerificationEnabled: true,
     outcomeVerificationMaxRounds: 3
+  },
+  agentCatalog: {
+    ready: true,
+    hasEffectiveCatalog: true,
+    effectiveRevision: "catalog-test",
+    loadedAt: "2026-09-02T12:00:00Z",
+    lastError: null,
+    validDefinitionCount: 0,
+    invalidDefinitionCount: 0
+  },
+  admission: {
+    ready: true,
+    failures: [],
+    checkedAt: "2026-09-02T12:00:00Z"
   },
   factoryEnabled: true,
   factoryDisabledReason: ""
@@ -66,6 +86,19 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
     title: "Refresh the public site",
     originalRequest: "Give the public site a fresh design.",
     consolidatedRequest: "Outcome: Refresh the public site with an interactive design.",
+    kind: "Delivery",
+    contractVersion: "studio-v2",
+    parentFlowRunId: null,
+    parentIteration: null,
+    linkKind: null,
+    linkedFlows: [],
+    agentCatalogRevision: "catalog-test",
+    outcomeOwnerPlanStepKey: null,
+    publicationPlanStepKey: null,
+    currentBlockerCode: null,
+    currentBlockerSummary: null,
+    currentBlockerDataJson: null,
+    customerBlockerMessage: null,
     status,
     iteration: 1,
     repositoryPath: "E:\\projects\\demo",
@@ -76,6 +109,8 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
     branchName: "ai-harness\\refresh-site",
     outcomeUrl: "",
     outcomeLabel: "",
+    reviewedPreviewUrl: null,
+    outcomeResult: null,
     failureReason: "",
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -108,6 +143,15 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
       }
     ],
     gateRecords: [],
+    review: {
+      gateId: null,
+      available: false,
+      resolved: false,
+      approved: null,
+      decision: null,
+      publicationStatus: "AwaitingApproval"
+    },
+    publicationStatus: "AwaitingApproval",
     outcomeVerification: {
       status: "NotStarted",
       legacyUnverified: false,
@@ -185,6 +229,80 @@ describe("IntakePage", () => {
     expect(composer).toHaveValue(request);
   });
 
+  it("navigates to a persisted failed intake and retries with the same flow id", async () => {
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(confirmationFlow());
+    const continueIntake = vi.spyOn(api, "continueIntake")
+      .mockRejectedValueOnce(
+        new ApiError(
+          "The flow was saved; retry it.",
+          409,
+          {
+            status: 409,
+            detail: "The flow was saved; retry it.",
+            flowId,
+            flowStatus: "Intake",
+            retryMessage: "Open the saved flow and retry."
+          }
+        )
+      )
+      .mockResolvedValueOnce({
+        flow: confirmationFlow(),
+        reply: "Please confirm the saved brief.",
+        readyToStart: false,
+        shouldSpeak: false
+      });
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false }
+      }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={["/intake"]}>
+            <Routes>
+              <Route path="/intake" element={<IntakePage />} />
+              <Route path="/intake/:id" element={<IntakePage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    const composer = screen.getByRole("textbox", {
+      name: "Customer request"
+    });
+    fireEvent.change(composer, {
+      target: { value: "Assess checkout resilience." }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(api.flow).toHaveBeenCalledWith(flowId)
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Flow 11111111/)).toBeInTheDocument()
+    );
+    fireEvent.change(
+      screen.getByRole("textbox", {
+        name: "Customer request"
+      }),
+      { target: { value: "Retry the saved intake." } }
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(continueIntake).toHaveBeenLastCalledWith({
+        flowId,
+        message: "Retry the saved intake."
+      })
+    );
+  });
+
   it("sends a confirmed brief directly to Team Lead without a second button", async () => {
     const pendingFlow = confirmationFlow();
     const queuedFlow = {
@@ -258,5 +376,88 @@ describe("IntakePage", () => {
     await waitFor(() => expect(screen.getByText("Team Lead started")).toBeInTheDocument());
     expect(continueIntake).toHaveBeenCalledWith({ flowId, message: "Yes." });
     expect(startFlow).not.toHaveBeenCalled();
+  });
+
+  it("renders the persisted Account Manager classification without sending a client-selected kind", async () => {
+    const advisory = {
+      ...confirmationFlow(),
+      kind: "Advisory" as const
+    };
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(advisory);
+    const continueIntake = vi.spyOn(api, "continueIntake").mockResolvedValue({
+      flow: advisory,
+      reply: "Please confirm.",
+      readyToStart: false,
+      shouldSpeak: false
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false }
+      }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    queryClient.setQueryData(queryKeys.flow(flowId), advisory);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/intake/${flowId}`]}>
+            <Routes>
+              <Route path="/intake/:id" element={<IntakePage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByText("Account Manager proposal")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Advisory" })).toBeInTheDocument();
+    expect(screen.getByText(/does not change or publish source code/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Customer request"), {
+      target: { value: "Please include rollout risks." }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(continueIntake).toHaveBeenCalledWith({
+        flowId,
+        message: "Please include rollout risks."
+      })
+    );
+  });
+
+  it("shows the exact admission reason when new intake is disabled", () => {
+    const locked = {
+      ...bootstrap,
+      factoryEnabled: false,
+      factoryDisabledReason:
+        "Agent catalog is not ready: team-lead.agent.md is missing.",
+      admission: {
+        ready: false,
+        failures: ["Agent catalog is not ready: team-lead.agent.md is missing."],
+        checkedAt: timestamp
+      }
+    } satisfies BootstrapDto;
+    vi.spyOn(api, "bootstrap").mockResolvedValue(locked);
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, locked);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={["/intake"]}>
+            <Routes>
+              <Route path="/intake" element={<IntakePage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(
+      screen.getByText("Agent catalog is not ready: team-lead.agent.md is missing.")
+    ).toBeInTheDocument();
   });
 });

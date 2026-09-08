@@ -10,7 +10,9 @@ import {
   useContinueIntakeMutation,
   useFlowQuery
 } from "../../api/queries";
-import type { FlowMessageDto } from "../../api/types";
+import { ApiError } from "../../api/client";
+import type { FlowMessageDto, FlowStatus } from "../../api/types";
+import { flowRoute } from "../../lib/flowRoute";
 import { MicIcon, SendIcon, waveMarkup } from "../../lib/icons";
 import { consumeDraftPrompt, consumeStartVoiceHint } from "../../lib/session";
 import { speak, toggleVoice } from "../../lib/voice";
@@ -81,6 +83,11 @@ export function IntakePage() {
   const awaitingConfirmation =
     latestIntakeEvent?.type === "intake.confirmation_requested" ||
     latestIntakeEvent?.type === "intake.ready";
+  const proposedKind =
+    flow?.contractVersion === "studio-v2" &&
+    (awaitingConfirmation || confirmed)
+      ? flow.kind
+      : null;
 
   async function submitIntake() {
     if (submitting.current) return;
@@ -102,7 +109,10 @@ export function IntakePage() {
     setMessage("");
 
     try {
-      const response = await continueIntake.mutateAsync({ flowId: flow?.id ?? null, message: trimmed });
+      const response = await continueIntake.mutateAsync({
+        flowId: flow?.id ?? params.id ?? null,
+        message: trimmed
+      });
       queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
       setPendingMessage(null);
       if (response.shouldSpeak) speak(response.reply);
@@ -116,7 +126,30 @@ export function IntakePage() {
     } catch (error) {
       setPendingMessage(null);
       setMessage(current => current || trimmed);
-      toast(error instanceof Error ? error.message : String(error), "error");
+      if (error instanceof ApiError) {
+        const recoveredFlowId = error.extensions.flowId;
+        const recoveredStatus = error.extensions.flowStatus;
+        const retryMessage = error.extensions.retryMessage;
+        if (typeof recoveredFlowId === "string" && recoveredFlowId.length > 0) {
+          navigate(
+            flowRoute(
+              recoveredFlowId,
+              typeof recoveredStatus === "string"
+                ? recoveredStatus as FlowStatus
+                : undefined
+            ),
+            { replace: true }
+          );
+        }
+        toast(
+          typeof retryMessage === "string" && retryMessage.length > 0
+            ? retryMessage
+            : error.message,
+          "error"
+        );
+      } else {
+        toast(error instanceof Error ? error.message : String(error), "error");
+      }
     } finally {
       submitting.current = false;
     }
@@ -231,6 +264,27 @@ export function IntakePage() {
                   ? "Reply yes to start immediately, or explain what should change."
                   : "Account Manager will ask only for material missing context."}
             </span>
+            {proposedKind && (
+              <section
+                className="intake-classification"
+                aria-labelledby="proposed-flow-kind"
+                aria-live="polite"
+              >
+                <div className="eyebrow">Account Manager proposal</div>
+                <h3 id="proposed-flow-kind">{proposedKind}</h3>
+                <p>
+                  {proposedKind === "Advisory"
+                    ? "Read-only repository analysis that returns a recommendation and safe text artifacts. It does not change or publish source code."
+                    : "Implementation in an isolated workspace. Nothing is published until you accept the reviewed result."}
+                </p>
+                {awaitingConfirmation && (
+                  <small>
+                    Confirming the brief also confirms this persisted classification. To change it,
+                    describe the correction instead of confirming.
+                  </small>
+                )}
+              </section>
+            )}
           </div>
         </div>
       </section>

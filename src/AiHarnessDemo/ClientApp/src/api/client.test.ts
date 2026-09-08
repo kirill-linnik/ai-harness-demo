@@ -62,6 +62,35 @@ describe("request", () => {
     );
   });
 
+  it("exposes top-level ProblemDetails extensions", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        {
+          title: "The request conflicts with the current flow state.",
+          status: 409,
+          detail: "The flow was saved.",
+          flowId: "11111111-1111-1111-1111-111111111111",
+          flowStatus: "Intake",
+          retryMessage: "Open the saved flow and retry."
+        },
+        { status: 409 }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await request("/api/intake", {
+      method: "POST",
+      body: { message: "sensitive request" }
+    }).catch(value => value);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).extensions).toEqual({
+      flowId: "11111111-1111-1111-1111-111111111111",
+      flowStatus: "Intake",
+      retryMessage: "Open the saved flow and retry."
+    });
+  });
+
   it("surfaces a plain-text error body", async () => {
     const fetchMock = vi.fn(
       async () => new Response("Internal failure", { status: 500, headers: { "Content-Type": "text/plain" } })

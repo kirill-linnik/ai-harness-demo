@@ -32,10 +32,18 @@ builder.Services.AddSingleton<WorkflowDefinitionProvider>();
 builder.Services.AddHostedService(
     services => services.GetRequiredService<WorkflowDefinitionProvider>());
 builder.Services.AddSingleton<WorkspaceHookRunner>();
+builder.Services.AddSingleton<PermissionProfileResolver>();
+builder.Services.AddSingleton<AgentManifestStager>();
+builder.Services.AddSingleton<AgentCatalogLoader>();
 builder.Services.AddSingleton<AgentCatalog>();
+builder.Services.AddSingleton<FlowAgentSnapshotService>();
+builder.Services.AddSingleton<NewWorkAdmissionService>();
+builder.Services.AddSingleton<INewWorkAdmissionService>(
+    services => services.GetRequiredService<NewWorkAdmissionService>());
 builder.Services.AddSingleton<RepositoryAnalyzer>();
 builder.Services.AddSingleton<IntakeCoordinator>();
 builder.Services.AddSingleton<FlowPlanner>();
+builder.Services.AddSingleton<TeamPlanValidator>();
 builder.Services.AddSingleton<BootstrapTaskProfileFactory>();
 builder.Services.AddSingleton<ModelCatalogDiscovery>();
 builder.Services.AddSingleton<AdaptiveModelRouter>();
@@ -43,12 +51,17 @@ builder.Services.AddSingleton<IModelRouter>(
     services => services.GetRequiredService<AdaptiveModelRouter>());
 builder.Services.AddSingleton<RoutingObservationRecorder>();
 builder.Services.AddSingleton<PreviewArtifactCatalog>();
+builder.Services.AddSingleton<AdvisoryArtifactCatalog>();
 builder.Services.AddSingleton<CandidateFingerprintService>();
+builder.Services.AddSingleton<IReviewedCandidateService, ReviewedCandidateService>();
 builder.Services.AddSingleton<OutcomeVerificationContextBuilder>();
 builder.Services.AddSingleton<IVerifiedCandidatePublisher, VerifiedCandidatePublisher>();
 builder.Services.AddSingleton<IWorkspaceProcessCleaner, WorkspaceProcessCleaner>();
 builder.Services.AddSingleton<IFlowSessionCleaner, FlowSessionCleaner>();
 builder.Services.AddSingleton<FlowLifecycleCoordinator>();
+builder.Services.AddSingleton<MissingQualificationCoordinator>();
+builder.Services.AddSingleton<LinkedFlowCoordinator>();
+builder.Services.AddSingleton<QualificationResolutionCoordinator>();
 builder.Services.AddSingleton<IPublishedOutcomeVerifier, PublishedOutcomeVerifier>();
 builder.Services.AddSingleton<CopilotReasoningHost>();
 builder.Services.AddSingleton(_ =>
@@ -58,6 +71,7 @@ builder.Services.AddSingleton(_ =>
     gate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
     gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
     gate.SetTrustLevel(HandoffActionType.OutcomeResolution, HandoffTrustLevel.Gated);
+    gate.SetTrustLevel(HandoffActionType.CustomerReview, HandoffTrustLevel.Gated);
     return gate;
 });
 builder.Services.AddSingleton<IWorkspaceManager, WorkspaceManager>();
@@ -68,6 +82,7 @@ builder.Services.AddSingleton<CopilotSessionJournal>();
 builder.Services.AddSingleton<FlowQueue>();
 builder.Services.AddSingleton<WorkflowEngine>();
 builder.Services.AddSingleton<FeedbackCoordinator>();
+builder.Services.AddSingleton<ReviewCoordinator>();
 builder.Services.AddSingleton<FlowWorker>();
 builder.Services.AddSingleton<IFlowExecutionController>(
     services => services.GetRequiredService<FlowWorker>());

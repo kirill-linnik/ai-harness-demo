@@ -1,11 +1,259 @@
+using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Text.Json;
+using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Orchestration;
+using AiHarnessDemo.Core.Security;
 using AiHarnessDemo.Core.Verification;
+using AiHarnessDemo.Data;
 using AiHarnessDemo.Services;
+using Microsoft.EntityFrameworkCore;
 
 namespace AiHarnessDemo.Tests;
 
 public sealed class VerifiedCandidatePublisherTests
 {
+    [Fact]
+    public async Task DeliveryNone_IsRejectedBeforePublisherOrVerifierSideEffects()
+    {
+        var databasePath = Path.Combine(
+            Path.GetTempPath(),
+            "verified-publication-tests",
+            Guid.NewGuid().ToString("N"),
+            "publication.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(databasePath)!);
+        try
+        {
+            var options = new DbContextOptionsBuilder<HarnessDbContext>()
+                .UseSqlite($"Data Source={databasePath};Pooling=False")
+                .Options;
+            IDbContextFactory<HarnessDbContext> factory =
+                new PublicationDbContextFactory(options);
+            var flow = new FlowRun
+            {
+                Title = "Malformed Delivery",
+                OriginalRequest = "Publish.",
+                ContractVersion = "studio-v2",
+                Kind = FlowKind.Delivery,
+                Status = FlowStatus.Queued,
+                RepositoryPath = "must-not-be-inspected",
+                WorkspacePath = "must-not-be-inspected",
+                Outcome = OutcomeType.None
+            };
+            var publication = new FlowStep
+            {
+                FlowRun = flow,
+                Iteration = 1,
+                Sequence = 10,
+                AgentId = "publisher",
+                AgentName = "Publisher",
+                AgentRole = "publisher",
+                PlanStepKey = "publish",
+                PlanDutiesJson = """["Publish"]""",
+                PlanStage = PlanStage.AfterApproval,
+                InvocationKind = ExecutionInvocationKind.Publication,
+                RemotePublicationAllowed = true,
+                Status = StepStatus.Running
+            };
+            await using (var database = await factory.CreateDbContextAsync())
+            {
+                await database.Database.EnsureCreatedAsync();
+                database.Flows.Add(flow);
+                database.FlowSteps.Add(publication);
+                await database.SaveChangesAsync();
+            }
+            var fingerprints = new CandidateFingerprintService(
+                new ProcessRunner(),
+                TimeProvider.System);
+            var publisher = new VerifiedCandidatePublisher(
+                new ProcessRunner(),
+                fingerprints,
+                new ReviewedCandidateService(fingerprints),
+                factory);
+
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                publisher.PublishAsync(flow, publication.Id));
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                new PublishedOutcomeVerifier(new ProcessRunner())
+                    .VerifyAsync(flow, "must not be interpreted"));
+            Assert.Throws<ArgumentException>(() =>
+                WorkflowEngine.ApprovedPublicationAssignment(
+                    OutcomeType.None));
+
+            await using var check = await factory.CreateDbContextAsync();
+            Assert.Empty(await check.FlowEvents.ToListAsync());
+        }
+        finally
+        {
+            VerifiedCandidatePublisherTestsCleanup.DeleteDirectoryBestEffort(
+                Path.GetDirectoryName(databasePath)!);
+        }
+    }
+
+    [Fact]
+    public async Task StudioCommitPublication_ReusesDurableReviewedIdentityAndRejectsDrift()
+    {
+        using var workspace = PublicationWorkspace.Create();
+        var databasePath = Path.Combine(workspace.Root, "publication.db");
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite($"Data Source={databasePath};Pooling=False")
+            .Options;
+        IDbContextFactory<HarnessDbContext> factory =
+            new PublicationDbContextFactory(options);
+        var flow = new FlowRun
+        {
+            Title = "Publish reviewed candidate",
+            OriginalRequest = "Publish the reviewed candidate.",
+            ConsolidatedRequest = "Publish the reviewed candidate.",
+            ContractVersion = "studio-v2",
+            Kind = FlowKind.Delivery,
+            Status = FlowStatus.Queued,
+            RepositoryPath = workspace.SourceRepository,
+            WorkspacePath = workspace.SourceRepository,
+            BranchName = workspace.GitOutput(
+                    workspace.SourceRepository,
+                    "branch",
+                    "--show-current")
+                .Trim(),
+            Outcome = OutcomeType.Commit,
+            OutcomeOwnerPlanStepKey = "outcome",
+            PublicationPlanStepKey = "publish",
+            OutcomeContractJson =
+                """{"Version":"flow-outcome-v1","Goal":"Publish.","Summary":"Reviewed.","ImplementationDetails":["Exact bytes."],"Artifacts":[]}"""
+        };
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = StudioWorkspaceRepositoryMapLedger.EventType,
+            Message = "Persisted trusted workspace repositories.",
+            DataJson = StudioWorkspaceRepositoryMapLedger.Serialize(
+                StudioWorkspaceRepositoryMapLedger.Create(
+                    flow,
+                    flow.WorkspacePath,
+                    [new WorkspaceRepositoryIdentity(".", string.Empty)]))
+        });
+        var owner = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = 10,
+            AgentId = "owner",
+            AgentName = "Owner",
+            AgentRole = "owner",
+            PlanStepKey = "outcome",
+            IsOutcomeOwner = true,
+            Status = StepStatus.Completed
+        };
+        var publication = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = 20,
+            AgentId = "publisher",
+            AgentName = "Publisher",
+            AgentRole = "publisher",
+            PlanStepKey = "publish",
+            PlanDutiesJson = """["Publish"]""",
+            PlanStage = PlanStage.AfterApproval,
+            InvocationKind = ExecutionInvocationKind.Publication,
+            PermissionProfile =
+                ExecutionPermissionProfile.Publish,
+            EffectivePermissionJson = JsonSerializer.Serialize(
+                PublicationPermission()),
+            WorkflowRevision = "publication-workflow-v1",
+            RemotePublicationAllowed = true,
+            Status = StepStatus.Running,
+            DependsOnStepId = owner.Id
+        };
+        publication.StableSemanticRootId = publication.Id;
+        flow.Steps.Add(owner);
+        flow.Steps.Add(publication);
+        flow.GateRecords.Add(new HandoffGateRecord
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = owner.Id,
+            ActionType = HandoffActionType.CustomerReview,
+            Decision = HandoffGateDecision.AwaitingHumanApproval,
+            ReviewDecision = ReviewDecision.Accepted,
+            TrustLevelAtDecision = HandoffTrustLevel.Gated,
+            Summary = "Customer accepted the reviewed candidate.",
+            Resolved = true,
+            Approved = true,
+            ResolvedBy = "customer",
+            ResolvedAt = DateTimeOffset.UtcNow
+        });
+        var fingerprints = new CandidateFingerprintService(
+            new ProcessRunner(),
+            TimeProvider.System);
+        var reviewed = new ReviewedCandidateService(fingerprints);
+        var identity = await reviewed.SealAsync(
+            flow,
+            owner.Id,
+            owner.PlanStepKey,
+            flow.OutcomeContractJson);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = owner.Id,
+            Type = ReviewedCandidateLedger.EventType,
+            Message = "Sealed exact reviewed candidate.",
+            DataJson = ReviewedCandidateLedger.Serialize(identity)
+        });
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+            database.Flows.Add(flow);
+            await database.SaveChangesAsync();
+        }
+        var publisher = new VerifiedCandidatePublisher(
+            new ProcessRunner(),
+            fingerprints,
+            reviewed,
+            factory);
+
+        var first = await publisher.PublishAsync(flow, publication.Id);
+        var retry = await publisher.PublishAsync(flow, publication.Id);
+
+        Assert.Equal(first, retry);
+        Assert.Contains(identity.Fingerprint, first);
+        Assert.Contains(identity.Repositories[0].Head, first);
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            Assert.Single(database.FlowEvents.Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Type == "delivery.reviewed-publication.completed"));
+        }
+
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.SourceRepository, "tracked.txt"),
+            "unreviewed drift");
+        await Assert.ThrowsAsync<CandidateValidationException>(
+            () => publisher.PublishAsync(flow, publication.Id));
+    }
+
+    private static EffectiveExecutionPermission
+        PublicationPermission() =>
+        new PermissionProfileResolver().Resolve(
+            new PermissionResolutionRequest(
+                FlowKind.Delivery,
+                ExecutionInvocationKind.Publication,
+                PlanStage.AfterApproval,
+                ImmutableArray.Create(PlanDuty.Publish),
+                DurableReviewDecision: ReviewDecision.Accepted,
+                DurableApproval: true,
+                IsOnlyPlannedPublishStep: true,
+                ContractVersion: "studio-v2",
+                LegacyPublicationAuthorized: false,
+                IsGovernedOutcomeVerification: false),
+            new WorkflowPermissionRestrictions(
+                ExecutionPermissionProfile.ReadOnlySource,
+                ExecutionPermissionProfile.WorkspaceWrite,
+                ExecutionPermissionProfile.Publish,
+                ImmutableDictionary<
+                    ExecutionPermissionProfile,
+                    ImmutableArray<string>>.Empty));
+
     [Fact]
     public async Task PublishVerifiedGitBranchAsync_IgnoresRepositoryHooksAndPublishesExactObjects()
     {
@@ -61,19 +309,6 @@ public sealed class VerifiedCandidatePublisherTests
             "[credential]\n" +
             $"    helper = \"!f() {{ printf helper > '{ToGitPath(markerPath)}'; exit 1; }}; f\"\n");
 
-        using var globalConfig = new EnvironmentVariableScope(
-            "GIT_CONFIG_GLOBAL",
-            configPath);
-        using var home = new EnvironmentVariableScope(
-            "HOME",
-            Path.Combine(workspace.Root, "global-home"));
-        using var userProfile = new EnvironmentVariableScope(
-            "USERPROFILE",
-            Path.Combine(workspace.Root, "global-home"));
-        using var xdg = new EnvironmentVariableScope(
-            "XDG_CONFIG_HOME",
-            Path.Combine(workspace.Root, "global-xdg"));
-
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
             VerifiedCandidatePublisher.PublishVerifiedGitBranchAsync(
                 new ProcessRunner(),
@@ -82,7 +317,21 @@ public sealed class VerifiedCandidatePublisherTests
                 "https://127.0.0.1:1/example/repository.git",
                 "verified-publication",
                 string.Empty,
-                remoteTimeout: TimeSpan.FromSeconds(10)));
+                remoteTimeout: TimeSpan.FromSeconds(10),
+                inheritedEnvironmentVariables:
+                    new Dictionary<string, string?>
+                    {
+                        ["GIT_CONFIG_GLOBAL"] = configPath,
+                        ["HOME"] = Path.Combine(
+                            workspace.Root,
+                            "global-home"),
+                        ["USERPROFILE"] = Path.Combine(
+                            workspace.Root,
+                            "global-home"),
+                        ["XDG_CONFIG_HOME"] = Path.Combine(
+                            workspace.Root,
+                            "global-xdg")
+                    }));
 
         Assert.Contains("push verified commit", exception.Message);
         Assert.False(File.Exists(markerPath));
@@ -100,13 +349,6 @@ public sealed class VerifiedCandidatePublisherTests
                 insteadOf = blocked-target
             """);
 
-        using var systemConfig = new EnvironmentVariableScope(
-            "GIT_CONFIG_SYSTEM",
-            systemConfigPath);
-        using var noSystem = new EnvironmentVariableScope(
-            "GIT_CONFIG_NOSYSTEM",
-            "0");
-
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
             VerifiedCandidatePublisher.PublishVerifiedGitBranchAsync(
                 new ProcessRunner(),
@@ -115,7 +357,13 @@ public sealed class VerifiedCandidatePublisherTests
                 "blocked-target",
                 "verified-publication",
                 string.Empty,
-                remoteTimeout: TimeSpan.FromSeconds(10)));
+                remoteTimeout: TimeSpan.FromSeconds(10),
+                inheritedEnvironmentVariables:
+                    new Dictionary<string, string?>
+                    {
+                        ["GIT_CONFIG_SYSTEM"] = systemConfigPath,
+                        ["GIT_CONFIG_NOSYSTEM"] = "0"
+                    }));
 
         Assert.Contains("push verified commit", exception.Message);
         Assert.False(HasRef(
@@ -265,21 +513,15 @@ public sealed class VerifiedCandidatePublisherTests
         }
     }
 
-    private sealed class EnvironmentVariableScope : IDisposable
+    private sealed class PublicationDbContextFactory(
+        DbContextOptions<HarnessDbContext> options)
+        : IDbContextFactory<HarnessDbContext>
     {
-        private readonly string _name;
-        private readonly string? _priorValue;
+        public HarnessDbContext CreateDbContext() => new(options);
 
-        public EnvironmentVariableScope(
-            string name,
-            string? value)
-        {
-            _name = name;
-            _priorValue = Environment.GetEnvironmentVariable(name);
-            Environment.SetEnvironmentVariable(name, value);
-        }
-
-        public void Dispose() => Environment.SetEnvironmentVariable(_name, _priorValue);
+        public Task<HarnessDbContext> CreateDbContextAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(new HarnessDbContext(options));
     }
 
     private static class VerifiedCandidatePublisherTestsCleanup

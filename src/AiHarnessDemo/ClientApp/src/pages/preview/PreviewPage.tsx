@@ -55,6 +55,8 @@ export function PreviewPage() {
   const preview = previewQuery.data;
   if (!preview) return null;
   const reviewedOutcome = preview.outcomeVerification;
+  const legacyPreview = preview.contractVersion === "legacy-v1";
+  const advisory = preview.kind === "Advisory";
 
   const contributors = preview.deliveredBy.filter(step => step.status === "Completed");
   const selectedArtifact =
@@ -121,43 +123,71 @@ export function PreviewPage() {
       </header>
       <main className="preview-main">
         <section className="preview-hero">
-          {preview.outcomeVerification.releaseReady && (
+          {(legacyPreview
+            ? preview.outcomeVerification.releaseReady
+            : preview.review.resolved && preview.review.approved === true) && (
             <div className="preview-check">
               <CheckIcon />
             </div>
           )}
-          <div className="eyebrow">Iteration {preview.iteration} is ready</div>
+          <div className="eyebrow">{preview.kind} · iteration {preview.iteration}</div>
           <h1>{preview.title}</h1>
           <p>
-            The AI factory completed its planned roles, resolved handoff gates, and prepared this customer-checkable
-            outcome for {preview.repositoryName}.
+            {advisory
+              ? `The read-only analysis of ${preview.repositoryName} is ready. No source changes or publication candidate were created.`
+              : `The AI factory prepared this customer-checkable Delivery outcome for ${preview.repositoryName}.`}
           </p>
           <div className="preview-meta">
-            <span
-              className={`status-pill ${
-                preview.outcomeVerification.releaseReady
-                  ? "approved"
+            {legacyPreview ? (
+              <span
+                className={`status-pill ${
+                  preview.outcomeVerification.releaseReady
+                    ? "approved"
+                    : preview.outcomeVerification.legacyUnverified
+                      ? "pending"
+                      : "failed"
+                }`}
+              >
+                {preview.outcomeVerification.releaseReady
+                  ? "Outcome verified"
                   : preview.outcomeVerification.legacyUnverified
-                    ? "pending"
-                    : "failed"
-              }`}
-            >
-              {preview.outcomeVerification.releaseReady
-                ? "Outcome verified"
-                : preview.outcomeVerification.legacyUnverified
-                  ? "Legacy unverified"
-                : preview.outcomeVerification.status}
+                    ? "Legacy unverified"
+                    : preview.outcomeVerification.status}
+              </span>
+            ) : (
+              <span className={`status-pill ${preview.review.resolved ? "approved" : "waitingforfeedback"}`}>
+                {preview.review.resolved
+                  ? preview.review.decision ?? "Reviewed"
+                  : "Customer review pending"}
+              </span>
+            )}
+            <span className="model-chip">
+              {advisory ? "Read-only recommendation" : preview.outcomeLabel || "Delivery result"}
             </span>
-            <span className="model-chip">{preview.outcomeLabel}</span>
-            <span className="model-chip">{contributors.length} verified handoffs</span>
+            <span className="model-chip">{contributors.length} completed handoffs</span>
           </div>
         </section>
-        <OutcomeVerificationPanel outcome={preview.outcomeVerification} />
-        <section className="callout preview-responsibilities" aria-label="Decision responsibilities">
-          <strong>Independent QA verification</strong> proves the candidate against the criterion matrix.{" "}
-          <strong>Product Manager feedback</strong> interprets customer comments.{" "}
-          <strong>Customer release approval</strong> is a separate final decision and never overrides failed QA.
-        </section>
+        {legacyPreview && <OutcomeVerificationPanel outcome={preview.outcomeVerification} />}
+        {legacyPreview && (
+          <section className="callout preview-responsibilities" aria-label="Decision responsibilities">
+            <strong>Independent QA verification</strong> proves the candidate against the criterion matrix.{" "}
+            <strong>Product Manager feedback</strong> interprets customer comments.{" "}
+            <strong>Customer release approval</strong> is a separate final decision and never overrides failed QA.
+          </section>
+        )}
+        {!legacyPreview && preview.outcomeResult && (
+          <section className="preview-outcome-summary" aria-labelledby="normalized-outcome-heading">
+            <div className="eyebrow">Normalized result</div>
+            <h2 id="normalized-outcome-heading">{preview.outcomeResult.goal}</h2>
+            <p>{preview.outcomeResult.summary}</p>
+            <h3>Implementation details</h3>
+            <ul>
+              {preview.outcomeResult.implementationDetails.map((detail, index) => (
+                <li key={`${index}:${detail}`}>{detail}</li>
+              ))}
+            </ul>
+          </section>
+        )}
         <section className="delivery-strip">
           {contributors.map(step => (
             <div className="delivery-person" key={step.id}>
@@ -169,13 +199,19 @@ export function PreviewPage() {
             </div>
           ))}
         </section>
-        <section className="preview-deliverable" aria-labelledby="interactive-result-heading">
+        <section className="preview-deliverable" aria-labelledby="preview-result-heading">
           <div className="preview-deliverable-head">
             <div>
               <div className="eyebrow">Customer-checkable outcome</div>
-              <h2 id="interactive-result-heading">Interactive result</h2>
+              <h2 id="preview-result-heading">
+                {advisory
+                  ? "Advisory artifacts"
+                  : legacyPreview
+                    ? "Interactive result"
+                    : "Delivery artifacts"}
+              </h2>
             </div>
-            {selectedArtifact && (
+            {selectedArtifact?.interactive && (
               <a
                 className="button small"
                 href={selectedArtifact.openUrl}
@@ -189,7 +225,7 @@ export function PreviewPage() {
               </a>
             )}
           </div>
-          {preview.artifacts.length > 1 && (
+          {!advisory && preview.artifacts.length > 1 && (
             <div className="segmented preview-artifact-tabs" aria-label="Preview variant">
               {preview.artifacts.map(artifact => (
                 <button
@@ -202,7 +238,35 @@ export function PreviewPage() {
               ))}
             </div>
           )}
-          {selectedArtifact ? (
+          {advisory && preview.artifacts.length > 0 ? (
+            <div className="artifact-list">
+              {preview.artifacts.map(artifact => (
+                <div className="artifact-row" key={artifact.id}>
+                  <span>
+                    <strong>{artifact.label}</strong>
+                    <small>
+                      {artifact.mediaType} · {(artifact.byteLength ?? 0).toLocaleString()} bytes
+                    </small>
+                  </span>
+                  <span className="flow-heading-actions">
+                    <a
+                      className="button small"
+                      href={artifact.openUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <ExternalIcon /> View safely
+                    </a>
+                    {artifact.downloadUrl && (
+                      <a className="button small" href={artifact.downloadUrl}>
+                        Download
+                      </a>
+                    )}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : selectedArtifact?.interactive ? (
             <iframe
               className="preview-frame"
               src={selectedArtifact.url}
@@ -212,13 +276,33 @@ export function PreviewPage() {
             />
           ) : (
             <div className="pushback-callout">
-              {preview.outcomeVerification.previewRequired
-                ? "The verified outcome requires a browser artifact, but none is available. Release approval is disabled."
-                : "This outcome does not require a browser artifact; review the verified criterion matrix above."}
+              {advisory
+                ? "This Advisory result contains no downloadable artifacts."
+                : !legacyPreview
+                  ? "This Delivery result contains no browser artifact. Review the normalized result above."
+                  : preview.outcomeVerification.previewRequired
+                    ? "The verified outcome requires a browser artifact, but none is available. Release approval is disabled."
+                    : "This outcome does not require a browser artifact; review the verified criterion matrix above."}
             </div>
           )}
         </section>
-        {preview.status === "WaitingForFeedback" &&
+        {!legacyPreview && preview.status === "WaitingForFeedback" && (
+          <section className="preview-decision" aria-labelledby="studio-review-heading">
+            <div>
+              <div className="eyebrow">Customer decision</div>
+              <h2 id="studio-review-heading">Continue in the flow review</h2>
+              <p className="muted">
+                {advisory
+                  ? "Accept, request a refinement, or promote this Advisory from the persisted review card."
+                  : "Accept or request a refinement from the persisted review card."}
+              </p>
+            </div>
+            <a className="button primary" href={`#/factory/${preview.flowId}`}>
+              <BackIcon /> Review result
+            </a>
+          </section>
+        )}
+        {legacyPreview && preview.status === "WaitingForFeedback" &&
           (preview.outcomeVerification.legacyUnverified ||
             (preview.outcomeVerification.releaseReady &&
               (!preview.outcomeVerification.previewRequired ||
@@ -262,7 +346,7 @@ export function PreviewPage() {
             </div>
           </section>
         )}
-        {preview.outcomeVerification.status === "AwaitingHumanResolution" && (
+        {legacyPreview && preview.outcomeVerification.status === "AwaitingHumanResolution" && (
           <section className="preview-decision" aria-labelledby="verification-resolution-heading">
             <div>
               <h2 id="verification-resolution-heading">Release approval is unavailable</h2>

@@ -6,6 +6,25 @@ using DeliveryOutcomeType = AiHarnessDemo.Core.Domain.OutcomeType;
 
 namespace AiHarnessDemo.Services;
 
+public enum StudioDependencyKind
+{
+    Direct,
+    Ancestor
+}
+
+public sealed record StudioDependencyOutput(
+    string PlanStepKey,
+    string AgentId,
+    StudioDependencyKind Kind,
+    int Distance,
+    int Attempt,
+    int Sequence,
+    string Output);
+
+public sealed record AdvisoryPromotionContext(
+    string CanonicalSeedJson,
+    string SeedHash);
+
 public sealed record AgentExecutionContext(
     Guid FlowId,
     int Iteration,
@@ -39,7 +58,15 @@ public sealed record AgentExecutionContext(
     bool IsOutcomeQa = false,
     bool IsHostControlledPublication = false,
     bool IsGovernedOutcomeVerification = false,
-    IReadOnlyList<string>? GovernedRepositoryRelativePaths = null);
+    IReadOnlyList<string>? GovernedRepositoryRelativePaths = null,
+    Guid FlowStepId = default,
+    string ContractVersion = "legacy-v1",
+    ExecutionInvocationKind InvocationKind = ExecutionInvocationKind.Worker,
+    IReadOnlyList<StudioDependencyOutput>? StudioDependencyOutputs = null,
+    AdvisoryPromotionContext? PromotionContext = null,
+    bool IsOutcomeOwner = false,
+    string PlanStepKey = "",
+    FlowKind? FlowKind = null);
 
 public sealed record AgentExecutionResult(
     string Output,

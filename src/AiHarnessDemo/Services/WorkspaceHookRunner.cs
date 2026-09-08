@@ -1,4 +1,5 @@
 using AiHarnessDemo.Core.Workflow;
+using AiHarnessDemo.Core.Domain;
 
 namespace AiHarnessDemo.Services;
 
@@ -20,7 +21,46 @@ public sealed class WorkspaceHookRunner(
         string workingDirectory,
         CancellationToken cancellationToken = default)
     {
-        var workflow = workflowProvider.GetValidated();
+        await RunAsync(
+            stage,
+            workingDirectory,
+            workflowProvider.GetValidated(),
+            cancellationToken);
+    }
+
+    public async Task RunAsync(
+        WorkspaceHookStage stage,
+        string workingDirectory,
+        WorkflowDefinition workflow,
+        CancellationToken cancellationToken = default)
+    {
+        await RunAsync(
+            stage,
+            workingDirectory,
+            workflow,
+            FlowKind.Delivery,
+            provisional: false,
+            cancellationToken);
+    }
+
+    public async Task RunAsync(
+        WorkspaceHookStage stage,
+        string workingDirectory,
+        WorkflowDefinition workflow,
+        FlowKind flowKind,
+        bool provisional,
+        CancellationToken cancellationToken = default)
+    {
+        if (provisional || flowKind == FlowKind.Advisory)
+        {
+            logger.LogInformation(
+                "Skipped Symphony workspace hook {HookStage} for guarded {WorkspacePolicy} execution in {WorkingDirectory}",
+                stage,
+                provisional ? "provisional intake" : "Advisory",
+                workingDirectory);
+            return;
+        }
+
         var script = stage switch
         {
             WorkspaceHookStage.AfterCreate => workflow.Config.Hooks.AfterCreate,

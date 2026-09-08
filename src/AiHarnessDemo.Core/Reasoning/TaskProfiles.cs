@@ -44,7 +44,9 @@ public static class TaskProfileRules
         TaskProfileInput input,
         Guid flowRunId,
         int iteration,
-        Guid? flowStepId = null)
+        Guid? flowStepId = null,
+        string planStepKey = "",
+        string agentId = "")
     {
         var errors = Validate(input);
         if (errors.Count > 0)
@@ -62,6 +64,8 @@ public static class TaskProfileRules
             FlowRunId = flowRunId,
             Iteration = iteration,
             FlowStepId = flowStepId,
+            PlanStepKey = planStepKey,
+            AgentId = agentId,
             Role = input.Role.Trim(),
             Complexity = input.Complexity,
             ReasoningDepth = input.ReasoningDepth,
@@ -237,6 +241,8 @@ public static class TaskProfileRules
             FlowRunId = source.FlowRunId,
             Iteration = source.Iteration,
             FlowStepId = flowStepId,
+            PlanStepKey = source.PlanStepKey,
+            AgentId = source.AgentId,
             Version = source.Version,
             Role = source.Role,
             Complexity = source.Complexity,
@@ -253,7 +259,8 @@ public static class TaskProfileRules
 
     public static TaskProfile CreatePreMortem(
         TaskProfile source,
-        Guid flowStepId) =>
+        Guid flowStepId,
+        string planStepKey = "") =>
         Create(
             new TaskProfileInput(
                 "pre-mortem-sceptic",
@@ -271,7 +278,9 @@ public static class TaskProfileRules
                 ]),
             source.FlowRunId,
             source.Iteration,
-            flowStepId);
+            flowStepId,
+            planStepKey,
+            "pre-mortem-sceptic");
 
     private static void ValidateMetric(int value, string name, ICollection<string> errors)
     {
@@ -295,7 +304,9 @@ public sealed class BootstrapTaskProfileFactory
         string brief,
         Guid flowRunId,
         int iteration,
-        Guid? flowStepId = null)
+        Guid? flowStepId = null,
+        string planStepKey = "",
+        string agentId = "")
     {
         var longBrief = brief.Length > 600;
         var crossCutting = brief.Contains(" and ", StringComparison.OrdinalIgnoreCase) ||
@@ -347,6 +358,8 @@ public sealed class BootstrapTaskProfileFactory
                 ]),
             flowRunId,
             iteration,
-            flowStepId);
+            flowStepId,
+            planStepKey,
+            agentId);
     }
 }

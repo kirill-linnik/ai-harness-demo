@@ -182,6 +182,32 @@ public sealed class CopilotSessionJournal
                     sessionId.ToString("D"));
                 if (Directory.Exists(knownDirectory))
                 {
+                    var snapshot = await InspectDirectoryAsync(
+                        home,
+                        knownDirectory,
+                        sessionId,
+                        cancellationToken);
+                    if (snapshot.State != CopilotSessionJournalState.Missing &&
+                        !PathEquals(snapshot.WorkspacePath, workspacePath))
+                    {
+                        throw new InvalidOperationException(
+                            $"Copilot session {sessionId:D} is not bound to the flow workspace and will not be deleted.");
+                    }
+                    if (snapshot.State == CopilotSessionJournalState.Missing)
+                    {
+                        snapshot = snapshot with
+                        {
+                            ActiveProcessIds = FindActiveProcessIds(
+                                knownDirectory,
+                                sessionStartedAt: null)
+                        };
+                    }
+                    if (snapshot.ActiveProcessIds.Count > 0 &&
+                        !TryStopActiveSession(snapshot))
+                    {
+                        throw new InvalidOperationException(
+                            $"Copilot session {snapshot.SessionId:D} could not be stopped before deletion.");
+                    }
                     DeleteSessionDirectory(knownDirectory);
                     deleted.Add(knownDirectory);
                 }

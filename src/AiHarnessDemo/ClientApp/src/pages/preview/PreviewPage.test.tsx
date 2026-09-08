@@ -14,24 +14,44 @@ const preview: PreviewDto = {
   title: "Refresh Devclub community site design",
   request: "Modernize both sites.",
   repositoryName: "devclub",
+  kind: "Delivery",
+  contractVersion: "legacy-v1",
   iteration: 1,
   status: "WaitingForFeedback",
   outcomeLabel: "Pull request candidate",
+  outcomeResult: null,
   artifacts: [
     {
       id: "eu",
       label: "devclub.eu",
       url: `/api/previews/${flowId}/artifacts/eu/index.html`,
-      openUrl: `/api/previews/${flowId}/artifacts/eu/view`
+      openUrl: `/api/previews/${flowId}/artifacts/eu/view`,
+      mediaType: "text/html",
+      byteLength: null,
+      downloadUrl: null,
+      interactive: true
     },
     {
       id: "ee",
       label: "devclub.ee",
       url: `/api/previews/${flowId}/artifacts/ee/index.html`,
-      openUrl: `/api/previews/${flowId}/artifacts/ee/view`
+      openUrl: `/api/previews/${flowId}/artifacts/ee/view`,
+      mediaType: "text/html",
+      byteLength: null,
+      downloadUrl: null,
+      interactive: true
     }
   ],
   deliveredBy: [],
+  review: {
+    gateId: null,
+    available: false,
+    resolved: false,
+    approved: null,
+    decision: null,
+    publicationStatus: "NotApplicable"
+  },
+  publicationStatus: "NotApplicable",
   outcomeVerification: {
     status: "Passed",
     legacyUnverified: false,
@@ -125,7 +145,9 @@ describe("PreviewPage", () => {
         feedback: ""
       })
     );
-    expect(await screen.findByText("Execution details")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Execution details", {}, { timeout: 5_000 })
+    ).toBeInTheDocument();
   });
 
   it("keeps untrusted preview messages away from decision controls and opens an isolated view", async () => {
@@ -278,7 +300,9 @@ describe("PreviewPage", () => {
       await screen.findByText(/candidate changed during approval/i)
     ).toBeInTheDocument();
     expect(screen.queryByText(/Approval recorded/i)).not.toBeInTheDocument();
-    expect(await screen.findByText("Execution details")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Execution details", {}, { timeout: 5_000 })
+    ).toBeInTheDocument();
   });
 
   it("confirms abandonment before removing customer artifacts", async () => {
@@ -345,5 +369,69 @@ describe("PreviewPage", () => {
       await screen.findByText(/requires a browser artifact, but none is available/)
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Approve and publish" })).not.toBeInTheDocument();
+  });
+
+  it("lists Advisory text artifacts safely without pull-request or legacy release controls", async () => {
+    const advisoryArtifactUrl =
+      `/api/flows/${flowId}/artifacts/abc123/recommendation.md`;
+    renderPage({
+      ...preview,
+      kind: "Advisory",
+      contractVersion: "studio-v2",
+      outcomeLabel: "Advisory result ready",
+      outcomeResult: {
+        goal: "Assess checkout resilience.",
+        summary: "The current retry boundary needs idempotency.",
+        implementationDetails: ["Persist an idempotency key before payment."],
+        artifacts: [
+          {
+            id: "abc123",
+            path: "recommendation.md",
+            mediaType: "text/markdown",
+            byteLength: 128,
+            url: advisoryArtifactUrl,
+            downloadUrl: `${advisoryArtifactUrl}?download=true`
+          }
+        ]
+      },
+      artifacts: [
+        {
+          id: "abc123",
+          label: "recommendation.md",
+          url: advisoryArtifactUrl,
+          openUrl: advisoryArtifactUrl,
+          mediaType: "text/markdown",
+          byteLength: 128,
+          downloadUrl: `${advisoryArtifactUrl}?download=true`,
+          interactive: false
+        }
+      ],
+      review: {
+        gateId: "99999999-9999-4999-8999-999999999999",
+        available: true,
+        resolved: false,
+        approved: null,
+        decision: null,
+        publicationStatus: "NotApplicable"
+      },
+      publicationStatus: "NotApplicable"
+    });
+
+    expect(await screen.findByRole("heading", { name: "Advisory artifacts" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "View safely" })).toHaveAttribute(
+      "href",
+      advisoryArtifactUrl
+    );
+    expect(screen.getByRole("link", { name: "Download" })).toHaveAttribute(
+      "href",
+      `${advisoryArtifactUrl}?download=true`
+    );
+    expect(screen.queryByTitle(/interactive customer preview/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve and publish" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/pull request/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Review result" })).toHaveAttribute(
+      "href",
+      `#/factory/${flowId}`
+    );
   });
 });

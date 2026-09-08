@@ -1,7 +1,27 @@
 // Typed mirror of src/AiHarnessDemo/Contracts/ApiModels.cs.
 // Enum members are serialized as their C# name strings by JsonStringEnumConverter.
 
-export type OutcomeType = "Commit" | "PullRequest";
+export type OutcomeType = "Commit" | "PullRequest" | "None";
+export type DeliveryOutcomeType = Exclude<OutcomeType, "None">;
+export type FlowKind = "Advisory" | "Delivery";
+export type FlowLinkKind =
+  | "AdvisoryPromotion"
+  | "QualificationRosterRepair"
+  | "QualificationScopeRevision";
+export type AgentDefinitionStatus = "Valid" | "Invalid";
+export type PlanDuty =
+  | "Analyze"
+  | "Design"
+  | "Implement"
+  | "Verify"
+  | "PrepareOutcome"
+  | "Publish";
+export type PlanStage = "BeforeReview" | "AfterApproval";
+export type ExecutionPermissionProfile =
+  | "ReadOnlySource"
+  | "WorkspaceWrite"
+  | "Publish"
+  | "PreMortemReadOnly";
 export type ModelSelectionStrategy = "MaximumQuality" | "FastestResponse" | "LowestCost";
 export type TaskRisk = "Low" | "Medium" | "High" | "Critical";
 
@@ -14,7 +34,8 @@ export type FlowStatus =
   | "Abandoning"
   | "Approved"
   | "Abandoned"
-  | "Failed";
+  | "Failed"
+  | "Blocked";
 
 export type StepStatus =
   | "Pending"
@@ -44,7 +65,31 @@ export type AgentRunPhase =
   | "Stalled"
   | "CanceledByReconciliation";
 
-export type HandoffActionType = "Advance" | "RequestRevision" | "Release" | "OutcomeResolution";
+export type HandoffActionType =
+  | "Advance"
+  | "RequestRevision"
+  | "Release"
+  | "OutcomeResolution"
+  | "CustomerReview";
+
+export type ReviewDecision =
+  | "Accepted"
+  | "RefinementRequested"
+  | "PromotedToDelivery";
+
+export type ReviewIntent =
+  | "Accept"
+  | "RequestRefinement"
+  | "PromoteToDelivery"
+  | "Ambiguous";
+
+export type ReviewPublicationStatus =
+  | "NotApplicable"
+  | "AwaitingApproval"
+  | "Queued"
+  | "Running"
+  | "Failed"
+  | "Published";
 
 export type HandoffGateDecision =
   | "BlockedKillSwitch"
@@ -81,7 +126,7 @@ export type OutcomeResolutionAction = "Continue" | "Replan";
 export interface SettingsDto {
   repositoryPath: string;
   repositoryKnowledge: string;
-  outcome: OutcomeType;
+  outcome: DeliveryOutcomeType;
   maxHandoffRetries: number;
   modelSelectionStrategy: ModelSelectionStrategy;
   updatedAt: string;
@@ -95,6 +140,12 @@ export interface AgentDto {
   accent: string;
   enabled: boolean;
   sortOrder: number;
+  definitionStatus: AgentDefinitionStatus;
+  validationError: string;
+  required: boolean;
+  switchable: boolean;
+  definitionHash: string;
+  loadedAt: string;
 }
 
 export interface AgentToolCallDto {
@@ -107,8 +158,18 @@ export interface AgentToolCallDto {
 export interface FlowSummaryDto {
   id: string;
   title: string;
+  kind: FlowKind;
+  contractVersion: string;
+  parentFlowRunId: string | null;
+  parentIteration: number | null;
+  linkKind: FlowLinkKind | null;
+  currentBlockerCode: string | null;
+  customerBlockerMessage: string | null;
+  review: FlowReviewSummaryDto;
+  linkedFlows: LinkedFlowDto[];
   status: FlowStatus;
   iteration: number;
+  agentCatalogRevision: string;
   repositoryPath: string;
   outcomeLabel: string;
   outcomeUrl: string;
@@ -124,6 +185,15 @@ export interface FlowStepDto {
   agentName: string;
   agentRole: string;
   label: string;
+  planStepKey: string;
+  duties: PlanDuty[];
+  stage: PlanStage;
+  isOutcomeOwner: boolean;
+  permissionProfile: ExecutionPermissionProfile;
+  effectivePermissionJson: string;
+  workflowRevision: string;
+  dependencyStepIds: string[];
+  dependencyPlanStepKeys: string[];
   model: string;
   modelEffort: string;
   modelReason: string;
@@ -146,6 +216,28 @@ export interface FlowStepDto {
   outcomeQaRound: number | null;
 }
 
+export interface LinkedFlowDto {
+  id: string;
+  title: string;
+  kind: FlowKind;
+  status: FlowStatus;
+  iteration: number;
+  parentIteration: number | null;
+  linkKind: FlowLinkKind | null;
+  outcomeLabel: string;
+  review: FlowReviewSummaryDto;
+  createdAt: string;
+}
+
+export interface FlowReviewSummaryDto {
+  gateId: string | null;
+  available: boolean;
+  resolved: boolean;
+  approved: boolean | null;
+  decision: ReviewDecision | null;
+  publicationStatus: ReviewPublicationStatus;
+}
+
 export interface FlowMessageDto {
   id: string;
   role: ConversationRole;
@@ -159,6 +251,7 @@ export interface FlowEventDto {
   flowStepId: string | null;
   type: string;
   message: string;
+  dataJson?: string | null;
   createdAt: string;
 }
 
@@ -167,6 +260,7 @@ export interface HandoffGateRecordDto {
   flowStepId: string;
   actionType: HandoffActionType;
   decision: HandoffGateDecision;
+  reviewDecision?: ReviewDecision | null;
   trustLevelAtDecision: HandoffTrustLevel;
   summary: string;
   evidence: string;
@@ -184,6 +278,19 @@ export interface FlowDetailDto {
   title: string;
   originalRequest: string;
   consolidatedRequest: string;
+  kind: FlowKind;
+  contractVersion: string;
+  parentFlowRunId: string | null;
+  parentIteration: number | null;
+  linkKind: FlowLinkKind | null;
+  linkedFlows: LinkedFlowDto[];
+  agentCatalogRevision: string;
+  outcomeOwnerPlanStepKey: string | null;
+  publicationPlanStepKey: string | null;
+  currentBlockerCode: string | null;
+  currentBlockerSummary: string | null;
+  currentBlockerDataJson: string | null;
+  customerBlockerMessage: string | null;
   status: FlowStatus;
   iteration: number;
   repositoryPath: string;
@@ -194,6 +301,8 @@ export interface FlowDetailDto {
   branchName: string;
   outcomeUrl: string;
   outcomeLabel: string;
+  reviewedPreviewUrl: string | null;
+  outcomeResult: FlowOutcomeDto | null;
   failureReason: string;
   createdAt: string;
   updatedAt: string;
@@ -202,6 +311,8 @@ export interface FlowDetailDto {
   messages: FlowMessageDto[];
   events: FlowEventDto[];
   gateRecords: HandoffGateRecordDto[];
+  review: FlowReviewSummaryDto;
+  publicationStatus: ReviewPublicationStatus;
   outcomeVerification: OutcomeVerificationDto;
 }
 
@@ -212,6 +323,22 @@ export interface OutcomeCriterionDto {
   ownerRoles: string[];
   evidenceKinds: OutcomeEvidenceKind[];
   customerVisible: boolean;
+}
+
+export interface AdvisoryArtifactDto {
+  id: string;
+  path: string;
+  mediaType: string;
+  byteLength: number;
+  url: string;
+  downloadUrl: string;
+}
+
+export interface FlowOutcomeDto {
+  goal: string;
+  summary: string;
+  implementationDetails: string[];
+  artifacts: AdvisoryArtifactDto[];
 }
 
 export interface OutcomeEvidenceDto {
@@ -279,6 +406,15 @@ export interface LearningDto {
 export interface HistoryItemDto {
   flowId: string;
   flowTitle: string;
+  flowKind: FlowKind;
+  flowStatus: FlowStatus;
+  parentFlowRunId: string | null;
+  parentIteration: number | null;
+  linkKind: FlowLinkKind | null;
+  currentBlockerCode: string | null;
+  customerBlockerMessage: string | null;
+  outcomeLabel: string;
+  review: FlowReviewSummaryDto;
   iteration: number;
   agentName: string;
   agentRole: string;
@@ -299,7 +435,12 @@ export interface HarnessStatsDto {
 
 export interface WorkflowStatusDto {
   ready: boolean;
+  currentFileValid: boolean;
+  hasEffectiveDefinition: boolean;
   sourcePath: string;
+  effectiveLoadedAt: string | null;
+  effectiveRevision: string | null;
+  currentFileError: string | null;
   loadedAt: string | null;
   lastError: string | null;
   maxConcurrentAgents: number | null;
@@ -307,6 +448,27 @@ export interface WorkflowStatusDto {
   workspaceRoot: string | null;
   outcomeVerificationEnabled: boolean | null;
   outcomeVerificationMaxRounds: number | null;
+}
+
+export interface AgentCatalogStatusDto {
+  ready: boolean;
+  hasEffectiveCatalog: boolean;
+  effectiveRevision: string | null;
+  loadedAt: string | null;
+  lastError: string | null;
+  validDefinitionCount: number;
+  invalidDefinitionCount: number;
+}
+
+export interface AgentCatalogDto {
+  status: AgentCatalogStatusDto;
+  agents: AgentDto[];
+}
+
+export interface NewWorkAdmissionStatusDto {
+  ready: boolean;
+  failures: string[];
+  checkedAt: string;
 }
 
 export interface CopilotCliStatusDto {
@@ -329,6 +491,8 @@ export interface ModelCatalogStatusDto {
 export interface TaskProfileDto {
   version: string;
   role: string;
+  planStepKey: string;
+  agentId: string;
   complexity: number;
   reasoningDepth: number;
   contextDemand: number;
@@ -377,6 +541,8 @@ export interface BootstrapDto {
   copilotCli: CopilotCliStatusDto;
   modelCatalog: ModelCatalogStatusDto;
   workflow: WorkflowStatusDto;
+  agentCatalog: AgentCatalogStatusDto;
+  admission: NewWorkAdmissionStatusDto;
   factoryEnabled: boolean;
   factoryDisabledReason: string;
 }
@@ -384,7 +550,7 @@ export interface BootstrapDto {
 export interface SaveSettingsRequest {
   repositoryPath: string;
   repositoryKnowledge: string;
-  outcome: OutcomeType;
+  outcome: DeliveryOutcomeType;
   maxHandoffRetries: number;
   modelSelectionStrategy: ModelSelectionStrategy;
 }
@@ -439,6 +605,64 @@ export interface FeedbackResponse {
   shouldSpeak: boolean;
 }
 
+export interface DirectReviewRequest {
+  gateId: string;
+  intent: ReviewIntent;
+  refinement?: {
+    goal?: string | null;
+    requestedChanges: string[];
+  } | null;
+}
+
+export interface DirectReviewResponse {
+  flowId: string;
+  gateId: string;
+  intent: ReviewIntent;
+  decision: ReviewDecision | null;
+  status: FlowStatus;
+  iteration: number;
+  publicationStepId: string | null;
+  linkedFlowId?: string | null;
+  publicationStatus: ReviewPublicationStatus;
+  message: string;
+}
+
+export type QualificationResolutionAction = "RosterRepair" | "ScopeRevision";
+
+export interface QualificationResolutionRequest {
+  action: QualificationResolutionAction;
+  scopeRevision?: {
+    goal: string;
+    scope: string[];
+  } | null;
+  revisedGoal?: string | null;
+  revisedScope?: string[] | null;
+}
+
+export interface QualificationResolutionResponse {
+  parentFlowId: string;
+  parentIteration: number;
+  successorFlowId: string;
+  linkKind: FlowLinkKind;
+  parentStatus: FlowStatus;
+  successorStatus: FlowStatus;
+  existingSuccessor: boolean;
+  accountManagerReply: string;
+}
+
+export interface FlowReviewResultResponse {
+  flowId: string;
+  gateId: string;
+  status: FlowStatus;
+  iteration: number;
+  resolved: boolean;
+  approved: boolean | null;
+  decision: ReviewDecision | null;
+  publicationStatus: ReviewPublicationStatus;
+  linkedFlowId: string | null;
+  linkKind: FlowLinkKind | null;
+}
+
 export interface FlowDecisionRequest {
   approve: boolean;
   gateId: string;
@@ -480,11 +704,16 @@ export interface PreviewDto {
   title: string;
   request: string;
   repositoryName: string;
+  kind: FlowKind;
+  contractVersion: string;
   iteration: number;
   status: FlowStatus;
   outcomeLabel: string;
+  outcomeResult: FlowOutcomeDto | null;
   artifacts: PreviewArtifactDto[];
   deliveredBy: FlowStepDto[];
+  review: FlowReviewSummaryDto;
+  publicationStatus: ReviewPublicationStatus;
   outcomeVerification: OutcomeVerificationDto;
   generatedAt: string;
 }
@@ -494,4 +723,8 @@ export interface PreviewArtifactDto {
   label: string;
   url: string;
   openUrl: string;
+  mediaType: string | null;
+  byteLength: number | null;
+  downloadUrl: string | null;
+  interactive: boolean;
 }

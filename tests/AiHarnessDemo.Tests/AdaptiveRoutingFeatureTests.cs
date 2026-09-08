@@ -462,9 +462,9 @@ public sealed class RoutingPersistenceTests
         await using var probe = connection.CreateCommand();
         probe.CommandText =
             "SELECT COUNT(*) FROM pragma_table_info('TaskProfiles') " +
-            "WHERE name = 'PreMortemAfter';";
+            "WHERE name IN ('PreMortemAfter', 'PlanStepKey', 'AgentId');";
 
-        Assert.Equal(1L, Convert.ToInt64(await probe.ExecuteScalarAsync()));
+        Assert.Equal(3L, Convert.ToInt64(await probe.ExecuteScalarAsync()));
     }
 }
 

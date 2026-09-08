@@ -47,7 +47,12 @@ const bootstrap: BootstrapDto = {
   },
   workflow: {
     ready: true,
+    currentFileValid: true,
+    hasEffectiveDefinition: true,
     sourcePath: "E:\\projects\\demo\\WORKFLOW.md",
+    effectiveLoadedAt: timestamp,
+    effectiveRevision: "workflow-test",
+    currentFileError: null,
     loadedAt: timestamp,
     lastError: null,
     maxConcurrentAgents: 1,
@@ -55,6 +60,20 @@ const bootstrap: BootstrapDto = {
     workspaceRoot: "E:\\projects\\demo\\data\\worktrees",
     outcomeVerificationEnabled: true,
     outcomeVerificationMaxRounds: 3
+  },
+  agentCatalog: {
+    ready: true,
+    hasEffectiveCatalog: true,
+    effectiveRevision: "catalog-test",
+    loadedAt: timestamp,
+    lastError: null,
+    validDefinitionCount: 0,
+    invalidDefinitionCount: 0
+  },
+  admission: {
+    ready: true,
+    failures: [],
+    checkedAt: timestamp
   },
   factoryEnabled: true,
   factoryDisabledReason: ""
@@ -69,6 +88,15 @@ function step(overrides: Partial<FlowStepDto> = {}): FlowStepDto {
     agentName: "Software Engineer",
     agentRole: "software-engineer",
     label: "Execute Software Engineer contract",
+    planStepKey: "",
+    duties: [],
+    stage: "BeforeReview",
+    isOutcomeOwner: false,
+    permissionProfile: "WorkspaceWrite",
+    effectivePermissionJson: "",
+    workflowRevision: "",
+    dependencyStepIds: [],
+    dependencyPlanStepKeys: [],
     model: "gpt-5.4",
     modelEffort: "high",
     modelReason: "Selected for implementation.",
@@ -99,6 +127,19 @@ function failedFlow(): FlowDetailDto {
     title: "Refresh the public site",
     originalRequest: "Refresh the public site.",
     consolidatedRequest: "Refresh the public site.",
+    kind: "Delivery",
+    contractVersion: "legacy-v1",
+    parentFlowRunId: null,
+    parentIteration: null,
+    linkKind: null,
+    linkedFlows: [],
+    agentCatalogRevision: "",
+    outcomeOwnerPlanStepKey: null,
+    publicationPlanStepKey: null,
+    currentBlockerCode: null,
+    currentBlockerSummary: null,
+    currentBlockerDataJson: null,
+    customerBlockerMessage: null,
     status: "Failed",
     iteration: 1,
     repositoryPath: "E:\\projects\\demo",
@@ -109,6 +150,8 @@ function failedFlow(): FlowDetailDto {
     branchName: "ai-harness\\refresh-site",
     outcomeUrl: "",
     outcomeLabel: "",
+    reviewedPreviewUrl: null,
+    outcomeResult: null,
     failureReason: "Agent process produced no output for 300 seconds.",
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -117,6 +160,15 @@ function failedFlow(): FlowDetailDto {
     messages: [],
     events: [],
     gateRecords: [],
+    review: {
+      gateId: null,
+      available: false,
+      resolved: false,
+      approved: null,
+      decision: null,
+      publicationStatus: "NotApplicable"
+    },
+    publicationStatus: "NotApplicable",
     outcomeVerification: {
       status: "LegacyUnverified",
       legacyUnverified: true,
@@ -137,6 +189,122 @@ function failedFlow(): FlowDetailDto {
       verifiedAt: null,
       humanResolutionGate: null
     }
+  };
+}
+
+function studioAdvisoryFlow(): FlowDetailDto {
+  const parentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const childId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const inspect = step({
+    id: "11111111-1111-4111-8111-111111111111",
+    sequence: 20,
+    agentId: "research-specialist",
+    agentName: "Research Specialist",
+    agentRole: "research-specialist",
+    label: "Inspect the current system",
+    planStepKey: "inspect-current-system",
+    duties: ["Analyze"],
+    permissionProfile: "ReadOnlySource",
+    status: "Completed",
+    phase: "Succeeded",
+    model: "gpt-5.4",
+    taskProfile: {
+      version: "task-profile-v1",
+      role: "research-specialist",
+      planStepKey: "inspect-current-system",
+      agentId: "research-specialist",
+      complexity: 6,
+      reasoningDepth: 7,
+      contextDemand: 7,
+      toolIntensity: 2,
+      taskTypeTags: ["Architecture"],
+      risk: "High",
+      riskReason: "Repository evidence is required.",
+      confidence: 0.8,
+      rationales: ["Inspect the current boundaries."]
+    }
+  });
+  const owner = step({
+    id: "22222222-2222-4222-8222-222222222222",
+    sequence: 30,
+    agentId: "research-specialist",
+    agentName: "Research Specialist",
+    agentRole: "research-specialist",
+    label: "Prepare the recommendation",
+    planStepKey: "prepare-recommendation",
+    duties: ["Analyze", "PrepareOutcome"],
+    isOutcomeOwner: true,
+    permissionProfile: "ReadOnlySource",
+    dependencyStepIds: [inspect.id],
+    dependencyPlanStepKeys: [inspect.planStepKey],
+    status: "Completed",
+    phase: "Succeeded"
+  });
+  return {
+    ...failedFlow(),
+    title: "Assess checkout resilience",
+    originalRequest: "Assess checkout resilience.",
+    consolidatedRequest: "{}",
+    kind: "Advisory",
+    contractVersion: "studio-v2",
+    parentFlowRunId: parentId,
+    parentIteration: 3,
+    linkKind: "QualificationScopeRevision",
+    linkedFlows: [
+      {
+        id: childId,
+        title: "Implement checkout resilience",
+        kind: "Delivery",
+        status: "Intake",
+        iteration: 1,
+        parentIteration: 2,
+        linkKind: "AdvisoryPromotion",
+        outcomeLabel: "",
+        review: {
+          gateId: null,
+          available: false,
+          resolved: false,
+          approved: null,
+          decision: null,
+          publicationStatus: "AwaitingApproval"
+        },
+        createdAt: timestamp
+      }
+    ],
+    agentCatalogRevision: "sha256:catalog",
+    outcomeOwnerPlanStepKey: owner.planStepKey,
+    publicationPlanStepKey: null,
+    status: "WaitingForFeedback",
+    outcome: "None",
+    outcomeUrl: `#/preview/${flowId}`,
+    outcomeLabel: "Advisory result ready",
+    outcomeResult: {
+      goal: "Harden checkout retries.",
+      summary: "Use durable idempotency.",
+      implementationDetails: ["Persist a request key before payment."],
+      artifacts: [
+        {
+          id: "artifact-1",
+          path: "checkout.md",
+          mediaType: "text/markdown",
+          byteLength: 42,
+          url: `/api/flows/${flowId}/artifacts/artifact-1/checkout.md`,
+          downloadUrl: `/api/flows/${flowId}/artifacts/artifact-1/checkout.md?download=true`
+        }
+      ]
+    },
+    failureReason: "",
+    completedAt: null,
+    steps: [inspect, owner],
+    review: {
+      gateId: "33333333-3333-4333-8333-333333333333",
+      available: true,
+      resolved: false,
+      approved: null,
+      decision: null,
+      publicationStatus: "NotApplicable"
+    },
+    publicationStatus: "NotApplicable"
   };
 }
 
@@ -168,11 +336,11 @@ describe("FlowPage manual restart", () => {
       ]
     };
     vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
-    vi.spyOn(api, "flow").mockResolvedValue(failed);
+    vi.spyOn(api, "flow").mockResolvedValue(restarted);
     const restartFlow = vi.spyOn(api, "restartFlow").mockResolvedValue(restarted);
     const queryClient = new QueryClient({
       defaultOptions: {
-        queries: { retry: false },
+        queries: { retry: false, staleTime: Infinity },
         mutations: { retry: false }
       }
     });
@@ -195,7 +363,9 @@ describe("FlowPage manual restart", () => {
 
     await waitFor(() => expect(restartFlow).toHaveBeenCalledWith(flowId));
     await waitFor(() =>
-      expect(screen.getByText("Manual restart of Software Engineer")).toBeInTheDocument()
+      expect(
+        screen.getAllByText("Manual restart of Software Engineer").length
+      ).toBeGreaterThan(0)
     );
     expect(screen.queryByText("Flow stopped")).not.toBeInTheDocument();
   });
@@ -245,7 +415,6 @@ describe("FlowPage manual restart", () => {
       }
     });
     queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
-    queryClient.setQueryData(queryKeys.flow(flowId), flow);
 
     render(
       <QueryClientProvider client={queryClient}>
@@ -273,5 +442,189 @@ describe("FlowPage manual restart", () => {
       })
     );
     expect(screen.queryByText("Approve this result or request changes")).not.toBeInTheDocument();
+  });
+
+  it("renders repeated dynamic agents as a persisted sequential plan with lineage and review", async () => {
+    const flow = studioAdvisoryFlow();
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(flow);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
+            <Routes>
+              <Route path="/factory/:id" element={<FlowPage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Sequential execution plan" })
+    ).toBeInTheDocument();
+    expect(api.flow).toHaveBeenCalledWith(flowId);
+    expect(screen.getAllByRole("button", { name: /Research Specialist/ })).toHaveLength(2);
+    expect(screen.getAllByText("Step prepare-recommendation").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Prepare Outcome").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Outcome owner").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Depends on:/)).toHaveTextContent("inspect-current-system");
+    expect(screen.getByText(/Profile: High risk/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Parent/ })).toHaveAttribute(
+      "href",
+      `/factory/${flow.parentFlowRunId}`
+    );
+    expect(screen.getByRole("link", { name: /Implement checkout resilience/ })).toHaveAttribute(
+      "href",
+      "/intake/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    );
+    expect(screen.getByRole("button", { name: "Promote to Delivery" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "View" })).toHaveAttribute(
+      "href",
+      `/api/flows/${flowId}/artifacts/artifact-1/checkout.md`
+    );
+    expect(screen.queryByText("Outcome verification")).not.toBeInTheDocument();
+    expect(screen.queryByText(/pull request outcome/i)).not.toBeInTheDocument();
+  });
+
+  it("shows Delivery publication progress only after persisted acceptance", () => {
+    const beforeAcceptance: FlowDetailDto = {
+      ...studioAdvisoryFlow(),
+      kind: "Delivery",
+      outcome: "PullRequest",
+      linkedFlows: [],
+      parentFlowRunId: null,
+      parentIteration: null,
+      linkKind: null,
+      outcomeUrl: "",
+      reviewedPreviewUrl: `#/preview/${flowId}`,
+      review: {
+        gateId: "33333333-3333-4333-8333-333333333333",
+        available: true,
+        resolved: false,
+        approved: null,
+        decision: null,
+        publicationStatus: "AwaitingApproval"
+      },
+      publicationStatus: "AwaitingApproval"
+    };
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(beforeAcceptance);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    queryClient.setQueryData(queryKeys.flow(flowId), beforeAcceptance);
+    const rendered = render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
+            <Routes>
+              <Route path="/factory/:id" element={<FlowPage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(screen.queryByText(/Publication running/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Promote to Delivery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Open reviewed preview" })
+    ).toHaveAttribute("href", `#/preview/${flowId}`);
+    expect(
+      screen.queryByRole("link", { name: "Published outcome" })
+    ).not.toBeInTheDocument();
+
+    const afterAcceptance: FlowDetailDto = {
+      ...beforeAcceptance,
+      status: "Running",
+      review: {
+        ...beforeAcceptance.review,
+        resolved: true,
+        approved: true,
+        decision: "Accepted",
+        publicationStatus: "Running"
+      },
+      publicationStatus: "Running",
+      reviewedPreviewUrl: null,
+      steps: [
+        ...beforeAcceptance.steps,
+        step({
+          id: "55555555-5555-4555-8555-555555555555",
+          sequence: 40,
+          agentId: "publisher",
+          agentName: "Publisher",
+          agentRole: "publisher",
+          planStepKey: "publish-approved-result",
+          duties: ["Publish"],
+          stage: "AfterApproval",
+          permissionProfile: "Publish",
+          status: "Running",
+          phase: "StreamingTurn"
+        })
+      ]
+    };
+    queryClient.setQueryData(queryKeys.flow(flowId), afterAcceptance);
+    rendered.rerender(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
+            <Routes>
+              <Route path="/factory/:id" element={<FlowPage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByText(/Publication running/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Accept" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Open reviewed preview" })
+    ).not.toBeInTheDocument();
+
+    const published: FlowDetailDto = {
+      ...afterAcceptance,
+      status: "Approved",
+      outcomeUrl: "https://github.com/example/repository/pull/42",
+      outcomeLabel: "Pull request #42",
+      reviewedPreviewUrl: null,
+      review: {
+        ...afterAcceptance.review,
+        publicationStatus: "Published"
+      },
+      publicationStatus: "Published",
+      steps: afterAcceptance.steps.map(item =>
+        item.planStepKey === "publish-approved-result"
+          ? { ...item, status: "Completed", phase: "Succeeded" }
+          : item
+      )
+    };
+    queryClient.setQueryData(queryKeys.flow(flowId), published);
+    rendered.rerender(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
+            <Routes>
+              <Route path="/factory/:id" element={<FlowPage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(
+      screen.queryByRole("link", { name: "Open reviewed preview" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getAllByRole("link", { name: "Published outcome" })
+    ).not.toHaveLength(0);
   });
 });

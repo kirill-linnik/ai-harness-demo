@@ -7,6 +7,7 @@ import { FatalScreen } from "../../components/FatalScreen";
 import { StatusPill } from "../../components/StatusPill";
 import { BackIcon, CopyIcon, ExternalIcon, FactoryIcon, RefreshIcon } from "../../lib/icons";
 import { groupBy, lastPathPart, statusLabel, timeAgo } from "../../lib/format";
+import { flowRoute } from "../../lib/flowRoute";
 import { useToast } from "../../lib/toast";
 import { IterationLane } from "./IterationLane";
 import { StepDetail } from "./StepDetail";
@@ -15,6 +16,8 @@ import { FeedbackCard } from "./FeedbackCard";
 import { AbandonFlowButton } from "./AbandonFlowButton";
 import { OutcomeResolutionCard } from "./OutcomeResolutionCard";
 import { OutcomeVerificationPanel } from "./OutcomeVerificationPanel";
+import { BlockedFlowCard } from "./BlockedFlowCard";
+import { ReviewCard } from "./ReviewCard";
 
 export function FlowPage() {
   const { id } = useParams<{ id: string }>();
@@ -62,6 +65,12 @@ export function FlowPage() {
       : 0;
   const grouped = groupBy(allSteps, step => step.iteration);
   const repositoryName = lastPathPart(flow.repositoryPath);
+  const studioFlow = flow.contractVersion === "studio-v2";
+  const publishedDelivery =
+    flow.kind === "Delivery" &&
+    flow.status === "Approved" &&
+    flow.publicationStatus === "Published" &&
+    Boolean(flow.outcomeUrl);
 
   async function copyFlowLink() {
     const link = `${location.origin}${location.pathname}#/factory/${flow!.id}`;
@@ -86,7 +95,11 @@ export function FlowPage() {
     <AppShell
       active="factory"
       title={`Flow ${flow.id.slice(0, 8)}`}
-      subtitle={`${repositoryName} · isolated Copilot CLI worktree`}
+      subtitle={`${repositoryName} · ${
+        flow.kind === "Advisory"
+          ? "read-only source snapshot"
+          : "isolated delivery workspace"
+      }`}
       actions={<StatusPill status={flow.status} />}
     >
       <section className="flow-heading">
@@ -96,16 +109,23 @@ export function FlowPage() {
           </Link>
           <h2>{flow.title}</h2>
           <p>
-            {repositoryName} · iteration {flow.iteration} ·{" "}
-            {flow.outcome === "PullRequest" ? "pull request outcome" : "commit outcome"} ·{" "}
-            {statusLabel(flow.modelSelectionStrategy)}
+            {repositoryName} · {flow.kind} · iteration {flow.iteration} ·{" "}
+            {flow.kind === "Advisory"
+              ? "read-only recommendation"
+              : `${flow.outcome === "PullRequest" ? "pull request" : "commit"} delivery`}{" "}
+            · {statusLabel(flow.modelSelectionStrategy)}
           </p>
           <div className="flow-meta">
             <StatusPill status={flow.status} />
             <span>Created {timeAgo(flow.createdAt)}</span>
             <span>{allSteps.length} agent executions</span>
+            {flow.agentCatalogRevision && (
+              <span title={flow.agentCatalogRevision}>
+                Catalog {flow.agentCatalogRevision.slice(0, 12)}
+              </span>
+            )}
             <span>{allSteps.filter(step => step.status === "Pushback").length} pushbacks observed</span>
-            {!flow.outcomeVerification.legacyUnverified && (
+            {!studioFlow && !flow.outcomeVerification.legacyUnverified && (
               <span>
                 QA {flow.outcomeVerification.currentRound}/{flow.outcomeVerification.maxRounds}
               </span>
@@ -113,24 +133,64 @@ export function FlowPage() {
           </div>
         </div>
         <div className="flow-heading-actions">
-          {flow.status !== "Approved" && flow.status !== "Abandoned" && (
+          {flow.status !== "Approved" &&
+            flow.status !== "Abandoned" &&
+            flow.status !== "Blocked" && (
             <AbandonFlowButton flowId={flow.id} className="button danger small" />
           )}
           <button className="button small" onClick={() => void copyFlowLink()}>
             <CopyIcon /> Copy link
           </button>
-          {flow.outcomeUrl && (
+          {(!studioFlow || publishedDelivery) && flow.outcomeUrl && (
             <a className="button primary small" href={flow.outcomeUrl}>
-              <ExternalIcon /> {flow.status === "Approved" ? "Published outcome" : "Customer preview"}
+              <ExternalIcon /> {publishedDelivery || flow.status === "Approved"
+                ? "Published outcome"
+                : "Customer preview"}
             </a>
           )}
         </div>
       </section>
+      {(flow.parentFlowRunId || flow.linkedFlows.length > 0) && (
+        <nav className="card flow-lineage" aria-label="Related flows">
+          <div className="card-header">
+            <div>
+              <h3>Flow lineage</h3>
+              <p>Linked flows remain independently addressable.</p>
+            </div>
+          </div>
+          <div className="card-body lineage-links">
+            {flow.parentFlowRunId && (
+              <Link className="lineage-link" to={`/factory/${flow.parentFlowRunId}`}>
+                <span>Parent · {statusLabel(flow.linkKind)}</span>
+                <strong>
+                  Flow {flow.parentFlowRunId.slice(0, 8)}
+                  {flow.parentIteration ? ` · iteration ${flow.parentIteration}` : ""}
+                </strong>
+              </Link>
+            )}
+            {flow.linkedFlows.map(child => (
+              <Link
+                className="lineage-link"
+                to={flowRoute(child.id, child.status)}
+                key={child.id}
+              >
+                <span>Child · {statusLabel(child.linkKind)}</span>
+                <strong>{child.title}</strong>
+                <small>
+                  {child.kind} · {statusLabel(child.status)}
+                  {child.review.decision ? ` · ${statusLabel(child.review.decision)}` : ""}
+                </small>
+              </Link>
+            ))}
+          </div>
+        </nav>
+      )}
+      {studioFlow && flow.status === "Blocked" && <BlockedFlowCard flow={flow} />}
       <div className="card lane-card">
         <div className="card-header">
           <div>
-            <h3>Observable delivery graph</h3>
-            <p>Gray is queued, blue is working, green is complete, red is a pushed-back handoff.</p>
+            <h3>Sequential execution plan</h3>
+            <p>Persisted steps run in the linear order shown below; status text accompanies every visual state.</p>
           </div>
           <span className={`status-pill ${flow.status.toLowerCase()}`}>{progress}% current iteration</span>
         </div>
@@ -159,7 +219,7 @@ export function FlowPage() {
           </div>
         )}
       </div>
-      <OutcomeVerificationPanel outcome={flow.outcomeVerification} />
+      {!studioFlow && <OutcomeVerificationPanel outcome={flow.outcomeVerification} />}
       <section className="factory-detail-grid">
         <div className="card detail-panel">
           <div className="card-header">
@@ -188,25 +248,38 @@ export function FlowPage() {
           </div>
         </div>
       </section>
-      {flow.status === "WaitingForFeedback" &&
+      {studioFlow && flow.review.available && <ReviewCard flow={flow} />}
+      {!studioFlow && flow.status === "WaitingForFeedback" &&
         flow.outcomeVerification.status !== "AwaitingHumanResolution" && <FeedbackCard flow={flow} />}
-      {flow.status === "WaitingForFeedback" &&
+      {!studioFlow && flow.status === "WaitingForFeedback" &&
         flow.outcomeVerification.status === "AwaitingHumanResolution" && (
           <OutcomeResolutionCard flow={flow} />
         )}
       {flow.status === "Approved" && (
         <section className="approval-banner">
           <div>
-            <strong>Customer approved this outcome</strong>
-            <span>The factory flow is complete and remains available in execution history.</span>
+            <strong>
+              {flow.kind === "Advisory"
+                ? "Customer accepted this Advisory"
+                : "Customer approved this Delivery"}
+            </strong>
+            <span>
+              {flow.kind === "Advisory"
+                ? "The recommendation is complete; no source publication was created."
+                : "The published result and execution evidence remain available in history."}
+            </span>
           </div>
           <div className="flow-heading-actions">
-            <a className="button" href={`#/preview/${flow.id}`}>
-              <ExternalIcon /> Accepted preview
-            </a>
-            <a className="button success" href={flow.outcomeUrl}>
-              <ExternalIcon /> Published outcome
-            </a>
+            {!studioFlow && (
+              <a className="button" href={`#/preview/${flow.id}`}>
+                <ExternalIcon /> Accepted preview
+              </a>
+            )}
+            {publishedDelivery && (
+              <a className="button success" href={flow.outcomeUrl}>
+                <ExternalIcon /> Published outcome
+              </a>
+            )}
           </div>
         </section>
       )}

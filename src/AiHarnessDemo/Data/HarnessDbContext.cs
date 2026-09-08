@@ -1,5 +1,6 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Services;
 using System.Data;
@@ -22,6 +23,13 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
     public DbSet<FlowMessage> FlowMessages => Set<FlowMessage>();
 
     public DbSet<FlowEvent> FlowEvents => Set<FlowEvent>();
+
+    public DbSet<FlowAgentSnapshot> FlowAgentSnapshots => Set<FlowAgentSnapshot>();
+
+    public DbSet<FlowPlanDocument> FlowPlanDocuments => Set<FlowPlanDocument>();
+
+    public DbSet<ReviewedPublicationRecord> ReviewedPublicationRecords =>
+        Set<ReviewedPublicationRecord>();
 
     public DbSet<HarnessLearning> Learnings => Set<HarnessLearning>();
 
@@ -57,6 +65,13 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.HasKey(item => item.Id);
             entity.Property(item => item.Id).HasMaxLength(120);
             entity.Property(item => item.Role).HasMaxLength(120);
+            entity.Property(item => item.DefinitionStatus)
+                .HasConversion<string>()
+                .HasDefaultValue(AgentDefinitionStatus.Valid);
+            entity.Property(item => item.ValidationError).HasDefaultValue(string.Empty);
+            entity.Property(item => item.Required).HasDefaultValue(false);
+            entity.Property(item => item.Switchable).HasDefaultValue(true);
+            entity.Property(item => item.DefinitionHash).HasDefaultValue(string.Empty);
             entity.HasIndex(item => item.SortOrder);
         });
 
@@ -64,6 +79,17 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
         {
             entity.HasKey(item => item.Id);
             entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.Kind).HasConversion<string>();
+            entity.Property(item => item.LinkKind).HasConversion<string>();
+            entity.Property(item => item.ContractVersion).HasDefaultValue("legacy-v1");
+            entity.Property(item => item.AgentCatalogRevision).HasDefaultValue(string.Empty);
+            entity.Property(item => item.OutcomeContractJson).HasDefaultValue(string.Empty);
+            entity.Property(item => item.CurrentBlockerCode).HasMaxLength(120);
+            entity.Property(item => item.CurrentBlockerSummary).HasMaxLength(
+                TeamPlanValidator.MaximumQualificationTextCharacters);
+            entity.Property(item => item.CurrentBlockerDataJson).HasMaxLength(65_536);
+            entity.Property(item => item.CustomerBlockerMessage).HasMaxLength(
+                IntakeV2Parser.MaximumCustomerReplyCharacters);
             entity.Property(item => item.Status).HasConversion<string>();
             entity.Property(item => item.Outcome).HasConversion<string>();
             entity.Property(item => item.ModelSelectionStrategy).HasConversion<string>();
@@ -71,6 +97,21 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.OutcomeVerificationJson).HasDefaultValue(string.Empty);
             entity.HasIndex(item => item.CreatedAt);
             entity.HasIndex(item => item.Status);
+            entity.HasIndex(item => item.ParentFlowRunId);
+            entity.HasIndex(item => new
+                {
+                    item.ParentFlowRunId,
+                    item.ParentIteration,
+                    item.LinkKind
+                })
+                .HasDatabaseName("IX_Flows_UniqueLinkedSuccessor")
+                .IsUnique()
+                .HasFilter(
+                    "\"ParentFlowRunId\" IS NOT NULL AND \"LinkKind\" IS NOT NULL");
+            entity.HasOne(item => item.ParentFlowRun)
+                .WithMany(flow => flow.LinkedFlowRuns)
+                .HasForeignKey(item => item.ParentFlowRunId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         modelBuilder.Entity<FlowStep>(entity =>
@@ -80,6 +121,20 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.Status).HasConversion<string>();
             entity.Property(item => item.Phase).HasConversion<string>();
             entity.Property(item => item.Kind).HasConversion<string>();
+            entity.Property(item => item.PlanStepKey).HasDefaultValue(string.Empty);
+            entity.Property(item => item.PlanDutiesJson).HasDefaultValue("[]");
+            entity.Property(item => item.PlanStage)
+                .HasConversion<string>()
+                .HasDefaultValue(PlanStage.BeforeReview);
+            entity.Property(item => item.IsOutcomeOwner).HasDefaultValue(false);
+            entity.Property(item => item.PermissionProfile)
+                .HasConversion<string>();
+            entity.Property(item => item.InvocationKind)
+                .HasConversion<string>();
+            entity.Property(item => item.EffectivePermissionJson).HasDefaultValue(string.Empty);
+            entity.Property(item => item.WorkflowRevision).HasDefaultValue(string.Empty);
+            entity.Property(item => item.ReviewClassificationStateJson)
+                .HasDefaultValue(string.Empty);
             entity.Property(item => item.OutcomePlanHash).HasDefaultValue(string.Empty);
             entity.Property(item => item.RemotePublicationAllowed).HasDefaultValue(false);
             entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.Sequence });
@@ -90,6 +145,7 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.HasIndex(item => item.PreMortemTargetStepId);
             entity.HasIndex(item => item.PreMortemReviewStepId);
             entity.HasIndex(item => item.StableSemanticRootId);
+            entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.PlanStepKey });
             entity.HasIndex(item => new
             {
                 item.FlowRunId,
@@ -119,6 +175,8 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
         {
             entity.HasKey(item => item.Id);
             entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.DataJson).HasMaxLength(
+                IntakeV2Parser.MaximumJsonCharacters);
             entity.HasIndex(item => new { item.FlowRunId, item.CreatedAt });
             entity.HasOne(item => item.FlowRun)
                 .WithMany(flow => flow.Events)
@@ -140,8 +198,14 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.Id).ValueGeneratedNever();
             entity.Property(item => item.ActionType).HasConversion<string>();
             entity.Property(item => item.Decision).HasConversion<string>();
+            entity.Property(item => item.ReviewDecision).HasConversion<string>();
             entity.Property(item => item.TrustLevelAtDecision).HasConversion<string>();
             entity.HasIndex(item => new { item.FlowRunId, item.DecidedAt });
+            entity.HasIndex(item => new { item.FlowRunId, item.ActionType })
+                .HasDatabaseName("IX_GateRecords_UnresolvedCustomerReview")
+                .IsUnique()
+                .HasFilter(
+                    "\"ActionType\" = 'CustomerReview' AND \"Resolved\" = 0");
             entity.HasOne<FlowRun>()
                 .WithMany(flow => flow.GateRecords)
                 .HasForeignKey(item => item.FlowRunId)
@@ -165,10 +229,67 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.Id).ValueGeneratedNever();
             entity.Property(item => item.Risk).HasConversion<string>();
             entity.Property(item => item.PreMortemAfter).HasDefaultValue(false);
+            entity.Property(item => item.PlanStepKey).HasDefaultValue(string.Empty);
+            entity.Property(item => item.AgentId).HasDefaultValue(string.Empty);
             entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.Role });
+            entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.PlanStepKey });
             entity.HasIndex(item => item.FlowStepId).IsUnique();
             entity.HasOne<FlowRun>()
                 .WithMany(flow => flow.TaskProfiles)
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<FlowAgentSnapshot>(entity =>
+        {
+            entity.HasKey(item => new { item.FlowRunId, item.AgentId });
+            entity.Property(item => item.AgentId).HasMaxLength(120);
+            entity.HasIndex(item => item.AgentId);
+            entity.HasOne(item => item.FlowRun)
+                .WithMany(flow => flow.AgentSnapshots)
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<FlowPlanDocument>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.HasIndex(item => new { item.FlowRunId, item.Iteration }).IsUnique();
+            entity.HasOne(item => item.FlowRun)
+                .WithMany(flow => flow.PlanDocuments)
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ReviewedPublicationRecord>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.Stage).HasConversion<string>();
+            entity.Property(item => item.CandidateFingerprint).HasMaxLength(128);
+            entity.Property(item => item.RelativePath).HasMaxLength(1_024);
+            entity.Property(item => item.RemoteRepository)
+                .HasMaxLength(512)
+                .HasDefaultValue(string.Empty);
+            entity.Property(item => item.BranchName)
+                .HasMaxLength(512)
+                .HasDefaultValue(string.Empty);
+            entity.Property(item => item.Head).HasMaxLength(128);
+            entity.Property(item => item.Tree).HasMaxLength(128);
+            entity.Property(item => item.PullRequestUrl)
+                .HasMaxLength(1_024)
+                .HasDefaultValue(string.Empty);
+            entity.HasIndex(item => new
+                {
+                    item.FlowRunId,
+                    item.PublicationRootId,
+                    item.RelativePath
+                })
+                .HasDatabaseName("IX_ReviewedPublicationRecords_Repository")
+                .IsUnique();
+            entity.HasOne<FlowRun>()
+                .WithMany()
                 .HasForeignKey(item => item.FlowRunId)
                 .OnDelete(DeleteBehavior.Cascade);
         });
@@ -272,6 +393,8 @@ public static class DatabaseInitializer
         await EnsureFlowStepSchemaAsync(database);
         await EnsureAgentToolCallSchemaAsync(database);
         await EnsureRoutingSchemaAsync(database);
+        await EnsureSliceOneSchemaAsync(database);
+        await EnsureReviewedPublicationSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         var settings = await database.Settings.SingleOrDefaultAsync();
@@ -298,7 +421,10 @@ public static class DatabaseInitializer
             .ToListAsync());
 
         var catalog = scope.ServiceProvider.GetRequiredService<AgentCatalog>();
-        await catalog.SyncAsync();
+        await catalog.LoadAsync();
+        await scope.ServiceProvider
+            .GetRequiredService<FlowAgentSnapshotService>()
+            .MigrateLegacyNonterminalAsync();
     }
 
     internal static async Task EnsureSettingsSchemaAsync(
@@ -328,8 +454,67 @@ public static class DatabaseInitializer
         await EnsureColumnAsync(
             database,
             "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PlanStepKey';",
+            "ALTER TABLE FlowSteps ADD COLUMN PlanStepKey TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PlanDutiesJson';",
+            "ALTER TABLE FlowSteps ADD COLUMN PlanDutiesJson TEXT NOT NULL DEFAULT '[]';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PlanStage';",
+            "ALTER TABLE FlowSteps ADD COLUMN PlanStage " +
+            "TEXT NOT NULL DEFAULT 'BeforeReview';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'IsOutcomeOwner';",
+            "ALTER TABLE FlowSteps ADD COLUMN IsOutcomeOwner INTEGER NOT NULL DEFAULT 0;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'PermissionProfile';",
+            "ALTER TABLE FlowSteps ADD COLUMN PermissionProfile " +
+            "TEXT NOT NULL DEFAULT 'WorkspaceWrite';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'InvocationKind';",
+            "ALTER TABLE FlowSteps ADD COLUMN InvocationKind " +
+            "TEXT NOT NULL DEFAULT 'Worker';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'EffectivePermissionJson';",
+            "ALTER TABLE FlowSteps ADD COLUMN EffectivePermissionJson " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'WorkflowRevision';",
+            "ALTER TABLE FlowSteps ADD COLUMN WorkflowRevision TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
             "WHERE name = 'ExecutionPrompt';",
             "ALTER TABLE FlowSteps ADD COLUMN ExecutionPrompt " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'ReviewClassificationStateJson';",
+            "ALTER TABLE FlowSteps ADD COLUMN ReviewClassificationStateJson " +
             "TEXT NOT NULL DEFAULT '';",
             cancellationToken);
         await EnsureColumnAsync(
@@ -419,6 +604,24 @@ public static class DatabaseInitializer
             "SELECT COUNT(*) FROM pragma_table_info('FlowSteps') " +
             "WHERE name = 'StableSemanticRootId';",
             "ALTER TABLE FlowSteps ADD COLUMN StableSemanticRootId TEXT NULL;",
+            cancellationToken);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            UPDATE FlowSteps
+            SET InvocationKind = CASE
+                WHEN PlanStepKey = 'team-plan' THEN 'Planning'
+                WHEN PlanStepKey = 'account-manager:refinement' THEN 'Intake'
+                WHEN PlanStepKey = 'account-manager:qualification-blocker'
+                    THEN 'BlockerExplanation'
+                WHEN PlanStepKey LIKE 'account-manager:review-classification:%'
+                    THEN 'ReviewClassification'
+                WHEN PlanStepKey LIKE 'pre-mortem:%'
+                     AND PreMortemTargetStepId IS NOT NULL
+                     AND PreMortemReviewStepId IS NULL
+                    THEN 'PreMortem'
+                ELSE InvocationKind
+            END;
+            """,
             cancellationToken);
         await database.Database.ExecuteSqlRawAsync(
             """
@@ -598,6 +801,8 @@ public static class DatabaseInitializer
                 ON FlowSteps (PreMortemReviewStepId);
             CREATE INDEX IF NOT EXISTS IX_FlowSteps_StableSemanticRootId
                 ON FlowSteps (StableSemanticRootId);
+            CREATE INDEX IF NOT EXISTS IX_FlowSteps_Flow_Iteration_PlanStepKey
+                ON FlowSteps (FlowRunId, Iteration, PlanStepKey);
             CREATE INDEX IF NOT EXISTS IX_FlowSteps_Flow_Iteration_Kind_QaRound
                 ON FlowSteps (FlowRunId, Iteration, Kind, OutcomeQaRound);
             """,
@@ -722,6 +927,83 @@ public static class DatabaseInitializer
     {
         await EnsureColumnAsync(
             database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') WHERE name = 'Kind';",
+            "ALTER TABLE Flows ADD COLUMN Kind TEXT NOT NULL DEFAULT 'Delivery';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'ContractVersion';",
+            "ALTER TABLE Flows ADD COLUMN ContractVersion " +
+            "TEXT NOT NULL DEFAULT 'legacy-v1';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'ParentFlowRunId';",
+            "ALTER TABLE Flows ADD COLUMN ParentFlowRunId TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'ParentIteration';",
+            "ALTER TABLE Flows ADD COLUMN ParentIteration INTEGER NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') WHERE name = 'LinkKind';",
+            "ALTER TABLE Flows ADD COLUMN LinkKind TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'AgentCatalogRevision';",
+            "ALTER TABLE Flows ADD COLUMN AgentCatalogRevision TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'OutcomeOwnerPlanStepKey';",
+            "ALTER TABLE Flows ADD COLUMN OutcomeOwnerPlanStepKey TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'PublicationPlanStepKey';",
+            "ALTER TABLE Flows ADD COLUMN PublicationPlanStepKey TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'OutcomeContractJson';",
+            "ALTER TABLE Flows ADD COLUMN OutcomeContractJson TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'CurrentBlockerCode';",
+            "ALTER TABLE Flows ADD COLUMN CurrentBlockerCode TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'CurrentBlockerSummary';",
+            "ALTER TABLE Flows ADD COLUMN CurrentBlockerSummary TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'CurrentBlockerDataJson';",
+            "ALTER TABLE Flows ADD COLUMN CurrentBlockerDataJson TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
+            "WHERE name = 'CustomerBlockerMessage';",
+            "ALTER TABLE Flows ADD COLUMN CustomerBlockerMessage TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
             "SELECT COUNT(*) FROM pragma_table_info('Flows') " +
             "WHERE name = 'ModelSelectionStrategy';",
             "ALTER TABLE Flows ADD COLUMN ModelSelectionStrategy " +
@@ -733,6 +1015,21 @@ public static class DatabaseInitializer
             "WHERE name = 'OutcomeVerificationJson';",
             "ALTER TABLE Flows ADD COLUMN OutcomeVerificationJson " +
             "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            UPDATE Flows
+            SET Kind = 'Delivery'
+            WHERE Kind IS NULL OR Kind = '';
+            UPDATE Flows
+            SET ContractVersion = 'legacy-v1'
+            WHERE ContractVersion IS NULL OR ContractVersion = '';
+            CREATE INDEX IF NOT EXISTS IX_Flows_ParentFlowRunId
+                ON Flows (ParentFlowRunId);
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_Flows_UniqueLinkedSuccessor
+                ON Flows (ParentFlowRunId, ParentIteration, LinkKind)
+                WHERE ParentFlowRunId IS NOT NULL AND LinkKind IS NOT NULL;
+            """,
             cancellationToken);
     }
 
@@ -767,13 +1064,43 @@ public static class DatabaseInitializer
                 .Select(flow => new
                 {
                     flow.Id,
+                    flow.ContractVersion,
                     flow.OutcomeVerificationJson
                 })
                 .ToDictionaryAsync(
                     item => item.Id,
-                    item => item.OutcomeVerificationJson,
+                    item => new LegacyFlowUpgradeState(
+                        item.ContractVersion,
+                        item.OutcomeVerificationJson),
                     cancellationToken)
-            : new Dictionary<Guid, string>();
+            : new Dictionary<Guid, LegacyFlowUpgradeState>();
+        var gateStates = await TableExistsAsync(
+                database,
+                "GateRecords",
+                cancellationToken)
+            ? await database.GateRecords
+                .AsNoTracking()
+                .Select(gate => new LegacyGateUpgradeState(
+                    gate.FlowRunId,
+                    gate.FlowStepId,
+                    gate.ActionType,
+                    gate.Resolved,
+                    gate.Approved))
+                .ToListAsync(cancellationToken)
+            : [];
+        var publicationEventStepIds = await TableExistsAsync(
+                database,
+                "FlowEvents",
+                cancellationToken)
+            ? await database.FlowEvents
+                .AsNoTracking()
+                .Where(item =>
+                    item.FlowStepId != null &&
+                    item.Type == "flow.approved-publication-queued")
+                .Select(item => item.FlowStepId!.Value)
+                .ToListAsync(cancellationToken)
+            : [];
+        var publicationEventIds = publicationEventStepIds.ToHashSet();
 
         var changed = false;
         foreach (var flowGroup in steps.GroupBy(item => item.FlowRunId))
@@ -794,14 +1121,53 @@ public static class DatabaseInitializer
                 }
             }
 
-            if (!flowStates.TryGetValue(flowGroup.Key, out var flowState) ||
-                string.IsNullOrWhiteSpace(flowState))
+            if (!flowStates.TryGetValue(flowGroup.Key, out var flowState))
             {
                 continue;
             }
+            if (string.Equals(
+                    flowState.ContractVersion,
+                    "legacy-v1",
+                    StringComparison.Ordinal))
+            {
+                var approvedReleaseIterations = gateStates
+                    .Where(gate =>
+                        gate.FlowRunId == flowGroup.Key &&
+                        gate.ActionType == HandoffActionType.Release &&
+                        gate.Resolved &&
+                        gate.Approved == true &&
+                        byId.TryGetValue(gate.FlowStepId, out _))
+                    .Select(gate => byId[gate.FlowStepId].Iteration)
+                    .ToHashSet();
+                var publicationJournalStepIds =
+                    string.IsNullOrWhiteSpace(
+                        flowState.OutcomeVerificationJson)
+                        ? []
+                        : BuildLegacyPublicationStepIds(
+                            flowState.OutcomeVerificationJson);
+                foreach (var step in ordered)
+                {
+                    if (BackfillLegacyExecutionMetadata(
+                            step,
+                            approvedReleaseIterations,
+                            publicationEventIds,
+                            publicationJournalStepIds,
+                            governed:
+                            !string.IsNullOrWhiteSpace(
+                                flowState.OutcomeVerificationJson)))
+                    {
+                        changed = true;
+                    }
+                }
+            }
 
+            if (string.IsNullOrWhiteSpace(
+                    flowState.OutcomeVerificationJson))
+            {
+                continue;
+            }
             var iterations = BuildLegacyOutcomeIterations(
-                flowState);
+                flowState.OutcomeVerificationJson);
             foreach (var step in ordered)
             {
                 if (!iterations.TryGetValue(step.Iteration, out var iteration))
@@ -836,6 +1202,144 @@ public static class DatabaseInitializer
         {
             await database.SaveChangesAsync(cancellationToken);
         }
+    }
+
+    private static bool BackfillLegacyExecutionMetadata(
+        FlowStep step,
+        IReadOnlySet<int> approvedReleaseIterations,
+        IReadOnlySet<Guid> publicationEventStepIds,
+        IReadOnlySet<Guid> publicationJournalStepIds,
+        bool governed)
+    {
+        var preMortemReview =
+            step.PreMortemReviewStepId is null &&
+            step.PreMortemTargetStepId is not null &&
+            (string.Equals(
+                 step.AgentRole,
+                 WorkflowEngine.PreMortemRole,
+                 StringComparison.Ordinal) ||
+             step.PreMortemOriginStepId is not null);
+        if (preMortemReview)
+        {
+            return SetLegacyExecutionMetadata(
+                step,
+                ExecutionInvocationKind.PreMortem,
+                """["Analyze","Verify"]""",
+                PlanStage.BeforeReview,
+                ExecutionPermissionProfile.PreMortemReadOnly);
+        }
+
+        var publicationSignal =
+            step.RemotePublicationAllowed ||
+            step.Kind == FlowStepKind.OutcomeApprovedPublication ||
+            string.Equals(
+                step.Label,
+                WorkflowEngine.ApprovedPublicationLabel,
+                StringComparison.Ordinal) ||
+            publicationEventStepIds.Contains(step.Id) ||
+            publicationJournalStepIds.Contains(step.Id) ||
+            step.InvocationKind ==
+                ExecutionInvocationKind.Publication ||
+            step.PlanStage == PlanStage.AfterApproval ||
+            string.Equals(
+                step.PlanDutiesJson,
+                """["Publish"]""",
+                StringComparison.Ordinal) ||
+            step.PermissionProfile ==
+                ExecutionPermissionProfile.Publish;
+        if (publicationSignal &&
+            approvedReleaseIterations.Contains(step.Iteration))
+        {
+            var publicationFlagChanged =
+                !step.RemotePublicationAllowed;
+            step.RemotePublicationAllowed = true;
+            return SetLegacyExecutionMetadata(
+                step,
+                ExecutionInvocationKind.Publication,
+                """["Publish"]""",
+                PlanStage.AfterApproval,
+                governed
+                    ? ExecutionPermissionProfile.WorkspaceWrite
+                    : ExecutionPermissionProfile.Publish) ||
+                   publicationFlagChanged;
+        }
+        if (publicationSignal)
+        {
+            var publicationFlagChanged =
+                step.RemotePublicationAllowed;
+            step.RemotePublicationAllowed = false;
+            return SetLegacyExecutionMetadata(
+                step,
+                ExecutionInvocationKind.Worker,
+                "[]",
+                PlanStage.BeforeReview,
+                ExecutionPermissionProfile.WorkspaceWrite) ||
+                   publicationFlagChanged;
+        }
+
+        if (string.Equals(
+                step.AgentRole,
+                "account-manager",
+                StringComparison.Ordinal))
+        {
+            return SetLegacyExecutionMetadata(
+                step,
+                ExecutionInvocationKind.Intake,
+                """["Analyze"]""",
+                PlanStage.BeforeReview,
+                ExecutionPermissionProfile.ReadOnlySource);
+        }
+        if (string.Equals(
+                step.AgentRole,
+                "team-lead",
+                StringComparison.Ordinal))
+        {
+            return SetLegacyExecutionMetadata(
+                step,
+                ExecutionInvocationKind.Planning,
+                """["Analyze","Design"]""",
+                PlanStage.BeforeReview,
+                ExecutionPermissionProfile.ReadOnlySource);
+        }
+        return false;
+    }
+
+    private static bool SetLegacyExecutionMetadata(
+        FlowStep step,
+        ExecutionInvocationKind invocationKind,
+        string dutiesJson,
+        PlanStage stage,
+        ExecutionPermissionProfile permissionProfile)
+    {
+        var changed =
+            step.InvocationKind != invocationKind ||
+            !string.Equals(
+                step.PlanDutiesJson,
+                dutiesJson,
+                StringComparison.Ordinal) ||
+            step.PlanStage != stage ||
+            step.PermissionProfile != permissionProfile;
+        step.InvocationKind = invocationKind;
+        step.PlanDutiesJson = dutiesJson;
+        step.PlanStage = stage;
+        step.PermissionProfile = permissionProfile;
+        return changed;
+    }
+
+    private static HashSet<Guid> BuildLegacyPublicationStepIds(string json)
+    {
+        var state = OutcomeVerificationRules.DeserializeAggregate(json);
+        var result = state.PriorIterations
+            .Select(archive => archive.Publication?.StepId)
+            .OfType<Guid>()
+            .Where(id => id != Guid.Empty)
+            .ToHashSet();
+        if (state.Publication?.StepId is { } stepId &&
+            stepId != Guid.Empty)
+        {
+            result.Add(stepId);
+        }
+        return result;
     }
 
     private static IReadOnlyDictionary<int, LegacyOutcomeIterationState>
@@ -1395,7 +1899,170 @@ public static class DatabaseInitializer
             "ALTER TABLE TaskProfiles ADD COLUMN PreMortemAfter " +
             "INTEGER NOT NULL DEFAULT 0;",
             cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('TaskProfiles') " +
+            "WHERE name = 'PlanStepKey';",
+            "ALTER TABLE TaskProfiles ADD COLUMN PlanStepKey TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('TaskProfiles') " +
+            "WHERE name = 'AgentId';",
+            "ALTER TABLE TaskProfiles ADD COLUMN AgentId TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE INDEX IF NOT EXISTS IX_TaskProfiles_Flow_Iteration_PlanStepKey
+                ON TaskProfiles (FlowRunId, Iteration, PlanStepKey);
+            """,
+            cancellationToken);
     }
+
+    internal static async Task EnsureSliceOneSchemaAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Agents') " +
+            "WHERE name = 'DefinitionStatus';",
+            "ALTER TABLE Agents ADD COLUMN DefinitionStatus TEXT NOT NULL DEFAULT 'Valid';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Agents') " +
+            "WHERE name = 'ValidationError';",
+            "ALTER TABLE Agents ADD COLUMN ValidationError TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Agents') WHERE name = 'Required';",
+            "ALTER TABLE Agents ADD COLUMN Required INTEGER NOT NULL DEFAULT 0;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Agents') WHERE name = 'Switchable';",
+            "ALTER TABLE Agents ADD COLUMN Switchable INTEGER NOT NULL DEFAULT 1;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Agents') " +
+            "WHERE name = 'DefinitionHash';",
+            "ALTER TABLE Agents ADD COLUMN DefinitionHash TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('Agents') WHERE name = 'LoadedAt';",
+            "ALTER TABLE Agents ADD COLUMN LoadedAt INTEGER NOT NULL DEFAULT 0;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('GateRecords') " +
+            "WHERE name = 'ReviewDecision';",
+            "ALTER TABLE GateRecords ADD COLUMN ReviewDecision TEXT NULL;",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('FlowEvents') " +
+            "WHERE name = 'DataJson';",
+            "ALTER TABLE FlowEvents ADD COLUMN DataJson TEXT NULL;",
+            cancellationToken);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_GateRecords_UnresolvedCustomerReview
+                ON GateRecords (FlowRunId, ActionType)
+                WHERE ActionType = 'CustomerReview' AND Resolved = 0;
+            """,
+            cancellationToken);
+
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE TABLE IF NOT EXISTS FlowAgentSnapshots (
+                FlowRunId TEXT NOT NULL,
+                AgentId TEXT NOT NULL,
+                Name TEXT NOT NULL,
+                Description TEXT NOT NULL,
+                Role TEXT NOT NULL,
+                Instructions TEXT NOT NULL,
+                DefinitionHash TEXT NOT NULL,
+                EnabledAtSnapshot INTEGER NOT NULL,
+                Required INTEGER NOT NULL,
+                Switchable INTEGER NOT NULL,
+                SourceFileName TEXT NOT NULL,
+                CapturedAt INTEGER NOT NULL,
+                CONSTRAINT PK_FlowAgentSnapshots PRIMARY KEY (FlowRunId, AgentId),
+                CONSTRAINT FK_FlowAgentSnapshots_Flows_FlowRunId
+                    FOREIGN KEY (FlowRunId)
+                    REFERENCES Flows (Id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS IX_FlowAgentSnapshots_AgentId
+                ON FlowAgentSnapshots (AgentId);
+
+            CREATE TABLE IF NOT EXISTS FlowPlanDocuments (
+                Id TEXT NOT NULL CONSTRAINT PK_FlowPlanDocuments PRIMARY KEY,
+                FlowRunId TEXT NOT NULL,
+                Iteration INTEGER NOT NULL,
+                Version TEXT NOT NULL,
+                Disposition TEXT NOT NULL,
+                RawJson TEXT NOT NULL,
+                CreatedAt INTEGER NOT NULL,
+                CONSTRAINT FK_FlowPlanDocuments_Flows_FlowRunId
+                    FOREIGN KEY (FlowRunId)
+                    REFERENCES Flows (Id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_FlowPlanDocuments_FlowRunId_Iteration
+                ON FlowPlanDocuments (FlowRunId, Iteration);
+            """,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Additive, idempotent upgrade for the durable reviewed-publication journal. Databases created
+    /// before the journal existed gain the table without losing any prior publication history.
+    /// </summary>
+    internal static async Task EnsureReviewedPublicationSchemaAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken = default)
+    {
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE TABLE IF NOT EXISTS ReviewedPublicationRecords (
+                Id TEXT NOT NULL CONSTRAINT PK_ReviewedPublicationRecords PRIMARY KEY,
+                FlowRunId TEXT NOT NULL,
+                PublicationRootId TEXT NOT NULL,
+                Iteration INTEGER NOT NULL,
+                CandidateFingerprint TEXT NOT NULL,
+                RelativePath TEXT NOT NULL,
+                RemoteRepository TEXT NOT NULL DEFAULT '',
+                BranchName TEXT NOT NULL DEFAULT '',
+                Head TEXT NOT NULL,
+                Tree TEXT NOT NULL,
+                Stage TEXT NOT NULL DEFAULT 'Intent',
+                PullRequestUrl TEXT NOT NULL DEFAULT '',
+                CreatedAt INTEGER NOT NULL,
+                UpdatedAt INTEGER NOT NULL,
+                CONSTRAINT FK_ReviewedPublicationRecords_Flows_FlowRunId
+                    FOREIGN KEY (FlowRunId)
+                    REFERENCES Flows (Id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_ReviewedPublicationRecords_Repository
+                ON ReviewedPublicationRecords
+                    (FlowRunId, PublicationRootId, RelativePath);
+            """,
+            cancellationToken);
+    }
+
+    private sealed record LegacyFlowUpgradeState(
+        string ContractVersion,
+        string OutcomeVerificationJson);
+
+    private sealed record LegacyGateUpgradeState(
+        Guid FlowRunId,
+        Guid FlowStepId,
+        HandoffActionType ActionType,
+        bool Resolved,
+        bool? Approved);
 
     private sealed record LegacyOutcomeIterationState(
         string? AcceptancePlanHash,

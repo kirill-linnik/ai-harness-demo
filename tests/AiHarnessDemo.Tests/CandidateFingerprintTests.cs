@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Workflow;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Infrastructure;
@@ -11,6 +12,72 @@ namespace AiHarnessDemo.Tests;
 
 public sealed class CandidateFingerprintTests
 {
+    [Fact]
+    public async Task ReviewedCandidate_SealsPersistsAndRejectsPostReviewByteChanges()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var flow = workspace.Flow;
+        flow.ContractVersion = "studio-v2";
+        flow.Kind = FlowKind.Delivery;
+        flow.OutcomeOwnerPlanStepKey = "outcome";
+        flow.OutcomeContractJson =
+            """{"Version":"flow-outcome-v1","Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["Changed tracked product bytes."],"Artifacts":[]}""";
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = StudioWorkspaceRepositoryMapLedger.EventType,
+            Message = "Fixture trusted repository map.",
+            DataJson = StudioWorkspaceRepositoryMapLedger.Serialize(
+                StudioWorkspaceRepositoryMapLedger.Create(
+                    flow,
+                    flow.WorkspacePath,
+                    [new WorkspaceRepositoryIdentity(".", string.Empty)]))
+        });
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "tracked.txt"),
+            "reviewed bytes");
+        var ownerStepId = Guid.NewGuid();
+        var service = new ReviewedCandidateService(
+            new CandidateFingerprintService(
+                new ProcessRunner(),
+                TimeProvider.System));
+
+        var identity = await service.SealAsync(
+            flow,
+            ownerStepId,
+            "outcome",
+            flow.OutcomeContractJson);
+        var eventJson = ReviewedCandidateLedger.Serialize(identity);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = ownerStepId,
+            Type = ReviewedCandidateLedger.EventType,
+            Message = "Fixture reviewed seal.",
+            DataJson = eventJson
+        });
+
+        var restartedIdentity = ReviewedCandidateLedger.Read(
+            flow,
+            ownerStepId);
+        var verified = await new ReviewedCandidateService(
+                new CandidateFingerprintService(
+                    new ProcessRunner(),
+                    TimeProvider.System))
+            .VerifyAsync(flow, restartedIdentity);
+        Assert.Equal(identity.Fingerprint, verified.Fingerprint);
+        Assert.Equal(
+            "reviewed bytes",
+            await File.ReadAllTextAsync(
+                Path.Combine(workspace.Root, "tracked.txt")));
+
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "tracked.txt"),
+            "unreviewed bytes");
+        await Assert.ThrowsAsync<CandidateValidationException>(
+            () => service.VerifyAsync(flow, identity));
+    }
+
     [Fact]
     public async Task Fingerprint_IsDeterministicAndOrdersMultipleRepositories()
     {

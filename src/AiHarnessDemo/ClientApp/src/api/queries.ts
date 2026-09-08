@@ -3,10 +3,12 @@ import { api } from "./endpoints";
 import { flowPollIntervalMs } from "../lib/pollInterval";
 import type {
   AnalyzeRepositoryRequest,
+  DirectReviewRequest,
   FeedbackRequest,
   FlowDecisionRequest,
   IntakeRequest,
   OutcomeResolutionRequest,
+  QualificationResolutionRequest,
   SaveSettingsRequest,
   ToggleAgentRequest
 } from "./types";
@@ -20,7 +22,11 @@ import type {
 
 export const queryKeys = {
   bootstrap: ["bootstrap"] as const,
+  settings: ["settings"] as const,
+  agentCatalog: ["agent-catalog"] as const,
+  flows: ["flows"] as const,
   flow: (flowId: string) => ["flow", flowId] as const,
+  reviewResult: (flowId: string) => ["review-result", flowId] as const,
   history: ["history"] as const,
   learnings: ["learnings"] as const,
   preview: (flowId: string) => ["preview", flowId] as const,
@@ -35,6 +41,30 @@ export function useBootstrapQuery() {
   });
 }
 
+export function useSettingsQuery() {
+  return useQuery({
+    queryKey: queryKeys.settings,
+    queryFn: api.settings,
+    staleTime: 0
+  });
+}
+
+export function useAgentCatalogQuery() {
+  return useQuery({
+    queryKey: queryKeys.agentCatalog,
+    queryFn: api.agentCatalog,
+    staleTime: 0
+  });
+}
+
+export function useFlowsQuery() {
+  return useQuery({
+    queryKey: queryKeys.flows,
+    queryFn: api.flows,
+    staleTime: 0
+  });
+}
+
 export function useFlowQuery(flowId: string | undefined) {
   return useQuery({
     queryKey: queryKeys.flow(flowId ?? ""),
@@ -43,6 +73,16 @@ export function useFlowQuery(flowId: string | undefined) {
     staleTime: 0,
     refetchInterval: query => flowPollIntervalMs(query.state.data?.status),
     refetchIntervalInBackground: true
+  });
+}
+
+export function useReviewResultQuery(flowId: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.reviewResult(flowId ?? ""),
+    queryFn: () => api.reviewResult(flowId!),
+    enabled: Boolean(flowId) && enabled,
+    staleTime: 0,
+    retry: false
   });
 }
 
@@ -74,87 +114,157 @@ export function useDirectoryListingQuery(path: string, enabled: boolean) {
   });
 }
 
-function useInvalidateBootstrap() {
+function useInvalidateProjection() {
   const queryClient = useQueryClient();
-  return () => queryClient.invalidateQueries({ queryKey: queryKeys.bootstrap });
+  return async (...flowIds: string[]) => {
+    const invalidations = [
+      queryClient.invalidateQueries({ queryKey: queryKeys.bootstrap }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.settings }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.agentCatalog }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.flows }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.history })
+    ];
+    if (flowIds.length > 0) {
+      for (const flowId of new Set(flowIds)) {
+        invalidations.push(
+          queryClient.invalidateQueries({ queryKey: queryKeys.flow(flowId) }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.reviewResult(flowId) }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.preview(flowId) })
+        );
+      }
+    } else {
+      invalidations.push(
+        queryClient.invalidateQueries({ queryKey: ["flow"] }),
+        queryClient.invalidateQueries({ queryKey: ["review-result"] }),
+        queryClient.invalidateQueries({ queryKey: ["preview"] })
+      );
+    }
+    await Promise.all(invalidations);
+  };
 }
 
 export function useSaveSettingsMutation() {
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: (body: SaveSettingsRequest) => api.saveSettings(body),
-    onSuccess: () => invalidateBootstrap()
+    onSuccess: () => invalidateProjection()
   });
 }
 
 export function useToggleAgentMutation() {
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: ({ agentId, body }: { agentId: string; body: ToggleAgentRequest }) =>
       api.toggleAgent(agentId, body),
-    onSuccess: () => invalidateBootstrap()
+    onSuccess: () => invalidateProjection()
+  });
+}
+
+export function useReloadAgentCatalogMutation() {
+  const invalidateProjection = useInvalidateProjection();
+  return useMutation({
+    mutationFn: api.reloadAgentCatalog,
+    onSuccess: () => invalidateProjection()
   });
 }
 
 export function useAnalyzeRepositoryMutation() {
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: (body: AnalyzeRepositoryRequest) => api.analyzeRepository(body),
-    onSuccess: () => invalidateBootstrap()
+    onSuccess: () => invalidateProjection()
   });
 }
 
 export function useContinueIntakeMutation() {
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const queryClient = useQueryClient();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: (body: IntakeRequest) => api.continueIntake(body),
-    onSuccess: () => invalidateBootstrap()
+    onSuccess: response => {
+      queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
+      return invalidateProjection(response.flow.id);
+    }
   });
 }
 
 export function useStartFlowMutation() {
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const queryClient = useQueryClient();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: (flowId: string) => api.startFlow(flowId),
-    onSuccess: () => invalidateBootstrap()
+    onSuccess: flow => {
+      queryClient.setQueryData(queryKeys.flow(flow.id), flow);
+      return invalidateProjection(flow.id);
+    }
   });
 }
 
 export function useRestartFlowMutation() {
   const queryClient = useQueryClient();
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: (flowId: string) => api.restartFlow(flowId),
     onSuccess: flow => {
       queryClient.setQueryData(queryKeys.flow(flow.id), flow);
-      invalidateBootstrap();
+      return invalidateProjection(flow.id);
     }
   });
 }
 
 export function useSendFeedbackMutation() {
+  const queryClient = useQueryClient();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: ({ flowId, body }: { flowId: string; body: FeedbackRequest }) =>
-      api.sendFeedback(flowId, body)
+      api.sendFeedback(flowId, body),
+    onSuccess: response => {
+      queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
+      return invalidateProjection(response.flow.id);
+    }
+  });
+}
+
+export function useReviewFlowMutation() {
+  const invalidateProjection = useInvalidateProjection();
+  return useMutation({
+    mutationFn: ({ flowId, body }: { flowId: string; body: DirectReviewRequest }) =>
+      api.reviewFlow(flowId, body),
+    onSuccess: result => invalidateProjection(result.flowId)
+  });
+}
+
+export function useResolveQualificationMutation() {
+  const invalidateProjection = useInvalidateProjection();
+  return useMutation({
+    mutationFn: ({
+      flowId,
+      body
+    }: {
+      flowId: string;
+      body: QualificationResolutionRequest;
+    }) => api.resolveQualification(flowId, body),
+    onSuccess: result =>
+      invalidateProjection(result.parentFlowId, result.successorFlowId)
   });
 }
 
 export function useDecideFlowMutation() {
   const queryClient = useQueryClient();
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: ({ flowId, body }: { flowId: string; body: FlowDecisionRequest }) =>
       api.decideFlow(flowId, body),
     onSuccess: result => {
       queryClient.setQueryData(queryKeys.flow(result.flow.id), result.flow);
-      invalidateBootstrap();
+      return invalidateProjection(result.flow.id);
     }
   });
 }
 
 export function useResolveOutcomeMutation() {
   const queryClient = useQueryClient();
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: ({
       flowId,
@@ -165,19 +275,19 @@ export function useResolveOutcomeMutation() {
     }) => api.resolveOutcome(flowId, body),
     onSuccess: flow => {
       queryClient.setQueryData(queryKeys.flow(flow.id), flow);
-      invalidateBootstrap();
+      return invalidateProjection(flow.id);
     }
   });
 }
 
 export function useAbandonFlowMutation() {
   const queryClient = useQueryClient();
-  const invalidateBootstrap = useInvalidateBootstrap();
+  const invalidateProjection = useInvalidateProjection();
   return useMutation({
     mutationFn: (flowId: string) => api.abandonFlow(flowId),
     onSuccess: result => {
       queryClient.invalidateQueries({ queryKey: queryKeys.flow(result.flowId) });
-      invalidateBootstrap();
+      return invalidateProjection(result.flowId);
     }
   });
 }

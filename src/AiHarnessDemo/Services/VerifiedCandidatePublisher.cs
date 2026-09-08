@@ -1,6 +1,10 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Data;
 using Microsoft.EntityFrameworkCore;
@@ -22,9 +26,27 @@ public interface IVerifiedCandidatePublisher
 public sealed partial class VerifiedCandidatePublisher(
     ProcessRunner processRunner,
     CandidateFingerprintService candidateFingerprintService,
+    IReviewedCandidateService reviewedCandidateService,
     IDbContextFactory<HarnessDbContext> databaseFactory)
     : IVerifiedCandidatePublisher
 {
+    internal const string ReviewedPublicationStartedEventType =
+        "delivery.reviewed-publication.started";
+
+    internal const string ReviewedPublicationRepositoryEventType =
+        "delivery.reviewed-publication.repository-published";
+
+    internal const string ReviewedPublicationCompletedEventType =
+        "delivery.reviewed-publication.completed";
+
+    /// <summary>
+    /// Serializes concurrent publication attempts for the same flow and publication root inside one
+    /// process. Crashes and restarts are handled by the durable journal instead, so this lock only
+    /// has to stop two in-flight callers from racing the same external side effects.
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> PublicationGates =
+        new(StringComparer.Ordinal);
+
     [GeneratedRegex(
         @"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+",
         RegexOptions.CultureInvariant)]
@@ -35,13 +57,38 @@ public sealed partial class VerifiedCandidatePublisher(
         Guid publicationStepId,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(flow);
+        // Publication is irreversible, so the caller's FlowRun graph is never an authorization
+        // input: any gate, step, iteration, or seal it carries may already be stale. Every decision
+        // below is made from authoritative rows read here, before any GitHub token lookup,
+        // workspace inspection, Git/GitHub command, or durable publication event can run.
         var publicationState = await LoadPublicationStateAsync(
             flow.Id,
             publicationStepId,
             cancellationToken);
         flow = publicationState.Flow;
+        var outcome = OutcomeTypeRules.RequireDelivery(
+            flow.Outcome,
+            nameof(flow.Outcome));
         var publicationStep = publicationState.Step;
         var publicationRootId = publicationStep.StableSemanticRootId ?? publicationStep.Id;
+        if (string.Equals(
+                flow.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal))
+        {
+            var authorization = AuthorizeReviewedPublication(
+                flow,
+                publicationStep,
+                publicationRootId);
+            candidateFingerprintService.ValidateWorkspaceRoot(flow);
+            return await PublishReviewedCandidateAsync(
+                flow,
+                publicationRootId,
+                outcome,
+                authorization,
+                cancellationToken);
+        }
         candidateFingerprintService.ValidateWorkspaceRoot(flow);
 
         if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
@@ -87,7 +134,7 @@ public sealed partial class VerifiedCandidatePublisher(
             publicationRootId,
             candidate,
             cancellationToken);
-        if (flow.Outcome == OutcomeType.Commit)
+        if (outcome == OutcomeType.Commit)
         {
             foreach (var repository in candidate.Manifest.Repositories)
             {
@@ -125,11 +172,1172 @@ public sealed partial class VerifiedCandidatePublisher(
                 publicationRootId,
                 cancellationToken);
             return BuildPublicationReport(
-                flow.Outcome,
+                outcome,
                 candidate,
                 await LoadPublicationJournalAsync(flow.Id, cancellationToken));
         }
+        return outcome switch
+        {
+            OutcomeType.PullRequest =>
+                await PublishGovernedPullRequestCandidateAsync(
+                    flow,
+                    publicationRootId,
+                    state,
+                    candidate,
+                    cancellationToken),
+            _ => throw new UnreachableException()
+        };
+    }
 
+    /// <summary>
+    /// Authorizes a reviewed studio-v2 publication purely from authoritative rows. Nothing here
+    /// touches the workspace, a token, Git, GitHub, or the durable publication journal: an
+    /// unauthorized attempt must leave no trace at all.
+    /// </summary>
+    private static ReviewedPublicationAuthorization AuthorizeReviewedPublication(
+        FlowRun flow,
+        FlowStep publicationStep,
+        Guid publicationRootId)
+    {
+        if (flow.Kind != FlowKind.Delivery ||
+            publicationStep.FlowRunId != flow.Id ||
+            publicationStep.Iteration != flow.Iteration ||
+            publicationRootId == Guid.Empty ||
+            publicationStep.Status != StepStatus.Running ||
+            !ReviewCoordinator.IsStudioPublicationStep(flow, publicationStep))
+        {
+            throw new InvalidOperationException(
+                "Host-controlled reviewed-candidate publication requires the durable approved studio-v2 Publish step.");
+        }
+        _ = ReviewCoordinator.RequireRemotePublicationAuthority(
+            flow,
+            publicationStep);
+        var currentPublicationStep = flow.Steps
+            .Where(step =>
+                step.Iteration == flow.Iteration &&
+                ReviewCoordinator.IsStudioPublicationStep(flow, step))
+            .OrderBy(step => step.Sequence)
+            .ThenBy(step => step.Attempt)
+            .ThenBy(step => step.StartedAt)
+            .LastOrDefault();
+        if (currentPublicationStep is null ||
+            currentPublicationStep.Id != publicationStep.Id ||
+            (currentPublicationStep.StableSemanticRootId ??
+             currentPublicationStep.Id) != publicationRootId)
+        {
+            throw new InvalidOperationException(
+                "Only the current studio-v2 publication step and its exact semantic root may publish.");
+        }
+        var currentSteps = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .ToDictionary(step => step.Id);
+        var reviewedOwnerStepIds = flow.GateRecords
+            .Where(gate =>
+                gate.FlowRunId == flow.Id &&
+                gate.ActionType == HandoffActionType.CustomerReview &&
+                gate.Resolved &&
+                gate.Approved == true &&
+                gate.ReviewDecision == ReviewDecision.Accepted &&
+                currentSteps.ContainsKey(gate.FlowStepId))
+            .Select(gate => gate.FlowStepId)
+            .Distinct()
+            .ToArray();
+        if (reviewedOwnerStepIds.Length != 1)
+        {
+            throw new InvalidOperationException(
+                reviewedOwnerStepIds.Length == 0
+                    ? "Host-controlled publication requires a resolved, approved customer review that accepted the current Delivery outcome."
+                    : "The current Delivery iteration has conflicting accepted customer reviews.");
+        }
+        var outcomeOwnerStep = currentSteps[reviewedOwnerStepIds[0]];
+        if (!outcomeOwnerStep.IsOutcomeOwner ||
+            outcomeOwnerStep.Status != StepStatus.Completed ||
+            string.IsNullOrWhiteSpace(flow.OutcomeOwnerPlanStepKey) ||
+            !string.Equals(
+                outcomeOwnerStep.PlanStepKey,
+                flow.OutcomeOwnerPlanStepKey,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The accepted customer review is not bound to the current completed Delivery outcome owner.");
+        }
+        return new ReviewedPublicationAuthorization(
+            outcomeOwnerStep.Id,
+            ReviewedCandidateLedger.Read(flow, outcomeOwnerStep.Id));
+    }
+
+    private async Task<string> PublishReviewedCandidateAsync(
+        FlowRun flow,
+        Guid publicationRootId,
+        OutcomeType outcome,
+        ReviewedPublicationAuthorization authorization,
+        CancellationToken cancellationToken)
+    {
+        var identity = authorization.Identity;
+        var gate = PublicationGates.GetOrAdd(
+            $"{flow.Id:D}:{publicationRootId:D}",
+            _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            var journal = await ReconcilePublicationJournalAsync(
+                flow,
+                publicationRootId,
+                identity,
+                cancellationToken);
+            var alreadyPublished = TryBuildCompletedPublicationReport(
+                flow,
+                outcome,
+                identity,
+                journal);
+            if (alreadyPublished is not null)
+            {
+                // Validate that the local reviewed bytes are still current, then
+                // skip every remote publication operation. In particular, do not
+                // reacquire a token, reconcile a branch, or contact GitHub.
+                _ = await reviewedCandidateService.VerifyAsync(
+                    flow,
+                    identity,
+                    cancellationToken);
+                return alreadyPublished;
+            }
+            foreach (var repository in identity.Repositories)
+            {
+                _ = await OpenRepositoryPublicationIntentAsync(
+                    flow,
+                    publicationRootId,
+                    identity,
+                    repository,
+                    cancellationToken);
+            }
+            // Every repository intent is durable before validation invokes local
+            // Git. Validation still precedes every remote publication side effect.
+            var candidate = await reviewedCandidateService.VerifyAsync(
+                flow,
+                identity,
+                cancellationToken);
+            await RecordReviewedPublicationEventAsync(
+                flow.Id,
+                publicationRootId,
+                ReviewedPublicationStartedEventType,
+                new ReviewedPublicationEventData(
+                    ReviewedPublicationEventData.CurrentVersion,
+                    identity.Fingerprint,
+                    string.Empty,
+                    string.Empty,
+                    string.Empty,
+                    string.Empty,
+                    string.Empty),
+                "Host-controlled publication started for the candidate sealed before customer review.",
+                cancellationToken);
+
+            return outcome switch
+            {
+                OutcomeType.Commit =>
+                    await PublishReviewedCommitsAsync(
+                        flow,
+                        publicationRootId,
+                        identity,
+                        candidate,
+                        cancellationToken),
+                OutcomeType.PullRequest =>
+                    await PublishReviewedPullRequestsAsync(
+                        flow,
+                        publicationRootId,
+                        identity,
+                        candidate,
+                        cancellationToken),
+                _ => throw new UnreachableException()
+            };
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<string> PublishReviewedCommitsAsync(
+        FlowRun flow,
+        Guid publicationRootId,
+        ReviewedCandidateIdentity identity,
+        OutcomeCandidateSnapshot candidate,
+        CancellationToken cancellationToken)
+    {
+        foreach (var repository in candidate.Manifest.Repositories)
+        {
+            var record = await OpenRepositoryPublicationIntentAsync(
+                flow,
+                publicationRootId,
+                identity,
+                repository,
+                cancellationToken);
+            if (record.Stage == ReviewedPublicationStage.Completed)
+            {
+                continue;
+            }
+            await RecordReviewedPublicationEventAsync(
+                flow.Id,
+                publicationRootId,
+                ReviewedPublicationRepositoryEventType,
+                new ReviewedPublicationEventData(
+                    ReviewedPublicationEventData.CurrentVersion,
+                    identity.Fingerprint,
+                    repository.RelativePath,
+                    repository.RemoteRepository,
+                    string.Empty,
+                    repository.Head,
+                    repository.Tree),
+                $"Retained reviewed commit {repository.Head} for '{repository.RelativePath}' without a remote side effect.",
+                cancellationToken);
+            _ = await AdvanceRepositoryPublicationAsync(
+                flow.Id,
+                publicationRootId,
+                repository.RelativePath,
+                ReviewedPublicationStage.Completed,
+                pullRequestUrl: null,
+                cancellationToken);
+        }
+        return await CompleteReviewedPublicationAsync(
+            flow,
+            publicationRootId,
+            OutcomeType.Commit,
+            identity,
+            candidate,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            "Host-controlled commit publication completed without changing the reviewed candidate.",
+            cancellationToken);
+    }
+
+    private async Task<string> PublishReviewedPullRequestsAsync(
+        FlowRun flow,
+        Guid publicationRootId,
+        ReviewedCandidateIdentity identity,
+        OutcomeCandidateSnapshot candidate,
+        CancellationToken cancellationToken)
+    {
+        var pullRequests = new Dictionary<string, string>(StringComparer.Ordinal);
+        string? gitHubToken = null;
+        IReadOnlyDictionary<string, string?>? ghEnvironment = null;
+        foreach (var repository in candidate.Manifest.Repositories)
+        {
+            // Intent is durable before the first external byte leaves this process, so a crash
+            // between repositories reconciles instead of repeating remote work.
+            var record = await OpenRepositoryPublicationIntentAsync(
+                flow,
+                publicationRootId,
+                identity,
+                repository,
+                cancellationToken);
+            if (record.Stage == ReviewedPublicationStage.Completed)
+            {
+                pullRequests[repository.RelativePath] =
+                    RequirePublishedPullRequestUrl(record);
+                continue;
+            }
+            var repositoryName = repository.RemoteRepository;
+            if (string.IsNullOrWhiteSpace(repositoryName))
+            {
+                throw new InvalidOperationException(
+                    $"Reviewed repository '{repository.RelativePath}' has no trusted GitHub publication target.");
+            }
+            var workspaceRepository = ResolveWorkspaceRepository(
+                flow.WorkspacePath,
+                repository.RelativePath);
+            var trustedRemoteUrl = BuildTrustedGitHubRemoteUrl(repositoryName);
+
+            // A recorded PR URL is the strongest remote identity in the journal. Reconcile that
+            // exact PR before looking at the branch: GitHub commonly deletes a head branch after
+            // merge, but the merged PR still retains the reviewed head identity.
+            PublishedPullRequestIdentity? reconciled = null;
+            if (!string.IsNullOrWhiteSpace(record.PullRequestUrl))
+            {
+                if (gitHubToken is null)
+                {
+                    // Acquiring a token is itself a side effect, so it waits until durable state
+                    // proves that real remote work remains.
+                    gitHubToken = await ResolveGitHubTokenAsync(
+                        AppContext.BaseDirectory,
+                        cancellationToken);
+                    ghEnvironment = BuildGitHubCliEnvironment(gitHubToken);
+                }
+                reconciled = await ReconcilePullRequestAsync(
+                    repositoryName,
+                    flow.BranchName,
+                    repository.Head,
+                    record.PullRequestUrl,
+                    ghEnvironment!,
+                    cancellationToken);
+            }
+
+            if (!string.Equals(
+                    reconciled?.State,
+                    "MERGED",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                if (gitHubToken is null)
+                {
+                    gitHubToken = await ResolveGitHubTokenAsync(
+                        AppContext.BaseDirectory,
+                        cancellationToken);
+                    ghEnvironment = BuildGitHubCliEnvironment(gitHubToken);
+                }
+                var remoteHead = await ReadRemoteBranchHeadAsync(
+                    workspaceRepository,
+                    trustedRemoteUrl,
+                    flow.BranchName,
+                    gitHubToken,
+                    cancellationToken);
+                var branchHoldsReviewedCommit = string.Equals(
+                    remoteHead,
+                    repository.Head,
+                    StringComparison.OrdinalIgnoreCase);
+                if ((record.Stage >= ReviewedPublicationStage.BranchPublished ||
+                     reconciled is not null) &&
+                    !branchHoldsReviewedCommit)
+                {
+                    throw new InvalidOperationException(
+                        $"The remote branch '{flow.BranchName}' in '{repositoryName}' no longer holds the reviewed commit {repository.Head}.");
+                }
+                if (!branchHoldsReviewedCommit)
+                {
+                    _ = await PublishVerifiedGitBranchAsync(
+                        processRunner,
+                        workspaceRepository,
+                        repository,
+                        trustedRemoteUrl,
+                        flow.BranchName,
+                        gitHubToken,
+                        cancellationToken);
+                }
+                record = await AdvanceRepositoryPublicationAsync(
+                    flow.Id,
+                    publicationRootId,
+                    repository.RelativePath,
+                    ReviewedPublicationStage.BranchPublished,
+                    pullRequestUrl: null,
+                    cancellationToken);
+            }
+
+            if (reconciled is null)
+            {
+                reconciled = await ReconcilePullRequestAsync(
+                    repositoryName,
+                    flow.BranchName,
+                    repository.Head,
+                    recordedPullRequestUrl: null,
+                    ghEnvironment!,
+                    cancellationToken);
+            }
+            var pullRequestUrl = reconciled?.Url;
+            if (pullRequestUrl is null)
+            {
+                var create = await RunRequiredAsync(
+                    "gh",
+                    [
+                        "pr", "create",
+                        "--repo", repositoryName,
+                        "--head", flow.BranchName,
+                        "--title", Clip(flow.Title, 200),
+                        "--body", BuildPullRequestBody(flow, candidate)
+                    ],
+                    AppContext.BaseDirectory,
+                    TimeSpan.FromMinutes(2),
+                    $"create the pull request for reviewed repository '{repository.RelativePath}'",
+                    cancellationToken,
+                    ghEnvironment);
+                pullRequestUrl = PullRequestUrlPattern()
+                    .Match(create.CombinedOutput)
+                    .Value;
+                if (string.IsNullOrWhiteSpace(pullRequestUrl))
+                {
+                    throw new InvalidOperationException(
+                        $"GitHub did not return a pull request URL for reviewed repository '{repository.RelativePath}'.");
+                }
+                var createdReference =
+                    PublishedOutcomeVerifier.ParsePullRequest(pullRequestUrl);
+                if (createdReference is null ||
+                    !string.Equals(
+                        createdReference.Repository,
+                        repositoryName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"GitHub returned a pull request outside reviewed repository '{repositoryName}'.");
+                }
+            }
+            record = await AdvanceRepositoryPublicationAsync(
+                flow.Id,
+                publicationRootId,
+                repository.RelativePath,
+                ReviewedPublicationStage.PullRequestOpened,
+                pullRequestUrl,
+                cancellationToken);
+            pullRequests[repository.RelativePath] =
+                RequirePublishedPullRequestUrl(record);
+            await RecordReviewedPublicationEventAsync(
+                flow.Id,
+                publicationRootId,
+                ReviewedPublicationRepositoryEventType,
+                new ReviewedPublicationEventData(
+                    ReviewedPublicationEventData.CurrentVersion,
+                    identity.Fingerprint,
+                    repository.RelativePath,
+                    repositoryName,
+                    pullRequestUrl,
+                    repository.Head,
+                    repository.Tree),
+                $"Published reviewed commit {repository.Head} for '{repository.RelativePath}' at {pullRequestUrl}.",
+                cancellationToken);
+            _ = await AdvanceRepositoryPublicationAsync(
+                flow.Id,
+                publicationRootId,
+                repository.RelativePath,
+                ReviewedPublicationStage.Completed,
+                pullRequestUrl,
+                cancellationToken);
+        }
+
+        return await CompleteReviewedPublicationAsync(
+            flow,
+            publicationRootId,
+            OutcomeType.PullRequest,
+            identity,
+            candidate,
+            pullRequests,
+            "Host-controlled publication completed without changing the candidate sealed before review.",
+            cancellationToken);
+    }
+
+    private async Task<string> CompleteReviewedPublicationAsync(
+        FlowRun flow,
+        Guid publicationRootId,
+        OutcomeType outcome,
+        ReviewedCandidateIdentity identity,
+        OutcomeCandidateSnapshot candidate,
+        IReadOnlyDictionary<string, string> pullRequests,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        _ = await reviewedCandidateService.VerifyAsync(
+            flow,
+            identity,
+            cancellationToken);
+        await RecordReviewedPublicationEventAsync(
+            flow.Id,
+            publicationRootId,
+            ReviewedPublicationCompletedEventType,
+            new ReviewedPublicationEventData(
+                ReviewedPublicationEventData.CurrentVersion,
+                identity.Fingerprint,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty),
+            message,
+            cancellationToken);
+        return BuildReviewedPublicationReport(
+            outcome,
+            identity.Fingerprint,
+            identity.Repositories,
+            pullRequests);
+    }
+
+    /// <summary>
+    /// Re-reads the durable journal - both the per-repository rows and the publication events -
+    /// inside the publication lock, and, for publications recorded before the journal table existed,
+    /// rebuilds rows from those events so a restart still skips external work instead of repeating it.
+    /// </summary>
+    private async Task<ReviewedPublicationJournalState>
+        ReconcilePublicationJournalAsync(
+            FlowRun flow,
+            Guid publicationRootId,
+            ReviewedCandidateIdentity identity,
+            CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var records = await database.ReviewedPublicationRecords
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.PublicationRootId == publicationRootId)
+            .ToListAsync(cancellationToken);
+        var events = await database.FlowEvents
+            .AsNoTracking()
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.FlowStepId == publicationRootId &&
+                (item.Type == ReviewedPublicationRepositoryEventType ||
+                 item.Type == ReviewedPublicationCompletedEventType))
+            .ToListAsync(cancellationToken);
+        var changed = false;
+        foreach (var item in events
+                     .Where(item =>
+                         item.Type == ReviewedPublicationRepositoryEventType))
+        {
+            var data = ReadReviewedPublicationEvent(item.DataJson);
+            if (!string.Equals(
+                    data.CandidateFingerprint,
+                    identity.Fingerprint,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "The durable reviewed publication journal already published a different reviewed candidate at this publication root.");
+            }
+            var sealedRepository = identity.Repositories.SingleOrDefault(
+                repository => string.Equals(
+                    repository.RelativePath,
+                    data.RelativePath,
+                    StringComparison.Ordinal))
+                ?? throw new InvalidOperationException(
+                    $"The durable reviewed publication event refers to unknown repository '{data.RelativePath}'.");
+            if (!string.Equals(
+                    data.RemoteRepository,
+                    sealedRepository.RemoteRepository,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(
+                    data.Head,
+                    sealedRepository.Head,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(
+                    data.Tree,
+                    sealedRepository.Tree,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"The durable reviewed publication event for '{data.RelativePath}' conflicts with the reviewed candidate.");
+            }
+            var existingRecord = records.SingleOrDefault(record =>
+                string.Equals(
+                    record.RelativePath,
+                    data.RelativePath,
+                    StringComparison.Ordinal));
+            if (existingRecord is not null)
+            {
+                RequireReconcilableRecord(
+                    existingRecord,
+                    identity,
+                    sealedRepository,
+                    flow.BranchName);
+                if (!string.IsNullOrWhiteSpace(data.PullRequestUrl) &&
+                    !string.Equals(
+                        existingRecord.PullRequestUrl,
+                        data.PullRequestUrl,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"The durable reviewed publication event for '{data.RelativePath}' conflicts with its repository journal.");
+                }
+                continue;
+            }
+            var restored = new ReviewedPublicationRecord
+            {
+                FlowRunId = flow.Id,
+                PublicationRootId = publicationRootId,
+                Iteration = identity.Iteration,
+                CandidateFingerprint = identity.Fingerprint,
+                RelativePath = data.RelativePath,
+                RemoteRepository = data.RemoteRepository,
+                BranchName = flow.BranchName,
+                Head = data.Head,
+                Tree = data.Tree,
+                Stage = ReviewedPublicationStage.Completed,
+                PullRequestUrl = data.PullRequestUrl
+            };
+            database.ReviewedPublicationRecords.Add(restored);
+            records.Add(restored);
+            changed = true;
+        }
+        foreach (var record in records)
+        {
+            var sealedRepository = identity.Repositories.SingleOrDefault(
+                repository => string.Equals(
+                    repository.RelativePath,
+                    record.RelativePath,
+                    StringComparison.Ordinal))
+                ?? throw new InvalidOperationException(
+                    $"The durable reviewed publication journal refers to unknown repository '{record.RelativePath}'.");
+            RequireReconcilableRecord(
+                record,
+                identity,
+                sealedRepository,
+                flow.BranchName);
+        }
+        if (changed)
+        {
+            await database.SaveChangesAsync(cancellationToken);
+        }
+        return new ReviewedPublicationJournalState(events, records);
+    }
+
+    private static string? TryBuildCompletedPublicationReport(
+        FlowRun flow,
+        OutcomeType outcome,
+        ReviewedCandidateIdentity identity,
+        ReviewedPublicationJournalState journal)
+    {
+        var completions = journal.Events
+            .Where(item => item.Type == ReviewedPublicationCompletedEventType)
+            .ToArray();
+        if (completions.Length == 0)
+        {
+            return null;
+        }
+        if (completions.Length > 1)
+        {
+            throw new InvalidOperationException(
+                "The durable reviewed publication journal has duplicate completion events.");
+        }
+        if (!string.Equals(
+                ReadReviewedPublicationEvent(completions[0].DataJson)
+                    .CandidateFingerprint,
+                identity.Fingerprint,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The durable reviewed publication journal completed a different reviewed candidate.");
+        }
+        var pullRequests = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var repository in identity.Repositories)
+        {
+            var record = journal.Records.SingleOrDefault(item =>
+                             string.Equals(
+                                 item.RelativePath,
+                                 repository.RelativePath,
+                                 StringComparison.Ordinal))
+                         ?? throw new InvalidOperationException(
+                             $"The completed reviewed publication has no durable record for '{repository.RelativePath}'.");
+            RequireReconcilableRecord(
+                record,
+                identity,
+                repository,
+                flow.BranchName);
+            if (record.Stage != ReviewedPublicationStage.Completed)
+            {
+                throw new InvalidOperationException(
+                    $"The completed reviewed publication left '{repository.RelativePath}' at stage {record.Stage}.");
+            }
+            if (outcome == OutcomeType.PullRequest)
+            {
+                pullRequests[repository.RelativePath] =
+                    RequirePublishedPullRequestUrl(record);
+            }
+        }
+        return BuildReviewedPublicationReport(
+            outcome,
+            identity.Fingerprint,
+            identity.Repositories,
+            pullRequests);
+    }
+
+    private Task<ReviewedPublicationRecord>
+        OpenRepositoryPublicationIntentAsync(
+            FlowRun flow,
+            Guid publicationRootId,
+            ReviewedCandidateIdentity identity,
+            CandidateRepositoryManifest repository,
+            CancellationToken cancellationToken) =>
+        OpenRepositoryPublicationIntentAsync(
+            flow,
+            publicationRootId,
+            identity,
+            new ReviewedCandidateRepositoryIdentity(
+                repository.RelativePath,
+                repository.Head,
+                repository.Tree,
+                repository.RemoteRepository),
+            cancellationToken);
+
+    private async Task<ReviewedPublicationRecord>
+        OpenRepositoryPublicationIntentAsync(
+            FlowRun flow,
+            Guid publicationRootId,
+            ReviewedCandidateIdentity identity,
+            ReviewedCandidateRepositoryIdentity repository,
+            CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var record = await database.ReviewedPublicationRecords
+            .SingleOrDefaultAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.PublicationRootId == publicationRootId &&
+                    item.RelativePath == repository.RelativePath,
+                cancellationToken);
+        if (record is null)
+        {
+            record = new ReviewedPublicationRecord
+            {
+                FlowRunId = flow.Id,
+                PublicationRootId = publicationRootId,
+                Iteration = identity.Iteration,
+                CandidateFingerprint = identity.Fingerprint,
+                RelativePath = repository.RelativePath,
+                RemoteRepository = repository.RemoteRepository,
+                BranchName = flow.BranchName,
+                Head = repository.Head,
+                Tree = repository.Tree,
+                Stage = ReviewedPublicationStage.Intent
+            };
+            database.ReviewedPublicationRecords.Add(record);
+            await database.SaveChangesAsync(cancellationToken);
+            return record;
+        }
+        RequireReconcilableRecord(
+            record,
+            identity,
+            repository,
+            flow.BranchName);
+        return record;
+    }
+
+    private async Task<ReviewedPublicationRecord>
+        AdvanceRepositoryPublicationAsync(
+            Guid flowId,
+            Guid publicationRootId,
+            string relativePath,
+            ReviewedPublicationStage stage,
+            string? pullRequestUrl,
+            CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var record = await database.ReviewedPublicationRecords
+            .SingleAsync(
+                item =>
+                    item.FlowRunId == flowId &&
+                    item.PublicationRootId == publicationRootId &&
+                    item.RelativePath == relativePath,
+                cancellationToken);
+        if (!string.IsNullOrWhiteSpace(pullRequestUrl))
+        {
+            if (!string.IsNullOrWhiteSpace(record.PullRequestUrl) &&
+                !string.Equals(
+                    record.PullRequestUrl,
+                    pullRequestUrl,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"The durable publication journal already published a different pull request for '{relativePath}'.");
+            }
+            record.PullRequestUrl = pullRequestUrl;
+        }
+        record.Stage = (ReviewedPublicationStage)Math.Max(
+            (int)record.Stage,
+            (int)stage);
+        record.UpdatedAt = DateTimeOffset.UtcNow;
+        await database.SaveChangesAsync(cancellationToken);
+        return record;
+    }
+
+    private static void RequireReconcilableRecord(
+        ReviewedPublicationRecord record,
+        ReviewedCandidateIdentity identity,
+        CandidateRepositoryManifest repository,
+        string branchName) =>
+        RequireReconcilableRecord(
+            record,
+            identity,
+            new ReviewedCandidateRepositoryIdentity(
+                repository.RelativePath,
+                repository.Head,
+                repository.Tree,
+                repository.RemoteRepository),
+            branchName);
+
+    private static void RequireReconcilableRecord(
+        ReviewedPublicationRecord record,
+        ReviewedCandidateIdentity identity,
+        ReviewedCandidateRepositoryIdentity repository,
+        string branchName)
+    {
+        if (!string.Equals(
+                record.CandidateFingerprint,
+                identity.Fingerprint,
+                StringComparison.Ordinal) ||
+            record.Iteration != identity.Iteration ||
+            !string.Equals(
+                record.Head,
+                repository.Head,
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                record.Tree,
+                repository.Tree,
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                record.RemoteRepository,
+                repository.RemoteRepository,
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                record.BranchName,
+                branchName,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"The durable publication journal for '{repository.RelativePath}' conflicts with the reviewed candidate.");
+        }
+        if (!string.IsNullOrWhiteSpace(record.PullRequestUrl))
+        {
+            var reference = PublishedOutcomeVerifier.ParsePullRequest(
+                record.PullRequestUrl);
+            if (reference is null ||
+                string.IsNullOrWhiteSpace(repository.RemoteRepository) ||
+                !string.Equals(
+                    reference.Repository,
+                    repository.RemoteRepository,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"The durable publication journal for '{repository.RelativePath}' contains a conflicting pull request URL.");
+            }
+        }
+    }
+
+    private static string RequirePublishedPullRequestUrl(
+        ReviewedPublicationRecord record) =>
+        string.IsNullOrWhiteSpace(record.PullRequestUrl)
+            ? throw new InvalidOperationException(
+                $"The durable publication journal for '{record.RelativePath}' has no pull request URL.")
+            : record.PullRequestUrl;
+
+    /// <summary>
+    /// Reads the remote branch tip without mutating anything, so a retry can tell "already pushed"
+    /// apart from "never pushed" instead of pushing again.
+    /// </summary>
+    private async Task<string?> ReadRemoteBranchHeadAsync(
+        string workingDirectory,
+        string remoteUrl,
+        string branchName,
+        string gitHubToken,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(branchName))
+        {
+            throw new InvalidOperationException(
+                "Reviewed publication requires a branch name.");
+        }
+        using var sandbox = TrustedGitSandbox.Create(remoteUrl, gitHubToken);
+        var reference = $"refs/heads/{branchName}";
+        var result = await processRunner.RunAsync(
+            "git",
+            ["ls-remote", "--heads", remoteUrl, reference],
+            workingDirectory,
+            TimeSpan.FromMinutes(1),
+            cancellationToken,
+            environmentVariables: sandbox.EnvironmentVariables);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to reconcile remote branch '{branchName}' at '{remoteUrl}': {result.CombinedOutput}");
+        }
+        foreach (var line in result.StandardOutput
+                     .ReplaceLineEndings("\n")
+                     .Split(
+                         '\n',
+                         StringSplitOptions.RemoveEmptyEntries |
+                         StringSplitOptions.TrimEntries))
+        {
+            var parts = line.Split(
+                '\t',
+                StringSplitOptions.RemoveEmptyEntries |
+                StringSplitOptions.TrimEntries);
+            if (parts.Length != 2 ||
+                !string.Equals(parts[1], reference, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var objectId = parts[0].ToLowerInvariant();
+            if (objectId.Length is not (40 or 64) ||
+                objectId.Any(character => !char.IsAsciiHexDigit(character)))
+            {
+                throw new InvalidOperationException(
+                    $"Remote branch '{branchName}' at '{remoteUrl}' reported an unusable commit identity.");
+            }
+            return objectId;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Resolves the pull request that already publishes the reviewed head, across open, closed, and
+    /// merged states, and rejects anything that conflicts with the durable record.
+    /// </summary>
+    private async Task<PublishedPullRequestIdentity?> ReconcilePullRequestAsync(
+        string repositoryName,
+        string branchName,
+        string expectedHead,
+        string? recordedPullRequestUrl,
+        IReadOnlyDictionary<string, string?> ghEnvironment,
+        CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(recordedPullRequestUrl))
+        {
+            var recorded = PublishedOutcomeVerifier.ParsePullRequest(
+                                recordedPullRequestUrl)
+                            ?? throw new InvalidOperationException(
+                                $"The durable publication journal holds an unusable pull request URL for '{repositoryName}'.");
+            if (!string.Equals(
+                    recorded.Repository,
+                    repositoryName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"The durable publication journal holds a pull request outside '{repositoryName}'.");
+            }
+            var view = await RunRequiredAsync(
+                "gh",
+                [
+                    "pr", "view",
+                    recorded.Number.ToString(CultureInfo.InvariantCulture),
+                    "--repo", repositoryName,
+                    "--json", "url,number,state,headRefName,headRefOid,headRepository,headRepositoryOwner"
+                ],
+                AppContext.BaseDirectory,
+                TimeSpan.FromSeconds(60),
+                $"reconcile the recorded pull request for '{repositoryName}'",
+                cancellationToken,
+                ghEnvironment);
+            using var document = JsonDocument.Parse(view.StandardOutput);
+            var match = MatchPullRequest(
+                document.RootElement,
+                repositoryName,
+                branchName,
+                expectedHead);
+            if (match is null ||
+                !string.Equals(
+                    match.Url,
+                    recordedPullRequestUrl,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"The recorded pull request for '{repositoryName}' no longer publishes reviewed commit {expectedHead}.");
+            }
+            RequirePublishablePullRequestState(match, repositoryName);
+            return match;
+        }
+
+        var list = await RunRequiredAsync(
+            "gh",
+            [
+                "pr", "list",
+                "--repo", repositoryName,
+                "--head", branchName,
+                "--state", "all",
+                "--limit", "100",
+                "--json", "url,number,state,headRefName,headRefOid,headRepository,headRepositoryOwner"
+            ],
+            AppContext.BaseDirectory,
+            TimeSpan.FromSeconds(60),
+            $"reconcile existing pull requests for '{repositoryName}'",
+            cancellationToken,
+            ghEnvironment);
+        using var listDocument = JsonDocument.Parse(list.StandardOutput);
+        if (listDocument.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+        var matches = listDocument.RootElement.EnumerateArray()
+            .Select(item => MatchPullRequest(
+                item,
+                repositoryName,
+                branchName,
+                expectedHead))
+            .OfType<PublishedPullRequestIdentity>()
+            .GroupBy(item => item.Url, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+        if (matches.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"GitHub reports conflicting pull requests for reviewed commit {expectedHead} in '{repositoryName}'.");
+        }
+        var matched = matches.SingleOrDefault();
+        if (matched is not null)
+        {
+            RequirePublishablePullRequestState(matched, repositoryName);
+        }
+        return matched;
+    }
+
+    private static void RequirePublishablePullRequestState(
+        PublishedPullRequestIdentity pullRequest,
+        string repositoryName)
+    {
+        if (string.Equals(
+                pullRequest.State,
+                "OPEN",
+                StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(
+                pullRequest.State,
+                "MERGED",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+        if (string.Equals(
+                pullRequest.State,
+                "CLOSED",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Pull request '{pullRequest.Url}' in '{repositoryName}' is closed without merge; refusing to create a replacement pull request.");
+        }
+        throw new InvalidOperationException(
+            $"Pull request '{pullRequest.Url}' in '{repositoryName}' has unsupported state '{pullRequest.State}'.");
+    }
+
+    private static PublishedPullRequestIdentity? MatchPullRequest(
+        JsonElement pullRequest,
+        string repositoryName,
+        string branchName,
+        string expectedHead)
+    {
+        if (pullRequest.ValueKind != JsonValueKind.Object ||
+            !pullRequest.TryGetProperty("url", out var url) ||
+            !pullRequest.TryGetProperty("headRefName", out var headRefName) ||
+            !pullRequest.TryGetProperty("headRefOid", out var headRefOid) ||
+            !string.Equals(
+                headRefName.GetString(),
+                branchName,
+                StringComparison.Ordinal) ||
+            !string.Equals(
+                headRefOid.GetString(),
+                expectedHead,
+                StringComparison.OrdinalIgnoreCase) ||
+            !PublishedOutcomeVerifier.IsExpectedHeadRepository(
+                pullRequest,
+                repositoryName))
+        {
+            return null;
+        }
+        var value = url.GetString() ?? string.Empty;
+        if (!string.Equals(
+                PullRequestUrlPattern().Match(value).Value,
+                value,
+                StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+        var state = pullRequest.TryGetProperty("state", out var stateElement)
+            ? stateElement.GetString() ?? string.Empty
+            : string.Empty;
+        return new PublishedPullRequestIdentity(value, state);
+    }
+
+    private static string BuildReviewedPublicationReport(
+            OutcomeType outcome,
+            string fingerprint,
+            IReadOnlyList<ReviewedCandidateRepositoryIdentity> repositories,
+            IReadOnlyDictionary<string, string> pullRequests)
+        {
+            var report = new List<string>
+            {
+                $"Reviewed candidate: {fingerprint}"
+            };
+            foreach (var repository in repositories)
+            {
+                var publication = outcome switch
+                {
+                    OutcomeType.Commit =>
+                        $"Repository {repository.RelativePath}: commit {repository.Head}, tree {repository.Tree}",
+                    OutcomeType.PullRequest =>
+                        $"Repository {repository.RelativePath}: reviewed remote commit {repository.Head}, tree {repository.Tree}, pull request {pullRequests[repository.RelativePath]}",
+                    _ => throw new ArgumentOutOfRangeException(
+                        nameof(outcome),
+                        outcome,
+                        "A Delivery publication report requires Commit or PullRequest.")
+                };
+                report.Add(
+                    publication);
+            }
+            return string.Join(Environment.NewLine, report);
+        }
+
+    private async Task RecordReviewedPublicationEventAsync(
+            Guid flowId,
+            Guid publicationRootId,
+            string type,
+            ReviewedPublicationEventData data,
+            string message,
+            CancellationToken cancellationToken)
+        {
+            var dataJson = JsonSerializer.Serialize(data);
+            await using var database =
+                await databaseFactory.CreateDbContextAsync(cancellationToken);
+            var existing = await database.FlowEvents
+                .Where(item =>
+                    item.FlowRunId == flowId &&
+                    item.FlowStepId == publicationRootId &&
+                    item.Type == type)
+                .ToListAsync(cancellationToken);
+            var sameKey = existing.Where(item =>
+                    string.Equals(
+                        ReadReviewedPublicationEvent(item.DataJson).RelativePath,
+                        data.RelativePath,
+                        StringComparison.Ordinal))
+                .ToArray();
+            if (sameKey.Length > 1 ||
+                sameKey.Length == 1 &&
+                !string.Equals(
+                    sameKey[0].DataJson,
+                    dataJson,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "The durable reviewed publication journal conflicts with this sealed candidate.");
+            }
+            if (sameKey.Length == 0)
+            {
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flowId,
+                    FlowStepId = publicationRootId,
+                    Type = type,
+                    Message = message,
+                    DataJson = dataJson
+                });
+                await database.SaveChangesAsync(cancellationToken);
+            }
+        }
+
+    private static ReviewedPublicationEventData ReadReviewedPublicationEvent(
+            string? json)
+        {
+            try
+            {
+                var data = JsonSerializer.Deserialize<ReviewedPublicationEventData>(
+                               json
+                               ?? throw new InvalidOperationException(
+                                   "The reviewed publication event has no structured data."))
+                           ?? throw new InvalidOperationException(
+                               "The reviewed publication event has empty structured data.");
+                if (!string.Equals(
+                        data.Version,
+                        ReviewedPublicationEventData.CurrentVersion,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "The reviewed publication event version is unsupported.");
+                }
+                return data;
+            }
+            catch (JsonException exception)
+            {
+                throw new InvalidOperationException(
+                    "The reviewed publication event data is invalid.",
+                    exception);
+            }
+        }
+
+    private async Task<string> PublishGovernedPullRequestCandidateAsync(
+        FlowRun flow,
+        Guid publicationRootId,
+        OutcomeVerificationState state,
+        OutcomeCandidateSnapshot candidate,
+        CancellationToken cancellationToken)
+    {
         var gitHubToken = await ResolveGitHubTokenAsync(
             AppContext.BaseDirectory,
             cancellationToken);
@@ -294,7 +1502,8 @@ public sealed partial class VerifiedCandidatePublisher(
         string branchName,
         string gitHubToken,
         CancellationToken cancellationToken = default,
-        TimeSpan? remoteTimeout = null)
+        TimeSpan? remoteTimeout = null,
+        IReadOnlyDictionary<string, string?>? inheritedEnvironmentVariables = null)
     {
         ArgumentNullException.ThrowIfNull(processRunner);
         if (string.IsNullOrWhiteSpace(sourceRepository))
@@ -316,7 +1525,8 @@ public sealed partial class VerifiedCandidatePublisher(
 
         using var sandbox = TrustedGitSandbox.Create(
             remoteUrl,
-            gitHubToken);
+            gitHubToken,
+            inheritedEnvironmentVariables);
         await RunGitRequiredAsync(
             processRunner,
             sandbox,
@@ -537,11 +1747,25 @@ public sealed partial class VerifiedCandidatePublisher(
         await using var database =
             await databaseFactory.CreateDbContextAsync(cancellationToken);
         var flow = await database.Flows
+            .Include(item => item.Events)
             .AsNoTracking()
             .SingleAsync(item => item.Id == flowId, cancellationToken);
-        var step = await database.FlowSteps
+        // Steps and gate records are loaded separately (rather than as extra collection includes)
+        // so the authoritative authorization inputs cannot be distorted by a cartesian join.
+        flow.Steps = await database.FlowSteps
             .AsNoTracking()
-            .SingleAsync(item => item.Id == publicationStepId, cancellationToken);
+            .Where(item => item.FlowRunId == flowId)
+            .ToListAsync(cancellationToken);
+        flow.GateRecords = await database.GateRecords
+            .AsNoTracking()
+            .Where(item => item.FlowRunId == flowId)
+            .ToListAsync(cancellationToken);
+        var step = flow.Steps.SingleOrDefault(item => item.Id == publicationStepId)
+                   ?? await database.FlowSteps
+                       .AsNoTracking()
+                       .SingleAsync(
+                           item => item.Id == publicationStepId,
+                           cancellationToken);
         return new PublicationState(flow, step);
     }
 
@@ -599,10 +1823,19 @@ public sealed partial class VerifiedCandidatePublisher(
         };
         foreach (var repository in journal.Repositories)
         {
+            var publication = outcome switch
+            {
+                OutcomeType.Commit =>
+                    $"Repository {repository.RelativePath}: commit {repository.Head}, tree {repository.Tree}",
+                OutcomeType.PullRequest =>
+                    $"Repository {repository.RelativePath}: verified remote commit {repository.Head}, tree {repository.Tree}, pull request {repository.PullRequestUrl}",
+                _ => throw new ArgumentOutOfRangeException(
+                    nameof(outcome),
+                    outcome,
+                    "A Delivery publication report requires Commit or PullRequest.")
+            };
             report.Add(
-                outcome == OutcomeType.Commit
-                    ? $"Repository {repository.RelativePath}: commit {repository.Head}, tree {repository.Tree}"
-                    : $"Repository {repository.RelativePath}: verified remote commit {repository.Head}, tree {repository.Tree}, pull request {repository.PullRequestUrl}");
+                publication);
         }
         return string.Join(Environment.NewLine, report);
     }
@@ -793,6 +2026,34 @@ public sealed partial class VerifiedCandidatePublisher(
         FlowRun Flow,
         FlowStep Step);
 
+    /// <summary>
+    /// The authoritative, database-backed proof that this exact publication attempt may run.
+    /// </summary>
+    private sealed record ReviewedPublicationAuthorization(
+        Guid OutcomeOwnerStepId,
+        ReviewedCandidateIdentity Identity);
+
+    private sealed record PublishedPullRequestIdentity(
+        string Url,
+        string State);
+
+    private sealed record ReviewedPublicationJournalState(
+        IReadOnlyList<FlowEvent> Events,
+        IReadOnlyList<ReviewedPublicationRecord> Records);
+
+    private sealed record ReviewedPublicationEventData(
+        string Version,
+        string CandidateFingerprint,
+        string RelativePath,
+        string RemoteRepository,
+        string PullRequestUrl,
+        string Head,
+        string Tree)
+    {
+        public const string CurrentVersion =
+            "reviewed-candidate-publication-v1";
+    }
+
     internal static OutcomePublicationStatus AdvancePublicationStatus(
         OutcomePublicationStatus current,
         OutcomePublicationStatus requested) =>
@@ -913,7 +2174,9 @@ public sealed partial class VerifiedCandidatePublisher(
 
         public static TrustedGitSandbox Create(
             string remoteUrl,
-            string gitHubToken)
+            string gitHubToken,
+            IReadOnlyDictionary<string, string?>?
+                inheritedEnvironmentVariables = null)
         {
             var rootPath = Path.Combine(
                 Path.GetTempPath(),
@@ -938,8 +2201,13 @@ public sealed partial class VerifiedCandidatePublisher(
                 "forbid-ssh");
 
             var environmentVariables =
-                new Dictionary<string, string?>(StringComparer.Ordinal)
-                {
+                new Dictionary<string, string?>(
+                    inheritedEnvironmentVariables ??
+                    new Dictionary<string, string?>(),
+                    StringComparer.Ordinal);
+            foreach (var (key, value) in
+                     new Dictionary<string, string?>(StringComparer.Ordinal)
+                     {
                     ["HOME"] = homePath,
                     ["USERPROFILE"] = homePath,
                     ["XDG_CONFIG_HOME"] = xdgPath,
@@ -958,8 +2226,11 @@ public sealed partial class VerifiedCandidatePublisher(
                     ["GIT_ASKPASS"] = askPassPath,
                     ["SSH_ASKPASS"] = askPassPath,
                     ["GIT_SSH"] = sshPath,
-                    ["GIT_SSH_COMMAND"] = QuoteCommand(sshPath)
-                };
+                         ["GIT_SSH_COMMAND"] = QuoteCommand(sshPath)
+                     })
+            {
+                environmentVariables[key] = value;
+            }
 
             var config = new List<KeyValuePair<string, string>>
             {

@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { useBootstrapQuery, useAnalyzeRepositoryMutation, useSaveSettingsMutation } from "../../api/queries";
-import type { ModelSelectionStrategy, OutcomeType } from "../../api/types";
+import {
+  useBootstrapQuery,
+  useAnalyzeRepositoryMutation,
+  useReloadAgentCatalogMutation,
+  useSaveSettingsMutation
+} from "../../api/queries";
+import type { DeliveryOutcomeType, ModelSelectionStrategy } from "../../api/types";
 import { AppShell } from "../../components/AppShell";
 import { CheckIcon, FolderIcon, RefreshIcon } from "../../lib/icons";
 import { lastPathPart } from "../../lib/format";
@@ -13,11 +18,14 @@ export function SettingsPage() {
   const toast = useToast();
   const saveSettings = useSaveSettingsMutation();
   const analyzeRepository = useAnalyzeRepositoryMutation();
+  const reloadAgentCatalog = useReloadAgentCatalogMutation();
 
   const settings = data?.settings;
   const [repositoryPath, setRepositoryPath] = useState(settings?.repositoryPath ?? "");
   const [knowledge, setKnowledge] = useState(settings?.repositoryKnowledge ?? "");
-  const [outcome, setOutcome] = useState<OutcomeType>(settings?.outcome ?? "PullRequest");
+  const [outcome, setOutcome] = useState<DeliveryOutcomeType>(
+    settings?.outcome ?? "PullRequest"
+  );
   const [maxHandoffRetries, setMaxHandoffRetries] = useState(settings?.maxHandoffRetries ?? 2);
   const [modelSelectionStrategy, setModelSelectionStrategy] = useState<ModelSelectionStrategy>(
     settings?.modelSelectionStrategy ?? "MaximumQuality"
@@ -39,7 +47,11 @@ export function SettingsPage() {
   if (!data || !settings) return null;
 
   const { agents, copilotCli, modelCatalog, workflow } = data;
-  const enabledCount = agents.filter(agent => agent.enabled).length;
+  const agentCatalog = data.agentCatalog;
+  const admission = data.admission;
+  const enabledCount = agents.filter(
+    agent => agent.enabled && agent.definitionStatus === "Valid"
+  ).length;
 
   async function onSave() {
     if (!Number.isInteger(maxHandoffRetries) || maxHandoffRetries < 0 || maxHandoffRetries > 10) {
@@ -138,8 +150,8 @@ export function SettingsPage() {
                 <h3>Symphony workflow contract</h3>
                 <p>Version-controlled policy, prompt template, hooks, and runtime limits.</p>
               </div>
-              <span className={`status-pill ${workflow.ready ? "approved" : "failed"}`}>
-                {workflow.ready ? "Hot reload active" : "Invalid"}
+              <span className={`status-pill ${workflow.currentFileValid ? "approved" : "failed"}`}>
+                {workflow.currentFileValid ? "Current file valid" : "Current file invalid"}
               </span>
             </div>
             <div className="card-body">
@@ -148,7 +160,15 @@ export function SettingsPage() {
                 <strong title={workflow.sourcePath}>{lastPathPart(workflow.sourcePath)}</strong>
               </div>
               <div className="runtime-line">
-                <small>Concurrency</small>
+                <small>Effective revision</small>
+                <strong className="mono">{workflow.effectiveRevision?.slice(0, 12) ?? "None"}</strong>
+              </div>
+              <div className="runtime-line">
+                <small>Effective last-known-good</small>
+                <strong>{workflow.hasEffectiveDefinition ? "Available" : "Unavailable"}</strong>
+              </div>
+              <div className="runtime-line">
+                <small>Concurrent flows</small>
                 <strong>{workflow.maxConcurrentAgents} flows</strong>
               </div>
               <div className="runtime-line">
@@ -167,7 +187,9 @@ export function SettingsPage() {
                 <small>Workspaces</small>
                 <strong title={workflow.workspaceRoot ?? ""}>{lastPathPart(workflow.workspaceRoot ?? "")}</strong>
               </div>
-              {workflow.lastError && <div className="pushback-callout">{workflow.lastError}</div>}
+              {workflow.currentFileError && (
+                <div className="pushback-callout">{workflow.currentFileError}</div>
+              )}
               <small>
                 Outcome verification is repository policy. Edit{" "}
                 <span className="mono">WORKFLOW.md</span> to change its round limit; active cycles retain their
@@ -183,9 +205,52 @@ export function SettingsPage() {
                   {enabledCount} of {agents.length} enabled for Team Lead selection
                 </p>
               </div>
-              <span className="status-pill approved">{enabledCount} active</span>
+              <div>
+                <span className={`status-pill ${agentCatalog.ready ? "approved" : "failed"}`}>
+                  {agentCatalog.ready ? "Current catalog valid" : "Current catalog invalid"}
+                </span>
+                <button
+                  className="button"
+                  style={{ marginLeft: 8 }}
+                  disabled={reloadAgentCatalog.isPending}
+                  onClick={() => void reloadAgentCatalog.mutateAsync().then(
+                    result => toast(
+                      result.status.ready ? "Agent catalog reloaded." : result.status.lastError ?? "Catalog reload failed.",
+                      result.status.ready ? "success" : "error"),
+                    error => toast(error instanceof Error ? error.message : String(error), "error")
+                  )}
+                >
+                  <RefreshIcon /> {reloadAgentCatalog.isPending ? "Reloading..." : "Reload catalog"}
+                </button>
+              </div>
             </div>
             <div className="card-body">
+              {!agentCatalog.ready && agentCatalog.lastError && (
+                <div className="pushback-callout">{agentCatalog.lastError}</div>
+              )}
+              <div className="runtime-line">
+                <small>Effective catalog revision</small>
+                <strong className="mono">
+                  {agentCatalog.effectiveRevision?.slice(0, 12) ?? "None"}
+                </strong>
+              </div>
+              <div className="runtime-line">
+                <small>Effective catalog</small>
+                <strong>
+                  {agentCatalog.hasEffectiveCatalog
+                    ? `${agentCatalog.validDefinitionCount} valid · ${agentCatalog.invalidDefinitionCount} invalid`
+                    : "Unavailable"}
+                </strong>
+              </div>
+              <div className="runtime-line">
+                <small>Enabled for future flows</small>
+                <strong>{enabledCount}</strong>
+              </div>
+              {!admission.ready && (
+                <div className="pushback-callout">
+                  <strong>New work unavailable:</strong> {admission.failures.join(" ")}
+                </div>
+              )}
               <div className="agent-grid">
                 {agents.map(agent => (
                   <AgentCard agent={agent} key={agent.id} />
@@ -326,8 +391,8 @@ export function SettingsPage() {
                 <span>
                   <strong>Powered by Copilot CLI.</strong>
                   <br />
-                  Every selected agent runs inside an isolated Git worktree and can modify code, run commands, and
-                  create the configured outcome.
+                  Every selected agent runs sequentially in an isolated flow workspace under its persisted
+                  permission profile. Advisory work remains read-only; Delivery publication waits for acceptance.
                 </span>
               </div>
             </div>

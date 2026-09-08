@@ -3,14 +3,796 @@ using System.Diagnostics;
 using System.Text.Json;
 using AiHarnessDemo.Api;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Security;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Core.Workflow;
+using AiHarnessDemo.Data;
 using AiHarnessDemo.Infrastructure;
 using AiHarnessDemo.Services;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Collections.Immutable;
 
 namespace AiHarnessDemo.Tests;
+
+public sealed class PermissionProfileResolverTests
+{
+    private readonly PermissionProfileResolver _resolver = new();
+
+    [Fact]
+    public void UnknownWorkflowProfile_FailsClosed()
+    {
+        var restrictions = Restrictions() with
+        {
+            DeliveryPreReviewMaximum = (ExecutionPermissionProfile)999
+        };
+
+        Assert.Throws<InvalidOperationException>(() => _resolver.Resolve(
+            Request(PlanDuty.Implement),
+            restrictions));
+    }
+
+    [Theory]
+    [InlineData("architect")]
+    [InlineData("anything-at-all")]
+    [InlineData("release-engineer")]
+    public void EveryNonPublishAgentId_GetsPublicationGuards(string agentId)
+    {
+        var permission = _resolver.Resolve(
+            Request(PlanDuty.Implement),
+            Restrictions());
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\workspace",
+            @"C:\agent",
+            agentId,
+            "model",
+            "high",
+            Guid.NewGuid(),
+            "prompt",
+            permission);
+
+        Assert.True(permission.GuardPublicationCredentials);
+        Assert.Contains("shell(git push)", permission.DeniedTools);
+        Assert.Contains("--deny-url=github.com", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+    }
+
+    [Fact]
+    public void PermissionResolution_HasNoAgentIdentityAuthorizationInput()
+    {
+        Assert.DoesNotContain(
+            typeof(PermissionResolutionRequest).GetProperties(),
+            property => property.Name.Contains(
+                "Agent",
+                StringComparison.OrdinalIgnoreCase));
+
+        var intake = _resolver.Resolve(
+            Request(PlanDuty.Analyze) with
+            {
+                InvocationKind = ExecutionInvocationKind.Intake
+            },
+            Restrictions());
+        var planning = _resolver.Resolve(
+            Request(PlanDuty.Analyze, PlanDuty.Design) with
+            {
+                InvocationKind = ExecutionInvocationKind.Planning
+            },
+            Restrictions());
+
+        Assert.Equal(
+            ExecutionPermissionProfile.ReadOnlySource,
+            intake.Profile);
+        Assert.Equal(
+            ExecutionPermissionProfile.ReadOnlySource,
+            planning.Profile);
+        Assert.True(PermissionProfileResolver.Equivalent(
+            intake,
+            _resolver.Resolve(
+                Request(PlanDuty.Analyze) with
+                {
+                    InvocationKind = ExecutionInvocationKind.Intake
+                },
+                Restrictions())));
+    }
+
+    [Fact]
+    public void AdvisoryAndPreMortem_DenyWriteAndShell()
+    {
+        var advisory = _resolver.Resolve(
+            Request(PlanDuty.Analyze) with { FlowKind = FlowKind.Advisory },
+            Restrictions());
+        var preMortem = _resolver.Resolve(
+            Request(PlanDuty.Analyze) with
+            {
+                InvocationKind = ExecutionInvocationKind.PreMortem
+            },
+            Restrictions());
+
+        Assert.Equal(ExecutionPermissionProfile.ReadOnlySource, advisory.Profile);
+        Assert.Equal(
+            ExecutionPermissionProfile.PreMortemReadOnly,
+            preMortem.Profile);
+        Assert.All(
+            new[] { advisory, preMortem },
+            permission =>
+            {
+                Assert.Contains("write", permission.DeniedTools);
+                Assert.Contains("shell", permission.DeniedTools);
+            });
+    }
+
+    [Fact]
+    public void PreMortemFindingRevision_RemainsWorkerWriteWhileScepticIsReadOnly()
+    {
+        var implementationRevision = _resolver.Resolve(
+            Request(PlanDuty.Implement) with
+            {
+                InvocationKind = ExecutionInvocationKind.Worker
+            },
+            Restrictions());
+        var sceptic = _resolver.Resolve(
+            Request(PlanDuty.Analyze, PlanDuty.Verify) with
+            {
+                InvocationKind = ExecutionInvocationKind.PreMortem
+            },
+            Restrictions());
+
+        Assert.Equal(
+            ExecutionPermissionProfile.WorkspaceWrite,
+            implementationRevision.Profile);
+        Assert.Contains("edit", implementationRevision.AllowedTools);
+        Assert.Equal(
+            ExecutionPermissionProfile.PreMortemReadOnly,
+            sceptic.Profile);
+        Assert.DoesNotContain("write", sceptic.AllowedTools);
+        Assert.Contains("write", sceptic.DeniedTools);
+        Assert.Contains("shell", sceptic.DeniedTools);
+    }
+
+    [Fact]
+    public void WorkflowRestrictions_CanOnlyLowerAndAddDenials()
+    {
+        var restrictions = Restrictions() with
+        {
+            DeliveryPostApprovalMaximum =
+                ExecutionPermissionProfile.WorkspaceWrite,
+            AdditionalDeniedTools = Restrictions().AdditionalDeniedTools.SetItem(
+                ExecutionPermissionProfile.WorkspaceWrite,
+                ["shell(dotnet publish:*)"])
+        };
+        var permission = _resolver.Resolve(
+            Request(PlanDuty.Publish) with
+            {
+                InvocationKind = ExecutionInvocationKind.Publication,
+                PlanStage = PlanStage.AfterApproval,
+                DurableApproval = true,
+                DurableReviewDecision = ReviewDecision.Accepted,
+                IsOnlyPlannedPublishStep = true,
+                ContractVersion = "studio-v2"
+            },
+            restrictions);
+
+        Assert.Equal(
+            ExecutionPermissionProfile.WorkspaceWrite,
+            permission.Profile);
+        Assert.False(permission.AllowRemotePublication);
+        Assert.Contains("shell(dotnet publish:*)", permission.DeniedTools);
+        Assert.Contains("shell(git push)", permission.DeniedTools);
+        Assert.Contains("write", permission.DeniedTools);
+        Assert.DoesNotContain("create", permission.AllowedTools);
+        Assert.DoesNotContain("edit", permission.AllowedTools);
+        Assert.False(CopilotReasoningHost.ShouldRunWorkspaceHooks(
+            "studio-v2",
+            ExecutionInvocationKind.Publication));
+    }
+
+    [Fact]
+    public void GovernedLegacyPublication_RemainsWorkspaceWriteAndRemoteGuarded()
+    {
+        var permission = _resolver.Resolve(
+            Request() with
+            {
+                ContractVersion = "legacy-v1",
+                LegacyPublicationAuthorized = true,
+                IsGovernedOutcomeVerification = true
+            },
+            Restrictions());
+
+        Assert.Equal(
+            ExecutionPermissionProfile.WorkspaceWrite,
+            permission.Profile);
+        Assert.True(permission.GovernedGitMetadataIsolation);
+        Assert.True(permission.GuardPublicationCredentials);
+        Assert.False(permission.AllowRemotePublication);
+    }
+
+    [Fact]
+    public void Publish_RequiresDurableAcceptanceAndSolePublishDuty()
+    {
+        var candidate = Request(PlanDuty.Publish) with
+        {
+            InvocationKind = ExecutionInvocationKind.Publication,
+            PlanStage = PlanStage.AfterApproval,
+            IsOnlyPlannedPublishStep = true,
+            ContractVersion = "studio-v2"
+        };
+        Assert.Throws<InvalidOperationException>(() =>
+            _resolver.Resolve(candidate, Restrictions()));
+        Assert.Throws<InvalidOperationException>(() =>
+            _resolver.Resolve(
+                candidate with
+                {
+                    DurableApproval = true,
+                    DurableReviewDecision = ReviewDecision.Accepted,
+                    PlanDuties = [PlanDuty.Publish, PlanDuty.Verify]
+                },
+                Restrictions()));
+
+        var permission = _resolver.Resolve(
+            candidate with
+            {
+                DurableApproval = true,
+                DurableReviewDecision = ReviewDecision.Accepted
+            },
+            Restrictions());
+
+        Assert.Equal(ExecutionPermissionProfile.Publish, permission.Profile);
+        Assert.True(permission.AllowRemotePublication);
+        Assert.True(permission.GuardPublicationCredentials);
+        Assert.DoesNotContain("create", permission.AllowedTools);
+        Assert.DoesNotContain("edit", permission.AllowedTools);
+        Assert.Contains(
+            OperatingSystem.IsWindows() ? "powershell" : "bash",
+            permission.AllowedTools);
+        Assert.Contains("write", permission.DeniedTools);
+        Assert.Contains("shell(git commit)", permission.DeniedTools);
+        Assert.Contains("shell(git push)", permission.DeniedTools);
+
+        var arguments = CopilotReasoningHost.BuildCliArguments(
+            @"C:\workspace",
+            @"C:\agent",
+            "publisher",
+            "model",
+            "high",
+            Guid.NewGuid(),
+            "Publish the sealed candidate.",
+            permission);
+        Assert.Contains("--allow-tool=shell", arguments);
+        Assert.DoesNotContain("--allow-tool=write", arguments);
+        Assert.Contains("--deny-tool=write", arguments);
+        Assert.Contains("--deny-tool=shell(git commit)", arguments);
+        Assert.Contains("--deny-tool=shell(git push)", arguments);
+        Assert.Contains("--no-remote", arguments);
+        Assert.False(CopilotReasoningHost.ShouldRunWorkspaceHooks(
+            "studio-v2",
+            ExecutionInvocationKind.Publication));
+        Assert.True(CopilotReasoningHost.ShouldRunWorkspaceHooks(
+            "legacy-v1",
+            ExecutionInvocationKind.Publication));
+    }
+
+    [Fact]
+    public void NonPublishEnvironment_UsesAnEmptyPerAttemptGhDirectory()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"permission-guard-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "copilot");
+        var workspace = Path.Combine(root, "workspace");
+        Directory.CreateDirectory(workspace);
+        string configDirectory;
+        try
+        {
+            using (var scope =
+                   CopilotReasoningHost.PublicationGuardScope.Create(
+                       home,
+                       workspace))
+            {
+                configDirectory = Assert.IsType<string>(
+                    scope.EnvironmentVariables["GH_CONFIG_DIR"]);
+                Assert.True(Directory.Exists(configDirectory));
+                Assert.Empty(Directory.GetFileSystemEntries(configDirectory));
+                Assert.Null(scope.EnvironmentVariables["GH_TOKEN"]);
+                Assert.Null(scope.EnvironmentVariables["GITHUB_TOKEN"]);
+                Assert.Null(scope.EnvironmentVariables["SSH_AUTH_SOCK"]);
+                Assert.Null(scope.EnvironmentVariables["GIT_ASKPASS"]);
+                Assert.Equal(
+                    string.Empty,
+                    scope.EnvironmentVariables["GIT_CONFIG_VALUE_1"]);
+            }
+
+            Assert.False(Directory.Exists(configDirectory));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task WorkerPreMortemRevision_PersistsWorkspaceWriteAtRuntimeBoundary()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        IDbContextFactory<HarnessDbContext> factory =
+            new PermissionDbContextFactory(options);
+        var flow = new FlowRun
+        {
+            Title = "Permission persistence",
+            OriginalRequest = "Persist policy",
+            ContractVersion = "studio-v2",
+            Kind = FlowKind.Delivery
+        };
+        var step = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 10,
+            AgentId = "implementation-worker",
+            AgentName = "Implementation Worker",
+            AgentRole = "worker",
+            PlanStepKey = "implement",
+            PlanDutiesJson = """["Implement"]""",
+            InvocationKind = ExecutionInvocationKind.Worker,
+            PreMortemReviewStepId = Guid.NewGuid()
+        };
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+            database.Flows.Add(flow);
+            database.FlowSteps.Add(step);
+            await database.SaveChangesAsync();
+        }
+        var workflow = new WorkflowDefinition(
+            new WorkflowConfig(),
+            "{{ task }}",
+            "WORKFLOW.md",
+            DateTimeOffset.UtcNow,
+            "revision-under-test");
+        var context = new AgentExecutionContext(
+            flow.Id,
+            1,
+            step.AgentId,
+            step.AgentName,
+            step.AgentRole,
+            "model",
+            "high",
+            1,
+            "task",
+            "knowledge",
+            @"C:\source",
+            @"C:\workspace",
+            Guid.NewGuid(),
+            OutcomeType.PullRequest,
+            "plan",
+            [],
+            [],
+            FlowStepId: step.Id,
+            ContractVersion: "studio-v2",
+            InvocationKind: ExecutionInvocationKind.Worker);
+
+        var permission =
+            await CopilotReasoningHost.ResolveAndPersistPermissionAsync(
+                context,
+                workflow,
+                _resolver,
+                factory,
+                CancellationToken.None);
+
+        await using var verification = await factory.CreateDbContextAsync();
+        var persisted = await verification.FlowSteps.SingleAsync();
+        Assert.Equal(ExecutionPermissionProfile.WorkspaceWrite, permission.Profile);
+        Assert.Equal(permission.Profile, persisted.PermissionProfile);
+        Assert.Equal("revision-under-test", persisted.WorkflowRevision);
+        Assert.Contains("\"Profile\":1", persisted.EffectivePermissionJson);
+    }
+
+    private static PermissionResolutionRequest Request(params PlanDuty[] duties) =>
+        new(
+            FlowKind.Delivery,
+            ExecutionInvocationKind.Worker,
+            PlanStage.BeforeReview,
+            duties.ToImmutableArray(),
+            null,
+            false,
+            false,
+            "contract-v2",
+            false,
+            false);
+
+    private static WorkflowPermissionRestrictions Restrictions() =>
+        new(
+            ExecutionPermissionProfile.ReadOnlySource,
+            ExecutionPermissionProfile.WorkspaceWrite,
+            ExecutionPermissionProfile.Publish,
+            Enum.GetValues<ExecutionPermissionProfile>()
+                .ToImmutableDictionary(
+                    profile => profile,
+                    _ => ImmutableArray<string>.Empty));
+
+    private sealed class PermissionDbContextFactory(
+        DbContextOptions<HarnessDbContext> options)
+        : IDbContextFactory<HarnessDbContext>
+    {
+        public HarnessDbContext CreateDbContext() => new(options);
+    }
+}
+
+public sealed class PromptStagingTests
+{
+    [Fact]
+    public async Task LargePrompt_IsStagedAndCliContainsOnlyBoundedReference()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"prompt-staging-{Guid.NewGuid():N}");
+        var sessionId = Guid.NewGuid();
+        var flowId = Guid.NewGuid();
+        var stepId = Guid.NewGuid();
+        var prompt =
+            "prompt-start:" +
+            new string('a', 20_000) +
+            ":prompt-middle:" +
+            new string('b', 20_000) +
+            ":prompt-last";
+        try
+        {
+            var stager = new AgentManifestStager();
+            var agent = await stager.StageAsync(
+                root,
+                Manifest(),
+                sessionId);
+            var staged = await stager.StagePromptAsync(
+                agent,
+                prompt,
+                sessionId,
+                flowId,
+                stepId,
+                attempt: 1);
+            var instruction =
+                AgentManifestStager.BuildPromptReferenceInstruction(
+                    staged,
+                    recoveringInterruptedSession: false);
+            var arguments = CopilotReasoningHost.BuildCliArguments(
+                root,
+                agent.Root,
+                agent.AgentId,
+                ExecutionInvocationKind.ReviewClassification,
+                "model",
+                "high",
+                sessionId,
+                instruction);
+
+            Assert.Equal(prompt, await File.ReadAllTextAsync(staged.Path));
+            Assert.Equal(
+                OutcomeVerificationRules.ComputeSha256(prompt),
+                staged.Sha256);
+            Assert.Equal(
+                System.Text.Encoding.UTF8.GetByteCount(prompt),
+                staged.ByteCount);
+            Assert.Equal("-p", arguments[^2]);
+            Assert.Equal(instruction, arguments[^1]);
+            Assert.DoesNotContain(
+                arguments,
+                value => value.Contains(
+                    "prompt-middle",
+                    StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                arguments,
+                value => value.Length >
+                         CopilotReasoningHost.MaximumInlinePromptCharacters);
+            Assert.Contains(
+                arguments,
+                value => value.StartsWith(
+                    "--deny-tool=write(",
+                    StringComparison.Ordinal) &&
+                         value.Contains(
+                             Path.GetFullPath(agent.Root)
+                                 .Replace('\\', '/'),
+                             StringComparison.Ordinal));
+            Assert.True(
+                CopilotReasoningHost.EstimateCliCommandLineCharacters(
+                    "copilot",
+                    arguments) <
+                CopilotReasoningHost.MaximumProcessCommandLineCharacters);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task MaximumReviewClassificationPrompt_IsCompleteOnlyInStagedFile()
+    {
+        static string Fill(string marker, char fill, int length) =>
+            marker + new string(fill, length - marker.Length);
+        var details = Enumerable.Range(1, 24)
+            .Select(index => Fill(
+                $"review-detail-{index:D2}:",
+                (char)('a' + index % 26),
+                FlowOutcomeParser.MaximumImplementationDetailCharacters))
+            .ToArray();
+        var outcomeJson = JsonSerializer.Serialize(
+            new FlowOutcomeDocument
+            {
+                Version = FlowOutcomeParser.Version,
+                Goal = Fill(
+                    "review-goal:",
+                    'g',
+                    FlowOutcomeParser.MaximumGoalCharacters),
+                Summary = new string('s', 12_000),
+                ImplementationDetails = details,
+                Artifacts = []
+            });
+        _ = FlowOutcomeParser.ParseJson(outcomeJson);
+        var feedback = Fill(
+            "review-feedback-last:",
+            'f',
+            ReviewFeedbackParser.MaximumRequestedChangeCharacters);
+        var task = ReviewCoordinator.BuildFeedbackClassificationTask(
+            FlowKind.Advisory,
+            outcomeJson,
+            feedback);
+        var flowId = Guid.NewGuid();
+        var stepId = Guid.NewGuid();
+        var sessionId = Guid.NewGuid();
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"review-prompt-{Guid.NewGuid():N}");
+        try
+        {
+            var context = new AgentExecutionContext(
+                flowId,
+                1,
+                "account-manager",
+                "Account Manager",
+                "account-manager",
+                "model",
+                "high",
+                1,
+                task,
+                "Repository facts.",
+                root,
+                root,
+                sessionId,
+                OutcomeType.None,
+                "Classify review.",
+                [],
+                [],
+                FlowStepId: stepId,
+                ContractVersion: "studio-v2",
+                InvocationKind:
+                    ExecutionInvocationKind.ReviewClassification);
+            var values = CopilotReasoningHost.BuildPromptValues(
+                context,
+                "Return review-feedback-v1.",
+                root);
+            var rendered = CopilotReasoningHost.BoundRenderedPrompt(
+                context,
+                new WorkflowPromptRenderer().Render(
+                    "{{ task }}\n\n{{ agent.instructions }}",
+                    values));
+
+            Assert.Equal(task, values["task"]);
+            Assert.Contains(details[11], rendered, StringComparison.Ordinal);
+            Assert.Contains(details[^1], rendered, StringComparison.Ordinal);
+            Assert.Contains(feedback, rendered, StringComparison.Ordinal);
+            Assert.True(
+                rendered.Length >
+                CopilotReasoningHost.MaximumInlinePromptCharacters);
+
+            var stager = new AgentManifestStager();
+            var agent = await stager.StageAsync(
+                root,
+                Manifest(),
+                sessionId);
+            var staged = await stager.StagePromptAsync(
+                agent,
+                rendered,
+                sessionId,
+                flowId,
+                stepId,
+                attempt: 1);
+            var instruction =
+                AgentManifestStager.BuildPromptReferenceInstruction(
+                    staged,
+                    recoveringInterruptedSession: false);
+            var arguments = CopilotReasoningHost.BuildCliArguments(
+                root,
+                agent.Root,
+                agent.AgentId,
+                ExecutionInvocationKind.ReviewClassification,
+                "model",
+                "high",
+                sessionId,
+                instruction);
+
+            var stagedText = await File.ReadAllTextAsync(staged.Path);
+            Assert.Contains(details[11], stagedText, StringComparison.Ordinal);
+            Assert.Contains(details[^1], stagedText, StringComparison.Ordinal);
+            Assert.Contains(feedback, stagedText, StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                arguments,
+                argument => argument.Contains(
+                    details[11],
+                    StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                arguments,
+                argument => argument.Contains(
+                    feedback,
+                    StringComparison.Ordinal));
+            Assert.True(
+                CopilotReasoningHost.EstimateCliCommandLineCharacters(
+                    "copilot",
+                    arguments) <
+                CopilotReasoningHost.MaximumProcessCommandLineCharacters);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task StagedPrompt_TamperingFailsClosed()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"prompt-tamper-{Guid.NewGuid():N}");
+        var sessionId = Guid.NewGuid();
+        var flowId = Guid.NewGuid();
+        var stepId = Guid.NewGuid();
+        const string prompt = "complete authoritative prompt";
+        try
+        {
+            var stager = new AgentManifestStager();
+            var agent = await stager.StageAsync(
+                root,
+                Manifest(),
+                sessionId);
+            var staged = await stager.StagePromptAsync(
+                agent,
+                prompt,
+                sessionId,
+                flowId,
+                stepId,
+                attempt: 1);
+            await File.WriteAllTextAsync(
+                staged.Path,
+                "tampered prompt");
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => stager.StagePromptAsync(
+                    agent,
+                    prompt,
+                    sessionId,
+                    flowId,
+                    stepId,
+                    attempt: 1));
+
+            Assert.Contains(
+                "SHA-256 validation",
+                exception.Message,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task StagedPrompt_ResumeValidatesAndReusesDeterministicBundle()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"prompt-resume-{Guid.NewGuid():N}");
+        var sessionId = Guid.NewGuid();
+        var flowId = Guid.NewGuid();
+        var stepId = Guid.NewGuid();
+        var prompt = new string('r', 40_000);
+        try
+        {
+            var stager = new AgentManifestStager();
+            var agent = await stager.StageAsync(
+                root,
+                Manifest(),
+                sessionId);
+            var first = await stager.StagePromptAsync(
+                agent,
+                prompt,
+                sessionId,
+                flowId,
+                stepId,
+                attempt: 3);
+            var resumed = await stager.StagePromptAsync(
+                agent,
+                prompt,
+                sessionId,
+                flowId,
+                stepId,
+                attempt: 3);
+            var instruction =
+                AgentManifestStager.BuildPromptReferenceInstruction(
+                    resumed,
+                    recoveringInterruptedSession: true);
+
+            Assert.False(first.Reused);
+            Assert.True(resumed.Reused);
+            Assert.Equal(first.Path, resumed.Path);
+            Assert.Equal(first.ManifestPath, resumed.ManifestPath);
+            Assert.Equal(first.Sha256, resumed.Sha256);
+            Assert.Contains(
+                "Resume from the current workspace",
+                instruction,
+                StringComparison.Ordinal);
+            Assert.Contains(resumed.Path, instruction, StringComparison.Ordinal);
+            Assert.Contains(resumed.Sha256, instruction, StringComparison.Ordinal);
+
+            stager.CleanupPrompt(resumed);
+            Assert.False(Directory.Exists(resumed.BundleRoot));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void CliArguments_RejectAProductPayloadAboveInlineLimit()
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            CopilotReasoningHost.BuildCliArguments(
+                @"C:\workspace",
+                @"C:\agent",
+                "account-manager",
+                ExecutionInvocationKind.ReviewClassification,
+                "model",
+                "high",
+                Guid.NewGuid(),
+                new string('x',
+                    CopilotReasoningHost.MaximumInlinePromptCharacters + 1)));
+
+        Assert.Contains(
+            "Stage the complete prompt",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    private static AgentManifest Manifest() =>
+        new(
+            "account-manager",
+            "Account Manager",
+            "Normalizes customer intent.",
+            "account-manager",
+            "violet",
+            10,
+            "account-manager.agent.md",
+            "Read the supplied prompt and return the strict contract.");
+}
 
 public sealed class CopilotJsonlParserTests
 {
@@ -330,14 +1112,14 @@ public sealed class GovernedPublicationBoundaryTests
         var environment =
             Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
                 CopilotReasoningHost.BuildProcessEnvironment(
-                    agentRole,
+                    ExecutionInvocationKind.Worker,
                     allowRemotePublication: true,
                     isGovernedOutcomeVerification: true));
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\governed-worktree",
             @"C:\harness",
             agentRole,
-            agentRole,
+            ExecutionInvocationKind.Worker,
             "model",
             "high",
             Guid.NewGuid(),
@@ -355,7 +1137,7 @@ public sealed class GovernedPublicationBoundaryTests
         Assert.Contains("--allow-tool=write", arguments);
         Assert.Contains("--allow-tool=shell", arguments);
         Assert.Contains(
-            "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS",
+            "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,GH_ENTERPRISE_TOKEN,GITHUB_ENTERPRISE_TOKEN,GITHUB_TOKEN_REQUEST_URL,GITHUB_TOKEN_REQUEST_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS",
             arguments);
         Assert.Contains("--disable-builtin-mcps", arguments);
         Assert.DoesNotContain("--allow-all-tools", arguments);
@@ -411,7 +1193,7 @@ public sealed class GovernedPublicationBoundaryTests
             @"C:\governed-worktree",
             @"C:\harness",
             "release-engineer",
-            "release-engineer",
+            ExecutionInvocationKind.Worker,
             "model",
             "high",
             Guid.NewGuid(),
@@ -1009,9 +1791,9 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--add-dir --acp --agent --allow-all-tools --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
+                "--add-dir --acp --agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
-                "--no-eager-powershell-resolution --output-format --secret-env-vars --session-id");
+                "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
 
             Assert.True(status.Ready);
@@ -1076,9 +1858,9 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--agent --allow-all-tools --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
+                "--agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
                 "--effort --model --no-ask-user --no-custom-instructions " +
-                "--no-eager-powershell-resolution --output-format --secret-env-vars --session-id");
+                "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
 
             Assert.False(status.Ready);
@@ -1693,12 +2475,26 @@ public sealed class WorkspaceManagerTests
                 workspace.BranchName,
                 await CurrentBranchAsync(processRunner, Path.Combine(workspace.Path, "data")));
 
+            flow.WorkspacePath = workspace.Path;
+            flow.BranchName = workspace.BranchName;
             var recovered = await manager.PrepareAsync(flow);
             Assert.False(recovered.CreatedNow);
             Assert.Equal(workspace.Path, recovered.Path);
 
-            flow.WorkspacePath = workspace.Path;
-            flow.BranchName = workspace.BranchName;
+            await RunGitAsync(
+                processRunner,
+                Path.Combine(workspace.Path, "site"),
+                ["checkout", "--detach", "HEAD"]);
+            var mismatch = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => manager.PrepareAsync(flow));
+            Assert.Contains(
+                "is not on the durable flow branch",
+                mismatch.Message);
+            await RunGitAsync(
+                processRunner,
+                Path.Combine(workspace.Path, "site"),
+                ["checkout", workspace.BranchName]);
+
             var cleanup = await manager.RemoveAsync(flow);
 
             Assert.Equal(2, cleanup.WorktreesRemoved);
@@ -1735,6 +2531,122 @@ public sealed class WorkspaceManagerTests
                 }
             }
             DeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task SensitiveStudioInvocations_SuppressAfterCreateHook()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-sensitive-workspace-{Guid.NewGuid():N}");
+        var project = Path.Combine(root, "project");
+        Directory.CreateDirectory(project);
+        var hook = OperatingSystem.IsWindows()
+            ? "Set-Content -Path after-create-hook.txt -Value ran"
+            : "printf ran > after-create-hook.txt";
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "WORKFLOW.md"),
+            $$"""
+              ---
+              workspace:
+                root: workspaces
+              hooks:
+                after_create: {{hook}}
+              ---
+
+              Test workflow.
+              """);
+        var processRunner = new ProcessRunner();
+        await CreateRepositoryAsync(
+            processRunner,
+            project,
+            "project.txt");
+        var paths = new HarnessPaths(
+            root,
+            Path.Combine(root, ".github", "agents"),
+            Path.Combine(root, "harness.db"));
+        var workflowProvider = new WorkflowDefinitionProvider(
+            paths,
+            new WorkflowLoader(),
+            NullLogger<WorkflowDefinitionProvider>.Instance);
+        await workflowProvider.StartAsync(CancellationToken.None);
+        var hookRunner = new WorkspaceHookRunner(
+            workflowProvider,
+            processRunner,
+            NullLogger<WorkspaceHookRunner>.Instance);
+        var manager = new WorkspaceManager(
+            processRunner,
+            workflowProvider,
+            hookRunner,
+            NullLogger<WorkspaceManager>.Instance);
+        var created = new List<FlowRun>();
+
+        try
+        {
+            foreach (var invocationKind in new[]
+                     {
+                         ExecutionInvocationKind.ReviewClassification,
+                         ExecutionInvocationKind.Publication
+                     })
+            {
+                var flow = new FlowRun
+                {
+                    Title = $"Sensitive {invocationKind}",
+                    OriginalRequest = "Use the sealed candidate.",
+                    ContractVersion = "studio-v2",
+                    Kind = FlowKind.Delivery,
+                    Status = invocationKind ==
+                             ExecutionInvocationKind.Publication
+                        ? FlowStatus.Queued
+                        : FlowStatus.WaitingForFeedback,
+                    RepositoryPath = project
+                };
+                created.Add(flow);
+                var workspace = await manager.PrepareForInvocationAsync(
+                    flow,
+                    invocationKind);
+                flow.WorkspacePath = workspace.Path;
+                flow.BranchName = workspace.BranchName;
+                Assert.False(File.Exists(Path.Combine(
+                    workspace.Path,
+                    "after-create-hook.txt")));
+            }
+
+            var worker = new FlowRun
+            {
+                Title = "Normal worker",
+                OriginalRequest = "Run normal Delivery work.",
+                ContractVersion = "studio-v2",
+                Kind = FlowKind.Delivery,
+                Status = FlowStatus.Running,
+                RepositoryPath = project
+            };
+            created.Add(worker);
+            var workerWorkspace = await manager.PrepareForInvocationAsync(
+                worker,
+                ExecutionInvocationKind.Worker);
+            worker.WorkspacePath = workerWorkspace.Path;
+            worker.BranchName = workerWorkspace.BranchName;
+            Assert.True(File.Exists(Path.Combine(
+                workerWorkspace.Path,
+                "after-create-hook.txt")));
+        }
+        finally
+        {
+            foreach (var flow in created)
+            {
+                if (!string.IsNullOrWhiteSpace(flow.WorkspacePath) &&
+                    Directory.Exists(flow.WorkspacePath))
+                {
+                    await manager.RemoveAsync(flow);
+                }
+            }
+            workflowProvider.Dispose();
+            if (Directory.Exists(root))
+            {
+                DeleteDirectory(root);
+            }
         }
     }
 
@@ -1800,5 +2712,337 @@ public sealed class WorkspaceManagerTests
             File.SetAttributes(file, FileAttributes.Normal);
         }
         Directory.Delete(path, recursive: true);
+    }
+}
+
+public sealed class CopilotReasoningHostAfterRunHookPolicyFallbackTests
+{
+    [Fact]
+    public async Task ResolveWorkspaceHookPolicyAsync_ThrowsWhenTheFlowRowDoesNotExist()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        IDbContextFactory<HarnessDbContext> factory =
+            new HookPolicyDbContextFactory(options);
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            CopilotReasoningHost.ResolveWorkspaceHookPolicyAsync(
+                factory,
+                Guid.NewGuid(),
+                CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AfterRunHook_InitialLookupFailsThenCleanupLookupSucceeds_DeliveryHookIsAttempted()
+    {
+        var root = CreateTempWorkspace();
+        try
+        {
+            var factory = await CreateFactoryAsync();
+            var flowId = Guid.NewGuid();
+
+            // Reproduces the initial workspace-hook-policy lookup (made earlier in the
+            // same RunAgentAsync call, inside the outer try) failing because the flow
+            // row was not yet visible to that query.
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                CopilotReasoningHost.ResolveWorkspaceHookPolicyAsync(
+                    factory,
+                    flowId,
+                    CancellationToken.None));
+
+            // The flow becomes visible before the finally block's best-effort cleanup
+            // re-resolution runs.
+            await SeedFlowAsync(
+                factory,
+                flowId,
+                FlowKind.Delivery,
+                FlowStatus.Running);
+
+            var marker = Path.Combine(root, "after-run.marker");
+            var hookRunner = CreateHookRunner(root);
+            var workflow = WorkflowWithAfterRunHook(MarkerScript(marker));
+
+            await CopilotReasoningHost.RunAfterRunWorkspaceHookAsync(
+                runWorkspaceHooks: true,
+                hookPolicy: null,
+                factory,
+                hookRunner,
+                flowId,
+                root,
+                workflow,
+                NullLogger.Instance,
+                CancellationToken.None);
+
+            Assert.True(File.Exists(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task AfterRunHook_InitialLookupFailsThenCleanupLookupSucceeds_AdvisoryHookRemainsSkipped()
+    {
+        var root = CreateTempWorkspace();
+        try
+        {
+            var factory = await CreateFactoryAsync();
+            var flowId = Guid.NewGuid();
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                CopilotReasoningHost.ResolveWorkspaceHookPolicyAsync(
+                    factory,
+                    flowId,
+                    CancellationToken.None));
+
+            await SeedFlowAsync(
+                factory,
+                flowId,
+                FlowKind.Advisory,
+                FlowStatus.Running);
+
+            var marker = Path.Combine(root, "after-run.marker");
+            var hookRunner = CreateHookRunner(root);
+            var workflow = WorkflowWithAfterRunHook(MarkerScript(marker));
+
+            // The cleanup re-resolution succeeds (it finds the flow row), but the
+            // resolved policy is Advisory, so the hook must still never execute.
+            await CopilotReasoningHost.RunAfterRunWorkspaceHookAsync(
+                runWorkspaceHooks: true,
+                hookPolicy: null,
+                factory,
+                hookRunner,
+                flowId,
+                root,
+                workflow,
+                NullLogger.Instance,
+                CancellationToken.None);
+
+            Assert.False(File.Exists(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AfterRunHook_SensitiveInvocationNeverAttemptsCleanupLookupOrHook(
+        bool flowRowExists)
+    {
+        var root = CreateTempWorkspace();
+        try
+        {
+            var factory = await CreateFactoryAsync();
+            var flowId = Guid.NewGuid();
+            if (flowRowExists)
+            {
+                // Even when a lookup would have succeeded, a sensitive invocation
+                // (ReviewClassification/Publication under studio-v2) must never
+                // attempt the after_run hook at all: runWorkspaceHooks already
+                // gates this before any policy is resolved.
+                await SeedFlowAsync(
+                    factory,
+                    flowId,
+                    FlowKind.Delivery,
+                    FlowStatus.Running);
+            }
+
+            var marker = Path.Combine(root, "after-run.marker");
+            var hookRunner = CreateHookRunner(root);
+            var workflow = WorkflowWithAfterRunHook(MarkerScript(marker));
+
+            await CopilotReasoningHost.RunAfterRunWorkspaceHookAsync(
+                runWorkspaceHooks: false,
+                hookPolicy: null,
+                factory,
+                hookRunner,
+                flowId,
+                root,
+                workflow,
+                NullLogger.Instance,
+                CancellationToken.None);
+
+            Assert.False(File.Exists(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task AfterRunHook_BothLookupsFailIsSwallowedSafelyAndSkipsHook()
+    {
+        var root = CreateTempWorkspace();
+        try
+        {
+            var factory = await CreateFactoryAsync();
+            var flowId = Guid.NewGuid();
+            var marker = Path.Combine(root, "after-run.marker");
+            var hookRunner = CreateHookRunner(root);
+            var workflow = WorkflowWithAfterRunHook(MarkerScript(marker));
+
+            // Neither the initial lookup nor the cleanup lookup can find the flow
+            // (it never existed for this test). The unknown policy must never run
+            // the hook, and the failure must be swallowed rather than thrown so the
+            // rest of the run's cleanup still completes.
+            await CopilotReasoningHost.RunAfterRunWorkspaceHookAsync(
+                runWorkspaceHooks: true,
+                hookPolicy: null,
+                factory,
+                hookRunner,
+                flowId,
+                root,
+                workflow,
+                NullLogger.Instance,
+                CancellationToken.None);
+
+            Assert.False(File.Exists(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task AfterRunHook_AlreadyResolvedDeliveryPolicySkipsCleanupLookupAndRunsHook()
+    {
+        var root = CreateTempWorkspace();
+        try
+        {
+            // A databaseFactory that throws on any use proves that when the policy
+            // was already resolved by the initial (successful) lookup, no cleanup
+            // re-resolution query is attempted at all.
+            IDbContextFactory<HarnessDbContext> throwingFactory =
+                new ThrowingDbContextFactory();
+            var marker = Path.Combine(root, "after-run.marker");
+            var hookRunner = CreateHookRunner(root);
+            var workflow = WorkflowWithAfterRunHook(MarkerScript(marker));
+
+            await CopilotReasoningHost.RunAfterRunWorkspaceHookAsync(
+                runWorkspaceHooks: true,
+                hookPolicy: new CopilotReasoningHost.WorkspaceHookPolicy(
+                    FlowKind.Delivery,
+                    Provisional: false),
+                throwingFactory,
+                hookRunner,
+                Guid.NewGuid(),
+                root,
+                workflow,
+                NullLogger.Instance,
+                CancellationToken.None);
+
+            Assert.True(File.Exists(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static string CreateTempWorkspace()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-after-run-hook-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        return root;
+    }
+
+    private static async Task<IDbContextFactory<HarnessDbContext>> CreateFactoryAsync()
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        IDbContextFactory<HarnessDbContext> factory =
+            new HookPolicyDbContextFactory(options);
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+        }
+        return factory;
+    }
+
+    private static async Task SeedFlowAsync(
+        IDbContextFactory<HarnessDbContext> factory,
+        Guid flowId,
+        FlowKind kind,
+        FlowStatus status)
+    {
+        await using var database = await factory.CreateDbContextAsync();
+        database.Flows.Add(new FlowRun
+        {
+            Id = flowId,
+            Title = "After-run hook policy fallback",
+            OriginalRequest = "Exercise the after_run hook fallback path.",
+            ContractVersion = "studio-v2",
+            Kind = kind,
+            Status = status
+        });
+        await database.SaveChangesAsync();
+    }
+
+    private static WorkspaceHookRunner CreateHookRunner(string root)
+    {
+        var paths = new HarnessPaths(
+            root,
+            Path.Combine(root, ".github", "agents"),
+            Path.Combine(root, "harness.db"));
+        var workflowProvider = new WorkflowDefinitionProvider(
+            paths,
+            new WorkflowLoader(),
+            NullLogger<WorkflowDefinitionProvider>.Instance);
+        return new WorkspaceHookRunner(
+            workflowProvider,
+            new ProcessRunner(),
+            NullLogger<WorkspaceHookRunner>.Instance);
+    }
+
+    private static WorkflowDefinition WorkflowWithAfterRunHook(string script) =>
+        new(
+            new WorkflowConfig
+            {
+                Hooks = new HookConfig
+                {
+                    AfterRun = script,
+                    TimeoutMs = 15_000
+                }
+            },
+            "{{ task }}",
+            "WORKFLOW.md",
+            DateTimeOffset.UtcNow,
+            "revision-under-test");
+
+    private static string MarkerScript(string markerPath) =>
+        OperatingSystem.IsWindows()
+            ? $"New-Item -ItemType File -Path \"{markerPath}\" -Force | Out-Null"
+            : $"touch \"{markerPath}\"";
+
+    private sealed class HookPolicyDbContextFactory(
+        DbContextOptions<HarnessDbContext> options)
+        : IDbContextFactory<HarnessDbContext>
+    {
+        public HarnessDbContext CreateDbContext() => new(options);
+    }
+
+    private sealed class ThrowingDbContextFactory : IDbContextFactory<HarnessDbContext>
+    {
+        public HarnessDbContext CreateDbContext() =>
+            throw new InvalidOperationException(
+                "The database must not be accessed when the policy was already resolved.");
     }
 }

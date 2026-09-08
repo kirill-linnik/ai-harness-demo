@@ -1,8 +1,12 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Services;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 
 namespace AiHarnessDemo.Contracts;
 
@@ -21,7 +25,13 @@ public sealed record AgentDto(
     string Role,
     string Accent,
     bool Enabled,
-    int SortOrder);
+    int SortOrder,
+    AgentDefinitionStatus DefinitionStatus,
+    string ValidationError,
+    bool Required,
+    bool Switchable,
+    string DefinitionHash,
+    DateTimeOffset LoadedAt);
 
 public sealed record AgentToolCallDto(
     Guid Id,
@@ -29,16 +39,46 @@ public sealed record AgentToolCallDto(
     string ArgumentsSummary,
     bool Succeeded);
 
+public sealed record FlowReviewSummaryDto(
+    Guid? GateId,
+    bool Available,
+    bool Resolved,
+    bool? Approved,
+    ReviewDecision? Decision,
+    ReviewPublicationStatus PublicationStatus);
+
 public sealed record FlowSummaryDto(
     Guid Id,
     string Title,
+    FlowKind Kind,
+    string ContractVersion,
+    Guid? ParentFlowRunId,
+    int? ParentIteration,
+    FlowLinkKind? LinkKind,
+    string? CurrentBlockerCode,
+    string? CustomerBlockerMessage,
+    FlowReviewSummaryDto Review,
+    IReadOnlyList<LinkedFlowDto> LinkedFlows,
     FlowStatus Status,
     int Iteration,
+    string AgentCatalogRevision,
     string RepositoryPath,
     string OutcomeLabel,
     string OutcomeUrl,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt);
+
+public sealed record LinkedFlowDto(
+    Guid Id,
+    string Title,
+    FlowKind Kind,
+    FlowStatus Status,
+    int Iteration,
+    int? ParentIteration,
+    FlowLinkKind? LinkKind,
+    string OutcomeLabel,
+    FlowReviewSummaryDto Review,
+    DateTimeOffset CreatedAt);
 
 public sealed record FlowStepDto(
     Guid Id,
@@ -48,6 +88,15 @@ public sealed record FlowStepDto(
     string AgentName,
     string AgentRole,
     string Label,
+    string PlanStepKey,
+    IReadOnlyList<PlanDuty> Duties,
+    PlanStage Stage,
+    bool IsOutcomeOwner,
+    ExecutionPermissionProfile PermissionProfile,
+    string EffectivePermissionJson,
+    string WorkflowRevision,
+    IReadOnlyList<Guid> DependencyStepIds,
+    IReadOnlyList<string> DependencyPlanStepKeys,
     string Model,
     string ModelEffort,
     string ModelReason,
@@ -81,6 +130,7 @@ public sealed record FlowEventDto(
     Guid? FlowStepId,
     string Type,
     string Message,
+    string? DataJson,
     DateTimeOffset CreatedAt);
 
 public sealed record HandoffGateRecordDto(
@@ -88,6 +138,7 @@ public sealed record HandoffGateRecordDto(
     Guid FlowStepId,
     HandoffActionType ActionType,
     HandoffGateDecision Decision,
+    ReviewDecision? ReviewDecision,
     HandoffTrustLevel TrustLevelAtDecision,
     string Summary,
     string Evidence,
@@ -104,6 +155,19 @@ public sealed record FlowDetailDto(
     string Title,
     string OriginalRequest,
     string ConsolidatedRequest,
+    FlowKind Kind,
+    string ContractVersion,
+    Guid? ParentFlowRunId,
+    int? ParentIteration,
+    FlowLinkKind? LinkKind,
+    IReadOnlyList<LinkedFlowDto> LinkedFlows,
+    string AgentCatalogRevision,
+    string? OutcomeOwnerPlanStepKey,
+    string? PublicationPlanStepKey,
+    string? CurrentBlockerCode,
+    string? CurrentBlockerSummary,
+    string? CurrentBlockerDataJson,
+    string? CustomerBlockerMessage,
     FlowStatus Status,
     int Iteration,
     string RepositoryPath,
@@ -114,6 +178,8 @@ public sealed record FlowDetailDto(
     string BranchName,
     string OutcomeUrl,
     string OutcomeLabel,
+    string? ReviewedPreviewUrl,
+    FlowOutcomeDto? OutcomeResult,
     string FailureReason,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
@@ -122,6 +188,8 @@ public sealed record FlowDetailDto(
     IReadOnlyList<FlowMessageDto> Messages,
     IReadOnlyList<FlowEventDto> Events,
     IReadOnlyList<HandoffGateRecordDto> GateRecords,
+    FlowReviewSummaryDto Review,
+    ReviewPublicationStatus PublicationStatus,
     OutcomeVerificationDto OutcomeVerification);
 
 public sealed record OutcomeVerificationDto(
@@ -192,6 +260,15 @@ public sealed record LearningDto(
 public sealed record HistoryItemDto(
     Guid FlowId,
     string FlowTitle,
+    FlowKind FlowKind,
+    FlowStatus FlowStatus,
+    Guid? ParentFlowRunId,
+    int? ParentIteration,
+    FlowLinkKind? LinkKind,
+    string? CurrentBlockerCode,
+    string? CustomerBlockerMessage,
+    string OutcomeLabel,
+    FlowReviewSummaryDto Review,
     int Iteration,
     string AgentName,
     string AgentRole,
@@ -210,7 +287,12 @@ public sealed record HarnessStatsDto(
 
 public sealed record WorkflowStatusDto(
     bool Ready,
+    bool CurrentFileValid,
+    bool HasEffectiveDefinition,
     string SourcePath,
+    DateTimeOffset? EffectiveLoadedAt,
+    string? EffectiveRevision,
+    string? CurrentFileError,
     DateTimeOffset? LoadedAt,
     string? LastError,
     int? MaxConcurrentAgents,
@@ -218,6 +300,24 @@ public sealed record WorkflowStatusDto(
     string? WorkspaceRoot,
     bool? OutcomeVerificationEnabled,
     int? OutcomeVerificationMaxRounds);
+
+public sealed record AgentCatalogStatusDto(
+    bool Ready,
+    bool HasEffectiveCatalog,
+    string? EffectiveRevision,
+    DateTimeOffset? LoadedAt,
+    string? LastError,
+    int ValidDefinitionCount,
+    int InvalidDefinitionCount);
+
+public sealed record AgentCatalogDto(
+    AgentCatalogStatusDto Status,
+    IReadOnlyList<AgentDto> Agents);
+
+public sealed record NewWorkAdmissionStatusDto(
+    bool Ready,
+    IReadOnlyList<string> Failures,
+    DateTimeOffset CheckedAt);
 
 public sealed record CopilotCliStatusDto(
     bool Ready,
@@ -237,6 +337,8 @@ public sealed record ModelCatalogStatusDto(
 public sealed record TaskProfileDto(
     string Version,
     string Role,
+    string PlanStepKey,
+    string AgentId,
     int Complexity,
     int ReasoningDepth,
     int ContextDemand,
@@ -282,6 +384,8 @@ public sealed record BootstrapDto(
     CopilotCliStatusDto CopilotCli,
     ModelCatalogStatusDto ModelCatalog,
     WorkflowStatusDto Workflow,
+    AgentCatalogStatusDto AgentCatalog,
+    NewWorkAdmissionStatusDto Admission,
     bool FactoryEnabled,
     string FactoryDisabledReason);
 
@@ -364,11 +468,16 @@ public sealed record PreviewDto(
     string Title,
     string Request,
     string RepositoryName,
+    FlowKind Kind,
+    string ContractVersion,
     int Iteration,
     FlowStatus Status,
     string OutcomeLabel,
+    FlowOutcomeDto? OutcomeResult,
     IReadOnlyList<PreviewArtifactDto> Artifacts,
     IReadOnlyList<FlowStepDto> DeliveredBy,
+    FlowReviewSummaryDto Review,
+    ReviewPublicationStatus PublicationStatus,
     OutcomeVerificationDto OutcomeVerification,
     DateTimeOffset GeneratedAt);
 
@@ -376,7 +485,25 @@ public sealed record PreviewArtifactDto(
     string Id,
     string Label,
     string Url,
-    string OpenUrl);
+    string OpenUrl,
+    string? MediaType,
+    int? ByteLength,
+    string? DownloadUrl,
+    bool Interactive);
+
+public sealed record FlowOutcomeDto(
+    string Goal,
+    string Summary,
+    IReadOnlyList<string> ImplementationDetails,
+    IReadOnlyList<AdvisoryArtifactDto> Artifacts);
+
+public sealed record AdvisoryArtifactDto(
+    string Id,
+    string Path,
+    string MediaType,
+    int ByteLength,
+    string Url,
+    string DownloadUrl);
 
 public static class ApiMappings
 {
@@ -384,7 +511,9 @@ public static class ApiMappings
         new(
             settings.RepositoryPath,
             settings.RepositoryKnowledge,
-            settings.Outcome,
+            OutcomeTypeRules.RequireDelivery(
+                settings.Outcome,
+                nameof(settings.Outcome)),
             settings.MaxHandoffRetries,
             settings.ModelSelectionStrategy,
             settings.UpdatedAt);
@@ -397,31 +526,80 @@ public static class ApiMappings
             agent.Role,
             agent.Accent,
             agent.Enabled,
-            agent.SortOrder);
+            agent.SortOrder,
+            agent.DefinitionStatus,
+            agent.ValidationError,
+            agent.Required,
+            agent.Switchable,
+            agent.DefinitionHash,
+            agent.LoadedAt);
 
     public static FlowSummaryDto ToSummaryDto(this FlowRun flow) =>
         new(
             flow.Id,
             flow.Title,
+            flow.Kind,
+            flow.ContractVersion,
+            flow.ParentFlowRunId,
+            flow.ParentIteration,
+            flow.LinkKind,
+            flow.CurrentBlockerCode,
+            flow.CustomerBlockerMessage,
+            flow.ToReviewSummaryDto(),
+            flow.LinkedFlowRuns
+                .OrderBy(item => item.CreatedAt)
+                .Select(item => item.ToLinkedFlowDto())
+                .ToList(),
             flow.Status,
             flow.Iteration,
+            flow.AgentCatalogRevision,
             flow.RepositoryPath,
             flow.OutcomeLabel,
             flow.OutcomeUrl,
             flow.CreatedAt,
             flow.UpdatedAt);
 
-    public static FlowDetailDto ToDetailDto(this FlowRun flow)
+    public static FlowDetailDto ToDetailDto(
+        this FlowRun flow,
+        string? reviewedPreviewUrl = null)
     {
         var outcomeState = string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
             ? null
             : OutcomeVerificationRules.DeserializeAggregate(
                 flow.OutcomeVerificationJson);
+        var planStepKeyById = flow.Steps
+            .Where(step => !string.IsNullOrWhiteSpace(step.PlanStepKey))
+            .GroupBy(step => step.Id)
+            .ToDictionary(
+                group => group.Key,
+                group => group.First().PlanStepKey);
+        var taskProfileByStepId = flow.TaskProfiles
+            .Where(profile => profile.FlowStepId is not null)
+            .GroupBy(profile => profile.FlowStepId!.Value)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderByDescending(profile => profile.CreatedAt).First());
         return new(
             flow.Id,
             flow.Title,
             flow.OriginalRequest,
             flow.ConsolidatedRequest,
+            flow.Kind,
+            flow.ContractVersion,
+            flow.ParentFlowRunId,
+            flow.ParentIteration,
+            flow.LinkKind,
+            flow.LinkedFlowRuns
+                .OrderBy(item => item.CreatedAt)
+                .Select(item => item.ToLinkedFlowDto())
+                .ToList(),
+            flow.AgentCatalogRevision,
+            flow.OutcomeOwnerPlanStepKey,
+            flow.PublicationPlanStepKey,
+            flow.CurrentBlockerCode,
+            flow.CurrentBlockerSummary,
+            flow.CurrentBlockerDataJson,
+            flow.CustomerBlockerMessage,
             flow.Status,
             flow.Iteration,
             flow.RepositoryPath,
@@ -432,6 +610,8 @@ public static class ApiMappings
             flow.BranchName,
             flow.OutcomeUrl,
             flow.OutcomeLabel,
+            reviewedPreviewUrl,
+            ToFlowOutcomeDto(flow),
             flow.FailureReason,
             flow.CreatedAt,
             flow.UpdatedAt,
@@ -439,7 +619,10 @@ public static class ApiMappings
             flow.Steps
                 .OrderBy(step => step.Iteration)
                 .ThenBy(step => step.Sequence)
-                .Select(step => step.ToDto(outcomeState))
+                .Select(step => step.ToDto(
+                    outcomeState,
+                    planStepKeyById,
+                    taskProfileByStepId.GetValueOrDefault(step.Id)))
                 .ToList(),
             flow.Messages
                 .OrderBy(message => message.CreatedAt)
@@ -457,6 +640,7 @@ public static class ApiMappings
                     item.FlowStepId,
                     item.Type,
                     item.Message,
+                    item.DataJson,
                     item.CreatedAt))
                 .ToList(),
             flow.GateRecords
@@ -466,6 +650,7 @@ public static class ApiMappings
                     item.FlowStepId,
                     item.ActionType,
                     item.Decision,
+                    item.ReviewDecision,
                     item.TrustLevelAtDecision,
                     item.Summary,
                     item.Evidence,
@@ -477,13 +662,72 @@ public static class ApiMappings
                     item.ResolutionNote,
                     item.ResolvedAt))
                 .ToList(),
+            flow.ToReviewSummaryDto(),
+            ReviewCoordinator.GetPublicationStatus(flow),
             ToOutcomeVerificationDto(flow));
+    }
+
+    public static FlowOutcomeDto? ToFlowOutcomeDto(this FlowRun flow)
+    {
+        if (string.IsNullOrWhiteSpace(flow.OutcomeContractJson))
+        {
+            return null;
+        }
+        var materialization = flow.Kind == FlowKind.Advisory
+            ? AdvisoryArtifactCatalog.ReadPersistedMaterialization(flow)
+            : null;
+        var outcome = materialization is null
+            ? FlowOutcomeParser.ParseJson(flow.OutcomeContractJson).Document
+            : FlowOutcomeParser.ParseJson(
+                flow.OutcomeContractJson,
+                materialization.MaximumArtifactCount,
+                materialization.MaximumTotalArtifactBytes).Document;
+        return new FlowOutcomeDto(
+            outcome.Goal,
+            outcome.Summary,
+            outcome.ImplementationDetails ?? [],
+            (flow.Kind == FlowKind.Advisory
+                    ? outcome.Artifacts ?? []
+                    : [])
+                .Select(artifact =>
+                {
+                    var path = artifact.Path.Replace('\\', '/');
+                    var artifactId = AdvisoryArtifactId(path);
+                    return new AdvisoryArtifactDto(
+                        artifactId,
+                        path,
+                        artifact.MediaType,
+                        Encoding.UTF8.GetByteCount(artifact.Content),
+                        AdvisoryArtifactUrl(flow.Id, artifactId, path),
+                        AdvisoryArtifactUrl(
+                            flow.Id,
+                            artifactId,
+                            path,
+                            download: true));
+                })
+                .ToArray());
     }
 
     public static FlowStepDto ToDto(
         this FlowStep step,
-        OutcomeVerificationState? outcomeState = null) =>
-        new(
+        OutcomeVerificationState? outcomeState = null,
+        IReadOnlyDictionary<Guid, string>? planStepKeyById = null,
+        TaskProfile? persistedTaskProfile = null)
+    {
+        var routing = step.RoutingDecisions
+            .Where(item => !item.Superseded)
+            .OrderByDescending(item => item.CreatedAt)
+            .FirstOrDefault();
+        var dependencyStepIds = step.DependsOnStepId is { } dependencyStepId
+            ? new[] { dependencyStepId }
+            : [];
+        var dependencyPlanStepKeys =
+            step.DependsOnStepId is { } dependencyId &&
+            planStepKeyById?.TryGetValue(dependencyId, out var dependencyKey) == true &&
+            !string.IsNullOrWhiteSpace(dependencyKey)
+                ? new[] { dependencyKey }
+                : [];
+        return new FlowStepDto(
             step.Id,
             step.Iteration,
             step.Sequence,
@@ -491,19 +735,20 @@ public static class ApiMappings
             step.AgentName,
             step.AgentRole,
             step.Label,
+            step.PlanStepKey,
+            ReadPlanDuties(step.PlanDutiesJson),
+            step.PlanStage,
+            step.IsOutcomeOwner,
+            step.PermissionProfile,
+            step.EffectivePermissionJson,
+            step.WorkflowRevision,
+            dependencyStepIds,
+            dependencyPlanStepKeys,
             step.Model,
             step.ModelEffort,
             step.ModelReason,
-            step.RoutingDecisions
-                .Where(item => !item.Superseded)
-                .OrderByDescending(item => item.CreatedAt)
-                .Select(item => item.TaskProfile?.ToDto())
-                .FirstOrDefault(),
-            step.RoutingDecisions
-                .Where(item => !item.Superseded)
-                .OrderByDescending(item => item.CreatedAt)
-                .Select(item => item.ToDto())
-                .FirstOrDefault(),
+            (routing?.TaskProfile ?? persistedTaskProfile)?.ToDto(),
+            routing?.ToDto(),
             step.Status,
             step.Phase,
             step.Attempt,
@@ -525,11 +770,14 @@ public static class ApiMappings
                 .ToList(),
             AssignedCriteria(step, outcomeState),
             OutcomeQaRound(step, outcomeState));
+    }
 
     public static TaskProfileDto ToDto(this TaskProfile profile) =>
         new(
             profile.Version,
             profile.Role,
+            profile.PlanStepKey,
+            profile.AgentId,
             profile.Complexity,
             profile.ReasoningDepth,
             profile.ContextDemand,
@@ -580,6 +828,62 @@ public static class ApiMappings
             learning.TimesApplied,
             learning.TimesObserved,
             learning.CreatedAt);
+
+    public static FlowReviewSummaryDto ToReviewSummaryDto(this FlowRun flow)
+    {
+        var currentStepIds = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .Select(step => step.Id)
+            .ToHashSet();
+        var gate = flow.GateRecords
+            .Where(item =>
+                item.ActionType == HandoffActionType.CustomerReview &&
+                currentStepIds.Contains(item.FlowStepId))
+            .OrderByDescending(item => item.DecidedAt)
+            .FirstOrDefault();
+        return new FlowReviewSummaryDto(
+            gate?.Id,
+            gate is not null,
+            gate?.Resolved ?? false,
+            gate?.Approved,
+            gate?.ReviewDecision,
+            ReviewCoordinator.GetPublicationStatus(flow));
+    }
+
+    public static LinkedFlowDto ToLinkedFlowDto(this FlowRun flow) =>
+        new(
+            flow.Id,
+            flow.Title,
+            flow.Kind,
+            flow.Status,
+            flow.Iteration,
+            flow.ParentIteration,
+            flow.LinkKind,
+            flow.OutcomeLabel,
+            flow.ToReviewSummaryDto(),
+            flow.CreatedAt);
+
+    internal static string AdvisoryArtifactId(string normalizedPath)
+    {
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes(normalizedPath));
+        return Convert.ToHexString(digest).ToLowerInvariant();
+    }
+
+    internal static string AdvisoryArtifactUrl(
+        Guid flowId,
+        string artifactId,
+        string normalizedPath,
+        bool download = false)
+    {
+        var escapedPath = string.Join(
+            "/",
+            normalizedPath
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .Select(Uri.EscapeDataString));
+        var url =
+            $"/api/flows/{flowId:D}/artifacts/{Uri.EscapeDataString(artifactId)}/{escapedPath}";
+        return download ? $"{url}?download=true" : url;
+    }
 
     public static OutcomeVerificationDto ToOutcomeVerificationDto(this FlowRun flow)
     {
@@ -704,6 +1008,32 @@ public static class ApiMappings
         string.IsNullOrWhiteSpace(digest)
             ? string.Empty
             : digest[..Math.Min(digest.Length, 19)];
+
+    private static IReadOnlyList<PlanDuty> ReadPlanDuties(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return [];
+        }
+        try
+        {
+            var names = JsonSerializer.Deserialize<string[]>(json) ?? [];
+            return names.Select(name =>
+                Enum.TryParse<PlanDuty>(name, ignoreCase: false, out var duty) &&
+                Enum.IsDefined(duty) &&
+                string.Equals(duty.ToString(), name, StringComparison.Ordinal)
+                    ? duty
+                    : throw new InvalidOperationException(
+                        $"Persisted plan duty '{name}' is invalid."))
+                .ToArray();
+        }
+        catch (JsonException exception)
+        {
+            throw new InvalidOperationException(
+                "Persisted plan duties are not valid JSON.",
+                exception);
+        }
+    }
 
     private static IReadOnlyList<string> AssignedCriteria(
         FlowStep step,

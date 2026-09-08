@@ -1,7 +1,13 @@
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Security;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Core.Workflow;
+using AiHarnessDemo.Data;
+using Microsoft.EntityFrameworkCore;
+using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -9,21 +15,62 @@ using System.Text.RegularExpressions;
 
 namespace AiHarnessDemo.Services;
 
+internal sealed record DurableExecutionInstructions(
+    string Prompt,
+    string WorkflowRevision,
+    bool Recovered);
+
 /// <summary>Reasoning host that runs enabled custom agents through the local Copilot CLI.</summary>
 public sealed partial class CopilotReasoningHost(
-    AgentCatalog agentCatalog,
+    FlowAgentSnapshotService snapshotService,
     ProcessRunner processRunner,
     WorkflowDefinitionProvider workflowProvider,
     CopilotCliRuntime copilotCliRuntime,
     WorkflowPromptRenderer promptRenderer,
     WorkspaceHookRunner hookRunner,
-    CopilotSessionJournal sessionJournal)
+    CopilotSessionJournal sessionJournal,
+    PermissionProfileResolver permissionResolver,
+    AgentManifestStager manifestStager,
+    IDbContextFactory<HarnessDbContext> databaseFactory,
+    ILogger<CopilotReasoningHost> logger)
     : ReasoningHost(new ReasoningHostConfig("copilot-cli"))
 {
     private const int MaximumPromptCharacters = 16_000;
+    internal const int MaximumInlinePromptCharacters = 8_192;
+    internal const int MaximumProcessCommandLineCharacters = 30_000;
+    internal const int MaximumPlanningRosterCharacters =
+        TeamPlanParser.MaximumDocumentCharacters;
+    internal const int MaximumPlanningBriefCharacters =
+        IntakeV2Parser.MaximumJsonCharacters >
+        AdvisoryPromotionSeedParser.MaximumDocumentCharacters
+            ? IntakeV2Parser.MaximumJsonCharacters
+            : AdvisoryPromotionSeedParser.MaximumDocumentCharacters;
+    internal const int MaximumPlanningTaskCharacters =
+        MaximumPlanningBriefCharacters +
+        MaximumPlanningRosterCharacters +
+        32_768;
+    internal const int MaximumReviewClassificationTaskCharacters =
+        FlowOutcomeParser.MaximumDocumentCharacters +
+        ReviewFeedbackParser.MaximumRequestedChangeCharacters +
+        8_192;
+    private const int MaximumPlanningPromptCharacters =
+        MaximumPlanningTaskCharacters +
+        TeamPlanParser.MaximumDocumentCharacters;
+    private const int MaximumReviewClassificationPromptCharacters =
+        MaximumReviewClassificationTaskCharacters +
+        ReviewFeedbackParser.MaximumDocumentCharacters;
     private const int AccountManagerRepositoryKnowledgeCharacters = 1_000;
     private const int DeliveryRepositoryKnowledgeCharacters = 2_000;
     private const int ProductManagerLedgerCharacters = 6_000;
+    internal const int MaximumStudioDependencyContextCharacters = 3_200;
+    internal const string StudioPlanContextBegin =
+        "STUDIO_PLAN_CONTEXT_V1_BEGIN";
+    internal const string StudioPlanContextEnd =
+        "STUDIO_PLAN_CONTEXT_V1_END";
+    private const int MinimumDirectDependencyOutputCharacters = 64;
+    private const int MaximumDirectDependencyOutputCharacters = 900;
+    private const int MinimumAncestorOutputCharacters = 64;
+    private const int MaximumAncestorOutputCharacters = 400;
     private const string AccountManagerTools = "view,grep,glob";
     private const string PreMortemTools = "view,grep,glob,web_fetch";
     private const string HostControlledPublicationTools = "view,grep,glob";
@@ -187,208 +234,458 @@ public sealed partial class CopilotReasoningHost(
         AgentRunRequest request,
         CancellationToken cancellationToken = default)
     {
-        var context = RequireContext(request);
-        var manifest = await agentCatalog.GetManifestAsync(context.AgentId, cancellationToken);
-        var workflow = workflowProvider.GetValidated();
-        var copilotCli = await copilotCliRuntime.GetAsync(
-            workflow.Config.Copilot.Command,
-            cancellationToken);
-        if (!copilotCli.Ready)
-        {
-            return Failure(
-                "Copilot CLI is not ready.",
-                copilotCli.Detail,
-                AgentRunFailureKind.DependencyUnavailable,
-                "copilot-cli");
-        }
-        request.Progress?.Invoke(new AgentRunProgress(
-            AgentRunPhase.BuildingPrompt,
-            "Rendering WORKFLOW.md with role-focused task context."));
-        var renderedPrompt = Clip(
-            string.IsNullOrWhiteSpace(context.DirectPrompt)
-                ? promptRenderer.Render(
-                    workflow.PromptTemplate,
-                    BuildPromptValues(
-                        context,
-                        manifest.Instructions,
-                        request.WorkingDirectory))
-                : $"{context.DirectPrompt.Trim()}{Environment.NewLine}{Environment.NewLine}" +
-                  $"## Quality Engineer role contract{Environment.NewLine}{Environment.NewLine}" +
-                  manifest.Instructions.Trim(),
-            MaximumPromptCharacters);
-        var prompt = context.RecoverInterruptedSession
-            ? RestartContinuationPrompt(renderedPrompt)
-            : renderedPrompt;
-        request.Progress?.Invoke(new AgentRunProgress(
-            AgentRunPhase.BuildingPrompt,
-            "Rendered the exact prompt for the Copilot CLI turn.",
-            prompt));
-        var copilotSessionHome = ResolveCopilotSessionHome();
-        var agentAccess = await PrepareRestrictedAgentRootAsync(
-            copilotSessionHome,
-            context.AgentId,
-            manifest.SourcePath,
-            request.CopilotSessionId,
-            cancellationToken);
-        using var governedGitIsolation = context.IsGovernedOutcomeVerification
-            ? GovernedGitIsolationScope.Create(
-                request.WorkingDirectory,
-                context.GovernedRepositoryRelativePaths ??
-                throw new InvalidOperationException(
-                    "Governed execution has no trusted repository mapping."))
-            : null;
-        var environmentVariables = MergeProcessEnvironment(
-            BuildProcessEnvironment(
-                context.AgentRole,
-                context.AllowRemotePublication,
-                context.IsGovernedOutcomeVerification),
-            governedGitIsolation?.EnvironmentVariables);
-        var arguments = BuildCliArguments(
-            request.WorkingDirectory,
-            agentAccess.Root,
-            agentAccess.AgentId,
-            context.AgentRole,
-            request.Model,
-            request.Effort,
-            request.CopilotSessionId,
-            prompt,
-            context.ResumeSession || context.RecoverInterruptedSession,
-            context.IsHostControlledPublication,
-            context.IsGovernedOutcomeVerification,
-            (string.Equals(
-                 context.AgentRole,
-                 "release-engineer",
-                 StringComparison.Ordinal) &&
-             !context.AllowRemotePublication) ||
-            context.IsGovernedOutcomeVerification).ToList();
-        if (governedGitIsolation is not null)
-        {
-            arguments.Insert(
-                Math.Max(0, arguments.Count - 2),
-                $"--deny-tool=write({Path.GetFullPath(
-                    governedGitIsolation.RootPath).Replace('\\', '/')})");
-        }
-        ProcessResult result;
-        var timeouts = ResolveExecutionTimeouts(
-            workflow.Config.Copilot,
-            context.ModelSelectionStrategy,
-            context.ExpectedAcceptedTimeSeconds);
-
+        AgentExecutionContext? context = null;
+        WorkflowDefinition? workflow = null;
+        string? copilotSessionHome = null;
+        GovernedGitIsolationScope? governedGitIsolation = null;
+        PublicationGuardScope? publicationGuard = null;
+        StagedAgentManifest? stagedAgentAccess = null;
+        StagedPromotionSeed? stagedPromotion = null;
+        StagedPrompt? stagedPrompt = null;
+        var retainStagedContextForRecovery = false;
+        var runWorkspaceHooks = false;
+        // Resolved inside the outer try so that a failure here (or in any other
+        // fallible setup that follows it) still reaches the finally block below;
+        // a null value here means the initial lookup did not complete and the
+        // finally block must best-effort re-resolve it before deciding whether
+        // the after_run hook may run.
+        WorkspaceHookPolicy? hookPolicy = null;
         try
         {
-            await hookRunner.RunAsync(
-                WorkspaceHookStage.BeforeRun,
-                request.WorkingDirectory,
+            context = RequireContext(request);
+            workflow = workflowProvider.GetEffective();
+            var recoveredInstructions =
+                context.RecoverInterruptedSession
+                    ? await LoadPersistedExecutionInstructionsAsync(
+                        context,
+                        databaseFactory,
+                        cancellationToken)
+                    : null;
+            copilotSessionHome = ResolveCopilotSessionHome();
+            runWorkspaceHooks = ShouldRunWorkspaceHooks(
+                context.ContractVersion,
+                context.InvocationKind);
+            hookPolicy = await ResolveWorkspaceHookPolicyAsync(
+                databaseFactory,
+                context.FlowId,
                 cancellationToken);
+            var permission = await ResolveAndPersistPermissionAsync(
+                context,
+                workflow,
+                permissionResolver,
+                databaseFactory,
+                cancellationToken);
+            var manifest = await snapshotService.GetManifestAsync(
+                context.FlowId,
+                context.AgentId,
+                cancellationToken);
+            var copilotCli = await copilotCliRuntime.GetAsync(
+                workflow.Config.Copilot.Command,
+                cancellationToken);
+            if (!copilotCli.Ready)
+            {
+                return Failure(
+                    "Copilot CLI is not ready.",
+                    copilotCli.Detail,
+                    AgentRunFailureKind.DependencyUnavailable,
+                    "copilot-cli");
+            }
+            var agentAccess = await manifestStager.StageAsync(
+                copilotSessionHome,
+                manifest,
+                request.CopilotSessionId,
+                cancellationToken);
+            stagedAgentAccess = agentAccess;
+            stagedPromotion = context.PromotionContext is null
+                ? null
+                : await manifestStager.StagePromotionSeedAsync(
+                    agentAccess,
+                    context.PromotionContext,
+                    cancellationToken);
             request.Progress?.Invoke(new AgentRunProgress(
-                AgentRunPhase.LaunchingAgentProcess,
-                $"Launching Copilot CLI {copilotCli.Version} with {request.Model}/{request.Effort}; " +
-                $"{timeouts.StallTimeout.TotalMinutes:0.#}-minute quiet watchdog and " +
-                $"{timeouts.TurnTimeout.TotalMinutes:0.#}-minute hard limit."));
-            result = await processRunner.RunAsync(
+                AgentRunPhase.BuildingPrompt,
+                "Rendering WORKFLOW.md with role-focused task context."));
+            var instructions = recoveredInstructions ??
+                await RenderAndPersistExecutionInstructionsAsync(
+                    context,
+                    workflow,
+                    manifest.Instructions,
+                    request.WorkingDirectory,
+                    stagedPromotion,
+                    promptRenderer,
+                    databaseFactory,
+                    cancellationToken);
+            var renderedPrompt = instructions.Prompt;
+            var inlinePrompt = renderedPrompt;
+            request.Progress?.Invoke(new AgentRunProgress(
+                AgentRunPhase.BuildingPrompt,
+                instructions.Recovered
+                    ? "Loaded the exact persisted prompt for the interrupted Copilot CLI turn."
+                    : "Rendered and persisted the exact prompt for the Copilot CLI turn.",
+                renderedPrompt));
+
+            governedGitIsolation = permission.GovernedGitMetadataIsolation
+                ? GovernedGitIsolationScope.Create(
+                    request.WorkingDirectory,
+                    context.GovernedRepositoryRelativePaths ??
+                    throw new InvalidOperationException(
+                        "Governed execution has no trusted repository mapping."))
+                : null;
+            publicationGuard = permission.GuardPublicationCredentials
+                ? PublicationGuardScope.Create(
+                    copilotSessionHome,
+                    request.WorkingDirectory)
+                : null;
+            var environmentVariables = MergeProcessEnvironment(
+                publicationGuard?.EnvironmentVariables,
+                governedGitIsolation?.EnvironmentVariables);
+
+            async Task<string> StagePromptReferenceAsync()
+            {
+                if (!permission.AllowedTools.Contains(
+                        "view",
+                        StringComparer.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "A staged prompt requires view access in the effective permission profile.");
+                }
+                stagedPrompt ??= await manifestStager.StagePromptAsync(
+                    agentAccess,
+                    renderedPrompt,
+                    request.CopilotSessionId,
+                    context.FlowId,
+                    context.FlowStepId,
+                    context.Attempt,
+                    cancellationToken);
+                return AgentManifestStager.BuildPromptReferenceInstruction(
+                    stagedPrompt,
+                    context.RecoverInterruptedSession);
+            }
+
+            List<string> BuildArguments(string cliPrompt)
+            {
+                var built = BuildCliArguments(
+                    request.WorkingDirectory,
+                    agentAccess.Root,
+                    agentAccess.AgentId,
+                    request.Model,
+                    request.Effort,
+                    request.CopilotSessionId,
+                    cliPrompt,
+                    permission,
+                    context.ResumeSession ||
+                    context.RecoverInterruptedSession).ToList();
+                if (governedGitIsolation is not null)
+                {
+                    built.Insert(
+                        Math.Max(0, built.Count - 2),
+                        $"--deny-tool=write({Path.GetFullPath(
+                            governedGitIsolation.RootPath).Replace('\\', '/')})");
+                }
+                return built;
+            }
+
+            var cliPrompt =
+                inlinePrompt.Length > MaximumInlinePromptCharacters
+                    ? await StagePromptReferenceAsync()
+                    : inlinePrompt;
+            var arguments = BuildArguments(cliPrompt);
+            if (EstimateCliCommandLineCharacters(
+                    copilotCli.ResolvedPath,
+                    arguments) >
+                MaximumProcessCommandLineCharacters &&
+                stagedPrompt is null)
+            {
+                cliPrompt = await StagePromptReferenceAsync();
+                arguments = BuildArguments(cliPrompt);
+            }
+            var commandLineCharacters = EstimateCliCommandLineCharacters(
                 copilotCli.ResolvedPath,
-                arguments,
-                request.WorkingDirectory,
-                timeouts.TurnTimeout,
-                cancellationToken,
-                CopilotJsonlParser.CreateProgressReporter(
-                    request.Progress,
-                    copilotSessionHome),
-                timeouts.StallTimeout,
-                environmentVariables);
-        }
-        catch (ProcessStalledException exception)
-        {
-            return await RecoverInterruptedProcessAsync(
-                context,
-                request,
-                copilotSessionHome,
-                "Copilot CLI stalled.",
-                exception.Message,
-                AgentRunFailureKind.Stalled);
-        }
-        catch (TimeoutException exception)
-        {
-            return await RecoverInterruptedProcessAsync(
-                context,
-                request,
-                copilotSessionHome,
-                "Copilot CLI timed out.",
-                exception.Message,
-                AgentRunFailureKind.TimedOut);
-        }
-        catch (System.ComponentModel.Win32Exception exception)
-        {
-            return Failure(
-                "Copilot CLI failed to launch.",
-                exception.Message,
-                AgentRunFailureKind.DependencyUnavailable,
-                "copilot-cli");
-        }
-        catch (InvalidOperationException exception)
-        {
-            return Failure(
-                "A required pre-run workspace hook failed.",
-                exception.Message,
-                AgentRunFailureKind.Transient);
+                arguments);
+            if (commandLineCharacters >
+                MaximumProcessCommandLineCharacters)
+            {
+                throw new InvalidOperationException(
+                    $"The Copilot CLI command line requires {commandLineCharacters} characters, " +
+                    $"exceeding the host limit of {MaximumProcessCommandLineCharacters}.");
+            }
+            var timeouts = ResolveExecutionTimeouts(
+                workflow.Config.Copilot,
+                context.ModelSelectionStrategy,
+                context.ExpectedAcceptedTimeSeconds);
+
+            ProcessResult result;
+            try
+            {
+                if (runWorkspaceHooks)
+                {
+                    await hookRunner.RunAsync(
+                        WorkspaceHookStage.BeforeRun,
+                        request.WorkingDirectory,
+                        workflow,
+                        hookPolicy.FlowKind,
+                        hookPolicy.Provisional,
+                        cancellationToken);
+                }
+                request.Progress?.Invoke(new AgentRunProgress(
+                    AgentRunPhase.LaunchingAgentProcess,
+                    $"Launching Copilot CLI {copilotCli.Version} with {request.Model}/{request.Effort}; " +
+                    $"{timeouts.StallTimeout.TotalMinutes:0.#}-minute quiet watchdog and " +
+                    $"{timeouts.TurnTimeout.TotalMinutes:0.#}-minute hard limit."));
+                // Once a process can observe the staged root, retain the entire session-owned
+                // context until the result is conclusive. Interrupted and still-active sessions
+                // need the same agent definition and prompt/seed bytes for a safe resume.
+                retainStagedContextForRecovery = true;
+                result = await processRunner.RunAsync(
+                    copilotCli.ResolvedPath,
+                    arguments,
+                    request.WorkingDirectory,
+                    timeouts.TurnTimeout,
+                    cancellationToken,
+                    CopilotJsonlParser.CreateProgressReporter(
+                        request.Progress,
+                        copilotSessionHome),
+                    timeouts.StallTimeout,
+                    environmentVariables);
+                retainStagedContextForRecovery = false;
+            }
+            catch (ProcessStalledException exception)
+            {
+                var recovered = await RecoverInterruptedProcessAsync(
+                    context,
+                    request,
+                    copilotSessionHome,
+                    "Copilot CLI stalled.",
+                    exception.Message,
+                    AgentRunFailureKind.Stalled);
+                retainStagedContextForRecovery =
+                    !recovered.Success &&
+                    (recovered.CanResumeSession ||
+                     recovered.ProcessTerminationUnconfirmed);
+                return recovered;
+            }
+            catch (TimeoutException exception)
+            {
+                var recovered = await RecoverInterruptedProcessAsync(
+                    context,
+                    request,
+                    copilotSessionHome,
+                    "Copilot CLI timed out.",
+                    exception.Message,
+                    AgentRunFailureKind.TimedOut);
+                retainStagedContextForRecovery =
+                    !recovered.Success &&
+                    (recovered.CanResumeSession ||
+                     recovered.ProcessTerminationUnconfirmed);
+                return recovered;
+            }
+            catch (System.ComponentModel.Win32Exception exception)
+            {
+                retainStagedContextForRecovery = false;
+                return Failure(
+                    "Copilot CLI failed to launch.",
+                    exception.Message,
+                    AgentRunFailureKind.DependencyUnavailable,
+                    "copilot-cli");
+            }
+            catch (InvalidOperationException exception)
+            {
+                return Failure(
+                    "A required pre-run workspace hook failed.",
+                    exception.Message,
+                    AgentRunFailureKind.Transient);
+            }
+
+            governedGitIsolation?.RestoreAndValidate();
+            if (governedGitIsolation?.UnauthorizedMetadataMutationDetected == true)
+            {
+                return Failure(
+                    "Governed execution modified disposable Git metadata.",
+                    "The host rejected and cleaned a .git mutation; authoritative Git metadata was restored unchanged.",
+                    AgentRunFailureKind.InvalidOutput);
+            }
+
+            if (result.ExitCode != 0)
+            {
+                var diagnostic = Tail(result.CombinedOutput, 1_500);
+                return Failure(
+                    $"Copilot CLI exited with code {result.ExitCode}.",
+                    diagnostic,
+                    IsModelUnavailableDiagnostic(diagnostic)
+                        ? AgentRunFailureKind.ModelUnavailable
+                        : AgentRunFailureKind.Transient,
+                    IsModelUnavailableDiagnostic(diagnostic)
+                        ? $"{request.Model}/{request.Effort}"
+                        : null);
+            }
+
+            return CopilotJsonlParser.Parse(
+                result.StandardOutput,
+                result.StandardError,
+                request.WorkingDirectory);
         }
         finally
         {
             try
             {
-                await hookRunner.RunAsync(
-                    WorkspaceHookStage.AfterRun,
-                    request.WorkingDirectory,
-                    CancellationToken.None);
+                if (context is not null && workflow is not null)
+                {
+                    await RunAfterRunWorkspaceHookAsync(
+                        runWorkspaceHooks,
+                        hookPolicy,
+                        databaseFactory,
+                        hookRunner,
+                        context.FlowId,
+                        request.WorkingDirectory,
+                        workflow,
+                        logger,
+                        CancellationToken.None);
+                }
             }
             finally
             {
-                governedGitIsolation?.RestoreAndValidate();
+                try
+                {
+                    governedGitIsolation?.RestoreAndValidate();
+                }
+                finally
+                {
+                    try
+                    {
+                        publicationGuard?.Dispose();
+                    }
+                    finally
+                    {
+                        if (stagedAgentAccess is not null &&
+                            copilotSessionHome is not null &&
+                            !retainStagedContextForRecovery)
+                        {
+                            manifestStager.CleanupSessionRoot(
+                                copilotSessionHome,
+                                request.CopilotSessionId,
+                                stagedAgentAccess.Root);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs the after_run workspace hook using an already-resolved policy when
+    /// available, or best-effort re-resolves it when the initial lookup (made
+    /// earlier in the same run, inside the same outer try/finally) failed to
+    /// complete. If both the initial lookup and this cleanup re-resolution fail,
+    /// the flow's kind is genuinely unknown and the hook must never run -- an
+    /// unrecognized flow could be Advisory, or the invocation could be a
+    /// sensitive ReviewClassification/Publication step, either of which must
+    /// never execute the after_run script. The lookup failure is logged, not
+    /// thrown, so the remaining cleanup (Git isolation restore, publication
+    /// guard disposal, staged-context cleanup) always still runs.
+    /// </summary>
+    internal static async Task RunAfterRunWorkspaceHookAsync(
+        bool runWorkspaceHooks,
+        WorkspaceHookPolicy? hookPolicy,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        WorkspaceHookRunner hookRunner,
+        Guid flowId,
+        string workingDirectory,
+        WorkflowDefinition workflow,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        if (!runWorkspaceHooks)
+        {
+            return;
+        }
+
+        if (hookPolicy is null)
+        {
+            try
+            {
+                hookPolicy = await ResolveWorkspaceHookPolicyAsync(
+                    databaseFactory,
+                    flowId,
+                    cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                logger.LogWarning(
+                    exception,
+                    "Best-effort workspace hook policy re-resolution failed for flow {FlowId}; " +
+                    "skipping the after_run workspace hook because its flow kind is unknown.",
+                    flowId);
+                return;
             }
         }
 
-        if (governedGitIsolation?.UnauthorizedMetadataMutationDetected == true)
-        {
-            return Failure(
-                "Governed execution modified disposable Git metadata.",
-                "The host rejected and cleaned a .git mutation; authoritative Git metadata was restored unchanged.",
-                AgentRunFailureKind.InvalidOutput);
-        }
-
-        if (result.ExitCode != 0)
-        {
-            var diagnostic = Tail(result.CombinedOutput, 1_500);
-            return Failure(
-                $"Copilot CLI exited with code {result.ExitCode}.",
-                diagnostic,
-                IsModelUnavailableDiagnostic(diagnostic)
-                    ? AgentRunFailureKind.ModelUnavailable
-                    : AgentRunFailureKind.Transient,
-                IsModelUnavailableDiagnostic(diagnostic)
-                    ? $"{request.Model}/{request.Effort}"
-                    : null);
-        }
-
-        return CopilotJsonlParser.Parse(
-            result.StandardOutput,
-            result.StandardError,
-            request.WorkingDirectory);
+        await hookRunner.RunAsync(
+            WorkspaceHookStage.AfterRun,
+            workingDirectory,
+            workflow,
+            hookPolicy.FlowKind,
+            hookPolicy.Provisional,
+            cancellationToken);
     }
+
+    internal static async Task<WorkspaceHookPolicy> ResolveWorkspaceHookPolicyAsync(
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var flow = await database.Flows
+            .AsNoTracking()
+            .Where(item => item.Id == flowId)
+            .Select(item => new
+            {
+                item.Kind,
+                item.Status,
+                item.ContractVersion
+            })
+            .SingleAsync(cancellationToken);
+        var studioV2 = string.Equals(
+            flow.ContractVersion,
+            "studio-v2",
+            StringComparison.Ordinal);
+        return new WorkspaceHookPolicy(
+            studioV2 ? flow.Kind : FlowKind.Delivery,
+            studioV2 && flow.Status == FlowStatus.Intake);
+    }
+
+    internal sealed record WorkspaceHookPolicy(
+        FlowKind FlowKind,
+        bool Provisional);
+
+    internal static bool ShouldRunWorkspaceHooks(
+        string contractVersion,
+        ExecutionInvocationKind invocationKind) =>
+        !string.Equals(
+            contractVersion,
+            "studio-v2",
+            StringComparison.Ordinal) ||
+        invocationKind is not (
+            ExecutionInvocationKind.ReviewClassification or
+            ExecutionInvocationKind.Publication);
 
     internal static IReadOnlyList<string> BuildCliArguments(
         string workingDirectory,
         string harnessRoot,
         string agentId,
-        string agentRole,
         string model,
         string effort,
         Guid copilotSessionId,
         string prompt,
-        bool resumeSession = false,
-        bool isHostControlledPublication = false,
-        bool isGovernedOutcomeVerification = false,
-        bool blockRemotePublication = false)
+        EffectiveExecutionPermission permission,
+        bool resumeSession = false)
     {
+        ArgumentNullException.ThrowIfNull(prompt);
+        if (prompt.Length > MaximumInlinePromptCharacters)
+        {
+            throw new InvalidOperationException(
+                $"The Copilot CLI prompt argument exceeds the {MaximumInlinePromptCharacters}-character inline limit. Stage the complete prompt before building arguments.");
+        }
         var arguments = new List<string>
         {
             "-C", workingDirectory,
@@ -409,62 +706,76 @@ public sealed partial class CopilotReasoningHost(
                 ? [$"--resume={copilotSessionId:D}"]
                 : ["--session-id", copilotSessionId.ToString("D")]);
 
-        if (IsAccountManager(agentRole))
+        ApplyToolPolicy(
+            arguments,
+            $"--available-tools={string.Join(',', permission.AllowedTools)}");
+        if (permission.DisableBuiltinMcps)
+        {
+            ApplyToolPolicy(arguments, "--disable-builtin-mcps");
+        }
+        if (permission.DisableCustomInstructions)
         {
             ApplyToolPolicy(
                 arguments,
-                $"--available-tools={AccountManagerTools}",
-                "--disable-builtin-mcps",
                 "--no-custom-instructions",
                 "--no-eager-powershell-resolution");
         }
-        else if (string.Equals(
-                     agentRole,
-                     "pre-mortem-sceptic",
-                     StringComparison.Ordinal))
+        if (permission.DisallowTemporaryDirectory)
         {
-            ApplyToolPolicy(
-                arguments,
-                $"--available-tools={PreMortemTools}",
-                "--disable-builtin-mcps",
-                "--deny-tool=write,shell",
-                "--disallow-temp-dir",
-                "--no-custom-instructions",
-                "--no-eager-powershell-resolution");
+            ApplyToolPolicy(arguments, "--disallow-temp-dir");
         }
-        else if (isHostControlledPublication)
+        if (permission.Profile == ExecutionPermissionProfile.WorkspaceWrite)
         {
-            ApplyToolPolicy(
-                arguments,
-                $"--available-tools={HostControlledPublicationTools}",
-                "--disable-builtin-mcps",
-                "--deny-tool=write,shell",
-                "--disallow-temp-dir",
-                "--no-custom-instructions",
-                "--no-eager-powershell-resolution");
+            if (!permission.DeniedTools.Contains("write"))
+            {
+                ApplyToolPolicy(arguments, "--allow-tool=write");
+            }
+            if (!permission.DeniedTools.Contains("shell"))
+            {
+                ApplyToolPolicy(arguments, "--allow-tool=shell");
+            }
         }
-        else if (isGovernedOutcomeVerification)
+        else if (permission.Profile == ExecutionPermissionProfile.Publish)
         {
-            ApplyToolPolicy(
-                arguments,
-                $"--available-tools={GovernedNonPublicationTools()}",
-                "--disable-builtin-mcps",
-                "--allow-tool=write",
-                "--allow-tool=shell",
-                "--disallow-temp-dir",
-                "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS");
-            ApplyToolPolicyRange(arguments, GovernedLocalMutationDenials);
-            ApplyToolPolicyRange(arguments, GovernedGitIsolationBypassDenials);
-            ApplyToolPolicy(
-                arguments,
-                "--no-eager-powershell-resolution");
+            ApplyToolPolicy(arguments, "--allow-tool=shell");
+        }
+        if (permission.DeniedTools.Contains("write") &&
+            permission.DeniedTools.Contains("shell"))
+        {
+            ApplyToolPolicy(arguments, "--deny-tool=write,shell");
         }
         else
         {
-            arguments.Add("--allow-all-tools");
+            if (permission.DeniedTools.Contains("write"))
+            {
+                ApplyToolPolicy(arguments, "--deny-tool=write");
+            }
+            if (permission.DeniedTools.Contains("shell"))
+            {
+                ApplyToolPolicy(arguments, "--deny-tool=shell");
+            }
         }
-        if (isGovernedOutcomeVerification)
+        foreach (var deniedTool in permission.DeniedTools
+                     .Where(value => value is not "write" and not "shell"))
         {
+            ApplyToolPolicy(arguments, $"--deny-tool={deniedTool}");
+        }
+        foreach (var deniedUrl in permission.DeniedUrls)
+        {
+            ApplyToolPolicy(arguments, $"--deny-url={deniedUrl}");
+        }
+        if (permission.GuardPublicationCredentials)
+        {
+            ApplyToolPolicy(
+                arguments,
+                "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,GH_ENTERPRISE_TOKEN,GITHUB_ENTERPRISE_TOKEN,GITHUB_TOKEN_REQUEST_URL,GITHUB_TOKEN_REQUEST_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS",
+                "--no-remote",
+                "--no-remote-export");
+        }
+        if (permission.GovernedGitMetadataIsolation)
+        {
+            ApplyToolPolicyRange(arguments, GovernedLocalMutationDenials);
+            ApplyToolPolicyRange(arguments, GovernedGitIsolationBypassDenials);
             ApplyToolPolicyRange(
                 arguments,
                 GovernedGitMarkerWriteDenials(workingDirectory));
@@ -474,18 +785,128 @@ public sealed partial class CopilotReasoningHost(
                     workingDirectory,
                     ".ai-harness",
                     "outcome-verification")).Replace('\\', '/')})");
-            ApplyToolPolicy(
-                arguments,
-                "--no-remote",
-                "--no-remote-export");
-        }
-        if (blockRemotePublication)
-        {
-            ApplyToolPolicyRange(arguments, RemoteMutationDenials);
         }
 
+        ApplyToolPolicy(
+            arguments,
+            $"--deny-tool=write({Path.GetFullPath(harnessRoot).Replace('\\', '/')})");
         arguments.AddRange(["-p", prompt]);
         return arguments;
+    }
+
+    internal static IReadOnlyList<string> BuildCliArguments(
+        string workingDirectory,
+        string harnessRoot,
+        string agentId,
+        ExecutionInvocationKind invocationKind,
+        string model,
+        string effort,
+        Guid copilotSessionId,
+        string prompt,
+        bool resumeSession = false,
+        bool isHostControlledPublication = false,
+        bool isGovernedOutcomeVerification = false,
+        bool blockRemotePublication = false)
+    {
+        if (!Enum.IsDefined(invocationKind))
+        {
+            throw new InvalidOperationException(
+                "The test invocation kind is invalid.");
+        }
+        var preMortem =
+            invocationKind == ExecutionInvocationKind.PreMortem;
+        var readOnly =
+            invocationKind is not ExecutionInvocationKind.Worker ||
+            isHostControlledPublication;
+        var profile = readOnly
+            ? preMortem
+                ? ExecutionPermissionProfile.PreMortemReadOnly
+                : ExecutionPermissionProfile.ReadOnlySource
+            : ExecutionPermissionProfile.WorkspaceWrite;
+        var permission = new EffectiveExecutionPermission(
+            profile,
+            readOnly
+                ? isHostControlledPublication
+                    ? HostControlledPublicationTools.Split(',').ToImmutableArray()
+                    : preMortem
+                        ? PreMortemTools.Split(',').ToImmutableArray()
+                        : AccountManagerTools.Split(',').ToImmutableArray()
+                : GovernedNonPublicationTools().Split(',').ToImmutableArray(),
+            (readOnly
+                    ? new[] { "write", "shell" }
+                    : Array.Empty<string>())
+                .Concat(blockRemotePublication ? RemoteMutationDenials
+                    .Where(item => item.StartsWith("--deny-tool=", StringComparison.Ordinal))
+                    .Select(item => item["--deny-tool=".Length..]) : [])
+                .ToImmutableArray(),
+            blockRemotePublication
+                ? ["github.com", "api.github.com"]
+                : [],
+            true,
+            true,
+            readOnly || isGovernedOutcomeVerification,
+            blockRemotePublication || isGovernedOutcomeVerification,
+            false,
+            isGovernedOutcomeVerification);
+        return BuildCliArguments(
+            workingDirectory,
+            harnessRoot,
+            agentId,
+            model,
+            effort,
+            copilotSessionId,
+            prompt,
+            permission,
+            resumeSession);
+    }
+
+    internal static int EstimateCliCommandLineCharacters(
+        string executable,
+        IReadOnlyList<string> arguments)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(executable);
+        ArgumentNullException.ThrowIfNull(arguments);
+        var total = QuotedArgumentCharacters(executable);
+        foreach (var argument in arguments)
+        {
+            total = checked(
+                total + 1 + QuotedArgumentCharacters(argument));
+        }
+        return total;
+    }
+
+    private static int QuotedArgumentCharacters(string argument)
+    {
+        ArgumentNullException.ThrowIfNull(argument);
+        if (argument.Length > 0 &&
+            !argument.Any(character =>
+                char.IsWhiteSpace(character) || character == '"'))
+        {
+            return argument.Length;
+        }
+
+        // ProcessStartInfo.ArgumentList uses the standard Windows argv quoting
+        // rules. This is also a conservative bound on platforms using execve.
+        var length = 1;
+        var backslashes = 0;
+        foreach (var character in argument)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            if (character == '"')
+            {
+                length = checked(length + (backslashes * 2) + 2);
+                backslashes = 0;
+                continue;
+            }
+
+            length = checked(length + backslashes + 1);
+            backslashes = 0;
+        }
+        return checked(length + (backslashes * 2) + 1);
     }
 
     internal static string GovernedNonPublicationTools() =>
@@ -574,59 +995,374 @@ public sealed partial class CopilotReasoningHost(
         return merged;
     }
 
-    internal static async Task<RestrictedAgentAccess>
-        PrepareRestrictedAgentRootAsync(
-            string copilotHome,
-            string agentId,
-            string sourcePath,
-            Guid sessionId,
-            CancellationToken cancellationToken = default)
+    internal static async Task<EffectiveExecutionPermission>
+        ResolveAndPersistPermissionAsync(
+            AgentExecutionContext context,
+            WorkflowDefinition workflow,
+            PermissionProfileResolver permissionResolver,
+            IDbContextFactory<HarnessDbContext> databaseFactory,
+            CancellationToken cancellationToken)
     {
-        var root = Path.Combine(
-            Path.GetFullPath(copilotHome),
-            "harness-agent-definitions",
-            sessionId.ToString("N"));
-        var agentsDirectory = Path.Combine(root, ".github", "agents");
-        Directory.CreateDirectory(agentsDirectory);
-        var restrictedAgentId =
-            $"harness-{agentId}-{sessionId:N}";
-        var destination = Path.Combine(
-            agentsDirectory,
-            $"{restrictedAgentId}.agent.md");
-        var content = await File.ReadAllTextAsync(
-            Path.GetFullPath(sourcePath),
-            cancellationToken);
-        await File.WriteAllTextAsync(
-            destination,
-            RemoveAgentModelFrontMatter(content),
-            cancellationToken);
-        return new RestrictedAgentAccess(root, restrictedAgentId);
+        if (context.FlowStepId == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                "A durable FlowStep ID is required before agent execution.");
+        }
+
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var step = await database.FlowSteps.SingleOrDefaultAsync(
+            item =>
+                item.Id == context.FlowStepId &&
+                item.FlowRunId == context.FlowId,
+            cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The durable execution step could not be found.");
+        var flow = await database.Flows
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == context.FlowId, cancellationToken);
+        if (step.InvocationKind != context.InvocationKind)
+        {
+            throw new InvalidOperationException(
+                "The execution context does not match the durable lifecycle invocation.");
+        }
+        ImmutableArray<PlanDuty> duties;
+        try
+        {
+            duties = (JsonSerializer.Deserialize<PlanDuty[]>(
+                    step.PlanDutiesJson,
+                    new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = false,
+                        Converters =
+                        {
+                            new System.Text.Json.Serialization.JsonStringEnumConverter(
+                                allowIntegerValues: false)
+                        }
+                    }) ?? [])
+                .ToImmutableArray();
+        }
+        catch (JsonException exception)
+        {
+            throw new InvalidOperationException(
+                "The durable plan duties are invalid; permission resolution failed closed.",
+                exception);
+        }
+
+        ReviewDecision? reviewDecision;
+        bool accepted;
+        if (flow.ContractVersion == "studio-v2")
+        {
+            reviewDecision = await (
+                    from gate in database.GateRecords.AsNoTracking()
+                    join reviewedStep in database.FlowSteps.AsNoTracking()
+                        on gate.FlowStepId equals reviewedStep.Id
+                    where gate.FlowRunId == flow.Id &&
+                          gate.ActionType == HandoffActionType.CustomerReview &&
+                          gate.Resolved &&
+                          gate.Approved == true &&
+                          gate.ReviewDecision == ReviewDecision.Accepted &&
+                          reviewedStep.FlowRunId == flow.Id &&
+                          reviewedStep.Iteration == step.Iteration &&
+                          reviewedStep.IsOutcomeOwner &&
+                          reviewedStep.PlanStepKey == flow.OutcomeOwnerPlanStepKey
+                    orderby gate.ResolvedAt descending
+                    select gate.ReviewDecision)
+                .FirstOrDefaultAsync(cancellationToken);
+            accepted = reviewDecision == ReviewDecision.Accepted;
+        }
+        else
+        {
+            accepted = await database.GateRecords
+                .AsNoTracking()
+                .AnyAsync(
+                    gate =>
+                        gate.FlowRunId == flow.Id &&
+                        gate.Resolved &&
+                        gate.Approved == true &&
+                        gate.ActionType == HandoffActionType.Release,
+                    cancellationToken);
+            reviewDecision = null;
+        }
+        var request = new PermissionResolutionRequest(
+            flow.Kind,
+            step.InvocationKind,
+            step.PlanStage,
+            duties,
+            reviewDecision,
+            accepted,
+            !string.IsNullOrWhiteSpace(flow.PublicationPlanStepKey) &&
+            string.Equals(
+                flow.PublicationPlanStepKey,
+                step.PlanStepKey,
+                StringComparison.Ordinal),
+            flow.ContractVersion,
+            flow.ContractVersion == "legacy-v1" &&
+            step.RemotePublicationAllowed &&
+            accepted,
+            context.IsGovernedOutcomeVerification);
+
+        if (flow.ContractVersion == "studio-v2" &&
+            !string.IsNullOrWhiteSpace(step.EffectivePermissionJson))
+        {
+            EffectiveExecutionPermission persisted;
+            try
+            {
+                persisted =
+                    JsonSerializer.Deserialize<EffectiveExecutionPermission>(
+                        step.EffectivePermissionJson)
+                    ?? throw new InvalidOperationException(
+                        "The persisted effective permission document is empty.");
+            }
+            catch (JsonException exception)
+            {
+                throw new InvalidOperationException(
+                    "The persisted effective permission document is invalid; execution failed closed.",
+                    exception);
+            }
+            PermissionProfileResolver.ValidatePersisted(
+                persisted,
+                step.PermissionProfile);
+            if (string.IsNullOrWhiteSpace(step.WorkflowRevision))
+            {
+                throw new InvalidOperationException(
+                    "The persisted studio-v2 permission has no workflow revision.");
+            }
+            if (context.RecoverInterruptedSession)
+            {
+                ValidateWorkflowRevision(step.WorkflowRevision);
+                PermissionProfileResolver.ValidatePersisted(
+                    persisted,
+                    persisted.Profile,
+                    request);
+                return persisted;
+            }
+
+            var current = permissionResolver.Resolve(
+                request,
+                PermissionProfileResolver.FromWorkflow(workflow));
+            var permission = step.PlanStage == PlanStage.AfterApproval &&
+                             duties.SequenceEqual([PlanDuty.Publish])
+                ? PermissionProfileResolver.Tighten(
+                    persisted,
+                    current)
+                : persisted;
+            PermissionProfileResolver.ValidatePersisted(
+                permission,
+                permission.Profile,
+                request);
+            var effectiveRemotePublicationAllowed =
+                step.RemotePublicationAllowed &&
+                PermissionProfileResolver.GrantsRemotePublication(
+                    permission);
+            if (!PermissionProfileResolver.Equivalent(
+                    persisted,
+                    permission) ||
+                step.RemotePublicationAllowed !=
+                effectiveRemotePublicationAllowed)
+            {
+                step.PermissionProfile = permission.Profile;
+                step.EffectivePermissionJson =
+                    JsonSerializer.Serialize(permission);
+                step.WorkflowRevision = workflow.Revision;
+                step.RemotePublicationAllowed =
+                    effectiveRemotePublicationAllowed;
+                await database.SaveChangesAsync(cancellationToken);
+            }
+            return permission;
+        }
+
+        var resolvedPermission = permissionResolver.Resolve(
+            request,
+            PermissionProfileResolver.FromWorkflow(workflow));
+        var unboundPendingAttempt =
+            flow.ContractVersion == "studio-v2" &&
+            step.Status == StepStatus.Pending &&
+            step.StartedAt is null &&
+            string.IsNullOrWhiteSpace(step.EffectivePermissionJson);
+        if (flow.ContractVersion == "studio-v2" &&
+            !string.IsNullOrWhiteSpace(step.WorkflowRevision) &&
+            !string.Equals(
+                step.WorkflowRevision,
+                workflow.Revision,
+                StringComparison.Ordinal) &&
+            !unboundPendingAttempt)
+        {
+            throw new InvalidOperationException(
+                "A started studio-v2 attempt cannot be rebound to a different workflow revision; execution failed closed.");
+        }
+
+        step.PermissionProfile = resolvedPermission.Profile;
+        step.EffectivePermissionJson =
+            JsonSerializer.Serialize(resolvedPermission);
+        if (flow.ContractVersion == "studio-v2")
+        {
+            step.RemotePublicationAllowed =
+                step.RemotePublicationAllowed &&
+                PermissionProfileResolver.GrantsRemotePublication(
+                    resolvedPermission);
+        }
+        if (unboundPendingAttempt ||
+            string.IsNullOrWhiteSpace(step.WorkflowRevision) ||
+            flow.ContractVersion == "legacy-v1")
+        {
+            step.WorkflowRevision = workflow.Revision;
+        }
+        await database.SaveChangesAsync(cancellationToken);
+        return resolvedPermission;
     }
 
-    internal static string RemoveAgentModelFrontMatter(string content)
+    internal static async Task<DurableExecutionInstructions>
+        LoadPersistedExecutionInstructionsAsync(
+            AgentExecutionContext context,
+            IDbContextFactory<HarnessDbContext> databaseFactory,
+            CancellationToken cancellationToken)
     {
-        var normalized = content.ReplaceLineEndings("\n");
-        if (!normalized.StartsWith("---\n", StringComparison.Ordinal))
+        if (!context.RecoverInterruptedSession)
         {
-            return normalized;
+            throw new InvalidOperationException(
+                "Persisted execution instructions are reserved for recovery of the same durable attempt.");
         }
-        var end = normalized.IndexOf("\n---\n", 4, StringComparison.Ordinal);
-        if (end < 0)
+        if (context.FlowStepId == Guid.Empty)
         {
-            return normalized;
+            throw new InvalidOperationException(
+                "A durable FlowStep ID is required to recover exact execution instructions.");
         }
 
-        var frontMatter = normalized[4..end]
-            .Split('\n')
-            .Where(line =>
-                !line.TrimStart().StartsWith(
-                    "model:",
-                    StringComparison.OrdinalIgnoreCase));
-        return
-            $"---{Environment.NewLine}" +
-            string.Join(Environment.NewLine, frontMatter) +
-            $"{Environment.NewLine}---{Environment.NewLine}" +
-            normalized[(end + 5)..];
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var step = await database.FlowSteps
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                item =>
+                    item.Id == context.FlowStepId &&
+                    item.FlowRunId == context.FlowId,
+                cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The durable execution step could not be found while recovering its instructions.");
+        ValidateAttemptIdentity(step, context);
+        if (step.Status != StepStatus.Running)
+        {
+            throw new InvalidOperationException(
+                "Exact execution instructions can be recovered only for a running durable attempt.");
+        }
+        ValidatePersistedExecutionInstructions(
+            step.ExecutionPrompt,
+            step.WorkflowRevision);
+        if (step.ExecutionPrompt.Length >
+            ResolveMaximumRenderedPromptCharacters(context))
+        {
+            throw new InvalidOperationException(
+                "The persisted execution prompt exceeds the durable attempt's prompt limit; recovery failed closed.");
+        }
+
+        return new DurableExecutionInstructions(
+            step.ExecutionPrompt,
+            step.WorkflowRevision,
+            Recovered: true);
+    }
+
+    internal static async Task<DurableExecutionInstructions>
+        RenderAndPersistExecutionInstructionsAsync(
+            AgentExecutionContext context,
+            WorkflowDefinition workflow,
+            string agentInstructions,
+            string workingDirectory,
+            StagedPromotionSeed? stagedPromotion,
+            WorkflowPromptRenderer promptRenderer,
+            IDbContextFactory<HarnessDbContext> databaseFactory,
+            CancellationToken cancellationToken)
+    {
+        if (context.RecoverInterruptedSession)
+        {
+            return await LoadPersistedExecutionInstructionsAsync(
+                context,
+                databaseFactory,
+                cancellationToken);
+        }
+
+        ValidateWorkflowRevision(workflow.Revision);
+        var renderedPrompt = BoundRenderedPrompt(
+            context,
+            string.IsNullOrWhiteSpace(context.DirectPrompt)
+                ? promptRenderer.Render(
+                    workflow.PromptTemplate,
+                    BuildPromptValues(
+                        context,
+                        agentInstructions,
+                        workingDirectory,
+                        stagedPromotion))
+                : $"{context.DirectPrompt.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+                  $"## Quality Engineer role contract{Environment.NewLine}{Environment.NewLine}" +
+                  agentInstructions.Trim());
+
+        if (context.FlowStepId == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                "A durable FlowStep ID is required before the execution prompt can be persisted.");
+        }
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var step = await database.FlowSteps.SingleOrDefaultAsync(
+            item =>
+                item.Id == context.FlowStepId &&
+                item.FlowRunId == context.FlowId,
+            cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The durable execution step could not be found while persisting its instructions.");
+        ValidateAttemptIdentity(step, context);
+        if (step.Status != StepStatus.Running)
+        {
+            throw new InvalidOperationException(
+                "The execution prompt can be bound only to a running durable attempt.");
+        }
+
+        step.ExecutionPrompt = renderedPrompt;
+        step.WorkflowRevision = workflow.Revision;
+        await database.SaveChangesAsync(cancellationToken);
+        return new DurableExecutionInstructions(
+            renderedPrompt,
+            workflow.Revision,
+            Recovered: false);
+    }
+
+    internal static void ValidatePersistedExecutionInstructions(
+        string executionPrompt,
+        string workflowRevision)
+    {
+        if (string.IsNullOrWhiteSpace(executionPrompt))
+        {
+            throw new InvalidOperationException(
+                "The interrupted durable attempt has no persisted exact execution prompt; recovery failed closed.");
+        }
+        ValidateWorkflowRevision(workflowRevision);
+    }
+
+    internal static void ValidateWorkflowRevision(string workflowRevision)
+    {
+        if (workflowRevision.Length != 64 ||
+            workflowRevision.Any(character =>
+                !((character >= '0' && character <= '9') ||
+                  (character >= 'a' && character <= 'f') ||
+                  (character >= 'A' && character <= 'F'))))
+        {
+            throw new InvalidOperationException(
+                "The interrupted durable attempt has an invalid persisted workflow revision; recovery failed closed.");
+        }
+    }
+
+    private static void ValidateAttemptIdentity(
+        FlowStep step,
+        AgentExecutionContext context)
+    {
+        if (step.Iteration != context.Iteration ||
+            step.Attempt != context.Attempt ||
+            step.InvocationKind != context.InvocationKind ||
+            step.CopilotSessionId != context.CopilotSessionId)
+        {
+            throw new InvalidOperationException(
+                "The execution context does not match the durable flow-step attempt; execution failed closed.");
+        }
     }
 
     internal static bool IsModelUnavailableDiagnostic(string diagnostic)
@@ -639,7 +1375,9 @@ public sealed partial class CopilotReasoningHost(
                value.Contains("invalid model", StringComparison.Ordinal);
     }
 
-    internal static string RestartContinuationPrompt(string renderedPrompt)
+    internal static string RestartContinuationPrompt(
+        string renderedPrompt,
+        int maximumPromptCharacters = MaximumPromptCharacters)
     {
         const string recoveryInstruction =
             "Resume from the current workspace; inspect existing changes before continuing.";
@@ -647,12 +1385,54 @@ public sealed partial class CopilotReasoningHost(
             recoveryInstruction +
             Environment.NewLine +
             Environment.NewLine +
-            Clip(
+            ClipPrompt(
                 renderedPrompt,
-                MaximumPromptCharacters -
+                maximumPromptCharacters -
                 recoveryInstruction.Length -
                 (Environment.NewLine.Length * 2));
     }
+
+    internal static string BoundRenderedPrompt(
+        AgentExecutionContext context,
+        string renderedPrompt)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(renderedPrompt);
+        var maximum = ResolveMaximumRenderedPromptCharacters(context);
+        if (IsStructuredLargePrompt(context))
+        {
+            if (renderedPrompt.Length > maximum)
+            {
+                throw new InvalidOperationException(
+                    $"The rendered {context.InvocationKind} prompt contains {renderedPrompt.Length} characters, exceeding its contract-derived hard limit of {maximum}. The host will not truncate confirmed structured context.");
+            }
+            return renderedPrompt;
+        }
+        return ClipPrompt(renderedPrompt, maximum);
+    }
+
+    internal static int ResolveMaximumRenderedPromptCharacters(
+        AgentExecutionContext context) =>
+        context.ContractVersion == "studio-v2"
+            ? context.InvocationKind switch
+            {
+                ExecutionInvocationKind.Planning =>
+                    MaximumPlanningPromptCharacters,
+                ExecutionInvocationKind.ReviewClassification =>
+                    MaximumReviewClassificationPromptCharacters,
+                _ => MaximumPromptCharacters
+            }
+            : context.InvocationKind ==
+              ExecutionInvocationKind.ReviewClassification
+                ? 131_072
+                : MaximumPromptCharacters;
+
+    private static bool IsStructuredLargePrompt(
+        AgentExecutionContext context) =>
+        context.ContractVersion == "studio-v2" &&
+        context.InvocationKind is
+            ExecutionInvocationKind.Planning or
+            ExecutionInvocationKind.ReviewClassification;
 
     internal static CopilotExecutionTimeouts ResolveExecutionTimeouts(
         CopilotConfig config,
@@ -724,7 +1504,12 @@ public sealed partial class CopilotReasoningHost(
                 context.AgentRole,
                 recovered.OutputSummary,
                 context.IsPreMortemRevision,
-                context.IsOutcomeQa) &&
+                context.IsOutcomeQa,
+                context.ContractVersion,
+                context.InvocationKind,
+                context.IsOutcomeOwner,
+                context.PlanStepKey,
+                context.FlowKind) &&
             IsRecoveryCurrent(
                 context.InvocationStartedAt,
                 snapshot.CompletedAt))
@@ -734,22 +1519,37 @@ public sealed partial class CopilotReasoningHost(
                 "Recovered the completed handoff from the Copilot session journal after the CLI stopped responding."));
             return recovered;
         }
+        if (snapshot.State == CopilotSessionJournalState.Completed)
+        {
+            return Failure(
+                "The completed Copilot session output was rejected.",
+                $"The journal output is stale or does not satisfy the persisted {context.InvocationKind} contract. It requires manual restart.",
+                AgentRunFailureKind.InvalidOutput);
+        }
 
         return Failure(
             summary,
             error,
             failureKind,
             canResumeSession:
-                snapshot.State is
-                    CopilotSessionJournalState.Interrupted or
-                    CopilotSessionJournalState.Completed);
+                snapshot.State ==
+                CopilotSessionJournalState.Interrupted,
+            processTerminationUnconfirmed:
+                snapshot.State ==
+                CopilotSessionJournalState.Active);
     }
 
     internal static bool IsRecoverableCompletedOutput(
         string agentRole,
         string output,
         bool isPreMortemRevision = false,
-        bool isOutcomeQa = false)
+        bool isOutcomeQa = false,
+        string contractVersion = "legacy-v1",
+        ExecutionInvocationKind invocationKind =
+            ExecutionInvocationKind.Worker,
+        bool isOutcomeOwner = false,
+        string planStepKey = "",
+        FlowKind? expectedFlowKind = null)
     {
         if (isOutcomeQa)
         {
@@ -772,13 +1572,101 @@ public sealed partial class CopilotReasoningHost(
             }
         }
 
+        if (contractVersion == "studio-v2" &&
+            invocationKind ==
+            ExecutionInvocationKind.ReviewClassification)
+        {
+            try
+            {
+                _ = ReviewFeedbackParser.Parse(output);
+                return true;
+            }
+            catch (ReviewFeedbackContractException)
+            {
+                return false;
+            }
+        }
+        if (contractVersion == "studio-v2" &&
+            invocationKind == ExecutionInvocationKind.Intake)
+        {
+            return HasValidIntakeContract(
+                output,
+                contractVersion,
+                planStepKey,
+                expectedFlowKind);
+        }
+        if (contractVersion == "studio-v2" &&
+            invocationKind ==
+            ExecutionInvocationKind.BlockerExplanation)
+        {
+            return HasValidBlockerExplanationContract(output);
+        }
+        if (contractVersion == "studio-v2" &&
+            invocationKind == ExecutionInvocationKind.PreMortem)
+        {
+            return HasValidPreMortemContract(output);
+        }
+        if (contractVersion == "studio-v2" &&
+            invocationKind is
+                ExecutionInvocationKind.Worker or
+                ExecutionInvocationKind.Publication or
+                ExecutionInvocationKind.Planning)
+        {
+            try
+            {
+                var status = AgentHandoffInspector.ParseDynamic(output);
+                if (invocationKind ==
+                    ExecutionInvocationKind.Planning)
+                {
+                    if (status.IsPushback)
+                    {
+                        return false;
+                    }
+                    _ = TeamPlanParser.Parse(output);
+                }
+                if (invocationKind == ExecutionInvocationKind.Worker &&
+                    isOutcomeOwner &&
+                    !status.IsPushback)
+                {
+                    _ = FlowOutcomeParser.Parse(output);
+                }
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }
+
         return agentRole switch
         {
-            "account-manager" => HasValidIntakeContract(output),
+            "account-manager" => HasValidIntakeContract(output, contractVersion),
             "product-manager" => FeedbackCoordinator.HasReworkTargetMarker(output),
             "pre-mortem-sceptic" => HasValidPreMortemContract(output),
             _ => AgentHandoffInspector.HasTerminalStatus(output)
         };
+    }
+
+    private static bool HasValidBlockerExplanationContract(string output)
+    {
+        try
+        {
+            var parsed = IntakeV2Parser.Parse(output);
+            var brief = parsed.Document.Brief;
+            return parsed.Document.Status ==
+                   IntakeV2Status.NeedsClarification &&
+                   parsed.Document.FlowKind is null &&
+                   brief is not null &&
+                   string.IsNullOrEmpty(brief.Goal) &&
+                   brief.Details is { Count: 0 } &&
+                   brief.SuccessCriteria is { Count: 0 } &&
+                   brief.Constraints is { Count: 0 } &&
+                   brief.Assumptions is { Count: 0 };
+        }
+        catch (IntakeV2ContractException)
+        {
+            return false;
+        }
     }
 
     internal static bool IsRecoveryCurrent(
@@ -788,11 +1676,27 @@ public sealed partial class CopilotReasoningHost(
         recoveredCompletedAt is { } completedAt &&
         completedAt >= invocationStartedAt.Value;
 
-    private static bool HasValidIntakeContract(string output)
+    private static bool HasValidIntakeContract(
+        string output,
+        string contractVersion,
+        string planStepKey = "",
+        FlowKind? expectedFlowKind = null)
     {
         try
         {
-            _ = IntakeCoordinator.ParseResponse(output);
+            var response =
+                IntakeCoordinator.ParseResponse(output, contractVersion);
+            if (contractVersion == "studio-v2" &&
+                string.Equals(
+                    planStepKey,
+                    WorkflowEngine.RefinementIntakePlanStepKey,
+                    StringComparison.Ordinal) &&
+                (response.Status !=
+                     AccountManagerIntakeStatus.Confirmed ||
+                 response.FlowKind != expectedFlowKind))
+            {
+                return false;
+            }
             return true;
         }
         catch (InvalidOperationException)
@@ -833,14 +1737,21 @@ public sealed partial class CopilotReasoningHost(
     internal static IReadOnlyDictionary<string, string> BuildPromptValues(
         AgentExecutionContext context,
         string agentInstructions,
-        string workingDirectory)
+        string workingDirectory,
+        StagedPromotionSeed? stagedPromotion = null)
     {
-        var isAccountManager = IsAccountManager(context.AgentRole);
-        var isProductManager = IsProductManager(context.AgentRole);
-        var isPreMortem = string.Equals(
-            context.AgentRole,
-            "pre-mortem-sceptic",
-            StringComparison.Ordinal);
+        var isAccountManager = context.InvocationKind is
+            ExecutionInvocationKind.Intake or
+            ExecutionInvocationKind.ReviewClassification or
+            ExecutionInvocationKind.BlockerExplanation;
+        var isProductManager =
+            !string.Equals(
+                context.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) &&
+            IsProductManager(context.AgentRole);
+        var isPreMortem =
+            context.InvocationKind == ExecutionInvocationKind.PreMortem;
         var usesCompactPreMortemContext =
             isPreMortem || context.IsPreMortemRevision;
         var workspace = PrepareWorkspace(workingDirectory);
@@ -855,9 +1766,22 @@ public sealed partial class CopilotReasoningHost(
                 isAccountManager
                     ? AccountManagerRepositoryKnowledgeCharacters
                     : DeliveryRepositoryKnowledgeCharacters);
-        var handoffs = isAccountManager || usesCompactPreMortemContext
-            ? string.Empty
-            : isProductManager
+        var studioDependencyContext =
+            string.Equals(
+                context.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) &&
+            context.InvocationKind == ExecutionInvocationKind.Worker &&
+            context.StudioDependencyOutputs is { Count: > 0 }
+                ? FormatStudioDependencyContext(
+                    context.StudioDependencyOutputs,
+                    context.SourceProjectPath)
+                : string.Empty;
+        var handoffs = !string.IsNullOrWhiteSpace(studioDependencyContext)
+            ? studioDependencyContext
+            : isAccountManager || usesCompactPreMortemContext
+                ? string.Empty
+                : isProductManager
                 ? CompactExecutionLedger(
                     context.PreviousOutputs,
                     context.SourceProjectPath,
@@ -886,9 +1810,24 @@ public sealed partial class CopilotReasoningHost(
         }
         if (!string.IsNullOrWhiteSpace(handoffs))
         {
+            roleContext.Add(string.IsNullOrWhiteSpace(studioDependencyContext)
+                ? $"## {(isProductManager ? "Execution ledger" : "Relevant upstream handoffs")}" +
+                  $"{Environment.NewLine}{Environment.NewLine}{handoffs}"
+                : handoffs);
+        }
+        if (stagedPromotion is not null)
+        {
             roleContext.Add(
-                $"## {(isProductManager ? "Execution ledger" : "Relevant upstream handoffs")}" +
-                $"{Environment.NewLine}{Environment.NewLine}{handoffs}");
+                "## Durable Advisory promotion context" +
+                Environment.NewLine +
+                Environment.NewLine +
+                "The complete normalized accepted Advisory seed is stored once in the " +
+                "host-controlled read-only context below. Read the file before responding; " +
+                "do not infer or omit any detail." +
+                Environment.NewLine +
+                $"PROMOTION_SEED_FILE: {stagedPromotion.Path}" +
+                Environment.NewLine +
+                $"PROMOTION_SEED_SHA256: {stagedPromotion.SeedHash}");
         }
         if (!string.IsNullOrWhiteSpace(learnings))
         {
@@ -903,16 +1842,19 @@ public sealed partial class CopilotReasoningHost(
         {
             ["agent.name"] = context.AgentName,
             ["agent.instructions"] = Clip(agentInstructions, 3_000),
-            ["task"] = Clip(
-                context.Task,
-                usesCompactPreMortemContext ? 10_000 : 6_000),
+            ["task"] = BoundTaskContext(
+                context,
+                usesCompactPreMortemContext),
             ["workspace"] = workspace,
             ["role.context"] = string.Join(
                 $"{Environment.NewLine}{Environment.NewLine}",
                 roleContext),
             ["response.contract"] = context.IsPreMortemRevision
                 ? PreMortemRevisionResponseContract()
-                : ResponseContract(context.AgentRole),
+                : ResponseContract(
+                    context.InvocationKind,
+                    context.AgentRole,
+                    context.ContractVersion),
             ["outcome.context"] = context.OutcomeContext,
             ["outcome.contract"] = context.OutcomeContract,
             // Retain legacy variables so a hot-reloaded older WORKFLOW.md remains valid.
@@ -924,6 +1866,42 @@ public sealed partial class CopilotReasoningHost(
             ["learnings"] = learnings,
             ["feedback"] = feedback
         };
+    }
+
+    private static string BoundTaskContext(
+        AgentExecutionContext context,
+        bool usesCompactPreMortemContext)
+    {
+        if (context.ContractVersion == "studio-v2")
+        {
+            var maximum = context.InvocationKind switch
+            {
+                ExecutionInvocationKind.Planning =>
+                    MaximumPlanningTaskCharacters,
+                ExecutionInvocationKind.ReviewClassification =>
+                    MaximumReviewClassificationTaskCharacters,
+                _ => 0
+            };
+            if (maximum > 0)
+            {
+                if (context.Task.Length > maximum)
+                {
+                    throw new InvalidOperationException(
+                        $"The {context.InvocationKind} task contains {context.Task.Length} characters, exceeding its contract-derived hard limit of {maximum}. The host will not truncate confirmed structured context.");
+                }
+                return context.Task;
+            }
+        }
+
+        return Clip(
+            context.Task,
+            usesCompactPreMortemContext
+                ? 10_000
+                : context.InvocationKind is
+                    ExecutionInvocationKind.Planning or
+                    ExecutionInvocationKind.ReviewClassification
+                    ? 131_072
+                    : 6_000);
     }
 
     internal static string CompactExecutionLedger(
@@ -956,6 +1934,180 @@ public sealed partial class CopilotReasoningHost(
             .ToList();
         return string.Join(separator, entries);
     }
+
+    internal static string FormatStudioDependencyContext(
+        IReadOnlyList<StudioDependencyOutput> outputs,
+        string sourceProjectPath,
+        int maximumCharacters = MaximumStudioDependencyContextCharacters)
+    {
+        ArgumentNullException.ThrowIfNull(outputs);
+        if (maximumCharacters <= 0 ||
+            maximumCharacters > MaximumStudioDependencyContextCharacters)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumCharacters),
+                $"Studio dependency context must be from 1 through {MaximumStudioDependencyContextCharacters} characters.");
+        }
+
+        var normalized = outputs
+            .Select(item => item with
+            {
+                Output = RemoveSourceProjectPath(
+                        item.Output,
+                        sourceProjectPath)
+                    .ReplaceLineEndings("\n")
+                    .Trim()
+            })
+            .ToList();
+        var direct = normalized
+            .Where(item => item.Kind == StudioDependencyKind.Direct)
+            .ToList();
+        if (direct.Count == 0)
+        {
+            return string.Empty;
+        }
+        if (direct.Any(item =>
+                string.IsNullOrWhiteSpace(item.PlanStepKey) ||
+                string.IsNullOrWhiteSpace(item.Output)) ||
+            direct.Select(item => item.PlanStepKey)
+                .Distinct(StringComparer.Ordinal)
+                .Count() != direct.Count)
+        {
+            throw new InvalidOperationException(
+                "Studio direct dependency context must contain one nonempty effective output per plan-step key.");
+        }
+
+        var budgets = direct
+            .Select(item => Math.Min(
+                item.Output.Length,
+                MinimumDirectDependencyOutputCharacters))
+            .ToArray();
+        if (StudioDependencySectionLength(direct, budgets) >
+            maximumCharacters)
+        {
+            throw new InvalidOperationException(
+                "Studio direct dependency identifiers exceed the bounded context envelope.");
+        }
+
+        var targets = direct
+            .Select(item => Math.Min(
+                item.Output.Length,
+                MaximumDirectDependencyOutputCharacters))
+            .ToArray();
+        while (true)
+        {
+            var advanced = false;
+            for (var index = 0; index < budgets.Length; index++)
+            {
+                if (budgets[index] >= targets[index])
+                {
+                    continue;
+                }
+                budgets[index]++;
+                if (StudioDependencySectionLength(direct, budgets) >
+                    maximumCharacters)
+                {
+                    budgets[index]--;
+                    continue;
+                }
+                advanced = true;
+            }
+            if (!advanced)
+            {
+                break;
+            }
+        }
+
+        var entries = direct
+            .Select((item, index) =>
+                RenderStudioDependencyEntry(item, budgets[index]))
+            .ToList();
+        var allDirectComplete = direct
+            .Select((item, index) => budgets[index] >= item.Output.Length)
+            .All(value => value);
+        if (allDirectComplete)
+        {
+            foreach (var ancestor in normalized
+                         .Where(item =>
+                             item.Kind == StudioDependencyKind.Ancestor &&
+                             !string.IsNullOrWhiteSpace(item.Output))
+                         .OrderBy(item => item.Distance)
+                         .ThenBy(item => item.Sequence)
+                         .ThenBy(item => item.PlanStepKey, StringComparer.Ordinal))
+            {
+                var minimumBudget = Math.Min(
+                    ancestor.Output.Length,
+                    MinimumAncestorOutputCharacters);
+                var maximumBudget = Math.Min(
+                    ancestor.Output.Length,
+                    MaximumAncestorOutputCharacters);
+                var selectedBudget = -1;
+                for (var budget = maximumBudget;
+                     budget >= minimumBudget;
+                     budget--)
+                {
+                    var candidateEntries = entries
+                        .Append(RenderStudioDependencyEntry(ancestor, budget))
+                        .ToList();
+                    if (RenderStudioDependencySection(candidateEntries).Length <=
+                        maximumCharacters)
+                    {
+                        selectedBudget = budget;
+                        break;
+                    }
+                }
+                if (selectedBudget < 0)
+                {
+                    continue;
+                }
+                entries.Add(
+                    RenderStudioDependencyEntry(
+                        ancestor,
+                        selectedBudget));
+            }
+        }
+
+        var result = RenderStudioDependencySection(entries);
+        if (result.Length > maximumCharacters)
+        {
+            throw new InvalidOperationException(
+                "Studio dependency context exceeded its hard bound.");
+        }
+        return result;
+    }
+
+    private static int StudioDependencySectionLength(
+        IReadOnlyList<StudioDependencyOutput> items,
+        IReadOnlyList<int> budgets) =>
+        RenderStudioDependencySection(
+                items.Select((item, index) =>
+                    RenderStudioDependencyEntry(item, budgets[index]))
+                    .ToList())
+            .Length;
+
+    private static string RenderStudioDependencyEntry(
+        StudioDependencyOutput item,
+        int outputBudget)
+    {
+        var relationship = item.Kind == StudioDependencyKind.Direct
+            ? "DIRECT DEPENDENCY"
+            : $"ANCESTOR (distance {item.Distance})";
+        var output = item.Output.Length <= outputBudget
+            ? item.Output
+            : item.Output[..outputBudget] +
+              $"\n...[dependency output clipped: kept {outputBudget} of {item.Output.Length} characters]...";
+        return
+            $"### {relationship} `{item.PlanStepKey}` (effective attempt {item.Attempt})\n" +
+            output;
+    }
+
+    private static string RenderStudioDependencySection(
+        IReadOnlyList<string> entries) =>
+        StudioPlanContextBegin +
+        "\n" +
+        string.Join("\n\n", entries) +
+        "\n" +
+        StudioPlanContextEnd;
 
     private static string CompactExecutionLedgerEntry(string output, int budget)
     {
@@ -1089,25 +2241,21 @@ public sealed partial class CopilotReasoningHost(
     }
 
     internal static IReadOnlyDictionary<string, string?>? BuildProcessEnvironment(
-        string agentRole,
+        ExecutionInvocationKind invocationKind,
         bool allowRemotePublication,
         bool isGovernedOutcomeVerification = false)
     {
-        if (isGovernedOutcomeVerification)
-        {
-            return BuildGuardedEnvironment("governed-host-publication-only");
-        }
-        if (agentRole == "pre-mortem-sceptic")
-        {
-            return BuildGuardedEnvironment("pre-mortem-read-only");
-        }
-        if (agentRole != "release-engineer" ||
-            allowRemotePublication)
+        if (allowRemotePublication && !isGovernedOutcomeVerification)
         {
             return null;
         }
 
-        return BuildGuardedEnvironment("customer-approval-required");
+        return BuildGuardedEnvironment(
+            isGovernedOutcomeVerification
+                ? "governed-host-publication-only"
+                : invocationKind == ExecutionInvocationKind.PreMortem
+                    ? "pre-mortem-read-only"
+                    : "publication-not-authorized");
     }
 
     private static IReadOnlyDictionary<string, string?> BuildGuardedEnvironment(
@@ -1119,11 +2267,17 @@ public sealed partial class CopilotReasoningHost(
         {
             ["GH_TOKEN"] = null,
             ["GITHUB_TOKEN"] = null,
+            ["GH_ENTERPRISE_TOKEN"] = null,
+            ["GITHUB_ENTERPRISE_TOKEN"] = null,
+            ["GITHUB_TOKEN_REQUEST_URL"] = null,
+            ["GITHUB_TOKEN_REQUEST_TOKEN"] = null,
             ["SSH_AUTH_SOCK"] = null,
+            ["SSH_AGENT_PID"] = null,
             ["GIT_TERMINAL_PROMPT"] = "0",
             ["GCM_INTERACTIVE"] = "Never",
-            ["GIT_ASKPASS"] = "echo",
-            ["SSH_ASKPASS"] = "echo",
+            ["GIT_ASKPASS"] = null,
+            ["SSH_ASKPASS"] = null,
+            ["GIT_CONFIG_NOSYSTEM"] = "1",
             ["GIT_SSH_COMMAND"] = OperatingSystem.IsWindows()
                 ? "cmd /c exit 1"
                 : "false"
@@ -1192,7 +2346,8 @@ public sealed partial class CopilotReasoningHost(
         string error,
         AgentRunFailureKind failureKind,
         string? dependency = null,
-        bool canResumeSession = false) =>
+        bool canResumeSession = false,
+        bool processTerminationUnconfirmed = false) =>
         new()
         {
             Success = false,
@@ -1200,7 +2355,9 @@ public sealed partial class CopilotReasoningHost(
             Error = error,
             FailureKind = failureKind,
             FailedDependency = dependency,
-            CanResumeSession = canResumeSession
+            CanResumeSession = canResumeSession,
+            ProcessTerminationUnconfirmed =
+                processTerminationUnconfirmed
         };
 
     internal sealed record CopilotExecutionTimeouts(
@@ -1211,8 +2368,95 @@ public sealed partial class CopilotReasoningHost(
         string Root,
         string AgentId);
 
-    internal static string ResponseContract(string agentRole) =>
-        agentRole switch
+    internal static string ResponseContract(
+        string agentRole,
+        string contractVersion = "legacy-v1") =>
+        ResponseContract(
+            contractVersion == "studio-v2" &&
+            string.Equals(agentRole, "team-lead", StringComparison.Ordinal)
+                ? ExecutionInvocationKind.Planning
+                : contractVersion == "studio-v2" &&
+                  string.Equals(
+                      agentRole,
+                      "account-manager",
+                      StringComparison.Ordinal)
+                    ? ExecutionInvocationKind.Intake
+                    : contractVersion == "studio-v2" &&
+                      string.Equals(
+                          agentRole,
+                          "pre-mortem-sceptic",
+                          StringComparison.Ordinal)
+                        ? ExecutionInvocationKind.PreMortem
+                        : ExecutionInvocationKind.Worker,
+            agentRole,
+            contractVersion);
+
+    internal static string ResponseContract(
+        ExecutionInvocationKind invocationKind,
+        string agentRole,
+        string contractVersion = "legacy-v1")
+    {
+        if (contractVersion == "studio-v2" &&
+            invocationKind == ExecutionInvocationKind.Planning)
+        {
+            return """
+              Select the smallest suitable downstream team from the exact enabled snapshot roster in the assignment.
+              Start with exactly: HANDOFF_STATUS: COMPLETE
+              Return exactly one strict team-plan-v1 JSON document between TEAM_PLAN_V1_BEGIN and TEAM_PLAN_V1_END.
+              Use only exact roster Id values. Account Manager, Team Lead, and Pre-mortem Sceptic are never workers.
+              Return either Planned or MissingQualification and follow every supplied property, enum, bound, duty, stage, dependency, outcome-owner, publication, and checkpoint rule exactly.
+              Do not emit legacy TEAM_TASK_PROFILES or PRE_MORTEM_PLAN documents, Markdown fences, or duplicate sentinels.
+              """;
+        }
+        if (contractVersion == "studio-v2" &&
+            invocationKind is
+                ExecutionInvocationKind.Intake or
+                ExecutionInvocationKind.BlockerExplanation)
+        {
+            return """
+              Classify the repository-grounded request as Advisory (inspect, recommend, or explain without source changes/publication) or Delivery (implement or change the product).
+              Discuss customer outcomes, never workspace, branch, hook, tooling, or publication mechanics.
+              Return exactly one strict JSON object between standalone INTAKE_V2_BEGIN and INTAKE_V2_END sentinels, with no Markdown fence and no duplicate sentinel:
+              INTAKE_V2_BEGIN
+              {"Version":"intake-v2","Status":"AwaitingConfirmation","FlowKind":"Advisory","TaskTitle":"Assess checkout resilience","CustomerReply":"Do I understand correctly that you want an assessment of checkout risks and a recommended approach?","Brief":{"Goal":"Identify the highest-impact checkout resilience gaps.","Details":["Inspect the configured source project."],"SuccessCriteria":["The customer receives an evidence-based recommendation."],"Constraints":["Do not change source files."],"Assumptions":[]}}
+              INTAKE_V2_END
+              Property names and enum casing are exact. Status is NeedsClarification, AwaitingConfirmation, or Confirmed. FlowKind is Advisory, Delivery, or null, and is mandatory for AwaitingConfirmation and Confirmed. Every Brief list is required, even when empty.
+              Default to AwaitingConfirmation once meaningful work can begin. NeedsClarification asks at most one material customer-outcome question.
+              Confirmed is valid only when the latest customer turn explicitly approves the immediately preceding proposal without a correction, unless the host assignment contains DURABLE_ADVISORY_PROMOTION_AUTHORIZATION for a linked Delivery first turn.
+              A host-authorized promotion may confirm only after reading the host-controlled promotion seed file, and only for its exact durable Delivery goal and ordered implementation details; it may not add scope. A correction is not confirmation.
+              On ordinary confirmation, reproduce the pending FlowKind, TaskTitle, and complete normalized Brief exactly. Never silently change the kind or brief.
+              """;
+        }
+        if (contractVersion == "studio-v2" &&
+            invocationKind == ExecutionInvocationKind.ReviewClassification)
+        {
+            return """
+              Classify only the customer's current free-text review message against the supplied normalized result.
+              Return exactly one strict JSON object between standalone REVIEW_FEEDBACK_V1_BEGIN and REVIEW_FEEDBACK_V1_END sentinels, with no Markdown fence and no duplicate sentinel:
+              REVIEW_FEEDBACK_V1_BEGIN
+              {"Version":"review-feedback-v1","Intent":"RequestRefinement","CustomerReply":"I’ll ask the team to narrow the result.","Refinement":{"Goal":"Limit the recommendation to checkout resilience.","RequestedChanges":["Exclude catalog and account services."]},"ExplicitImplementationAdoption":false}
+              REVIEW_FEEDBACK_V1_END
+              Property names and enum casing are exact. Intent is Accept, RequestRefinement, PromoteToDelivery, or Ambiguous.
+              Use Accept only for unambiguous approval of the current result. Use PromoteToDelivery only when an Advisory customer explicitly asks to implement, build, ship, or otherwise adopt the result; set ExplicitImplementationAdoption to true. Use RequestRefinement only for requested changes and include a complete non-empty Goal plus 1-24 concrete RequestedChanges. Use Ambiguous when intent is not safe to infer and return one short customer-safe clarification.
+              Refinement must be null unless Intent is RequestRefinement. ExplicitImplementationAdoption must be false unless Intent is PromoteToDelivery.
+              Never expose tool logs, internal prompts, agent IDs, or operator diagnostics in CustomerReply.
+              """;
+        }
+        if (contractVersion == "studio-v2" &&
+            invocationKind is
+                ExecutionInvocationKind.Worker or
+                ExecutionInvocationKind.Publication)
+        {
+            return """
+              Complete only the assigned plan step in the isolated workspace.
+              Start with exactly one standalone line: HANDOFF_STATUS: COMPLETE or HANDOFF_STATUS: PUSHBACK.
+              For PUSHBACK, immediately include exactly one PUSHBACK_OWNER_STEP_ID naming an earlier dependency or ancestor plan-step ID and exactly one bounded PUSHBACK_REASON.
+              Do not use legacy role ownership markers. Return concise Decision, Deliverable, Evidence, and Next owner sections.
+              When the supplied outcome contract requires flow-outcome-v1, emit that complete strict document after the handoff. It is mandatory for the final outcome owner.
+              """;
+        }
+
+        return agentRole switch
         {
             "account-manager" => """
               Move a workable customer request toward delivery without treating clarity as customer approval.
@@ -1273,6 +2517,7 @@ public sealed partial class CopilotReasoningHost(
               If an upstream handoff is insufficient, stop this turn and select the PUSHBACK status.
               """
         };
+    }
 
     internal static string PreMortemRevisionResponseContract() => """
         Complete this role's response to the Pre-mortem Sceptic findings.
@@ -1293,6 +2538,74 @@ public sealed partial class CopilotReasoningHost(
     private static string Tail(string value, int maxCharacters) =>
         value.Length <= maxCharacters ? value : value[^maxCharacters..];
 
+    private static string ClipPrompt(string value, int maxCharacters)
+    {
+        if (value.Length <= maxCharacters)
+        {
+            return value;
+        }
+
+        var begin = value.IndexOf(
+            StudioPlanContextBegin,
+            StringComparison.Ordinal);
+        if (begin < 0)
+        {
+            return Clip(value, maxCharacters);
+        }
+        var secondBegin = value.IndexOf(
+            StudioPlanContextBegin,
+            begin + StudioPlanContextBegin.Length,
+            StringComparison.Ordinal);
+        var endStart = value.IndexOf(
+            StudioPlanContextEnd,
+            begin + StudioPlanContextBegin.Length,
+            StringComparison.Ordinal);
+        if (secondBegin >= 0 ||
+            endStart < 0 ||
+            value.IndexOf(
+                StudioPlanContextEnd,
+                endStart + StudioPlanContextEnd.Length,
+                StringComparison.Ordinal) >= 0)
+        {
+            throw new InvalidOperationException(
+                "The rendered Studio dependency context markers are invalid.");
+        }
+
+        var end = endStart + StudioPlanContextEnd.Length;
+        var required = value[begin..end];
+        const string compacted = "\n...[prompt context compacted]...\n";
+        var available = maxCharacters - required.Length -
+                        (compacted.Length * 2);
+        if (available < 0)
+        {
+            throw new InvalidOperationException(
+                "The required Studio dependency context cannot fit in the Copilot prompt envelope.");
+        }
+
+        var prefix = value[..begin];
+        var suffix = value[end..];
+        var prefixBudget = Math.Min(prefix.Length, available * 2 / 5);
+        var suffixBudget = Math.Min(suffix.Length, available - prefixBudget);
+        var unused = available - prefixBudget - suffixBudget;
+        if (unused > 0)
+        {
+            var additionalPrefix = Math.Min(
+                prefix.Length - prefixBudget,
+                unused);
+            prefixBudget += additionalPrefix;
+            unused -= additionalPrefix;
+            suffixBudget += Math.Min(
+                suffix.Length - suffixBudget,
+                unused);
+        }
+
+        return prefix[..prefixBudget] +
+               compacted +
+               required +
+               compacted +
+               suffix[^suffixBudget..];
+    }
+
     private static string Clip(string value, int maxCharacters)
     {
         if (value.Length <= maxCharacters)
@@ -1304,6 +2617,118 @@ public sealed partial class CopilotReasoningHost(
         var available = maxCharacters - marker.Length;
         var headLength = available * 2 / 3;
         return value[..headLength] + marker + value[^(available - headLength)..];
+    }
+
+    internal sealed class PublicationGuardScope : IDisposable
+    {
+        private readonly string _root;
+
+        private PublicationGuardScope(string root)
+        {
+            _root = root;
+            EnvironmentVariables = new Dictionary<string, string?>(
+                BuildGuardedEnvironment("publication-not-authorized"),
+                StringComparer.Ordinal)
+            {
+                ["GH_CONFIG_DIR"] = root
+            };
+        }
+
+        public IReadOnlyDictionary<string, string?> EnvironmentVariables { get; }
+
+        public static PublicationGuardScope Create(
+            string copilotHome,
+            string workingDirectory)
+        {
+            var root = Path.Combine(
+                Path.GetFullPath(copilotHome),
+                "harness-runtime",
+                "gh-config",
+                Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var scope = new PublicationGuardScope(root);
+            var environment =
+                (Dictionary<string, string?>)scope.EnvironmentVariables;
+            var remoteNames = DiscoverRemoteNames(workingDirectory)
+                .Where(name => !string.Equals(
+                    name,
+                    "origin",
+                    StringComparison.Ordinal))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var count = int.Parse(
+                environment["GIT_CONFIG_COUNT"]!,
+                System.Globalization.CultureInfo.InvariantCulture);
+            foreach (var remoteName in remoteNames)
+            {
+                environment[$"GIT_CONFIG_KEY_{count}"] =
+                    $"remote.{remoteName}.pushurl";
+                environment[$"GIT_CONFIG_VALUE_{count}"] =
+                    "disabled://publication-not-authorized";
+                count++;
+            }
+            environment["GIT_CONFIG_COUNT"] =
+                count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return scope;
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                if (Directory.Exists(_root))
+                {
+                    Directory.Delete(_root, recursive: true);
+                }
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup; a later run uses a different empty directory.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Best-effort cleanup; permissions must not turn execution success into failure.
+            }
+        }
+
+        private static IEnumerable<string> DiscoverRemoteNames(
+            string workingDirectory)
+        {
+            foreach (var repository in
+                     CandidateFingerprintService.DiscoverRepositories(
+                         workingDirectory))
+            {
+                var start = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "git",
+                    WorkingDirectory = repository,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                start.ArgumentList.Add("remote");
+                using var process = System.Diagnostics.Process.Start(start);
+                if (process is null ||
+                    !process.WaitForExit((int)TimeSpan.FromSeconds(3).TotalMilliseconds) ||
+                    process.ExitCode != 0)
+                {
+                    continue;
+                }
+                foreach (var name in process.StandardOutput.ReadToEnd()
+                             .Split(
+                                 ['\r', '\n'],
+                                 StringSplitOptions.RemoveEmptyEntries |
+                                 StringSplitOptions.TrimEntries)
+                             .Where(name =>
+                                 name.All(character =>
+                                     char.IsAsciiLetterOrDigit(character) ||
+                                     character is '-' or '_' or '.')))
+                {
+                    yield return name;
+                }
+            }
+        }
     }
 
     internal sealed class GovernedGitIsolationScope : IDisposable

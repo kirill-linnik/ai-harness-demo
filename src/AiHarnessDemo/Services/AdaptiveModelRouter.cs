@@ -113,6 +113,8 @@ public sealed class AdaptiveModelRouter(
                         item.FlowRunId == step.FlowRunId &&
                         item.Iteration == step.Iteration &&
                         item.Role == step.AgentRole &&
+                        (step.PlanStepKey == string.Empty ||
+                         item.PlanStepKey == step.PlanStepKey) &&
                         item.FlowStepId == null)
                     .OrderBy(item => item.CreatedAt)
                     .FirstOrDefaultAsync(cancellationToken);
@@ -127,7 +129,9 @@ public sealed class AdaptiveModelRouter(
                         .Where(item =>
                             item.FlowRunId == step.FlowRunId &&
                             item.Iteration == step.Iteration &&
-                            item.Role == step.AgentRole)
+                            item.Role == step.AgentRole &&
+                            (step.PlanStepKey == string.Empty ||
+                             item.PlanStepKey == step.PlanStepKey))
                         .OrderByDescending(item => item.CreatedAt)
                         .FirstOrDefaultAsync(cancellationToken)
                         ?? throw new InvalidOperationException(

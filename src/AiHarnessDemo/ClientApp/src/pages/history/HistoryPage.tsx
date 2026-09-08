@@ -6,7 +6,8 @@ import { FatalScreen } from "../../components/FatalScreen";
 import { StatCard } from "../../components/StatCard";
 import { StatusPill } from "../../components/StatusPill";
 import { HistoryIcon } from "../../lib/icons";
-import { formatDuration, timeAgo } from "../../lib/format";
+import { formatDuration, statusLabel, timeAgo } from "../../lib/format";
+import { flowRoute } from "../../lib/flowRoute";
 
 export function HistoryPage() {
   const historyQuery = useHistoryQuery();
@@ -64,6 +65,7 @@ export function HistoryPage() {
               <thead>
                 <tr>
                   <th>Factory flow</th>
+                  <th>Flow state</th>
                   <th>Iteration</th>
                   <th>Agent</th>
                   <th>Model</th>
@@ -76,9 +78,34 @@ export function HistoryPage() {
                 {history.map((item, index) => (
                   <tr key={`${item.flowId}-${index}`}>
                     <td>
-                      <Link className="table-flow" to={`/factory/${item.flowId}`} title={item.flowTitle}>
+                      <Link
+                        className="table-flow"
+                        to={flowRoute(item.flowId, item.flowStatus)}
+                        title={item.flowTitle}
+                      >
                         {item.flowTitle}
                       </Link>
+                      <br />
+                      <span className="muted">
+                        {item.flowKind}
+                        {item.parentFlowRunId
+                          ? ` · ${statusLabel(item.linkKind)} from ${item.parentFlowRunId.slice(0, 8)}`
+                          : ""}
+                      </span>
+                    </td>
+                    <td>
+                      <StatusPill status={item.flowStatus} />
+                      <br />
+                      <span className="muted">
+                        {item.customerBlockerMessage ||
+                        (item.review.decision
+                          ? statusLabel(item.review.decision)
+                          : item.outcomeLabel || "No customer decision")}
+                        {item.review.publicationStatus !== "NotApplicable" &&
+                        item.review.publicationStatus !== "AwaitingApproval"
+                          ? ` · publication ${statusLabel(item.review.publicationStatus).toLowerCase()}`
+                          : ""}
+                      </span>
                     </td>
                     <td>{item.iteration}</td>
                     <td>

@@ -122,7 +122,7 @@ public sealed class PreMortemWorkflowTests
     }
 
     [Fact]
-    public async Task RunAsync_UsesIndependentFamilyAndAppliesPerCheckpointRoundCap()
+    public async Task MigratedLegacyRun_UsesSnapshottedScepticAcrossAllRounds()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -134,6 +134,7 @@ public sealed class PreMortemWorkflowTests
         Directory.CreateDirectory(workspacePath);
         foreach (var (id, name) in new[]
                  {
+                     ("account-manager", "Account Manager"),
                      ("team-lead", "Team Lead"),
                      ("software-engineer", "Software Engineer"),
                      ("pre-mortem-sceptic", "Pre-mortem Sceptic"),
@@ -202,6 +203,17 @@ public sealed class PreMortemWorkflowTests
             new WorkflowLoader(),
             NullLogger<WorkflowDefinitionProvider>.Instance);
         await workflowProvider.StartAsync(CancellationToken.None);
+        var catalog = new AgentCatalog(paths, databaseFactory);
+        var catalogStatus = await catalog.LoadAsync();
+        Assert.True(catalogStatus.Ready, catalogStatus.LastError);
+        var snapshots =
+            new FlowAgentSnapshotService(databaseFactory, catalog);
+        Assert.Equal(
+            1,
+            await snapshots.MigrateLegacyNonterminalAsync());
+        _ = await catalog.ToggleAsync(
+            WorkflowEngine.PreMortemRole,
+            enabled: false);
         var runner = new PreMortemAgentRunner();
         var router = new FamilyAwareModelRouter(databaseFactory);
         using var handoffGate = new HandoffGateEngine();
@@ -210,7 +222,7 @@ public sealed class PreMortemWorkflowTests
         handoffGate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
         var engine = new WorkflowEngine(
             databaseFactory,
-            new AgentCatalog(paths, databaseFactory),
+            catalog,
             new FlowPlanner(),
             router,
             new BootstrapTaskProfileFactory(),
@@ -220,7 +232,8 @@ public sealed class PreMortemWorkflowTests
             handoffGate,
             new CopilotSessionJournal(),
             workflowProvider,
-            NullLogger<WorkflowEngine>.Instance);
+            NullLogger<WorkflowEngine>.Instance,
+            flowAgentSnapshotService: snapshots);
 
         try
         {

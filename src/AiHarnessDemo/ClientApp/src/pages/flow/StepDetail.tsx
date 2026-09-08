@@ -38,6 +38,30 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
     <>
       <div className="detail-kicker">{step.label || step.agentRole}</div>
       <h3>{step.agentName}</h3>
+      <div className="detail-model" aria-label="Persisted plan assignment">
+        <span className="mono">{step.agentId}</span>
+        {step.planStepKey && <span className="model-chip">Step {step.planStepKey}</span>}
+        <span>{statusLabel(step.stage)}</span>
+        <span>{statusLabel(step.permissionProfile)}</span>
+        {step.isOutcomeOwner && <span className="model-chip">Outcome owner</span>}
+      </div>
+      {step.duties.length > 0 && (
+        <div className="detail-model" aria-label="Plan duties">
+          {step.duties.map(duty => (
+            <span className="model-chip" key={duty}>{statusLabel(duty)}</span>
+          ))}
+        </div>
+      )}
+      {(step.dependencyPlanStepKeys.length > 0 || step.dependencyStepIds.length > 0) && (
+        <p className="muted">
+          Depends on{" "}
+          <span className="mono">
+            {(step.dependencyPlanStepKeys.length > 0
+              ? step.dependencyPlanStepKeys
+              : step.dependencyStepIds.map(id => id.slice(0, 8))).join(", ")}
+          </span>
+        </p>
+      )}
       <div className="detail-model">
         <span className="model-chip">
           {step.model ? `${step.model}${step.modelEffort ? ` · ${step.modelEffort}` : ""}` : "Model pending"}
@@ -125,6 +149,12 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
             <p className="muted" key={`${index}:${rationale}`}>{rationale}</p>
           ))}
         </section>
+      )}
+      {step.effectivePermissionJson && (
+        <details className="operator-details">
+          <summary>Effective permission policy</summary>
+          <pre>{step.effectivePermissionJson}</pre>
+        </details>
       )}
       {gate && (
         <div

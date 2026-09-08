@@ -1,5 +1,10 @@
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
+using System.Text;
+using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Orchestration;
 using YamlDotNet.Core;
+using YamlDotNet.RepresentationModel;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -9,7 +14,8 @@ public sealed record WorkflowDefinition(
     WorkflowConfig Config,
     string PromptTemplate,
     string SourcePath,
-    DateTimeOffset LoadedAt);
+    DateTimeOffset LoadedAt,
+    string Revision);
 
 public sealed class WorkflowConfig
 {
@@ -24,6 +30,87 @@ public sealed class WorkflowConfig
     public CopilotConfig Copilot { get; set; } = new();
 
     public OutcomeVerificationConfig OutcomeVerification { get; set; } = new();
+
+    public StudioConfig Studio { get; set; } = new();
+}
+
+public sealed class StudioConfig
+{
+    public int Version { get; set; } = 1;
+
+    public StudioPlanningConfig Planning { get; set; } = new();
+
+    public StudioFlowKindsConfig FlowKinds { get; set; } = new();
+
+    public StudioAdvisoryConfig Advisory { get; set; } = new();
+
+    public StudioPermissionsConfig Permissions { get; set; } = new();
+}
+
+public sealed class StudioPlanningConfig
+{
+    public int MaxSteps { get; set; } = 24;
+
+    public int MaxDependenciesPerStep { get; set; } = 8;
+
+    public int MaxAssignmentCharacters { get; set; } = 4_000;
+}
+
+public sealed class StudioFlowKindsConfig
+{
+    public StudioAdvisoryFlowConfig Advisory { get; set; } = new();
+
+    public StudioDeliveryFlowConfig Delivery { get; set; } = new();
+}
+
+public sealed class StudioAdvisoryFlowConfig
+{
+    public List<PlanDuty> RequiredDuties { get; set; } = [PlanDuty.PrepareOutcome];
+
+    public ExecutionPermissionProfile MaximumPermission { get; set; } =
+        ExecutionPermissionProfile.ReadOnlySource;
+}
+
+public sealed class StudioDeliveryFlowConfig
+{
+    public List<PlanDuty> RequiredDuties { get; set; } =
+    [
+        PlanDuty.Implement,
+        PlanDuty.Verify,
+        PlanDuty.PrepareOutcome,
+        PlanDuty.Publish
+    ];
+
+    public ExecutionPermissionProfile PreReviewMaximumPermission { get; set; } =
+        ExecutionPermissionProfile.WorkspaceWrite;
+
+    public ExecutionPermissionProfile PostApprovalMaximumPermission { get; set; } =
+        ExecutionPermissionProfile.Publish;
+}
+
+public sealed class StudioAdvisoryConfig
+{
+    public string ArtifactDirectory { get; set; } = @".studio\advisory";
+
+    public int MaxArtifactCount { get; set; } = 8;
+
+    public int MaxTotalArtifactBytes { get; set; } = 65_536;
+}
+
+public sealed class StudioPermissionsConfig
+{
+    public StudioPermissionRestrictionConfig ReadOnlySource { get; set; } = new();
+
+    public StudioPermissionRestrictionConfig WorkspaceWrite { get; set; } = new();
+
+    public StudioPermissionRestrictionConfig Publish { get; set; } = new();
+
+    public StudioPermissionRestrictionConfig PreMortemReadOnly { get; set; } = new();
+}
+
+public sealed class StudioPermissionRestrictionConfig
+{
+    public List<string> AdditionalDeniedTools { get; set; } = [];
 }
 
 public sealed class TrackerConfig
@@ -123,6 +210,7 @@ public sealed class WorkflowLoader
         }
 
         var (frontMatter, prompt) = Split(text);
+        ValidateStudioShape(frontMatter);
         WorkflowConfig config;
         try
         {
@@ -145,7 +233,131 @@ public sealed class WorkflowLoader
                 $"Symphony workflow path has no parent directory: {fullPath}");
         config.Workspace.ResolvedRoot = ResolvePath(config.Workspace.Root, workflowDirectory);
         Validate(config, prompt);
-        return new WorkflowDefinition(config, prompt.Trim(), fullPath, DateTimeOffset.UtcNow);
+        var revision = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+        return new WorkflowDefinition(
+            config,
+            prompt.Trim(),
+            fullPath,
+            DateTimeOffset.UtcNow,
+            revision);
+    }
+
+    private static void ValidateStudioShape(string frontMatter)
+    {
+        if (string.IsNullOrWhiteSpace(frontMatter))
+        {
+            return;
+        }
+
+        var stream = new YamlStream();
+        try
+        {
+            stream.Load(new StringReader(frontMatter));
+        }
+        catch (YamlException exception)
+        {
+            throw new WorkflowConfigurationException(
+                $"Symphony workflow front matter is invalid: {exception.Message}",
+                exception);
+        }
+
+        if (stream.Documents[0].RootNode is not YamlMappingNode root)
+        {
+            throw new WorkflowConfigurationException(
+                "Symphony workflow front matter must be a YAML mapping.");
+        }
+        if (!TryGet(root, "studio", out var studioNode))
+        {
+            return;
+        }
+        var studio = RequireMapping(studioNode, "studio");
+        RejectUnknown(studio, "studio", "version", "planning", "flow_kinds", "advisory", "permissions");
+
+        ValidateMapping(studio, "planning", "studio.planning",
+            "max_steps", "max_dependencies_per_step", "max_assignment_characters");
+        if (TryGet(studio, "flow_kinds", out var flowKindsNode))
+        {
+            var flowKinds = RequireMapping(flowKindsNode, "studio.flow_kinds");
+            RejectUnknown(flowKinds, "studio.flow_kinds", "advisory", "delivery");
+            ValidateMapping(flowKinds, "advisory", "studio.flow_kinds.advisory",
+                "required_duties", "maximum_permission");
+            ValidateMapping(flowKinds, "delivery", "studio.flow_kinds.delivery",
+                "required_duties", "pre_review_maximum_permission",
+                "post_approval_maximum_permission");
+        }
+        ValidateMapping(studio, "advisory", "studio.advisory",
+            "artifact_directory", "max_artifact_count", "max_total_artifact_bytes");
+        if (TryGet(studio, "permissions", out var permissionsNode))
+        {
+            var permissions = RequireMapping(permissionsNode, "studio.permissions");
+            RejectUnknown(permissions, "studio.permissions",
+                "read_only_source", "workspace_write", "publish", "pre_mortem_read_only");
+            foreach (var key in new[]
+                     {
+                         "read_only_source", "workspace_write", "publish",
+                         "pre_mortem_read_only"
+                     })
+            {
+                ValidateMapping(
+                    permissions,
+                    key,
+                    $"studio.permissions.{key}",
+                    "additional_denied_tools");
+            }
+        }
+    }
+
+    private static void ValidateMapping(
+        YamlMappingNode parent,
+        string key,
+        string path,
+        params string[] allowed)
+    {
+        if (TryGet(parent, key, out var node))
+        {
+            RejectUnknown(RequireMapping(node, path), path, allowed);
+        }
+    }
+
+    private static YamlMappingNode RequireMapping(YamlNode node, string path) =>
+        node as YamlMappingNode
+        ?? throw new WorkflowConfigurationException(
+            $"{path} must be a YAML mapping and cannot be null.");
+
+    private static void RejectUnknown(
+        YamlMappingNode mapping,
+        string path,
+        params string[] allowed)
+    {
+        var accepted = allowed.ToHashSet(StringComparer.Ordinal);
+        foreach (var keyNode in mapping.Children.Keys)
+        {
+            var key = (keyNode as YamlScalarNode)?.Value ?? string.Empty;
+            if (!accepted.Contains(key))
+            {
+                throw new WorkflowConfigurationException(
+                    $"Unknown WORKFLOW.md field '{path}.{key}'.");
+            }
+        }
+    }
+
+    private static bool TryGet(
+        YamlMappingNode mapping,
+        string key,
+        out YamlNode value)
+    {
+        foreach (var pair in mapping.Children)
+        {
+            if (pair.Key is YamlScalarNode scalar &&
+                string.Equals(scalar.Value, key, StringComparison.Ordinal))
+            {
+                value = pair.Value;
+                return true;
+            }
+        }
+        value = null!;
+        return false;
     }
 
     private static (string FrontMatter, string Prompt) Split(string text)
@@ -231,6 +443,21 @@ public sealed class WorkflowLoader
             throw new WorkflowConfigurationException(
                 "outcome_verification must be a YAML mapping and cannot be null.");
         }
+        if (config.Studio is null ||
+            config.Studio.Planning is null ||
+            config.Studio.FlowKinds is null ||
+            config.Studio.FlowKinds.Advisory is null ||
+            config.Studio.FlowKinds.Delivery is null ||
+            config.Studio.Advisory is null ||
+            config.Studio.Permissions is null ||
+            config.Studio.Permissions.ReadOnlySource is null ||
+            config.Studio.Permissions.WorkspaceWrite is null ||
+            config.Studio.Permissions.Publish is null ||
+            config.Studio.Permissions.PreMortemReadOnly is null)
+        {
+            throw new WorkflowConfigurationException(
+                "studio and all of its declared sections must be YAML mappings and cannot be null.");
+        }
         if (config.Tracker.ActiveStates is null)
         {
             throw new WorkflowConfigurationException(
@@ -297,12 +524,134 @@ public sealed class WorkflowLoader
             throw new WorkflowConfigurationException(
                 "outcome_verification.max_rounds must be an integer from 1 through 10.");
         }
+        ValidateStudio(config.Studio);
         if (string.IsNullOrWhiteSpace(prompt))
         {
             throw new WorkflowConfigurationException(
                 "WORKFLOW.md must contain a non-empty prompt template.");
         }
     }
+
+    private static void ValidateStudio(StudioConfig studio)
+    {
+        if (studio.Version != 1)
+        {
+            throw new WorkflowConfigurationException("studio.version must be 1.");
+        }
+        if (studio.Planning.MaxSteps is < 1 or > 24)
+        {
+            throw new WorkflowConfigurationException(
+                "studio.planning.max_steps must be from 1 through 24.");
+        }
+        if (studio.Planning.MaxDependenciesPerStep is < 0 or > 8)
+        {
+            throw new WorkflowConfigurationException(
+                "studio.planning.max_dependencies_per_step must be from 0 through 8.");
+        }
+        if (studio.Planning.MaxAssignmentCharacters is < 1 or > 4_000)
+        {
+            throw new WorkflowConfigurationException(
+                "studio.planning.max_assignment_characters must be from 1 through 4000.");
+        }
+        RequireMinimumDuties(
+            studio.FlowKinds.Advisory.RequiredDuties,
+            [PlanDuty.PrepareOutcome],
+            "studio.flow_kinds.advisory.required_duties");
+        RequireMinimumDuties(
+            studio.FlowKinds.Delivery.RequiredDuties,
+            [PlanDuty.Implement, PlanDuty.Verify, PlanDuty.PrepareOutcome, PlanDuty.Publish],
+            "studio.flow_kinds.delivery.required_duties");
+        if (studio.FlowKinds.Advisory.MaximumPermission !=
+            ExecutionPermissionProfile.ReadOnlySource)
+        {
+            throw new WorkflowConfigurationException(
+                "studio.flow_kinds.advisory.maximum_permission cannot exceed ReadOnlySource.");
+        }
+        if (studio.FlowKinds.Delivery.PreReviewMaximumPermission ==
+                ExecutionPermissionProfile.PreMortemReadOnly ||
+            PermissionRank(studio.FlowKinds.Delivery.PreReviewMaximumPermission) >
+                PermissionRank(ExecutionPermissionProfile.WorkspaceWrite))
+        {
+            throw new WorkflowConfigurationException(
+                "studio.flow_kinds.delivery.pre_review_maximum_permission cannot exceed WorkspaceWrite.");
+        }
+        if (studio.FlowKinds.Delivery.PostApprovalMaximumPermission ==
+                ExecutionPermissionProfile.PreMortemReadOnly ||
+            PermissionRank(studio.FlowKinds.Delivery.PostApprovalMaximumPermission) >
+                PermissionRank(ExecutionPermissionProfile.Publish))
+        {
+            throw new WorkflowConfigurationException(
+                "studio.flow_kinds.delivery.post_approval_maximum_permission cannot exceed Publish.");
+        }
+        var advisoryArtifactSegments = studio.Advisory.ArtifactDirectory?
+            .Split(['\\', '/'], StringSplitOptions.None) ?? [];
+        if (string.IsNullOrWhiteSpace(studio.Advisory.ArtifactDirectory) ||
+            Path.IsPathRooted(studio.Advisory.ArtifactDirectory) ||
+            studio.Advisory.ArtifactDirectory.Contains(':', StringComparison.Ordinal) ||
+            advisoryArtifactSegments.Any(segment =>
+                string.IsNullOrWhiteSpace(segment) ||
+                segment is "." or ".." ||
+                segment.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
+                segment.Equals(".studio-host", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new WorkflowConfigurationException(
+                "studio.advisory.artifact_directory must be a relative path without traversal.");
+        }
+        if (studio.Advisory.MaxArtifactCount is < 1 or >
+            FlowOutcomeParser.HardMaximumArtifactCount)
+        {
+            throw new WorkflowConfigurationException(
+                $"studio.advisory.max_artifact_count must be from 1 through {FlowOutcomeParser.HardMaximumArtifactCount}.");
+        }
+        if (studio.Advisory.MaxTotalArtifactBytes is < 1 or >
+            FlowOutcomeParser.HardMaximumTotalArtifactBytes)
+        {
+            throw new WorkflowConfigurationException(
+                $"studio.advisory.max_total_artifact_bytes must be from 1 through {FlowOutcomeParser.HardMaximumTotalArtifactBytes}.");
+        }
+
+        foreach (var (path, restriction) in new[]
+                 {
+                     ("read_only_source", studio.Permissions.ReadOnlySource),
+                     ("workspace_write", studio.Permissions.WorkspaceWrite),
+                     ("publish", studio.Permissions.Publish),
+                     ("pre_mortem_read_only", studio.Permissions.PreMortemReadOnly)
+                 })
+        {
+            if (restriction.AdditionalDeniedTools is null ||
+                restriction.AdditionalDeniedTools.Any(string.IsNullOrWhiteSpace))
+            {
+                throw new WorkflowConfigurationException(
+                    $"studio.permissions.{path}.additional_denied_tools must be a sequence of non-empty tool names.");
+            }
+        }
+    }
+
+    private static void RequireMinimumDuties(
+        IReadOnlyCollection<PlanDuty>? configured,
+        IReadOnlyCollection<PlanDuty> required,
+        string path)
+    {
+        if (configured is null)
+        {
+            throw new WorkflowConfigurationException($"{path} must be a YAML sequence.");
+        }
+        var missing = required.Except(configured).ToList();
+        if (missing.Count > 0)
+        {
+            throw new WorkflowConfigurationException(
+                $"{path} cannot remove code-required duties: {string.Join(", ", missing)}.");
+        }
+    }
+
+    private static int PermissionRank(ExecutionPermissionProfile profile) => profile switch
+    {
+        ExecutionPermissionProfile.ReadOnlySource => 0,
+        ExecutionPermissionProfile.PreMortemReadOnly => 0,
+        ExecutionPermissionProfile.WorkspaceWrite => 1,
+        ExecutionPermissionProfile.Publish => 2,
+        _ => int.MaxValue
+    };
 }
 
 public sealed partial class WorkflowPromptRenderer

@@ -1862,6 +1862,20 @@ public sealed class CandidateFingerprintService(
     private static IReadOnlyList<OutcomeTrustedRepository> ReadTrustedRepositories(
         FlowRun flow)
     {
+        if (string.Equals(
+                flow.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) &&
+            flow.Kind == FlowKind.Delivery)
+        {
+            return StudioWorkspaceRepositoryMapLedger.Read(flow)
+                .Repositories
+                .Select(item => new OutcomeTrustedRepository(
+                    item.RelativePath,
+                    item.RemoteRepository))
+                .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+                .ToArray();
+        }
         if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
         {
             throw new CandidateValidationException(

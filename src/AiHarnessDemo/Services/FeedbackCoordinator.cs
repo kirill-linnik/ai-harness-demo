@@ -19,7 +19,8 @@ public sealed partial class FeedbackCoordinator(
     FlowQueue flowQueue,
     FlowLifecycleCoordinator lifecycle,
     CandidateFingerprintService? candidateFingerprintService = null,
-    WorkflowDefinitionProvider? workflowProvider = null)
+    WorkflowDefinitionProvider? workflowProvider = null,
+    FlowAgentSnapshotService? flowAgentSnapshotService = null)
 {
     [GeneratedRegex(
         @"(?im)^\s*REWORK_TARGET_ROLES\s*:\s*(?<roles>NONE|[a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)\s*$")]
@@ -52,6 +53,11 @@ public sealed partial class FeedbackCoordinator(
                        .Include(item => item.GateRecords)
                        .SingleOrDefaultAsync(item => item.Id == flowId, cancellationToken)
                    ?? throw new KeyNotFoundException($"Factory flow '{flowId}' was not found.");
+            if (flow.ContractVersion != "legacy-v1")
+            {
+                throw new InvalidOperationException(
+                    "studio-v2 feedback must be handled by the generic ReviewCoordinator.");
+            }
             if (flow.Status != FlowStatus.WaitingForFeedback)
             {
                 throw new InvalidOperationException(
@@ -74,10 +80,16 @@ public sealed partial class FeedbackCoordinator(
             };
             flow.Messages.Add(customerMessage);
             database.Entry(customerMessage).State = EntityState.Added;
-            productManager = await database.Agents
-                .AsNoTracking()
-                .SingleOrDefaultAsync(
-                    item => item.Role == "product-manager" && item.Enabled,
+            productManager = flowAgentSnapshotService is not null
+                ? (await flowAgentSnapshotService.GetAgentsAsync(
+                        flow.Id,
+                        cancellationToken))
+                    .SingleOrDefault(item =>
+                        item.Role == "product-manager" &&
+                        item.Enabled)
+                : await ResolveLegacyProductManagerAsync(
+                    database,
+                    flow.Id,
                     cancellationToken);
 
             if (productManager is not null)
@@ -85,6 +97,8 @@ public sealed partial class FeedbackCoordinator(
                 step = new FlowStep
                 {
                     FlowRunId = flow.Id,
+                    WorkflowRevision =
+                        workflowProvider?.GetEffective().Revision ?? string.Empty,
                     Iteration = flow.Iteration,
                     Sequence = flow.Steps
                         .Where(item => item.Iteration == flow.Iteration)
@@ -122,7 +136,11 @@ public sealed partial class FeedbackCoordinator(
                 step.Status = StepStatus.Running;
                 step.StartedAt = DateTimeOffset.UtcNow;
                 step.CopilotSessionId =
-                    AgentSessionIdentity.Create(flow.Id, flow.Iteration, productManager.Id);
+                    AgentSessionIdentity.Create(
+                        flow.Id,
+                        flow.Iteration,
+                        productManager.Id,
+                        step.PlanStepKey);
                 step.CopilotSessionHome = CopilotReasoningHost.ResolveCopilotSessionHome();
                 await database.SaveChangesAsync(cancellationToken);
             }
@@ -194,7 +212,8 @@ public sealed partial class FeedbackCoordinator(
                                     CancellationToken.None)
                                 .GetAwaiter()
                                 .GetResult(),
-                        InvocationStartedAt: step.StartedAt),
+                        InvocationStartedAt: step.StartedAt,
+                        FlowStepId: step.Id),
                     cancellationToken);
             }
             catch (Exception exception)
@@ -295,6 +314,46 @@ public sealed partial class FeedbackCoordinator(
         }
     }
 
+    private static async Task<AgentRecord?> ResolveLegacyProductManagerAsync(
+        HarnessDbContext database,
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        var snapshots = await database.FlowAgentSnapshots
+            .AsNoTracking()
+            .Where(item => item.FlowRunId == flowId)
+            .ToListAsync(cancellationToken);
+        if (snapshots.Count > 0)
+        {
+            var snapshot = snapshots.SingleOrDefault(item =>
+                item.Role == "product-manager" &&
+                item.EnabledAtSnapshot);
+            return snapshot is null
+                ? null
+                : new AgentRecord
+                {
+                    Id = snapshot.AgentId,
+                    Name = snapshot.Name,
+                    Description = snapshot.Description,
+                    Role = snapshot.Role,
+                    SourcePath = snapshot.SourceFileName,
+                    Enabled = true,
+                    Required = snapshot.Required,
+                    Switchable = snapshot.Switchable,
+                    DefinitionHash = snapshot.DefinitionHash,
+                    LoadedAt = snapshot.CapturedAt,
+                    UpdatedAt = snapshot.CapturedAt
+                };
+        }
+        return await database.Agents
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                item =>
+                    item.Role == "product-manager" &&
+                    item.Enabled,
+                cancellationToken);
+    }
+
     public async Task<FlowDecisionResponse> DecideAsync(
         Guid flowId,
         bool approve,
@@ -321,6 +380,11 @@ public sealed partial class FeedbackCoordinator(
                        .SingleOrDefaultAsync(item => item.Id == flowId, cancellationToken)
                    ?? throw new KeyNotFoundException($"Factory flow '{flowId}' was not found.");
 
+        if (flow.ContractVersion != "legacy-v1")
+        {
+            throw new InvalidOperationException(
+                "studio-v2 decisions must be handled by the generic ReviewCoordinator.");
+        }
         if (flow.Status != FlowStatus.WaitingForFeedback)
         {
             throw new InvalidOperationException("This flow is not waiting for a customer decision.");
@@ -444,7 +508,7 @@ public sealed partial class FeedbackCoordinator(
                         cancellationToken);
                 ApplyPreparedGate(superseded, pendingReleaseGate);
                 flow.OutcomeVerificationJson = nextOutcomeJson;
-                flow.Status = FlowStatus.Queued;
+                lifecycle.Transition(flow, FlowStatus.Queued);
                 flow.OutcomeUrl = string.Empty;
                 flow.OutcomeLabel = string.Empty;
                 flow.UpdatedAt = DateTimeOffset.UtcNow;
@@ -589,6 +653,9 @@ public sealed partial class FeedbackCoordinator(
             var publicationStep = new FlowStep
             {
                 FlowRunId = flow.Id,
+                WorkflowRevision =
+                    workflowProvider?.GetEffective().Revision ??
+                    releaseStep.WorkflowRevision,
                 Iteration = flow.Iteration,
                 Sequence = flow.Steps
                     .Where(item => item.Iteration == flow.Iteration)
@@ -599,6 +666,12 @@ public sealed partial class FeedbackCoordinator(
                 AgentName = releaseStep.AgentName,
                 AgentRole = releaseStep.AgentRole,
                 Label = WorkflowEngine.ApprovedPublicationLabel,
+                PlanDutiesJson = """["Publish"]""",
+                PlanStage = PlanStage.AfterApproval,
+                InvocationKind = ExecutionInvocationKind.Publication,
+                PermissionProfile = governed
+                    ? ExecutionPermissionProfile.WorkspaceWrite
+                    : ExecutionPermissionProfile.Publish,
                 Kind = governed
                     ? FlowStepKind.OutcomeApprovedPublication
                     : FlowStepKind.Standard,
@@ -621,7 +694,7 @@ public sealed partial class FeedbackCoordinator(
             publicationStep.StableSemanticRootId = publicationStep.Id;
             flow.Steps.Add(publicationStep);
             database.Entry(publicationStep).State = EntityState.Added;
-            flow.Status = FlowStatus.Queued;
+            lifecycle.Transition(flow, FlowStatus.Queued);
             flow.CompletedAt = null;
             var approvedEvent = new FlowEvent
             {
@@ -650,7 +723,7 @@ public sealed partial class FeedbackCoordinator(
                 flow.OutcomeVerificationJson = nextIterationOutcomeJson;
             }
             flow.Iteration++;
-            flow.Status = FlowStatus.Queued;
+            lifecycle.Transition(flow, FlowStatus.Queued);
             flow.OutcomeUrl = string.Empty;
             flow.OutcomeLabel = string.Empty;
             var reworkEvent = new FlowEvent
@@ -752,6 +825,7 @@ public sealed partial class FeedbackCoordinator(
                 "The prepared gate decision does not match the persisted release gate.");
         }
         tracked.Decision = prepared.Decision;
+        tracked.ReviewDecision = prepared.ReviewDecision;
         tracked.TrustLevelAtDecision = prepared.TrustLevelAtDecision;
         tracked.Summary = prepared.Summary;
         tracked.Evidence = prepared.Evidence;

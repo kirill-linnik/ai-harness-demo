@@ -183,6 +183,24 @@ public sealed class CopilotSessionJournalTests
         Assert.False(Directory.Exists(fixture.SessionDirectory));
         Assert.True(Directory.Exists(unrelatedDirectory));
     }
+
+    [Fact]
+    public async Task DeleteWorkspaceSessionsAsync_DoesNotDeleteKnownIdBoundElsewhere()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: true);
+        var journal = new CopilotSessionJournal();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            journal.DeleteWorkspaceSessionsAsync(
+                [fixture.CopilotHome],
+                Path.Combine(fixture.Root, "different-workspace"),
+                [fixture.SessionId]));
+
+        Assert.Contains("not bound to the flow workspace", exception.Message);
+        Assert.True(Directory.Exists(fixture.SessionDirectory));
+    }
 }
 
 public sealed class WorkflowRestartRecoveryTests
@@ -210,6 +228,274 @@ public sealed class WorkflowRestartRecoveryTests
         Assert.Contains(
             await database.FlowEvents.ToListAsync(),
             item => item.Type == "step.session-output-recovered");
+    }
+
+    [Fact]
+    public async Task StudioV2Recovery_CompletesJournalAttemptOnceWithoutRefreshingSnapshot()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: false,
+            contractVersion: "studio-v2");
+        var stagedRoot = AgentManifestStager.GetSessionRoot(
+            fixture.CopilotHome,
+            fixture.SessionId);
+        Directory.CreateDirectory(stagedRoot);
+        await File.WriteAllTextAsync(
+            Path.Combine(stagedRoot, "sensitive-marker.txt"),
+            "SENSITIVE_RECOVERED_PROMPT");
+
+        var first = await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+        var second = await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+
+        await using var database = await fixture.DatabaseFactory.CreateDbContextAsync();
+        var flow = await database.Flows
+            .Include(item => item.Steps)
+            .Include(item => item.AgentSnapshots)
+            .Include(item => item.GateRecords)
+            .Include(item => item.Events)
+            .SingleAsync();
+        var step = Assert.Single(flow.Steps);
+        Assert.Contains(flow.Id, first);
+        Assert.Contains(flow.Id, second);
+        Assert.Equal(FlowStatus.Queued, flow.Status);
+        Assert.Equal(StepStatus.Completed, step.Status);
+        Assert.Single(flow.AgentSnapshots);
+        Assert.Single(flow.GateRecords);
+        Assert.Single(
+            flow.Events,
+            item => item.Type == "step.session-output-recovered");
+        Assert.False(Directory.Exists(stagedRoot));
+    }
+
+    public static TheoryData<ExecutionInvocationKind, string>
+        StudioInvocationJournalContracts => new()
+        {
+            {
+                ExecutionInvocationKind.Intake,
+                IntakeContract(
+                    IntakeV2Status.AwaitingConfirmation,
+                    FlowKind.Delivery)
+            },
+            {
+                ExecutionInvocationKind.BlockerExplanation,
+                IntakeContract(
+                    IntakeV2Status.NeedsClarification,
+                    flowKind: null,
+                    emptyBrief: true)
+            },
+            {
+                ExecutionInvocationKind.PreMortem,
+                """
+                PRE_MORTEM_STATUS: CLEAR
+                PRE_MORTEM_FINDINGS_V1_BEGIN
+                {"Version":"pre-mortem-findings-v1","Findings":[]}
+                PRE_MORTEM_FINDINGS_V1_END
+                """
+            },
+            {
+                ExecutionInvocationKind.Planning,
+                PlanningContract()
+            },
+            {
+                ExecutionInvocationKind.ReviewClassification,
+                ReviewContract()
+            }
+        };
+
+    [Theory]
+    [MemberData(nameof(StudioInvocationJournalContracts))]
+    public async Task StudioRecovery_AppliesValidInvocationContractOnceWithoutAgentRerun(
+        ExecutionInvocationKind invocationKind,
+        string output)
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: false,
+            contractVersion: "studio-v2",
+            invocationKind: invocationKind,
+            completedOutput: output);
+
+        await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+        await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+
+        await using var database =
+            await fixture.DatabaseFactory.CreateDbContextAsync();
+        var flow = await database.Flows
+            .Include(item => item.Steps)
+            .Include(item => item.GateRecords)
+            .Include(item => item.Events)
+            .SingleAsync();
+        var step = Assert.Single(flow.Steps);
+        Assert.Equal(invocationKind, step.InvocationKind);
+        Assert.Equal(StepStatus.Completed, step.Status);
+        Assert.Single(flow.GateRecords);
+        Assert.Single(
+            flow.Events,
+            item => item.Type == "step.session-output-recovered");
+    }
+
+    [Fact]
+    public async Task StudioRecovery_InvalidCompletedIntakeRemainsFailedAndManualRetryKeepsKind()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: true,
+            contractVersion: "studio-v2",
+            invocationKind: ExecutionInvocationKind.Intake,
+            completedOutput:
+                "HANDOFF_STATUS: COMPLETE without intake-v2");
+
+        await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+
+        await using (var database =
+                     await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var failed = await database.Flows
+                .Include(item => item.Steps)
+                .Include(item => item.GateRecords)
+                .SingleAsync();
+            Assert.Equal(FlowStatus.Failed, failed.Status);
+            Assert.Equal(
+                StepStatus.Failed,
+                Assert.Single(failed.Steps).Status);
+            Assert.Empty(failed.GateRecords);
+        }
+
+        var restarted = await fixture.Engine.RestartFailedFlowAsync(
+            fixture.FlowId,
+            CancellationToken.None);
+        var retry = Assert.Single(
+            restarted.Steps,
+            item => item.Label.StartsWith(
+                "Manual restart of",
+                StringComparison.Ordinal));
+        Assert.Equal(
+            ExecutionInvocationKind.Intake,
+            retry.InvocationKind);
+        Assert.Null(retry.CopilotSessionId);
+        Assert.Equal(FlowStatus.Queued, restarted.Status);
+    }
+
+    [Fact]
+    public async Task StudioRecovery_OutcomeOwnerRequiresAndAppliesFlowOutcomeContract()
+    {
+        const string output = """
+            HANDOFF_STATUS: COMPLETE
+            FLOW_OUTCOME_V1_BEGIN
+            {"Version":"flow-outcome-v1","Goal":"Recover the outcome.","Summary":"The durable outcome is complete.","ImplementationDetails":["Apply the recovered result exactly once."],"Artifacts":[]}
+            FLOW_OUTCOME_V1_END
+            """;
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: false,
+            contractVersion: "studio-v2",
+            invocationKind: ExecutionInvocationKind.Worker,
+            completedOutput: output,
+            isOutcomeOwner: true);
+
+        await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+
+        await using var database =
+            await fixture.DatabaseFactory.CreateDbContextAsync();
+        var flow = await database.Flows
+            .Include(item => item.Steps)
+            .SingleAsync();
+        Assert.True(
+            Assert.Single(flow.Steps).Status == StepStatus.Completed,
+            flow.FailureReason +
+            Environment.NewLine +
+            string.Join(
+                Environment.NewLine,
+                await database.FlowEvents
+                    .Where(item => item.FlowRunId == flow.Id)
+                    .Select(item => item.Message)
+                    .ToListAsync()));
+        Assert.Contains(
+            "Recover the outcome.",
+            flow.OutcomeContractJson,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StudioV2Recovery_QueuesInterruptedAttemptForSameSessionResume()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false,
+            persistSessionId: true,
+            contractVersion: "studio-v2");
+        var stagedRoot = AgentManifestStager.GetSessionRoot(
+            fixture.CopilotHome,
+            fixture.SessionId);
+        Directory.CreateDirectory(stagedRoot);
+        await File.WriteAllTextAsync(
+            Path.Combine(stagedRoot, "sensitive-marker.txt"),
+            "SENSITIVE_RESUMABLE_PROMPT");
+
+        var recovered = await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+
+        await using var database = await fixture.DatabaseFactory.CreateDbContextAsync();
+        var flow = await database.Flows
+            .Include(item => item.Steps)
+            .Include(item => item.AgentSnapshots)
+            .Include(item => item.Events)
+            .SingleAsync();
+        var step = Assert.Single(flow.Steps);
+        Assert.Contains(flow.Id, recovered);
+        Assert.Equal(FlowStatus.Queued, flow.Status);
+        Assert.Equal(StepStatus.Pending, step.Status);
+        Assert.Equal(AgentRunPhase.CanceledByReconciliation, step.Phase);
+        Assert.Equal(fixture.SessionId, step.CopilotSessionId);
+        Assert.Single(flow.AgentSnapshots);
+        Assert.Contains(
+            flow.Events,
+            item => item.Type == "step.resume-queued");
+        Assert.True(Directory.Exists(stagedRoot));
+    }
+
+    [Fact]
+    public async Task StudioV2Recovery_MissingPersistedPromptFailsClosedBeforeRerun()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false,
+            persistSessionId: true,
+            contractVersion: "studio-v2");
+        await using (var database =
+                     await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var step = await database.FlowSteps.SingleAsync();
+            step.ExecutionPrompt = string.Empty;
+            await database.SaveChangesAsync();
+        }
+
+        var recovered = await fixture.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+
+        Assert.DoesNotContain(fixture.FlowId, recovered);
+        await using var verification =
+            await fixture.DatabaseFactory.CreateDbContextAsync();
+        var flow = await verification.Flows
+            .Include(item => item.Steps)
+            .Include(item => item.Events)
+            .SingleAsync();
+        Assert.Equal(FlowStatus.Failed, flow.Status);
+        Assert.Equal(
+            StepStatus.Failed,
+            Assert.Single(flow.Steps).Status);
+        Assert.Contains(
+            flow.Events,
+            item =>
+                item.Type == "step.recovery-failed" &&
+                item.Message.Contains(
+                    "no persisted exact execution prompt",
+                    StringComparison.Ordinal));
     }
 
     [Fact]
@@ -990,6 +1276,75 @@ public sealed class WorkflowRestartRecoveryTests
             restarted.Events,
             item => item.Type == "flow.completed-output-recovered");
     }
+
+    private static string IntakeContract(
+        IntakeV2Status status,
+        FlowKind? flowKind,
+        bool emptyBrief = false) =>
+        IntakeV2Parser.BeginSentinel +
+        Environment.NewLine +
+        IntakeV2Parser.Serialize(new IntakeV2Document
+        {
+            Version = IntakeV2Parser.Version,
+            Status = status,
+            FlowKind = flowKind,
+            TaskTitle = "Recover intake",
+            CustomerReply = "The recovered intake result is valid.",
+            Brief = new IntakeV2Brief
+            {
+                Goal = emptyBrief ? string.Empty : "Recover the intake.",
+                Details = emptyBrief ? [] : ["Keep the durable request."],
+                SuccessCriteria = emptyBrief ? [] : ["The brief is preserved."],
+                Constraints = [],
+                Assumptions = []
+            }
+        }) +
+        Environment.NewLine +
+        IntakeV2Parser.EndSentinel;
+
+    private static string PlanningContract()
+    {
+        var document = new TeamPlanDocument
+        {
+            Version = TeamPlanParser.Version,
+            Disposition = TeamPlanDisposition.MissingQualification,
+            Steps = [],
+            PreMortemCheckpoints = [],
+            MissingQualification = new MissingQualification
+            {
+                Summary = "A specialist is required.",
+                Missing = ["Specialist analysis"],
+                WhyRequired = "The work cannot be planned safely.",
+                SuggestedAgent = new SuggestedAgent
+                {
+                    Id = "specialist",
+                    Name = "Specialist",
+                    Description = "Performs the required analysis."
+                }
+            }
+        };
+        return "HANDOFF_STATUS: COMPLETE" +
+               Environment.NewLine +
+               TeamPlanParser.BeginSentinel +
+               Environment.NewLine +
+               TeamPlanParser.Serialize(document) +
+               Environment.NewLine +
+               TeamPlanParser.EndSentinel;
+    }
+
+    private static string ReviewContract() =>
+        ReviewFeedbackParser.BeginSentinel +
+        Environment.NewLine +
+        ReviewFeedbackParser.Serialize(new ReviewFeedbackDocument
+        {
+            Version = ReviewFeedbackParser.Version,
+            Intent = ReviewIntent.Ambiguous,
+            CustomerReply = "Please clarify the requested review decision.",
+            Refinement = null,
+            ExplicitImplementationAdoption = false
+        }) +
+        Environment.NewLine +
+        ReviewFeedbackParser.EndSentinel;
 }
 
 internal sealed class RecoveryFixture : IAsyncDisposable
@@ -1040,7 +1395,12 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         bool completed,
         bool persistSessionId,
         bool includeShutdown = true,
-        bool includeToolCall = false)
+        bool includeToolCall = false,
+        string contractVersion = "legacy-v1",
+        ExecutionInvocationKind invocationKind =
+            ExecutionInvocationKind.Worker,
+        string? completedOutput = null,
+        bool isOutcomeOwner = false)
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -1051,7 +1411,47 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         var databasePath = Path.Combine(root, "harness.db");
         Directory.CreateDirectory(agentsDirectory);
         Directory.CreateDirectory(workspacePath);
-        var sessionId = Guid.NewGuid();
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "WORKFLOW.md"),
+            """
+            ---
+            workspace:
+              root: workspace
+            agent:
+              max_concurrent_agents: 1
+              max_attempts: 1
+            studio:
+              version: 1
+              planning:
+                max_steps: 24
+                max_dependencies_per_step: 8
+                max_assignment_characters: 4000
+              flow_kinds:
+                advisory:
+                  required_duties: [PrepareOutcome]
+                  maximum_permission: ReadOnlySource
+                delivery:
+                  required_duties: [Implement, Verify, PrepareOutcome, Publish]
+                  pre_review_maximum_permission: WorkspaceWrite
+                  post_approval_maximum_permission: Publish
+              advisory:
+                artifact_directory: .studio\advisory
+                max_artifact_count: 8
+                max_total_artifact_bytes: 65536
+            ---
+
+            {{ task }}
+            """);
+        var flowId = Guid.NewGuid();
+        var (agentId, agentName, agentRole, planStepKey) =
+            InvocationIdentity(invocationKind);
+        var sessionId = contractVersion == "studio-v2"
+            ? AgentSessionIdentity.Create(
+                flowId,
+                1,
+                agentId,
+                planStepKey)
+            : Guid.NewGuid();
         var sessionDirectory = Path.Combine(
             copilotHome,
             "session-state",
@@ -1064,7 +1464,9 @@ internal sealed class RecoveryFixture : IAsyncDisposable
                 workspacePath,
                 completed,
                 includeShutdown,
-                includeToolCall));
+                includeToolCall,
+                agentName,
+                completedOutput));
 
         var options = new DbContextOptionsBuilder<HarnessDbContext>()
             .UseSqlite($"Data Source={databasePath};Pooling=False")
@@ -1072,10 +1474,12 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         var databaseFactory = new TestDbContextFactory(options);
         var flow = new FlowRun
         {
+            Id = flowId,
             Title = "Recover implementation",
             OriginalRequest = "Recover implementation",
             ConsolidatedRequest = "Complete the implementation.",
             Status = FlowStatus.Running,
+            ContractVersion = contractVersion,
             RepositoryPath = root,
             RepositoryKnowledge = "Test repository.",
             WorkspacePath = workspacePath
@@ -1085,20 +1489,72 @@ internal sealed class RecoveryFixture : IAsyncDisposable
             FlowRunId = flow.Id,
             Iteration = 1,
             Sequence = 40,
-            AgentId = "software-engineer",
-            AgentName = "Software Engineer",
-            AgentRole = "software-engineer",
+            AgentId = agentId,
+            AgentName = agentName,
+            AgentRole = agentRole,
+            PlanStepKey = contractVersion == "studio-v2"
+                ? planStepKey
+                : string.Empty,
+            PlanDutiesJson = contractVersion == "studio-v2"
+                ? invocationKind == ExecutionInvocationKind.Planning
+                    ? """["Analyze","Design"]"""
+                    : """["Analyze"]"""
+                : "[]",
+            InvocationKind = invocationKind,
+            IsOutcomeOwner = isOutcomeOwner,
             Label = "Execute Software Engineer contract",
             Status = StepStatus.Running,
             Phase = AgentRunPhase.StreamingTurn,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
             CopilotSessionId = persistSessionId ? sessionId : null,
-            CopilotSessionHome = copilotHome
+            CopilotSessionHome = copilotHome,
+            ExecutionPrompt = contractVersion == "studio-v2"
+                ? "Original durable execution prompt."
+                : string.Empty,
+            WorkflowRevision = contractVersion == "studio-v2"
+                ? new string('A', 64)
+                : string.Empty
         });
+        if (contractVersion == "studio-v2")
+        {
+            flow.AgentSnapshots.Add(new FlowAgentSnapshot
+            {
+                FlowRunId = flow.Id,
+                AgentId = agentId,
+                Name = agentName,
+                Description = "Performs the recovered work.",
+                Role = agentRole,
+                Instructions = "Complete the assignment.",
+                DefinitionHash = "sha256:recovery",
+                EnabledAtSnapshot = true,
+                SourceFileName = $"{agentId}.agent.md"
+            });
+        }
         await using (var database = await databaseFactory.CreateDbContextAsync())
         {
             await database.Database.EnsureCreatedAsync();
             database.Flows.Add(flow);
+            if (contractVersion == "studio-v2")
+            {
+                database.TaskProfiles.Add(new TaskProfile
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = flow.Steps.Single().Id,
+                    Iteration = flow.Iteration,
+                    PlanStepKey = planStepKey,
+                    AgentId = agentId,
+                    Role = agentRole,
+                    Complexity = 4,
+                    ReasoningDepth = 4,
+                    ContextDemand = 4,
+                    ToolIntensity = 2,
+                    TaskTypeTagsJson = """["CrossCutting"]""",
+                    Risk = TaskRisk.Low,
+                    RiskReason = "Recovery fixture.",
+                    Confidence = 1,
+                    RationalesJson = """["Recovery fixture."]"""
+                });
+            }
             await database.SaveChangesAsync();
         }
 
@@ -1148,7 +1604,9 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         string workspacePath,
         bool completed,
         bool includeShutdown,
-        bool includeToolCall)
+        bool includeToolCall,
+        string agentName,
+        string? completedOutput)
     {
         var startedAt = DateTimeOffset.UtcNow.AddMinutes(-4);
         var events = new List<string>
@@ -1169,8 +1627,8 @@ internal sealed class RecoveryFixture : IAsyncDisposable
                 startedAt.AddSeconds(1),
                 new
                 {
-                    agentName = "Software Engineer",
-                    agentDisplayName = "Software Engineer"
+                    agentName,
+                    agentDisplayName = agentName
                 }),
             Serialize(
                 "assistant.turn_start",
@@ -1216,8 +1674,8 @@ internal sealed class RecoveryFixture : IAsyncDisposable
                 new
                 {
                     turnId = "0",
-                    content =
-                        "HANDOFF_STATUS: COMPLETE\n\n## Decision\n\nImplementation is complete.",
+                    content = completedOutput ??
+                              "HANDOFF_STATUS: COMPLETE\n\n## Decision\n\nImplementation is complete.",
                     toolRequests = Array.Empty<object>()
                 }));
             events.Add(Serialize(
@@ -1245,6 +1703,36 @@ internal sealed class RecoveryFixture : IAsyncDisposable
 
         return string.Join(Environment.NewLine, events) + Environment.NewLine;
     }
+
+    private static (
+        string AgentId,
+        string AgentName,
+        string AgentRole,
+        string PlanStepKey) InvocationIdentity(
+        ExecutionInvocationKind invocationKind) =>
+        invocationKind switch
+        {
+            ExecutionInvocationKind.Intake =>
+                ("account-manager", "Account Manager", "account-manager",
+                    "account-manager:intake"),
+            ExecutionInvocationKind.BlockerExplanation =>
+                ("account-manager", "Account Manager", "account-manager",
+                    MissingQualificationCoordinator.AccountManagerPlanStepKey),
+            ExecutionInvocationKind.PreMortem =>
+                (WorkflowEngine.PreMortemRole, "Pre-mortem Sceptic",
+                    WorkflowEngine.PreMortemRole, "pre-mortem:recover"),
+            ExecutionInvocationKind.Planning =>
+                ("team-lead", "Team Lead", "team-lead",
+                    WorkflowEngine.TeamLeadPlanStepKey),
+            ExecutionInvocationKind.ReviewClassification =>
+                ("account-manager", "Account Manager", "account-manager",
+                    "account-manager:review-classification:recovery"),
+            ExecutionInvocationKind.Publication =>
+                ("publisher", "Publisher", "publisher", "publish"),
+            _ =>
+                ("software-engineer", "Software Engineer",
+                    "software-engineer", "implement")
+        };
 
     internal static string Serialize(
         string type,

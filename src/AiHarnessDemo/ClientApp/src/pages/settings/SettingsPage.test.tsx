@@ -39,7 +39,12 @@ const bootstrap: BootstrapDto = {
   },
   workflow: {
     ready: true,
+    currentFileValid: true,
+    hasEffectiveDefinition: true,
     sourcePath: "E:\\projects\\demo\\WORKFLOW.md",
+    effectiveLoadedAt: timestamp,
+    effectiveRevision: "workflow-test",
+    currentFileError: null,
     loadedAt: timestamp,
     lastError: null,
     maxConcurrentAgents: 1,
@@ -47,6 +52,20 @@ const bootstrap: BootstrapDto = {
     workspaceRoot: "E:\\projects\\demo\\data\\worktrees",
     outcomeVerificationEnabled: true,
     outcomeVerificationMaxRounds: 3
+  },
+  agentCatalog: {
+    ready: true,
+    hasEffectiveCatalog: true,
+    effectiveRevision: "catalog-test",
+    loadedAt: timestamp,
+    lastError: null,
+    validDefinitionCount: 0,
+    invalidDefinitionCount: 0
+  },
+  admission: {
+    ready: true,
+    failures: [],
+    checkedAt: timestamp
   },
   factoryEnabled: true,
   factoryDisabledReason: ""
@@ -58,6 +77,25 @@ afterEach(() => {
 });
 
 describe("SettingsPage model strategy", () => {
+  it("offers only persisted Delivery outcomes", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter>
+            <SettingsPage />
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByRole("button", { name: "Commit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pull request" })).toBeInTheDocument();
+    expect(screen.queryByText("None")).not.toBeInTheDocument();
+  });
+
   it("shows the repository-owned outcome verification round policy read-only", () => {
     const queryClient = new QueryClient();
     queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
@@ -131,5 +169,131 @@ describe("SettingsPage model strategy", () => {
     await waitFor(() =>
       expect(save).toHaveBeenCalledWith(expect.objectContaining({ modelSelectionStrategy: "LowestCost" }))
     );
+  });
+
+  it("shows catalog readiness, exact diagnostics, and disables required core toggles", async () => {
+    const reload = vi.spyOn(api, "reloadAgentCatalog").mockResolvedValue({
+      status: {
+        ready: false,
+        hasEffectiveCatalog: true,
+        effectiveRevision: "ABC",
+        loadedAt: timestamp,
+        lastError: "Required agent definition is malformed.",
+        validDefinitionCount: 1,
+        invalidDefinitionCount: 1
+      },
+      agents: []
+    });
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, {
+      ...bootstrap,
+      agents: [
+        {
+          id: "account-manager",
+          name: "Account Manager",
+          description: "Intake",
+          role: "account-manager",
+          accent: "amber",
+          enabled: true,
+          sortOrder: 10,
+          definitionStatus: "Valid",
+          validationError: "",
+          required: true,
+          switchable: false,
+          definitionHash: "A",
+          loadedAt: timestamp
+        },
+        {
+          id: "team-lead",
+          name: "Team Lead",
+          description: "Plans the work",
+          role: "team-lead",
+          accent: "blue",
+          enabled: true,
+          sortOrder: 20,
+          definitionStatus: "Valid",
+          validationError: "",
+          required: true,
+          switchable: false,
+          definitionHash: "B",
+          loadedAt: timestamp
+        },
+        {
+          id: "pre-mortem-sceptic",
+          name: "Pre-mortem Sceptic",
+          description: "Challenges planned work",
+          role: "pre-mortem-sceptic",
+          accent: "red",
+          enabled: false,
+          sortOrder: 30,
+          definitionStatus: "Valid",
+          validationError: "",
+          required: true,
+          switchable: true,
+          definitionHash: "C",
+          loadedAt: timestamp
+        },
+        {
+          id: "optional",
+          name: "Optional",
+          description: "",
+          role: "optional",
+          accent: "violet",
+          enabled: true,
+          sortOrder: 500,
+          definitionStatus: "Invalid",
+          validationError: "description is required",
+          required: false,
+          switchable: true,
+          definitionHash: "",
+          loadedAt: timestamp
+        }
+      ],
+      agentCatalog: {
+        ready: false,
+        hasEffectiveCatalog: true,
+        effectiveRevision: "ABC",
+        loadedAt: timestamp,
+        lastError: "Required agent definition is malformed.",
+        validDefinitionCount: 3,
+        invalidDefinitionCount: 1
+      },
+      admission: {
+        ready: false,
+        failures: ["Agent catalog is not ready."],
+        checkedAt: timestamp
+      }
+    } satisfies BootstrapDto);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter>
+            <SettingsPage />
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(screen.getAllByText("Required")).toHaveLength(2);
+    expect(screen.getByTitle("Account Manager is required").querySelector("input")).toBeDisabled();
+    expect(screen.getByTitle("Team Lead is required").querySelector("input")).toBeDisabled();
+    expect(screen.getByText("Required definition · Optional execution")).toBeInTheDocument();
+    expect(screen.getByLabelText("Enable Pre-mortem Sceptic")).toBeEnabled();
+    expect(
+      screen.getByLabelText("Optional has an invalid definition and cannot be enabled")
+    ).toBeDisabled();
+    expect(
+      screen.getByLabelText("Optional has an invalid definition and cannot be enabled")
+    ).not.toBeChecked();
+    expect(screen.getByRole("heading", { name: "Symphony workflow contract" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Available agents" })).toBeInTheDocument();
+    expect(screen.getByText("Effective last-known-good")).toBeInTheDocument();
+    expect(screen.getByText("Effective catalog revision")).toBeInTheDocument();
+    expect(screen.getByText("Concurrent flows")).toBeInTheDocument();
+    expect(screen.queryByText("Concurrent agents")).not.toBeInTheDocument();
+    expect(screen.getByText("description is required")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reload catalog" }));
+    await waitFor(() => expect(reload).toHaveBeenCalledOnce());
   });
 });

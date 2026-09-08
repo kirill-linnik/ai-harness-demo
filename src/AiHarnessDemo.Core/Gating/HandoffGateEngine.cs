@@ -1,3 +1,5 @@
+using AiHarnessDemo.Core.Domain;
+
 namespace AiHarnessDemo.Core.Gating;
 
 /// <summary>How much autonomy an agent action currently has.</summary>
@@ -13,7 +15,8 @@ public enum HandoffActionType
     Advance,
     RequestRevision,
     Release,
-    OutcomeResolution
+    OutcomeResolution,
+    CustomerReview
 }
 
 public enum HandoffBlastRadius
@@ -61,6 +64,8 @@ public sealed class HandoffGateRecord
     public HandoffActionType ActionType { get; set; }
 
     public HandoffGateDecision Decision { get; set; }
+
+    public ReviewDecision? ReviewDecision { get; set; }
 
     public HandoffTrustLevel TrustLevelAtDecision { get; set; }
 
@@ -147,6 +152,10 @@ public sealed class HandoffGateEngine : IDisposable
 
     public HandoffTrustLevel GetTrustLevel(HandoffActionType actionType)
     {
+        if (actionType == HandoffActionType.CustomerReview)
+        {
+            return HandoffTrustLevel.Gated;
+        }
         lock (_lock)
         {
             return _trustLevels.GetValueOrDefault(actionType, HandoffTrustLevel.Shadow);
@@ -155,8 +164,17 @@ public sealed class HandoffGateEngine : IDisposable
 
     public void SetTrustLevel(HandoffActionType actionType, HandoffTrustLevel trustLevel)
     {
+        if (actionType == HandoffActionType.CustomerReview &&
+            trustLevel != HandoffTrustLevel.Gated)
+        {
+            throw new InvalidOperationException(
+                "CustomerReview is human-gated and must remain at Gated trust.");
+        }
         if (trustLevel == HandoffTrustLevel.Auto &&
-            actionType is HandoffActionType.Release or HandoffActionType.OutcomeResolution)
+            actionType is
+                HandoffActionType.Release or
+                HandoffActionType.OutcomeResolution or
+                HandoffActionType.CustomerReview)
         {
             throw new InvalidOperationException(
                 $"{actionType} is human-gated and can never receive automatic trust.");
@@ -168,13 +186,43 @@ public sealed class HandoffGateEngine : IDisposable
         }
     }
 
+    public HandoffGateRecord PrepareReviewResolution(
+        HandoffGateRecord record,
+        ReviewDecision decision,
+        string resolvedBy,
+        string? note = null,
+        DateTimeOffset? resolvedAt = null)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        if (record.ActionType != HandoffActionType.CustomerReview)
+        {
+            throw new InvalidOperationException(
+                $"Gate record {record.Id} is not a customer review.");
+        }
+        if (!Enum.IsDefined(decision))
+        {
+            throw new ArgumentOutOfRangeException(nameof(decision));
+        }
+
+        var resolved = PrepareResolutionCore(
+            record,
+            decision is ReviewDecision.Accepted or ReviewDecision.PromotedToDelivery,
+            resolvedBy,
+            note,
+            resolvedAt);
+        resolved.ReviewDecision = decision;
+        return resolved;
+    }
+
     public HandoffGateRecord SubmitProposal(HandoffProposal proposal)
     {
         lock (_lock)
         {
-            var trustLevel = _trustLevels.GetValueOrDefault(
-                proposal.ActionType,
-                HandoffTrustLevel.Shadow);
+            var trustLevel = proposal.ActionType == HandoffActionType.CustomerReview
+                ? HandoffTrustLevel.Gated
+                : _trustLevels.GetValueOrDefault(
+                    proposal.ActionType,
+                    HandoffTrustLevel.Shadow);
             var decision = Decide(proposal, trustLevel);
             var record = new HandoffGateRecord
             {
@@ -219,6 +267,27 @@ public sealed class HandoffGateEngine : IDisposable
         DateTimeOffset? resolvedAt = null)
     {
         ArgumentNullException.ThrowIfNull(record);
+        if (record.ActionType == HandoffActionType.CustomerReview)
+        {
+            throw new InvalidOperationException(
+                "CustomerReview must be resolved with a typed ReviewDecision.");
+        }
+        return PrepareResolutionCore(
+            record,
+            approved,
+            resolvedBy,
+            note,
+            resolvedAt);
+    }
+
+    private static HandoffGateRecord PrepareResolutionCore(
+        HandoffGateRecord record,
+        bool approved,
+        string resolvedBy,
+        string? note,
+        DateTimeOffset? resolvedAt)
+    {
+        ArgumentNullException.ThrowIfNull(record);
         if (record.Decision != HandoffGateDecision.AwaitingHumanApproval)
         {
             throw new InvalidOperationException(
@@ -243,6 +312,7 @@ public sealed class HandoffGateEngine : IDisposable
             FlowStepId = record.FlowStepId,
             ActionType = record.ActionType,
             Decision = record.Decision,
+            ReviewDecision = record.ReviewDecision,
             TrustLevelAtDecision = record.TrustLevelAtDecision,
             Summary = record.Summary,
             Evidence = record.Evidence,
@@ -305,6 +375,7 @@ public sealed class HandoffGateEngine : IDisposable
             FlowStepId = record.FlowStepId,
             ActionType = record.ActionType,
             Decision = record.Decision,
+            ReviewDecision = record.ReviewDecision,
             TrustLevelAtDecision = record.TrustLevelAtDecision,
             Summary = record.Summary,
             Evidence = record.Evidence,
@@ -354,6 +425,7 @@ public sealed class HandoffGateEngine : IDisposable
         destination.FlowStepId = source.FlowStepId;
         destination.ActionType = source.ActionType;
         destination.Decision = source.Decision;
+        destination.ReviewDecision = source.ReviewDecision;
         destination.TrustLevelAtDecision = source.TrustLevelAtDecision;
         destination.Summary = source.Summary;
         destination.Evidence = source.Evidence;
@@ -373,6 +445,10 @@ public sealed class HandoffGateEngine : IDisposable
         if (_killSwitchEngaged)
         {
             return HandoffGateDecision.BlockedKillSwitch;
+        }
+        if (proposal.ActionType == HandoffActionType.CustomerReview)
+        {
+            return HandoffGateDecision.AwaitingHumanApproval;
         }
         if (trustLevel == HandoffTrustLevel.Shadow)
         {
@@ -402,6 +478,9 @@ public sealed class HandoffGateEngine : IDisposable
         HandoffGateDecision.AwaitingHumanApproval
             when proposal.ActionType == HandoffActionType.OutcomeResolution =>
             "Operator resolution is required before outcome verification can continue.",
+        HandoffGateDecision.AwaitingHumanApproval
+            when proposal.ActionType == HandoffActionType.CustomerReview =>
+            "Customer review requires an explicit durable human decision.",
         HandoffGateDecision.AwaitingHumanApproval =>
             "The proposal is gated because its trust level or blast radius requires human approval.",
         HandoffGateDecision.AutoApproved

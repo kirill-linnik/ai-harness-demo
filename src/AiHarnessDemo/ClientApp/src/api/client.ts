@@ -6,6 +6,8 @@
 // - Returns null for 204 No Content.
 
 export class ApiError extends Error {
+  public readonly extensions: Readonly<Record<string, unknown>>;
+
   constructor(
     message: string,
     public readonly status: number,
@@ -13,7 +15,23 @@ export class ApiError extends Error {
   ) {
     super(message);
     this.name = "ApiError";
+    this.extensions = extractProblemExtensions(payload);
   }
+}
+
+function extractProblemExtensions(payload: unknown): Readonly<Record<string, unknown>> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
+  const standardProblemFields = new Set([
+    "type",
+    "title",
+    "status",
+    "detail",
+    "instance",
+    "message"
+  ]);
+  return Object.fromEntries(
+    Object.entries(payload).filter(([key]) => !standardProblemFields.has(key))
+  );
 }
 
 export interface RequestOptions {

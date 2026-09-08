@@ -6,7 +6,90 @@ namespace AiHarnessDemo.Core.Domain;
 public enum OutcomeType
 {
     Commit,
-    PullRequest
+    PullRequest,
+    None
+}
+
+public static class OutcomeTypeRules
+{
+    public static OutcomeType RequireDelivery(
+        OutcomeType outcome,
+        string parameterName = "outcome")
+    {
+        if (!Enum.IsDefined(outcome) || outcome == OutcomeType.None)
+        {
+            throw new ArgumentException(
+                "A persisted Delivery outcome must be Commit or PullRequest.",
+                parameterName);
+        }
+        return outcome;
+    }
+}
+
+public enum FlowKind
+{
+    Advisory,
+    Delivery
+}
+
+public enum FlowLinkKind
+{
+    AdvisoryPromotion,
+    QualificationRosterRepair,
+    QualificationScopeRevision
+}
+
+public enum PlanDuty
+{
+    Analyze,
+    Design,
+    Implement,
+    Verify,
+    PrepareOutcome,
+    Publish
+}
+
+public enum PlanStage
+{
+    BeforeReview,
+    AfterApproval
+}
+
+public enum ExecutionPermissionProfile
+{
+    ReadOnlySource,
+    WorkspaceWrite,
+    Publish,
+    PreMortemReadOnly
+}
+
+/// <summary>
+/// Host-owned lifecycle purpose for an agent turn. This value is assigned by orchestration code,
+/// never by an agent manifest or plan document, and is the authorization input used alongside
+/// flow kind, stage, and duties.
+/// </summary>
+public enum ExecutionInvocationKind
+{
+    Intake,
+    Planning,
+    Worker,
+    PreMortem,
+    ReviewClassification,
+    BlockerExplanation,
+    Publication
+}
+
+public enum ReviewDecision
+{
+    Accepted,
+    RefinementRequested,
+    PromotedToDelivery
+}
+
+public enum AgentDefinitionStatus
+{
+    Valid,
+    Invalid
 }
 
 public enum ModelSelectionStrategy
@@ -50,7 +133,8 @@ public enum FlowStatus
     Abandoning,
     Approved,
     Abandoned,
-    Failed
+    Failed,
+    Blocked
 }
 
 public enum StepStatus
@@ -121,6 +205,18 @@ public sealed class AgentRecord
 
     public bool Enabled { get; set; } = true;
 
+    public AgentDefinitionStatus DefinitionStatus { get; set; } = AgentDefinitionStatus.Valid;
+
+    public string ValidationError { get; set; } = string.Empty;
+
+    public bool Required { get; set; }
+
+    public bool Switchable { get; set; } = true;
+
+    public string DefinitionHash { get; set; } = string.Empty;
+
+    public DateTimeOffset LoadedAt { get; set; } = DateTimeOffset.UtcNow;
+
     public int SortOrder { get; set; }
 
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -135,6 +231,34 @@ public sealed class FlowRun
     public required string OriginalRequest { get; set; }
 
     public string ConsolidatedRequest { get; set; } = string.Empty;
+
+    public FlowKind Kind { get; set; } = FlowKind.Delivery;
+
+    public string ContractVersion { get; set; } = "legacy-v1";
+
+    public Guid? ParentFlowRunId { get; set; }
+
+    public FlowRun? ParentFlowRun { get; set; }
+
+    public int? ParentIteration { get; set; }
+
+    public FlowLinkKind? LinkKind { get; set; }
+
+    public string AgentCatalogRevision { get; set; } = string.Empty;
+
+    public string? OutcomeOwnerPlanStepKey { get; set; }
+
+    public string? PublicationPlanStepKey { get; set; }
+
+    public string OutcomeContractJson { get; set; } = string.Empty;
+
+    public string? CurrentBlockerCode { get; set; }
+
+    public string? CurrentBlockerSummary { get; set; }
+
+    public string? CurrentBlockerDataJson { get; set; }
+
+    public string? CustomerBlockerMessage { get; set; }
 
     public FlowStatus Status { get; set; } = FlowStatus.Intake;
 
@@ -179,6 +303,12 @@ public sealed class FlowRun
     public List<HandoffGateRecord> GateRecords { get; set; } = [];
 
     public List<TaskProfile> TaskProfiles { get; set; } = [];
+
+    public List<FlowRun> LinkedFlowRuns { get; set; } = [];
+
+    public List<FlowAgentSnapshot> AgentSnapshots { get; set; } = [];
+
+    public List<FlowPlanDocument> PlanDocuments { get; set; } = [];
 }
 
 public sealed class FlowStep
@@ -200,6 +330,24 @@ public sealed class FlowStep
     public required string AgentRole { get; set; }
 
     public string Label { get; set; } = string.Empty;
+
+    public string PlanStepKey { get; set; } = string.Empty;
+
+    public string PlanDutiesJson { get; set; } = "[]";
+
+    public PlanStage PlanStage { get; set; } = PlanStage.BeforeReview;
+
+    public bool IsOutcomeOwner { get; set; }
+
+    public ExecutionPermissionProfile PermissionProfile { get; set; } =
+        ExecutionPermissionProfile.WorkspaceWrite;
+
+    public ExecutionInvocationKind InvocationKind { get; set; } =
+        ExecutionInvocationKind.Worker;
+
+    public string EffectivePermissionJson { get; set; } = string.Empty;
+
+    public string WorkflowRevision { get; set; } = string.Empty;
 
     public FlowStepKind Kind { get; set; } = FlowStepKind.Standard;
 
@@ -228,6 +376,8 @@ public sealed class FlowStep
     public string InputSummary { get; set; } = string.Empty;
 
     public string ExecutionPrompt { get; set; } = string.Empty;
+
+    public string ReviewClassificationStateJson { get; set; } = string.Empty;
 
     public Guid? CopilotSessionId { get; set; }
 
@@ -272,6 +422,10 @@ public sealed class TaskProfile
     public int Iteration { get; set; }
 
     public Guid? FlowStepId { get; set; }
+
+    public string PlanStepKey { get; set; } = string.Empty;
+
+    public string AgentId { get; set; } = string.Empty;
 
     public string Version { get; set; } = "task-profile-v1";
 
@@ -523,6 +677,56 @@ public sealed class FlowEvent
     public required string Type { get; set; }
 
     public required string Message { get; set; }
+
+    public string? DataJson { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class FlowAgentSnapshot
+{
+    public Guid FlowRunId { get; set; }
+
+    public FlowRun? FlowRun { get; set; }
+
+    public required string AgentId { get; set; }
+
+    public required string Name { get; set; }
+
+    public required string Description { get; set; }
+
+    public required string Role { get; set; }
+
+    public required string Instructions { get; set; }
+
+    public required string DefinitionHash { get; set; }
+
+    public bool EnabledAtSnapshot { get; set; }
+
+    public bool Required { get; set; }
+
+    public bool Switchable { get; set; }
+
+    public required string SourceFileName { get; set; }
+
+    public DateTimeOffset CapturedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class FlowPlanDocument
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid FlowRunId { get; set; }
+
+    public FlowRun? FlowRun { get; set; }
+
+    public int Iteration { get; set; }
+
+    public required string Version { get; set; }
+
+    public required string Disposition { get; set; }
+
+    public required string RawJson { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

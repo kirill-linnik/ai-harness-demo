@@ -423,7 +423,7 @@ public sealed class AgentCatalogTests
             Produce working code.
             """;
 
-        var manifest = AgentCatalog.Parse(
+        var manifest = AgentCatalogLoader.Parse(
             "software-engineer",
             "software-engineer.agent.md",
             content);
@@ -601,13 +601,68 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
+    public void StudioRecoverableOutput_DispatchesByInvocationKindNotAgentRole()
+    {
+        var confirmedIntake =
+            IntakeV2Parser.BeginSentinel +
+            Environment.NewLine +
+            IntakeV2Parser.Serialize(new IntakeV2Document
+            {
+                Version = IntakeV2Parser.Version,
+                Status = IntakeV2Status.Confirmed,
+                FlowKind = FlowKind.Delivery,
+                TaskTitle = "Implement recovery",
+                CustomerReply = "The implementation is confirmed.",
+                Brief = new IntakeV2Brief
+                {
+                    Goal = "Implement recovery.",
+                    Details = ["Preserve invocation kind."],
+                    SuccessCriteria = ["Recovery is deterministic."],
+                    Constraints = [],
+                    Assumptions = []
+                }
+            }) +
+            Environment.NewLine +
+            IntakeV2Parser.EndSentinel;
+
+        Assert.True(CopilotReasoningHost.IsRecoverableCompletedOutput(
+            "account-manager",
+            confirmedIntake,
+            contractVersion: "studio-v2",
+            invocationKind: ExecutionInvocationKind.Intake));
+        Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
+            "account-manager",
+            confirmedIntake,
+            contractVersion: "studio-v2",
+            invocationKind:
+                ExecutionInvocationKind.BlockerExplanation));
+        Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
+            "team-lead",
+            "HANDOFF_STATUS: COMPLETE",
+            contractVersion: "studio-v2",
+            invocationKind: ExecutionInvocationKind.Planning));
+        Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
+            "account-manager",
+            "HANDOFF_STATUS: COMPLETE",
+            contractVersion: "studio-v2",
+            invocationKind:
+                ExecutionInvocationKind.ReviewClassification));
+        Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
+            "outcome-writer",
+            "HANDOFF_STATUS: COMPLETE",
+            contractVersion: "studio-v2",
+            invocationKind: ExecutionInvocationKind.Worker,
+            isOutcomeOwner: true));
+    }
+
+    [Fact]
     public void AccountManagerInvocation_IsReadOnlyAndPreservesUserConfiguration()
     {
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\worktree",
             @"C:\harness",
             "account-manager",
-            "account-manager",
+            ExecutionInvocationKind.Intake,
             "claude-sonnet-5",
             "low",
             Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
@@ -637,7 +692,7 @@ public sealed class CopilotReasoningHostTests
             @"C:\worktree",
             @"C:\harness",
             "pre-mortem-sceptic",
-            "pre-mortem-sceptic",
+            ExecutionInvocationKind.PreMortem,
             "gpt-5.6-sol",
             "max",
             Guid.Parse("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
@@ -664,19 +719,22 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
-    public void DeliveryAgentInvocation_PreservesCliToolsAndUserConfiguration()
+    public void DeliveryAgentInvocation_UsesExplicitToolsAndDisablesExtensions()
     {
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\worktree",
             @"C:\harness",
             "software-engineer",
-            "software-engineer",
+            ExecutionInvocationKind.Worker,
             "gpt-5.4-mini",
             "medium",
             Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
             "Prompt");
 
-        Assert.Contains("--allow-all-tools", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+        Assert.Contains(
+            $"--available-tools={CopilotReasoningHost.GovernedNonPublicationTools()}",
+            arguments);
         Assert.Contains(
             Enumerable.Range(0, arguments.Count - 1),
             index =>
@@ -689,8 +747,8 @@ public sealed class CopilotReasoningHostTests
             index =>
                 arguments[index] == "--session-id" &&
                 arguments[index + 1] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
-        Assert.DoesNotContain("--available-tools", arguments);
-        Assert.DoesNotContain("--disable-builtin-mcps", arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.Contains("--no-custom-instructions", arguments);
     }
 
     [Fact]
@@ -700,7 +758,7 @@ public sealed class CopilotReasoningHostTests
             @"C:\worktree",
             @"C:\harness",
             "software-engineer",
-            "software-engineer",
+            ExecutionInvocationKind.Worker,
             "model-with-default-effort",
             "default",
             Guid.Parse("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
@@ -714,7 +772,7 @@ public sealed class CopilotReasoningHostTests
     {
         var guarded = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
             CopilotReasoningHost.BuildProcessEnvironment(
-                "release-engineer",
+                ExecutionInvocationKind.Worker,
                 allowRemotePublication: false));
 
         Assert.Null(guarded["GH_TOKEN"]);
@@ -723,10 +781,10 @@ public sealed class CopilotReasoningHostTests
         Assert.Equal(string.Empty, guarded["GIT_CONFIG_VALUE_1"]);
         Assert.Equal("remote.origin.pushurl", guarded["GIT_CONFIG_KEY_0"]);
         Assert.Null(CopilotReasoningHost.BuildProcessEnvironment(
-            "release-engineer",
+            ExecutionInvocationKind.Publication,
             allowRemotePublication: true));
-        Assert.Null(CopilotReasoningHost.BuildProcessEnvironment(
-            "software-engineer",
+        Assert.NotNull(CopilotReasoningHost.BuildProcessEnvironment(
+            ExecutionInvocationKind.Worker,
             allowRemotePublication: false));
     }
 
@@ -742,14 +800,14 @@ public sealed class CopilotReasoningHostTests
         var environment =
             Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
                 CopilotReasoningHost.BuildProcessEnvironment(
-                    role,
+                    ExecutionInvocationKind.Worker,
                     allowRemotePublication: true,
                     isGovernedOutcomeVerification: true));
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\worktree",
             @"C:\harness",
             role,
-            role,
+            ExecutionInvocationKind.Worker,
             "model",
             "high",
             Guid.Parse("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
@@ -824,7 +882,7 @@ public sealed class CopilotReasoningHostTests
             @"C:\worktree",
             @"C:\harness",
             "release-engineer",
-            "release-engineer",
+            ExecutionInvocationKind.Worker,
             "model",
             "high",
             Guid.Parse("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
@@ -848,14 +906,17 @@ public sealed class CopilotReasoningHostTests
             @"C:\worktree",
             @"C:\harness",
             "release-engineer",
-            "release-engineer",
+            ExecutionInvocationKind.Worker,
             "model",
             "high",
             Guid.Parse("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
             "Prepare the local candidate.",
             blockRemotePublication: true);
 
-        Assert.Contains("--allow-all-tools", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+        Assert.Contains(
+            $"--available-tools={CopilotReasoningHost.GovernedNonPublicationTools()}",
+            arguments);
         Assert.Contains("--deny-tool=shell(git push)", arguments);
         Assert.Contains("--deny-tool=shell(git send-pack)", arguments);
         Assert.Contains("--deny-tool=shell(gh:*)", arguments);
@@ -867,7 +928,7 @@ public sealed class CopilotReasoningHostTests
     {
         var guarded = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
             CopilotReasoningHost.BuildProcessEnvironment(
-                "pre-mortem-sceptic",
+                ExecutionInvocationKind.PreMortem,
                 allowRemotePublication: false));
 
         Assert.Null(guarded["GH_TOKEN"]);
@@ -884,7 +945,7 @@ public sealed class CopilotReasoningHostTests
             @"C:\worktree",
             @"C:\harness",
             role,
-            role,
+            ExecutionInvocationKind.Worker,
             "model",
             "high",
             Guid.Parse("ffffffff-ffff-4fff-8fff-ffffffffffff"),
@@ -901,7 +962,7 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("--allow-tool=write", arguments);
         Assert.Contains("--allow-tool=shell", arguments);
         Assert.Contains(
-            "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS",
+            "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,GH_ENTERPRISE_TOKEN,GITHUB_ENTERPRISE_TOKEN,GITHUB_TOKEN_REQUEST_URL,GITHUB_TOKEN_REQUEST_TOKEN,SSH_AUTH_SOCK,GIT_ASKPASS,SSH_ASKPASS",
             arguments);
         Assert.Contains("--disable-builtin-mcps", arguments);
         Assert.DoesNotContain("--allow-all-tools", arguments);
@@ -958,19 +1019,21 @@ public sealed class CopilotReasoningHostTests
             $"restricted-agent-{Guid.NewGuid():N}");
         var harnessRoot = Path.Combine(root, "harness");
         var copilotHome = Path.Combine(root, "copilot");
-        var sourceDirectory = Path.Combine(harnessRoot, ".github", "agents");
-        Directory.CreateDirectory(sourceDirectory);
-        var source = Path.Combine(
-            sourceDirectory,
-            "pre-mortem-sceptic.agent.md");
-        await File.WriteAllTextAsync(source, "# Pre-mortem Sceptic");
+        Directory.CreateDirectory(harnessRoot);
 
         try
         {
-            var access = await CopilotReasoningHost.PrepareRestrictedAgentRootAsync(
+            var access = await new AgentManifestStager().StageAsync(
                 copilotHome,
-                "pre-mortem-sceptic",
-                source,
+                new AgentManifest(
+                    "pre-mortem-sceptic",
+                    "Pre-mortem Sceptic",
+                    "Independent review.",
+                    "pre-mortem-sceptic",
+                    "rose",
+                    85,
+                    "ignored.agent.md",
+                    "# Pre-mortem Sceptic"),
                 Guid.Parse("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"));
             var files = Directory.GetFiles(
                 access.Root,
@@ -992,22 +1055,40 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
-    public void StagedAgentDefinition_RemovesModelOverride()
+    public async Task StagedAgentDefinition_RebuildsSafeFrontmatter()
     {
-        var sanitized = CopilotReasoningHost.RemoveAgentModelFrontMatter(
-            """
-            ---
-            name: Pre-mortem Sceptic
-            model: claude-opus-5
-            description: Independent review.
-            ---
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"safe-agent-{Guid.NewGuid():N}");
+        try
+        {
+            var access = await new AgentManifestStager().StageAsync(
+                root,
+                new AgentManifest(
+                    "crafted",
+                    "Crafted",
+                    "Safe description",
+                    "worker",
+                    "blue",
+                    10,
+                    "ignored.agent.md",
+                    "tools: ['shell']\nmcps: ['publisher']\n# Contract"),
+                Guid.NewGuid());
+            var content = await File.ReadAllTextAsync(
+                Directory.GetFiles(
+                    access.Root,
+                    "*.agent.md",
+                    SearchOption.AllDirectories).Single());
 
-            # Contract
-            """);
-
-        Assert.DoesNotContain("model:", sanitized);
-        Assert.Contains("name: Pre-mortem Sceptic", sanitized);
-        Assert.Contains("# Contract", sanitized);
+            Assert.DoesNotContain("model:", content);
+            Assert.Equal(2, content.Split("---").Length - 1);
+            Assert.StartsWith("---\nname: \"Crafted\"\ndescription: \"Safe description\"\n---", content.ReplaceLineEndings("\n"));
+            Assert.Contains("# Contract", content);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
     }
 
     [Fact]
@@ -1052,7 +1133,7 @@ public sealed class CopilotReasoningHostTests
             @"C:\worktree",
             @"C:\harness",
             "software-engineer",
-            "software-engineer",
+            ExecutionInvocationKind.Worker,
             "gpt-5.4-mini",
             "high",
             sessionId,
@@ -1921,6 +2002,21 @@ public sealed class PersistenceTests
         Assert.Contains("OutcomeQaRound", columns);
         Assert.Contains("OutcomePlanHash", columns);
         Assert.Contains("StableSemanticRootId", columns);
+        Assert.Contains("PlanStepKey", columns);
+        Assert.Contains("PlanDutiesJson", columns);
+        Assert.Contains("PlanStage", columns);
+        Assert.Contains("IsOutcomeOwner", columns);
+        Assert.Contains("PermissionProfile", columns);
+        Assert.Contains("InvocationKind", columns);
+        Assert.Contains("EffectivePermissionJson", columns);
+        Assert.Contains("WorkflowRevision", columns);
+        await using var invocationDefaultProbe = connection.CreateCommand();
+        invocationDefaultProbe.CommandText =
+            "SELECT dflt_value FROM pragma_table_info('FlowSteps') " +
+            "WHERE name = 'InvocationKind';";
+        Assert.Equal(
+            "'Worker'",
+            await invocationDefaultProbe.ExecuteScalarAsync());
         await using var backfillProbe = connection.CreateCommand();
         backfillProbe.CommandText =
             "SELECT RetryOfStepId FROM FlowSteps WHERE Id = 'retry-step';";
@@ -2092,6 +2188,65 @@ public sealed class PersistenceTests
             RemotePublicationAllowed = true,
             Status = StepStatus.Pending
         };
+        var accountManager = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = -10,
+            AgentId = "account-manager",
+            AgentName = "Account Manager",
+            AgentRole = "account-manager",
+            Label = "Review customer intake",
+            Status = StepStatus.Completed
+        };
+        var preMortem = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 25,
+            AgentId = "pre-mortem-sceptic",
+            AgentName = "Pre-mortem Sceptic",
+            AgentRole = WorkflowEngine.PreMortemRole,
+            Label = "Pre-mortem review of Software Engineer (round 1)",
+            Status = StepStatus.Completed,
+            PreMortemOriginStepId = deliveryStep.Id,
+            PreMortemTargetStepId = deliveryStep.Id
+        };
+        var preMortemRevision = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            Sequence = 27,
+            AgentId = "software-engineer",
+            AgentName = "Software Engineer",
+            AgentRole = "software-engineer",
+            Label = "Revise after pre-mortem review",
+            Status = StepStatus.Completed,
+            PreMortemReviewStepId = preMortem.Id
+        };
+        var rejectedGateSource = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 2,
+            Sequence = 5,
+            AgentId = "release-engineer",
+            AgentName = "Release Engineer",
+            AgentRole = "release-engineer",
+            Label = "Rejected release review",
+            Status = StepStatus.Completed
+        };
+        var rejectedReleaseCandidate = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 2,
+            Sequence = 10,
+            AgentId = "release-engineer",
+            AgentName = "Release Engineer",
+            AgentRole = "release-engineer",
+            Label = "Unapproved legacy publication candidate",
+            RemotePublicationAllowed = true,
+            Status = StepStatus.Pending
+        };
         var plan = new OutcomeAcceptancePlan(
             OutcomeVerificationRules.AcceptanceVersion,
             [
@@ -2203,23 +2358,94 @@ public sealed class PersistenceTests
         state.VerifiedAt = now;
         flow.OutcomeVerificationJson =
             OutcomeVerificationRules.SerializeAggregate(state);
+        flow.GateRecords.AddRange(
+            new HandoffGateRecord
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = releaseStep.Id,
+                ActionType = HandoffActionType.Release,
+                Decision = HandoffGateDecision.AwaitingHumanApproval,
+                TrustLevelAtDecision = HandoffTrustLevel.Gated,
+                Resolved = true,
+                Approved = true
+            },
+            new HandoffGateRecord
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = rejectedGateSource.Id,
+                ActionType = HandoffActionType.Release,
+                Decision = HandoffGateDecision.AwaitingHumanApproval,
+                TrustLevelAtDecision = HandoffTrustLevel.Gated,
+                Resolved = true,
+                Approved = false
+            });
 
         database.Flows.Add(flow);
         database.FlowSteps.AddRange(
+            accountManager,
             planStep,
             deliveryStep,
+            preMortem,
+            preMortemRevision,
             releaseStep,
             qaStep,
             qaRetry,
             planCorrection,
             ownerCorrection,
             candidateRefresh,
-            publication);
+            publication,
+            rejectedGateSource,
+            rejectedReleaseCandidate);
         await database.SaveChangesAsync();
 
         await database.Database.ExecuteSqlRawAsync(
-            "UPDATE FlowSteps SET Kind = 'Standard', OutcomeQaRound = NULL, OutcomePlanHash = '', StableSemanticRootId = NULL;");
+            """
+            UPDATE FlowSteps
+            SET Kind = 'Standard',
+                OutcomeQaRound = NULL,
+                OutcomePlanHash = '',
+                StableSemanticRootId = NULL;
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE FlowStepsLegacy AS
+            SELECT Id, FlowRunId, Iteration, Sequence, AgentId, AgentName,
+                   AgentRole, Label, Kind, OutcomeQaRound, OutcomePlanHash,
+                   StableSemanticRootId, Model, ModelEffort, ModelReason,
+                   RemotePublicationAllowed, Status, Phase, Attempt,
+                   ExecutionAttempts, InputSummary, ExecutionPrompt,
+                   CopilotSessionId, CopilotSessionHome, OutputSummary,
+                   PushbackReason, RetryOfStepId, DependsOnStepId,
+                   PushbackRootStepId, PreMortemOriginStepId,
+                   PreMortemTargetStepId, PreMortemReviewStepId, StartedAt,
+                   CompletedAt, DurationMilliseconds
+            FROM FlowSteps;
+            DROP TABLE FlowSteps;
+            ALTER TABLE FlowStepsLegacy RENAME TO FlowSteps;
+            PRAGMA foreign_keys = ON;
+            """);
 
+        database.ChangeTracker.Clear();
+        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
+        database.ChangeTracker.Clear();
+        var firstRejectedBackfill = await database.FlowSteps
+            .AsNoTracking()
+            .SingleAsync(item =>
+                item.Id == rejectedReleaseCandidate.Id);
+        Assert.Equal(
+            ExecutionInvocationKind.Worker,
+            firstRejectedBackfill.InvocationKind);
+        Assert.False(firstRejectedBackfill.RemotePublicationAllowed);
+        await database.Database.ExecuteSqlInterpolatedAsync(
+            $"""
+             UPDATE FlowSteps
+             SET PlanDutiesJson = '["Publish"]',
+                 PlanStage = 'AfterApproval',
+                 PermissionProfile = 'Publish',
+                 InvocationKind = 'Publication'
+             WHERE Id = {rejectedReleaseCandidate.Id};
+             """);
+
+        database.ChangeTracker.Clear();
+        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
         await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
         database.ChangeTracker.Clear();
 
@@ -2231,6 +2457,24 @@ public sealed class PersistenceTests
         Assert.Equal(FlowStepKind.OutcomePlan, reloaded[planStep.Label].Kind);
         Assert.Equal(snapshot.Hash, reloaded[planStep.Label].OutcomePlanHash);
         Assert.NotNull(reloaded[planStep.Label].StableSemanticRootId);
+        Assert.Equal(
+            ExecutionInvocationKind.Intake,
+            reloaded[accountManager.Label].InvocationKind);
+        Assert.Equal(
+            ExecutionPermissionProfile.ReadOnlySource,
+            reloaded[accountManager.Label].PermissionProfile);
+        Assert.Equal(
+            """["Analyze"]""",
+            reloaded[accountManager.Label].PlanDutiesJson);
+        Assert.Equal(
+            ExecutionInvocationKind.Planning,
+            reloaded[planStep.Label].InvocationKind);
+        Assert.Equal(
+            ExecutionPermissionProfile.ReadOnlySource,
+            reloaded[planStep.Label].PermissionProfile);
+        Assert.Equal(
+            """["Analyze","Design"]""",
+            reloaded[planStep.Label].PlanDutiesJson);
 
         Assert.Equal(
             FlowStepKind.OutcomeDelivery,
@@ -2272,5 +2516,38 @@ public sealed class PersistenceTests
             reloaded[publication.Label].Kind);
         Assert.Equal(1, reloaded[publication.Label].OutcomeQaRound);
         Assert.Equal(snapshot.Hash, reloaded[publication.Label].OutcomePlanHash);
+        Assert.Equal(
+            ExecutionInvocationKind.Publication,
+            reloaded[publication.Label].InvocationKind);
+        Assert.Equal(
+            PlanStage.AfterApproval,
+            reloaded[publication.Label].PlanStage);
+        Assert.Equal(
+            """["Publish"]""",
+            reloaded[publication.Label].PlanDutiesJson);
+        Assert.Equal(
+            ExecutionPermissionProfile.WorkspaceWrite,
+            reloaded[publication.Label].PermissionProfile);
+        Assert.Equal(
+            ExecutionInvocationKind.PreMortem,
+            reloaded[preMortem.Label].InvocationKind);
+        Assert.Equal(
+            ExecutionPermissionProfile.PreMortemReadOnly,
+            reloaded[preMortem.Label].PermissionProfile);
+        Assert.Equal(
+            ExecutionInvocationKind.Worker,
+            reloaded[preMortemRevision.Label].InvocationKind);
+        Assert.Equal(
+            ExecutionPermissionProfile.WorkspaceWrite,
+            reloaded[preMortemRevision.Label].PermissionProfile);
+        Assert.Equal(
+            ExecutionInvocationKind.Worker,
+            reloaded[rejectedReleaseCandidate.Label].InvocationKind);
+        Assert.Equal(
+            PlanStage.BeforeReview,
+            reloaded[rejectedReleaseCandidate.Label].PlanStage);
+        Assert.False(
+            reloaded[rejectedReleaseCandidate.Label]
+                .RemotePublicationAllowed);
     }
 }

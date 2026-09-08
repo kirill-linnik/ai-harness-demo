@@ -1,10 +1,15 @@
 using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Data;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Orchestration;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
 
 namespace AiHarnessDemo.Api;
 
@@ -21,6 +26,8 @@ public static class DemoApi
         api.MapPut("/settings", SaveSettingsAsync);
         api.MapGet("/agents", GetAgentsAsync);
         api.MapPut("/agents/{agentId}", ToggleAgentAsync);
+        api.MapGet("/agent-catalog", GetAgentCatalog);
+        api.MapPost("/agent-catalog/reload", ReloadAgentCatalogAsync);
         api.MapGet("/directories", ListDirectories);
         api.MapPost("/repositories/analyze", AnalyzeRepositoryAsync);
         api.MapPost("/intake", ContinueIntakeAsync);
@@ -28,6 +35,14 @@ public static class DemoApi
         api.MapGet("/flows/{flowId:guid}", GetFlowAsync);
         api.MapPost("/flows/{flowId:guid}/start", StartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/restart", RestartFlowAsync);
+        api.MapPost("/flows/{flowId:guid}/review", ReviewFlowAsync);
+        api.MapGet("/flows/{flowId:guid}/review-result", GetReviewResultAsync);
+        api.MapPost(
+            "/flows/{flowId:guid}/qualification-resolution",
+            ResolveQualificationAsync);
+        api.MapGet(
+            "/flows/{flowId:guid}/artifacts/{artifactId}/{**path}",
+            GetFlowArtifactAsync);
         api.MapPost("/flows/{flowId:guid}/feedback", AddFeedbackAsync);
         api.MapPost("/flows/{flowId:guid}/decision", DecideFlowAsync);
         api.MapPost(
@@ -78,13 +93,21 @@ public static class DemoApi
         WorkflowDefinitionProvider workflowProvider,
         CopilotCliRuntime copilotCliRuntime,
         ModelCatalogDiscovery modelCatalog,
+        NewWorkAdmissionService admissionService,
         CancellationToken cancellationToken)
     {
-        var agents = await catalog.SyncAsync(cancellationToken);
+        var agents = catalog.List();
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var settings = await database.Settings.AsNoTracking().SingleAsync(cancellationToken);
         var flows = await database.Flows
             .AsNoTracking()
+            .AsSplitQuery()
+            .Include(item => item.Steps)
+            .Include(item => item.GateRecords)
+            .Include(item => item.LinkedFlowRuns)
+            .ThenInclude(item => item.Steps)
+            .Include(item => item.LinkedFlowRuns)
+            .ThenInclude(item => item.GateRecords)
             .OrderByDescending(item => item.UpdatedAt)
             .Take(100)
             .ToListAsync(cancellationToken);
@@ -96,6 +119,7 @@ public static class DemoApi
         var stats = new HarnessStatsDto(
             flows.Count,
             flows.Count(item => item.Status is
+                FlowStatus.Intake or
                 FlowStatus.Queued or
                 FlowStatus.Running or
                 FlowStatus.Reworking or
@@ -108,11 +132,10 @@ public static class DemoApi
             workflow.Config.Copilot.Command,
             cancellationToken);
         var workflowStatus = workflowProvider.Status();
-        var factoryDisabledReason = FactoryDisabledReason(
-            settings,
-            copilotCli,
-            modelCatalog.Current,
-            workflowStatus);
+        var admission = await admissionService.GetStatusAsync(cancellationToken);
+        var factoryDisabledReason = admission.Ready
+            ? string.Empty
+            : string.Join(" ", admission.Failures);
 
         return Results.Ok(new BootstrapDto(
             settings.ToDto(),
@@ -123,6 +146,8 @@ public static class DemoApi
             ToDto(copilotCli),
             ToDto(modelCatalog.Current),
             ToDto(workflowStatus),
+            ToDto(catalog.Status()),
+            ToDto(admission),
             string.IsNullOrEmpty(factoryDisabledReason),
             factoryDisabledReason));
     }
@@ -141,6 +166,7 @@ public static class DemoApi
         IDbContextFactory<HarnessDbContext> databaseFactory,
         CancellationToken cancellationToken)
     {
+        ValidateSaveSettingsRequest(request);
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var settings = await database.Settings.SingleAsync(cancellationToken);
         if (request.RepositoryPath is not null)
@@ -171,30 +197,48 @@ public static class DemoApi
         return Results.Ok(settings.ToDto());
     }
 
-    private static async Task<IResult> GetAgentsAsync(
+    internal static void ValidateSaveSettingsRequest(
+        SaveSettingsRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        _ = OutcomeTypeRules.RequireDelivery(
+            request.Outcome,
+            nameof(request.Outcome));
+    }
+
+    private static IResult GetAgentsAsync(AgentCatalog catalog)
+    {
+        var agents = catalog.List();
+        return Results.Ok(agents.Select(item => item.ToDto()));
+    }
+
+    private static IResult GetAgentCatalog(AgentCatalog catalog) =>
+        Results.Ok(new AgentCatalogDto(
+            ToDto(catalog.Status()),
+            catalog.List().Select(item => item.ToDto()).ToList()));
+
+    private static async Task<IResult> ReloadAgentCatalogAsync(
         AgentCatalog catalog,
+        FlowAgentSnapshotService snapshots,
         CancellationToken cancellationToken)
     {
-        var agents = await catalog.SyncAsync(cancellationToken);
-        return Results.Ok(agents.Select(item => item.ToDto()));
+        var status = await catalog.ReloadAsync(cancellationToken);
+        if (status.Ready)
+        {
+            await snapshots.MigrateLegacyNonterminalAsync(cancellationToken);
+        }
+        return Results.Ok(new AgentCatalogDto(
+            ToDto(status),
+            catalog.List().Select(item => item.ToDto()).ToList()));
     }
 
     private static async Task<IResult> ToggleAgentAsync(
         string agentId,
         ToggleAgentRequest request,
         AgentCatalog catalog,
-        IDbContextFactory<HarnessDbContext> databaseFactory,
         CancellationToken cancellationToken)
     {
-        await catalog.SyncAsync(cancellationToken);
-        await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
-        var agent = await database.Agents.SingleOrDefaultAsync(
-                        item => item.Id == agentId,
-                        cancellationToken)
-                    ?? throw new KeyNotFoundException($"Agent '{agentId}' was not found.");
-        agent.Enabled = request.Enabled;
-        agent.UpdatedAt = DateTimeOffset.UtcNow;
-        await database.SaveChangesAsync(cancellationToken);
+        var agent = await catalog.ToggleAsync(agentId, request.Enabled, cancellationToken);
         return Results.Ok(agent.ToDto());
     }
 
@@ -232,6 +276,13 @@ public static class DemoApi
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var flows = await database.Flows
             .AsNoTracking()
+            .AsSplitQuery()
+            .Include(item => item.Steps)
+            .Include(item => item.GateRecords)
+            .Include(item => item.LinkedFlowRuns)
+            .ThenInclude(item => item.Steps)
+            .Include(item => item.LinkedFlowRuns)
+            .ThenInclude(item => item.GateRecords)
             .OrderByDescending(item => item.UpdatedAt)
             .Take(200)
             .ToListAsync(cancellationToken);
@@ -241,18 +292,92 @@ public static class DemoApi
     private static async Task<IResult> GetFlowAsync(
         Guid flowId,
         IDbContextFactory<HarnessDbContext> databaseFactory,
+        PreviewArtifactCatalog artifactCatalog,
+        IReviewedCandidateService reviewedCandidateService,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
-        return Results.Ok(flow.ToDetailDto());
+        var reviewedPreviewUrl = await ResolveReviewedPreviewUrlAsync(
+            flow,
+            artifactCatalog,
+            reviewedCandidateService,
+            cancellationToken);
+        return Results.Ok(flow.ToDetailDto(reviewedPreviewUrl));
+    }
+
+    internal static async Task<string?> ResolveReviewedPreviewUrlAsync(
+        FlowRun flow,
+        PreviewArtifactCatalog artifactCatalog,
+        IReviewedCandidateService reviewedCandidateService,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(flow);
+        ArgumentNullException.ThrowIfNull(artifactCatalog);
+        ArgumentNullException.ThrowIfNull(reviewedCandidateService);
+        if (!string.Equals(
+                flow.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) ||
+            flow.Kind != FlowKind.Delivery ||
+            flow.Status != FlowStatus.WaitingForFeedback)
+        {
+            return null;
+        }
+
+        var currentStepIds = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .Select(step => step.Id)
+            .ToHashSet();
+        var hasCurrentOpenReview = flow.GateRecords.Any(gate =>
+            gate.ActionType == HandoffActionType.CustomerReview &&
+            !gate.Resolved &&
+            currentStepIds.Contains(gate.FlowStepId));
+        if (!hasCurrentOpenReview)
+        {
+            return null;
+        }
+
+        try
+        {
+            var reviewed = await EnsureStudioDeliveryPreviewCurrentAsync(
+                flow,
+                reviewedCandidateService,
+                cancellationToken);
+            return reviewed is not null &&
+                   artifactCatalog.DiscoverVerified(
+                           flow,
+                           reviewed.Manifest.PreviewArtifacts)
+                       .Count > 0
+                ? $"#/preview/{flow.Id:D}"
+                : null;
+        }
+        catch (CandidateValidationException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     private static async Task<IResult> StartFlowAsync(
         Guid flowId,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         FlowQueue queue,
+        FlowLifecycleCoordinator lifecycle,
         CancellationToken cancellationToken)
     {
+        await using var lifecycleLease =
+            await lifecycle.EnterAsync(flowId, cancellationToken);
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var flow = await database.Flows
                        .Include(item => item.Steps)
@@ -285,7 +410,7 @@ public static class DemoApi
             latestAccountManagerMessage.IsQuestion ||
             latestIntakeEvent?.Type != "intake.confirmed" ||
             !flow.Steps.Any(item =>
-                item.AgentRole == "account-manager" &&
+                item.InvocationKind == ExecutionInvocationKind.Intake &&
                 item.Status == StepStatus.Completed))
         {
             throw new InvalidOperationException(
@@ -294,8 +419,7 @@ public static class DemoApi
 
         var settings = await database.Settings.AsNoTracking().SingleAsync(cancellationToken);
         flow.ModelSelectionStrategy = settings.ModelSelectionStrategy;
-        flow.Status = FlowStatus.Queued;
-        flow.UpdatedAt = DateTimeOffset.UtcNow;
+        lifecycle.Transition(flow, FlowStatus.Queued);
         var queuedEvent = new FlowEvent
         {
             FlowRunId = flow.Id,
@@ -318,8 +442,105 @@ public static class DemoApi
         Guid flowId,
         FeedbackRequest request,
         FeedbackCoordinator coordinator,
+        ReviewCoordinator reviewCoordinator,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        CancellationToken cancellationToken)
+    {
+        if (!await IsStudioV2Async(
+                flowId,
+                databaseFactory,
+                cancellationToken))
+        {
+            return Results.Ok(
+                await coordinator.RespondAsync(
+                    flowId,
+                    request.Message,
+                    cancellationToken));
+        }
+
+        var result = await reviewCoordinator.RespondToFeedbackAsync(
+            flowId,
+            request.Message,
+            cancellationToken);
+        return Results.Ok(new FeedbackResponse(
+            result.Flow.ToDetailDto(),
+            result.Reply,
+            result.ShouldSpeak));
+    }
+
+    private static async Task<IResult> ReviewFlowAsync(
+        Guid flowId,
+        DirectReviewRequest request,
+        ReviewCoordinator coordinator,
+        CancellationToken cancellationToken)
+    {
+        var result = await coordinator.ReviewAsync(
+            flowId,
+            request,
+            cancellationToken);
+        return Results.Ok(result.Review);
+    }
+
+    private static async Task<IResult> GetReviewResultAsync(
+        Guid flowId,
+        ReviewCoordinator coordinator,
         CancellationToken cancellationToken) =>
-        Results.Ok(await coordinator.RespondAsync(flowId, request.Message, cancellationToken));
+        Results.Ok(await coordinator.GetReviewResultAsync(
+            flowId,
+            cancellationToken));
+
+    private static async Task<IResult> ResolveQualificationAsync(
+        Guid flowId,
+        QualificationResolutionRequest request,
+        QualificationResolutionCoordinator coordinator,
+        CancellationToken cancellationToken)
+    {
+        var result = await coordinator.ResolveAsync(
+            flowId,
+            request,
+            cancellationToken);
+        return Results.Ok(result.Response);
+    }
+
+    private static async Task<IResult> GetFlowArtifactAsync(
+        Guid flowId,
+        string artifactId,
+        string? path,
+        [FromQuery] bool download,
+        HttpContext httpContext,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        AdvisoryArtifactCatalog artifactCatalog,
+        CancellationToken cancellationToken)
+    {
+        var flow = await LoadFlowAsync(
+            databaseFactory,
+            flowId,
+            cancellationToken);
+        if (!string.Equals(
+                flow.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) ||
+            flow.Kind != FlowKind.Advisory)
+        {
+            throw new InvalidOperationException(
+                "Generic flow artifacts are available only for studio-v2 Advisory flows.");
+        }
+        if (flow.Status is not (
+                FlowStatus.WaitingForFeedback or
+                FlowStatus.Approved))
+        {
+            throw new InvalidOperationException(
+                "Advisory artifacts are available only after the result enters customer review.");
+        }
+
+        return ResolveAdvisoryArtifactResult(
+            flow.Id,
+            artifactId,
+            path,
+            download,
+            httpContext.Response,
+            artifactCatalog.Discover(flow));
+    }
 
     private static async Task<IResult> RestartFlowAsync(
         Guid flowId,
@@ -346,8 +567,44 @@ public static class DemoApi
         Guid flowId,
         FlowDecisionRequest request,
         FeedbackCoordinator coordinator,
+        ReviewCoordinator reviewCoordinator,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
         CancellationToken cancellationToken)
     {
+        if (await IsStudioV2Async(
+                flowId,
+                databaseFactory,
+                cancellationToken))
+        {
+            var result = await reviewCoordinator.ReviewAsync(
+                flowId,
+                new DirectReviewRequest
+                {
+                    GateId = request.GateId,
+                    Intent = request.Approve
+                        ? ReviewIntent.Accept
+                        : ReviewIntent.RequestRefinement,
+                    Refinement = request.Approve
+                        ? null
+                        : new DirectReviewRefinement
+                        {
+                            RequestedChanges =
+                            [
+                                string.IsNullOrWhiteSpace(request.Feedback)
+                                    ? "Revise the result for another customer review."
+                                    : request.Feedback
+                            ]
+                        }
+                },
+                cancellationToken);
+            return Results.Ok(new FlowDecisionResponse(
+                request.Approve
+                    ? ReleaseDecisionOutcome.Approved
+                    : ReleaseDecisionOutcome.Rejected,
+                result.Flow.ToDetailDto(),
+                result.Review.Message));
+        }
+
         var decision = await coordinator.DecideAsync(
             flowId,
             request.Approve,
@@ -356,6 +613,26 @@ public static class DemoApi
             request.Feedback,
             cancellationToken);
         return ToFlowDecisionResult(decision);
+    }
+
+    private static async Task<bool> IsStudioV2Async(
+        Guid flowId,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var contractVersion = await database.Flows
+            .AsNoTracking()
+            .Where(flow => flow.Id == flowId)
+            .Select(flow => flow.ContractVersion)
+            .SingleOrDefaultAsync(cancellationToken)
+            ?? throw new KeyNotFoundException(
+                $"Factory flow '{flowId}' was not found.");
+        return string.Equals(
+            contractVersion,
+            "studio-v2",
+            StringComparison.Ordinal);
     }
 
     internal static IResult ToFlowDecisionResult(FlowDecisionResponse decision) =>
@@ -391,24 +668,58 @@ public static class DemoApi
         CancellationToken cancellationToken)
     {
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
-        var history = await (
+        var attempts = await (
                 from step in database.FlowSteps.AsNoTracking()
                 join flow in database.Flows.AsNoTracking()
                     on step.FlowRunId equals flow.Id
                 orderby step.StartedAt descending
-                select new HistoryItemDto(
-                    flow.Id,
+                select new
+                {
+                    FlowId = flow.Id,
                     flow.Title,
                     step.Iteration,
                     step.AgentName,
                     step.AgentRole,
                     step.Model,
-                    step.Status,
+                    StepStatus = step.Status,
                     step.DurationMilliseconds,
                     step.StartedAt,
-                    step.PushbackReason))
+                    step.PushbackReason
+                })
             .Take(500)
             .ToListAsync(cancellationToken);
+        var flowIds = attempts.Select(item => item.FlowId).Distinct().ToArray();
+        var flows = await database.Flows
+            .AsNoTracking()
+            .AsSplitQuery()
+            .Where(item => flowIds.Contains(item.Id))
+            .Include(item => item.Steps)
+            .Include(item => item.GateRecords)
+            .ToDictionaryAsync(item => item.Id, cancellationToken);
+        var history = attempts.Select(item =>
+        {
+            var flow = flows[item.FlowId];
+            return new HistoryItemDto(
+                flow.Id,
+                flow.Title,
+                flow.Kind,
+                flow.Status,
+                flow.ParentFlowRunId,
+                flow.ParentIteration,
+                flow.LinkKind,
+                flow.CurrentBlockerCode,
+                flow.CustomerBlockerMessage,
+                flow.OutcomeLabel,
+                flow.ToReviewSummaryDto(),
+                item.Iteration,
+                item.AgentName,
+                item.AgentRole,
+                item.Model,
+                item.StepStatus,
+                item.DurationMilliseconds,
+                item.StartedAt,
+                item.PushbackReason);
+        }).ToList();
         return Results.Ok(history);
     }
 
@@ -425,12 +736,14 @@ public static class DemoApi
         return Results.Ok(learnings.Select(item => item.ToDto()));
     }
 
-    private static async Task<IResult> GetPreviewAsync(
+    internal static async Task<IResult> GetPreviewAsync(
         Guid flowId,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         PreviewArtifactCatalog artifactCatalog,
+        AdvisoryArtifactCatalog advisoryArtifactCatalog,
         WorkflowEngine workflowEngine,
         FlowQueue flowQueue,
+        IReviewedCandidateService reviewedCandidateService,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
@@ -438,7 +751,17 @@ public static class DemoApi
         {
             throw new InvalidOperationException("This flow does not have a customer preview yet.");
         }
-        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        var reviewedSnapshot =
+            await EnsureStudioDeliveryPreviewCurrentAsync(
+            flow,
+            reviewedCandidateService,
+            cancellationToken);
+        var legacyFlow = string.Equals(
+            flow.ContractVersion,
+            "legacy-v1",
+            StringComparison.Ordinal);
+        if (legacyFlow &&
+            !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
         {
             var state = AiHarnessDemo.Core.Verification.OutcomeVerificationRules
                 .DeserializeAggregate(flow.OutcomeVerificationJson);
@@ -476,13 +799,45 @@ public static class DemoApi
             .Select(item => item.ToDto(outcomeState))
             .ToList();
         var outcomeVerification = flow.ToOutcomeVerificationDto();
-        var artifacts = artifactCatalog.Discover(flow)
-            .Select(item => new PreviewArtifactDto(
-                item.Id,
-                item.Label,
-                item.Url,
-                item.OpenUrl))
-            .ToList();
+        var artifacts = flow.Kind == FlowKind.Advisory
+            ? advisoryArtifactCatalog.Discover(flow)
+                .Select(item =>
+                {
+                    var artifactId = ApiMappings.AdvisoryArtifactId(item.Path);
+                    var url = ApiMappings.AdvisoryArtifactUrl(
+                        flow.Id,
+                        artifactId,
+                        item.Path);
+                    return new PreviewArtifactDto(
+                        artifactId,
+                        item.Path,
+                        url,
+                        url,
+                        item.MediaType,
+                        item.ByteLength,
+                        ApiMappings.AdvisoryArtifactUrl(
+                            flow.Id,
+                            artifactId,
+                            item.Path,
+                            download: true),
+                        Interactive: false);
+                })
+                .ToList()
+            : (reviewedSnapshot is null
+                ? artifactCatalog.Discover(flow)
+                : artifactCatalog.DiscoverVerified(
+                    flow,
+                    reviewedSnapshot.Manifest.PreviewArtifacts))
+                .Select(item => new PreviewArtifactDto(
+                    item.Id,
+                    item.Label,
+                    item.Url,
+                    item.OpenUrl,
+                    "text/html",
+                    null,
+                    null,
+                    Interactive: true))
+                .ToList();
         if (outcomeVerification.PreviewRequired && artifacts.Count == 0)
         {
             throw new InvalidOperationException(
@@ -493,16 +848,21 @@ public static class DemoApi
             flow.Title,
             flow.ConsolidatedRequest,
             Path.GetFileName(flow.RepositoryPath),
+            flow.Kind,
+            flow.ContractVersion,
             flow.Iteration,
             flow.Status,
             flow.OutcomeLabel,
+            flow.ToFlowOutcomeDto(),
             artifacts,
             deliveredBy,
+            flow.ToReviewSummaryDto(),
+            ReviewCoordinator.GetPublicationStatus(flow),
             outcomeVerification,
             flow.UpdatedAt));
     }
 
-    private static async Task<IResult> GetPreviewArtifactAsync(
+    internal static async Task<IResult> GetPreviewArtifactAsync(
         Guid flowId,
         string artifactId,
         string? path,
@@ -511,6 +871,7 @@ public static class DemoApi
         PreviewArtifactCatalog artifactCatalog,
         WorkflowEngine workflowEngine,
         FlowQueue flowQueue,
+        IReviewedCandidateService reviewedCandidateService,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
@@ -519,6 +880,11 @@ public static class DemoApi
             throw new InvalidOperationException(
                 "This flow does not have a customer preview yet.");
         }
+        var reviewedSnapshot =
+            await EnsureStudioDeliveryPreviewCurrentAsync(
+            flow,
+            reviewedCandidateService,
+            cancellationToken);
         if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
             AiHarnessDemo.Core.Verification.OutcomeVerificationRules
                 .DeserializeAggregate(flow.OutcomeVerificationJson)
@@ -552,10 +918,87 @@ public static class DemoApi
             contentType = "application/octet-stream";
         }
         ApplyPreviewArtifactSecurityHeaders(httpContext.Response);
+        if (reviewedSnapshot is not null)
+        {
+            var bytes = await ReadVerifiedPreviewFileAsync(
+                flow,
+                filePath,
+                reviewedSnapshot,
+                cancellationToken);
+            return Results.File(
+                bytes,
+                contentType,
+                enableRangeProcessing: true);
+        }
         return Results.File(
             filePath,
             contentType,
             enableRangeProcessing: true);
+    }
+
+    internal static async Task<OutcomeCandidateSnapshot?>
+        EnsureStudioDeliveryPreviewCurrentAsync(
+        FlowRun flow,
+        IReviewedCandidateService reviewedCandidateService,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(
+                flow.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) ||
+            flow.Kind != FlowKind.Delivery)
+        {
+            return null;
+        }
+
+        var identity = ReviewedCandidateLedger.Read(flow);
+        return await reviewedCandidateService.VerifyAsync(
+            flow,
+            identity,
+            cancellationToken);
+    }
+
+    private static async Task<byte[]> ReadVerifiedPreviewFileAsync(
+        FlowRun flow,
+        string filePath,
+        OutcomeCandidateSnapshot verified,
+        CancellationToken cancellationToken)
+    {
+        var workspace = Path.GetFullPath(flow.WorkspacePath);
+        CandidateFingerprintService.ValidateLinksStayInside(workspace);
+        var relativePath = Path.GetRelativePath(workspace, filePath)
+            .Replace('\\', '/');
+        var entries = verified.Manifest.PreviewArtifacts
+            .Where(item => string.Equals(
+                item.RelativePath.Replace('\\', '/'),
+                relativePath,
+                StringComparison.Ordinal))
+            .ToArray();
+        if (entries.Length != 1)
+        {
+            throw new CandidateValidationException(
+                entries.Length == 0
+                    ? "The requested preview file is not part of the reviewed candidate."
+                    : "The reviewed candidate contains duplicate preview file identities.");
+        }
+
+        var bytes = await File.ReadAllBytesAsync(
+            filePath,
+            cancellationToken);
+        var digest =
+            "sha256:" +
+            Convert.ToHexString(SHA256.HashData(bytes))
+                .ToLowerInvariant();
+        if (entries[0].Length != bytes.LongLength ||
+            !string.Equals(
+                entries[0].Digest,
+                digest,
+                StringComparison.Ordinal))
+        {
+            throw new CandidateValidationException(
+                "The requested preview file changed after candidate verification.");
+        }
+        return bytes;
     }
 
     internal static IResult GetIsolatedPreviewView(
@@ -615,6 +1058,82 @@ public static class DemoApi
         ApplyCommonPreviewSecurityHeaders(response);
     }
 
+    internal static IResult ResolveAdvisoryArtifactResult(
+        Guid flowId,
+        string artifactId,
+        string? path,
+        bool download,
+        HttpResponse response,
+        IReadOnlyList<AdvisoryArtifact> artifacts)
+    {
+        var normalizedPath = (path ?? string.Empty).Replace('\\', '/');
+        if (string.IsNullOrWhiteSpace(normalizedPath) ||
+            normalizedPath.StartsWith('/') ||
+            normalizedPath.Split('/', StringSplitOptions.None).Any(segment =>
+                string.IsNullOrWhiteSpace(segment) ||
+                segment is "." or ".." ||
+                segment.Any(char.IsControl)))
+        {
+            throw new UnauthorizedAccessException(
+                "Advisory artifact paths must remain inside the accepted artifact set.");
+        }
+
+        var artifact = artifacts.SingleOrDefault(item =>
+            string.Equals(
+                ApiMappings.AdvisoryArtifactId(item.Path),
+                artifactId,
+                StringComparison.Ordinal) &&
+            string.Equals(
+                item.Path.Replace('\\', '/'),
+                normalizedPath,
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal))
+            ?? throw new FileNotFoundException(
+                $"Advisory artifact '{artifactId}' was not found.");
+        if (!File.Exists(artifact.FullPath))
+        {
+            throw new FileNotFoundException(
+                $"Advisory artifact '{artifact.Path}' is missing.");
+        }
+
+        var contentType = artifact.MediaType switch
+        {
+            "text/plain" => "text/plain; charset=utf-8",
+            "text/markdown" => "text/markdown; charset=utf-8",
+            "text/csv" => "text/csv; charset=utf-8",
+            "application/json" => "application/json; charset=utf-8",
+            _ => throw new InvalidOperationException(
+                "The accepted Advisory artifact has an unsupported media type.")
+        };
+        ApplyAdvisoryArtifactSecurityHeaders(response);
+        var disposition = new ContentDispositionHeaderValue(
+            download ? "attachment" : "inline")
+        {
+            FileNameStar = artifact.Path.Split('/').Last()
+        };
+        response.Headers.ContentDisposition = disposition.ToString();
+        return Results.File(
+            artifact.FullPath,
+            contentType,
+            enableRangeProcessing: true);
+    }
+
+    internal static void ApplyAdvisoryArtifactSecurityHeaders(
+        HttpResponse response)
+    {
+        response.Headers["Content-Security-Policy"] =
+            "sandbox; default-src 'none'; form-action 'none'; object-src 'none'; " +
+            "base-uri 'none'; frame-ancestors 'none'";
+        response.Headers["Cross-Origin-Resource-Policy"] = "same-origin";
+        response.Headers["Permissions-Policy"] =
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()";
+        response.Headers["Referrer-Policy"] = "no-referrer";
+        response.Headers["X-Content-Type-Options"] = "nosniff";
+        response.Headers["X-Download-Options"] = "noopen";
+        response.Headers.CacheControl = "no-store";
+    }
+
     private static void ApplyCommonPreviewSecurityHeaders(HttpResponse response)
     {
         response.Headers["Cross-Origin-Opener-Policy"] = "noopener-allow-popups";
@@ -631,19 +1150,25 @@ public static class DemoApi
         AgentCatalog catalog,
         CopilotCliRuntime copilotCliRuntime,
         ModelCatalogDiscovery modelCatalog,
+        FlowAgentSnapshotService snapshots,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         FlowQueue queue,
         CancellationToken cancellationToken)
     {
         var requestedAt = DateTimeOffset.UtcNow;
-        var workflow = workflowProvider.GetValidated();
+        await workflowProvider.ReloadAsync(cancellationToken);
+        var workflow = workflowProvider.GetEffective();
         await copilotCliRuntime.RefreshAsync(
             workflow.Config.Copilot.Command,
             cancellationToken);
         await modelCatalog.RefreshAsync(
             Directory.GetCurrentDirectory(),
             cancellationToken);
-        await catalog.SyncAsync(cancellationToken);
+        var catalogStatus = await catalog.ReloadAsync(cancellationToken);
+        if (catalogStatus.Ready)
+        {
+            await snapshots.MigrateLegacyNonterminalAsync(cancellationToken);
+        }
 
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var queued = await database.Flows
@@ -693,6 +1218,12 @@ public static class DemoApi
                    .Include(item => item.Messages)
                    .Include(item => item.Events)
                    .Include(item => item.GateRecords)
+                   .Include(item => item.TaskProfiles)
+                   .Include(item => item.PlanDocuments)
+                   .Include(item => item.LinkedFlowRuns)
+                   .ThenInclude(item => item.Steps)
+                   .Include(item => item.LinkedFlowRuns)
+                   .ThenInclude(item => item.GateRecords)
                    .SingleOrDefaultAsync(item => item.Id == flowId, cancellationToken)
                ?? throw new KeyNotFoundException($"Factory flow '{flowId}' was not found.");
     }
@@ -700,7 +1231,12 @@ public static class DemoApi
     private static WorkflowStatusDto ToDto(WorkflowRuntimeStatus status) =>
         new(
             status.Ready,
+            status.CurrentFileValid,
+            status.HasEffectiveDefinition,
             status.SourcePath,
+            status.EffectiveLoadedAt,
+            status.EffectiveRevision,
+            status.CurrentFileError,
             status.LoadedAt,
             status.LastError,
             status.MaxConcurrentAgents,
@@ -708,6 +1244,19 @@ public static class DemoApi
             status.WorkspaceRoot,
             status.OutcomeVerificationEnabled,
             status.OutcomeVerificationMaxRounds);
+
+    private static AgentCatalogStatusDto ToDto(AgentCatalogRuntimeStatus status) =>
+        new(
+            status.Ready,
+            status.HasEffectiveCatalog,
+            status.EffectiveRevision,
+            status.LoadedAt,
+            status.LastError,
+            status.ValidDefinitionCount,
+            status.InvalidDefinitionCount);
+
+    private static NewWorkAdmissionStatusDto ToDto(NewWorkAdmissionStatus status) =>
+        new(status.Ready, status.Failures, status.CheckedAt);
 
     private static CopilotCliStatusDto ToDto(CopilotCliRuntimeStatus status) =>
         new(
@@ -726,37 +1275,4 @@ public static class DemoApi
             status.Detail,
             status.CheckedAt);
 
-    private static string FactoryDisabledReason(
-        HarnessSettings settings,
-        CopilotCliRuntimeStatus copilotCli,
-        ModelCatalogRuntimeStatus modelCatalog,
-        WorkflowRuntimeStatus workflow)
-    {
-        if (!copilotCli.Ready)
-        {
-            return copilotCli.Detail;
-        }
-        if (!workflow.Ready)
-        {
-            return workflow.LastError ?? "WORKFLOW.md is not ready.";
-        }
-        if (!modelCatalog.Ready)
-        {
-            return modelCatalog.Detail;
-        }
-        if (string.IsNullOrWhiteSpace(settings.RepositoryPath) ||
-            string.IsNullOrWhiteSpace(settings.RepositoryKnowledge))
-        {
-            return "Add and study a source project in Settings before starting the factory.";
-        }
-        if (!Directory.Exists(settings.RepositoryPath))
-        {
-            return "The selected source project no longer exists. Choose it again in Settings.";
-        }
-        if (!RepositoryAnalyzer.IsProjectDirectory(settings.RepositoryPath))
-        {
-            return "The selected project folder contains no Git repositories. Choose a project with source control in Settings.";
-        }
-        return string.Empty;
-    }
 }

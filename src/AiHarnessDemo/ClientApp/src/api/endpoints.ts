@@ -6,13 +6,18 @@ import type {
   AnalyzeRepositoryRequest,
   AnalyzeRepositoryResponse,
   AbandonFlowResponse,
+  AgentDto,
+  AgentCatalogDto,
   BootstrapDto,
   DirectoryListingDto,
+  DirectReviewRequest,
+  DirectReviewResponse,
   FeedbackRequest,
   FeedbackResponse,
   FlowDetailDto,
   FlowDecisionRequest,
   FlowDecisionResponse,
+  FlowReviewResultResponse,
   FlowSummaryDto,
   HistoryItemDto,
   IntakeRequest,
@@ -20,6 +25,8 @@ import type {
   LearningDto,
   OutcomeResolutionRequest,
   PreviewDto,
+  QualificationResolutionRequest,
+  QualificationResolutionResponse,
   SaveSettingsRequest,
   SettingsDto,
   ToggleAgentRequest
@@ -28,10 +35,13 @@ import type {
 export const api = {
   bootstrap: () => request<BootstrapDto>("/api/bootstrap"),
   settings: () => request<SettingsDto>("/api/settings"),
+  agentCatalog: () => request<AgentCatalogDto>("/api/agent-catalog"),
   saveSettings: (body: SaveSettingsRequest) =>
     request<SettingsDto>("/api/settings", { method: "PUT", body }),
   toggleAgent: (agentId: string, body: ToggleAgentRequest) =>
-    request(`/api/agents/${encodeURIComponent(agentId)}`, { method: "PUT", body }),
+    request<AgentDto>(`/api/agents/${encodeURIComponent(agentId)}`, { method: "PUT", body }),
+  reloadAgentCatalog: () =>
+    request<AgentCatalogDto>("/api/agent-catalog/reload", { method: "POST" }),
   listDirectories: (path: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
     return request<DirectoryListingDto>(`/api/directories${query}`);
@@ -46,6 +56,18 @@ export const api = {
     request<FlowDetailDto>(`/api/flows/${flowId}/start`, { method: "POST", body: {} }),
   restartFlow: (flowId: string) =>
     request<FlowDetailDto>(`/api/flows/${flowId}/restart`, { method: "POST", body: {} }),
+  reviewFlow: (flowId: string, body: DirectReviewRequest) =>
+    request<DirectReviewResponse>(`/api/flows/${flowId}/review`, {
+      method: "POST",
+      body
+    }),
+  reviewResult: (flowId: string) =>
+    request<FlowReviewResultResponse>(`/api/flows/${flowId}/review-result`),
+  resolveQualification: (flowId: string, body: QualificationResolutionRequest) =>
+    request<QualificationResolutionResponse>(
+      `/api/flows/${flowId}/qualification-resolution`,
+      { method: "POST", body }
+    ),
   sendFeedback: (flowId: string, body: FeedbackRequest) =>
     request<FeedbackResponse>(`/api/flows/${flowId}/feedback`, { method: "POST", body }),
   decideFlow: (flowId: string, body: FlowDecisionRequest) =>

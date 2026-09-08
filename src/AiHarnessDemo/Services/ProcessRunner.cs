@@ -15,9 +15,13 @@ public sealed record ProcessResult(int ExitCode, string StandardOutput, string S
 
 public sealed class ProcessStalledException(string message) : TimeoutException(message);
 
-public sealed class ProcessRunner
+/// <summary>
+/// Starts external processes. The class stays overridable so publication tests can prove exactly
+/// which external commands ran (or that none ran) without touching Git, GitHub, or the network.
+/// </summary>
+public class ProcessRunner
 {
-    public async Task<ProcessResult> RunAsync(
+    public virtual async Task<ProcessResult> RunAsync(
         string executable,
         IEnumerable<string> arguments,
         string workingDirectory,
