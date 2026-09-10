@@ -270,6 +270,57 @@ public sealed partial class PublishedOutcomeVerifier(
                 "Reviewed publication verification requires one current accepted CustomerReview.");
         }
         var owner = currentSteps[acceptedOwnerIds[0]];
+        var acceptedGateId = flow.GateRecords
+            .Where(gate =>
+                gate.ActionType == HandoffActionType.CustomerReview &&
+                gate.Resolved &&
+                gate.Approved == true &&
+                gate.ReviewDecision == ReviewDecision.Accepted &&
+                gate.FlowStepId == owner.Id)
+            .OrderByDescending(gate => gate.ResolvedAt)
+            .Select(gate => gate.Id)
+            .First();
+        // Remote verification has already happened; the same durable binding is rechecked here so a
+        // post-review mutation or a superseded assessment cannot be recorded as a verified outcome.
+        var readinessBinding = await new DeliveryReadinessService().LoadCurrentAsync(
+            database,
+            flow.Id,
+            cancellationToken);
+        if (readinessBinding is null ||
+            readinessBinding.State != DeliveryReadinessState.ReadyToApprove)
+        {
+            throw new DeliveryReadinessConflictException(
+                DeliveryReadinessConflicts.PublicationNotAuthorized,
+                "Reviewed publication verification requires a current ReadyToApprove readiness assessment.",
+                readinessBinding?.State,
+                readinessBinding?.Revision,
+                readinessBinding?.ContractHash);
+        }
+        var authorizedJournal = await database.ReviewedPublicationRecords
+            .AsNoTracking()
+            .Where(item => item.FlowRunId == flow.Id)
+            .ToListAsync(cancellationToken);
+        if (authorizedJournal.Count > 0 &&
+            authorizedJournal.Any(item =>
+                item.ReviewedCandidateId != readinessBinding.Candidate.Id ||
+                item.ReadinessSnapshotId != readinessBinding.Record.Id ||
+                item.CustomerReviewGateId != acceptedGateId ||
+                !string.Equals(
+                    item.ReadinessContractHash,
+                    readinessBinding.ContractHash,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    item.WaiverSetHash,
+                    readinessBinding.WaiverSetHash,
+                    StringComparison.Ordinal)))
+        {
+            throw new DeliveryReadinessConflictException(
+                DeliveryReadinessConflicts.PublicationNotAuthorized,
+                "The reviewed publication journal is not bound to the current readiness, review, and waiver identity.",
+                readinessBinding.State,
+                readinessBinding.Revision,
+                readinessBinding.ContractHash);
+        }
         if (!owner.IsOutcomeOwner ||
             owner.Status != StepStatus.Completed ||
             string.IsNullOrWhiteSpace(flow.OutcomeOwnerPlanStepKey) ||

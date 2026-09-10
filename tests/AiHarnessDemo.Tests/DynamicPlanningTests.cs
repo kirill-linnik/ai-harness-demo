@@ -423,11 +423,28 @@ public sealed class DynamicPlanningTests
                     owner: true)
             ],
             PreMortemCheckpoints = [],
+            AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
             MissingQualification = null
         };
         Assert.Throws<TeamPlanContractException>(
             () => _validator.Validate(
                 noPublish,
+                Context(FlowKind.Delivery, snapshots)));
+
+        // A Delivery plan without typed acceptance criteria is rejected outright, so no later
+        // stage can invent a criterion namespace from prose.
+        var withoutCriteria = new TeamPlanDocument
+        {
+            Version = TeamPlanParser.Version,
+            Disposition = TeamPlanDisposition.Planned,
+            Steps = DeliveryPlan().Steps,
+            PreMortemCheckpoints = [],
+            AcceptanceCriteria = null,
+            MissingQualification = null
+        };
+        Assert.Throws<TeamPlanContractException>(
+            () => _validator.Validate(
+                withoutCriteria,
                 Context(FlowKind.Delivery, snapshots)));
 
         var valid = DeliveryPlan();
@@ -1334,25 +1351,24 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public void StudioContractCorrection_DetectsContradictoryQualityVerdict()
+    public void StudioContractCorrection_NeverAuthorizesFromQualityProse()
     {
         var context = StudioWorkerContext(
             "quality-engineer",
             isOutcomeOwner: false);
 
-        var reason = WorkflowEngine.GetStudioContractCorrectionReason(
+        // Contradictory prose is diagnostics only. It can no longer trigger a correction, because
+        // authorization comes exclusively from typed criterion results in the readiness snapshot.
+        Assert.Null(WorkflowEngine.GetStudioContractCorrectionReason(
             context,
             """
             `HANDOFF_STATUS: COMPLETE`
 
             ## Decision
             NOT release-ready. Two required checks failed.
-            """);
-
-        Assert.Contains(
-            "failing or not-release-ready verdict",
-            reason,
-            StringComparison.Ordinal);
+            """));
+        Assert.True(WorkflowEngine.ContainsContradictoryQualityProse(
+            "NOT release-ready. Two required checks failed."));
         Assert.Null(WorkflowEngine.GetStudioContractCorrectionReason(
             context,
             """
@@ -1360,12 +1376,20 @@ public sealed class DynamicPlanningTests
             PUSHBACK_OWNER_STEP_ID: implement-redesign
             PUSHBACK_REASON: Two required checks failed.
             """));
+
+        // A Delivery verification turn must still return the strict typed contract.
+        var verificationContext = context with { RequiresDeliveryReadinessQa = true };
+        var missing = WorkflowEngine.GetStudioContractCorrectionReason(
+            verificationContext,
+            "HANDOFF_STATUS: COMPLETE\nEvery check passed.");
+        Assert.Contains(
+            DeliveryReadinessPolicy.QaBeginMarker,
+            missing,
+            StringComparison.Ordinal);
         Assert.Null(WorkflowEngine.GetStudioContractCorrectionReason(
-            context,
-            """
-            HANDOFF_STATUS: COMPLETE
-            The prior result was NOT release-ready; the listed defects are now fixed and every check passes.
-            """));
+            verificationContext,
+            "HANDOFF_STATUS: COMPLETE\n" +
+            DeliveryReadinessFixtures.QaBlockFromPrompt(prompt: null)));
     }
 
     [Fact]
@@ -1506,6 +1530,7 @@ public sealed class DynamicPlanningTests
                     emptyProfile: true)
             ],
             PreMortemCheckpoints = [],
+            AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
             MissingQualification = null
         };
 
@@ -1947,6 +1972,13 @@ public sealed class DynamicPlanningTests
                         """ +
                         Environment.NewLine +
                         FlowOutcomeParser.EndSentinel;
+                }
+                if (context.RequiresDeliveryReadinessQa)
+                {
+                    output +=
+                        Environment.NewLine +
+                        DeliveryReadinessFixtures.QaBlockFromPrompt(
+                            context.OutcomeContext);
                 }
             }
             var result = new AgentExecutionResult(

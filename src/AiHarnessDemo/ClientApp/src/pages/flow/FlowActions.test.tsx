@@ -151,6 +151,9 @@ describe("ReviewCard", () => {
       expect(review).toHaveBeenCalledWith(flowId, {
         gateId,
         intent: "RequestRefinement",
+        reviewedCandidateId: null,
+        readinessRevision: null,
+        readinessContractHash: null,
         refinement: {
           goal: "Focus on payment retries.",
           requestedChanges: ["Exclude catalog retries.", "Add rollout guidance."]
@@ -250,6 +253,9 @@ describe("ReviewCard", () => {
     expect(review).toHaveBeenCalledWith(flowId, {
       gateId,
       intent: "PromoteToDelivery",
+      reviewedCandidateId: null,
+      readinessRevision: null,
+      readinessContractHash: null,
       refinement: null
     });
   });
@@ -293,6 +299,9 @@ describe("ReviewCard", () => {
     expect(review).toHaveBeenCalledWith(flowId, {
       gateId,
       intent: "PromoteToDelivery",
+      reviewedCandidateId: null,
+      readinessRevision: null,
+      readinessContractHash: null,
       refinement: null
     });
   });

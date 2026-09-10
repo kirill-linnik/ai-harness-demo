@@ -21,6 +21,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The captured production flow used by the deterministic incident regression. -->
+    <Content Include="Fixtures\**\*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\AiHarnessDemo\AiHarnessDemo.csproj" />
     <ProjectReference Include="..\..\src\AiHarnessDemo.Core\AiHarnessDemo.Core.csproj" />
   </ItemGroup>

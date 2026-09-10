@@ -70,7 +70,81 @@ export type HandoffActionType =
   | "RequestRevision"
   | "Release"
   | "OutcomeResolution"
-  | "CustomerReview";
+  | "CustomerReview"
+  | "CustomerWaiver";
+
+export type DeliveryReadinessState =
+  | "ReadyToApprove"
+  | "NeedsCustomerWaiver"
+  | "NeedsRefinement"
+  | "Blocked";
+
+export type DeliveryReadinessReconciliation =
+  | "Current"
+  | "LegacyUnverified"
+  | "SupersededByReconciliation";
+
+export type DeliveryCriterionOutcome = "Verified" | "Failed" | "Blocked";
+
+export type DeliveryRiskClassification =
+  | "NonBlockingDisclosure"
+  | "WaiverRequired"
+  | "Blocking";
+
+export type DeliveryRiskSeverity = "Low" | "Medium" | "High" | "Critical";
+
+export type DeliveryReadinessAction =
+  | "None"
+  | "Accept"
+  | "RequestRefinement"
+  | "GrantWaiver"
+  | "Continue"
+  | "Replan"
+  | "Abandon";
+
+export interface DeliveryReadinessCriterionDto {
+  criterionId: string;
+  requirement: string;
+  outcome: DeliveryCriterionOutcome;
+  rationale: string;
+  remediation: string | null;
+  evidenceIds: string[];
+  responsibleRoles: string[];
+  customerVisible: boolean;
+}
+
+export interface DeliveryReadinessRiskDto {
+  riskId: string;
+  classification: DeliveryRiskClassification;
+  severity: DeliveryRiskSeverity;
+  statement: string;
+  impact: string;
+  evidenceIds: string[];
+  criterionIds: string[];
+  sourceRole: string;
+  sourceStepId: string;
+  preMortemFindingId: string | null;
+  waived: boolean;
+}
+
+export interface DeliveryReadinessDto {
+  state: DeliveryReadinessState;
+  reconciliation: DeliveryReadinessReconciliation;
+  revision: number;
+  contractHash: string;
+  reviewedCandidateId: string;
+  candidateFingerprintPrefix: string;
+  criteria: DeliveryReadinessCriterionDto[];
+  risks: DeliveryReadinessRiskDto[];
+  requiredWaiverRiskIds: string[];
+  grantedWaiverRiskIds: string[];
+  diagnostics: string[];
+  allowedActions: DeliveryReadinessAction[];
+  reviewGateId: string | null;
+  waiverGateId: string | null;
+  publicationAssurance: string;
+  label: string;
+}
 
 export type ReviewDecision =
   | "Accepted"
@@ -155,8 +229,7 @@ export interface AgentToolCallDto {
   succeeded: boolean
 }
 
-export interface FlowSummaryDto {
-  id: string;
+export interface FlowSummaryDto {  id: string;
   title: string;
   kind: FlowKind;
   contractVersion: string;
@@ -175,6 +248,8 @@ export interface FlowSummaryDto {
   outcomeUrl: string;
   createdAt: string;
   updatedAt: string;
+  readinessState?: DeliveryReadinessState | null;
+  readinessLabel?: string | null;
 }
 
 export interface FlowStepDto {
@@ -314,6 +389,7 @@ export interface FlowDetailDto {
   review: FlowReviewSummaryDto;
   publicationStatus: ReviewPublicationStatus;
   outcomeVerification: OutcomeVerificationDto;
+  deliveryReadiness?: DeliveryReadinessDto | null;
 }
 
 export interface OutcomeCriterionDto {
@@ -423,6 +499,8 @@ export interface HistoryItemDto {
   durationMilliseconds: number;
   startedAt: string | null;
   pushbackReason: string;
+  readinessState?: DeliveryReadinessState | null;
+  readinessLabel?: string | null;
 }
 
 export interface HarnessStatsDto {
@@ -612,6 +690,54 @@ export interface DirectReviewRequest {
     goal?: string | null;
     requestedChanges: string[];
   } | null;
+  reviewedCandidateId?: string | null;
+  readinessRevision?: number | null;
+  readinessContractHash?: string | null;
+}
+
+export interface ReadinessWaiverRequest {
+  gateId: string;
+  reviewedCandidateId: string;
+  readinessRevision: number;
+  readinessContractHash: string;
+  riskIds: string[];
+  acknowledgement: string;
+}
+
+export interface ReadinessWaiverResponse {
+  flowId: string;
+  gateId: string;
+  reviewedCandidateId: string;
+  readinessRevision: number;
+  readinessContractHash: string;
+  waivedRiskIds: string[];
+  message: string;
+}
+
+export type ReadinessResolutionAction =
+  | "RequestRefinement"
+  | "Continue"
+  | "Replan"
+  | "Abandon";
+
+export interface ReadinessResolutionRequest {
+  reviewedCandidateId: string;
+  readinessRevision: number;
+  readinessContractHash: string;
+  action: ReadinessResolutionAction;
+  refinement?: {
+    goal?: string | null;
+    requestedChanges: string[];
+  } | null;
+}
+
+export interface ReadinessResolutionResponse {
+  flowId: string;
+  action: ReadinessResolutionAction;
+  resolvedFrom: DeliveryReadinessState;
+  status: FlowStatus;
+  iteration: number;
+  message: string;
 }
 
 export interface DirectReviewResponse {

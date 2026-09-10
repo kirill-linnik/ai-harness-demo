@@ -38,11 +38,17 @@ export function ReviewCard({ flow }: { flow: FlowDetailDto }) {
 
   const outcome = flow.outcomeResult;
   const review = flow.review;
+  const readiness = flow.deliveryReadiness ?? null;
+  // The server is the only authority. The Accept action exists here only when the persisted
+  // readiness assessment is ReadyToApprove and still names this exact review gate.
+  const readinessBlocksDecision =
+    readiness !== null && readiness.state !== "ReadyToApprove";
   const awaitingDecision =
     flow.status === "WaitingForFeedback" &&
     review.available &&
     !review.resolved &&
-    Boolean(review.gateId);
+    Boolean(review.gateId) &&
+    !readinessBlocksDecision;
   const reviewedPreviewAvailable =
     flow.contractVersion === "studio-v2" &&
     flow.kind === "Delivery" &&
@@ -108,7 +114,10 @@ export function ReviewCard({ flow }: { flow: FlowDetailDto }) {
                   goal: goal.trim() || null,
                   requestedChanges: changes
                 }
-              : null
+              : null,
+          reviewedCandidateId: readiness?.reviewedCandidateId ?? null,
+          readinessRevision: readiness?.revision ?? null,
+          readinessContractHash: readiness?.contractHash ?? null
         }
       });
       toast(result.message, "success");
@@ -157,6 +166,16 @@ export function ReviewCard({ flow }: { flow: FlowDetailDto }) {
         )}
       </div>
       <div className="card-body">
+        {readinessBlocksDecision && (
+          <div className="callout" role="status">
+            <strong>{readiness!.label}</strong>
+            <span>
+              Acceptance is unavailable because host-derived Delivery readiness is
+              {" "}
+              {readiness!.state}.
+            </span>
+          </div>
+        )}
         {outcome ? (
           <div className="review-outcome">
             <section>

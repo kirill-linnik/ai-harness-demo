@@ -998,6 +998,11 @@ public sealed class ReviewedPublicationJournalTests
                 await database.Database.EnsureCreatedAsync();
                 database.Flows.Add(flow);
                 await database.SaveChangesAsync();
+                await DeliveryReadinessFixtures.SeedReadyToApproveAsync(
+                    database,
+                    flow,
+                    identity,
+                    outcomeOwner.Id);
             }
 
             var runner = new ScriptedProcessRunner();

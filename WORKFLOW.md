@@ -97,6 +97,36 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
 - Legacy outcome-verification flows retain their static Release Engineer and Quality Engineer gates;
   do not infer those roles for a `studio-v2` plan.
 
+### Delivery readiness gates
+
+- A `studio-v2` Delivery `team-plan-v1` must declare `AcceptanceCriteria`. Every criterion needs a
+  stable `AC-000` identifier, a requirement, an independently observable verification, owner roles,
+  evidence kinds, and its customer visibility. The host hashes this plan; it is the only criterion
+  namespace any later turn may use.
+- The plan step that carries the `Verify` duty must return exactly one strict `outcome-qa-v2` block
+  between `OUTCOME_QA_V2_BEGIN` and `OUTCOME_QA_V2_END`. The host injects the exact
+  `AcceptancePlanHash`, the planned criteria, and the complete set of host-issued evidence
+  identifiers into that turn's assignment; the response must echo the hash verbatim, cover every
+  criterion, and cite only those identifiers. It must contain one result for every planned
+  criterion (`Verified`, `Failed`, or `Blocked`, exact casing) plus zero or more residual risks
+  classified `NonBlockingDisclosure`, `WaiverRequired`, or `Blocking`. A non-verified criterion
+  must state remediation. The host derives the verdict; a supplied verdict must equal the
+  derivation and grants no authority on its own.
+- Evidence identifiers are minted by the host from its own execution records (`EV-Snnn-nnn`) and
+  recorded durably before the verification turn is dispatched. A fabricated identifier fails the
+  turn closed.
+- `HANDOFF_STATUS: COMPLETE` and any narrative wording are never authorization. The host derives
+  `ReadyToApprove`, `NeedsCustomerWaiver`, `NeedsRefinement`, or `Blocked` from the typed results,
+  binds the assessment immutably to the sealed candidate, and only then opens a gate.
+- An ordinary `CustomerReview` exists only for `ReadyToApprove`. `NeedsCustomerWaiver` opens the
+  separate `CustomerWaiver` gate, which is informed consent to named disclosed risks and is never
+  acceptance. Failed, blocked, or missing criteria are never waivable.
+- `NeedsRefinement` and `Blocked` are resolved through the typed readiness-resolution path:
+  `NeedsRefinement` accepts only `RequestRefinement`, and `Blocked` accepts only `Continue`,
+  `Replan`, or `Abandon`. None of them can accept a result or waive a risk.
+- Review acceptance, publication authorization, remote verification, and final approval each re-read
+  the same durable readiness, candidate, waiver, and review identifiers before acting.
+
 ## Current outcome-verification assignment
 
 {{ outcome.context }}

@@ -1,5 +1,6 @@
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Reasoning;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Core.Workflow;
 using System.Text.RegularExpressions;
 
@@ -211,6 +212,7 @@ public sealed class TeamPlanValidator
             context.MaximumSteps,
             errors);
         ValidateOutcomeAndFlowRules(steps, context, errors);
+        ValidateAcceptanceCriteria(document, context, errors);
 
         ThrowIfInvalid(errors);
         var ordered = indexedSteps.Select(item => item.Step).ToArray();
@@ -221,6 +223,41 @@ public sealed class TeamPlanValidator
             ordered.SingleOrDefault(step =>
                 step.Stage == PlanStage.AfterApproval &&
                 step.Duties?.SequenceEqual([PlanDuty.Publish]) == true));
+    }
+
+    /// <summary>
+    /// A studio-v2 Delivery plan must publish typed acceptance criteria. They are the only criterion
+    /// namespace that later verification may use, so a missing or malformed plan is rejected here
+    /// rather than being reconstructed from prose later.
+    /// </summary>
+    private static void ValidateAcceptanceCriteria(
+        TeamPlanDocument document,
+        TeamPlanValidationContext context,
+        ICollection<string> errors)
+    {
+        if (context.FlowKind != FlowKind.Delivery)
+        {
+            if (document.AcceptanceCriteria is not null)
+            {
+                errors.Add(
+                    "acceptanceCriteria is accepted only for Delivery plans");
+            }
+            return;
+        }
+        if (document.AcceptanceCriteria is null)
+        {
+            errors.Add(
+                "acceptanceCriteria is required for a Delivery plan and must define every " +
+                "customer-visible success criterion with a stable AC-000 identifier");
+            return;
+        }
+        foreach (var error in DeliveryReadinessPolicy.ValidateAcceptancePlan(
+                     new DeliveryAcceptancePlan(
+                         DeliveryAcceptancePlan.CurrentVersion,
+                         document.AcceptanceCriteria)))
+        {
+            errors.Add(error);
+        }
     }
 
     public static bool IsDependencyAncestor(

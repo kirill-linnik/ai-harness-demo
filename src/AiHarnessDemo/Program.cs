@@ -59,6 +59,7 @@ builder.Services.AddSingleton<IVerifiedCandidatePublisher, VerifiedCandidatePubl
 builder.Services.AddSingleton<IWorkspaceProcessCleaner, WorkspaceProcessCleaner>();
 builder.Services.AddSingleton<IFlowSessionCleaner, FlowSessionCleaner>();
 builder.Services.AddSingleton<FlowLifecycleCoordinator>();
+builder.Services.AddSingleton<DeliveryReadinessService>();
 builder.Services.AddSingleton<MissingQualificationCoordinator>();
 builder.Services.AddSingleton<LinkedFlowCoordinator>();
 builder.Services.AddSingleton<QualificationResolutionCoordinator>();
@@ -72,6 +73,7 @@ builder.Services.AddSingleton(_ =>
     gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
     gate.SetTrustLevel(HandoffActionType.OutcomeResolution, HandoffTrustLevel.Gated);
     gate.SetTrustLevel(HandoffActionType.CustomerReview, HandoffTrustLevel.Gated);
+    gate.SetTrustLevel(HandoffActionType.CustomerWaiver, HandoffTrustLevel.Gated);
     return gate;
 });
 builder.Services.AddSingleton<IWorkspaceManager, WorkspaceManager>();

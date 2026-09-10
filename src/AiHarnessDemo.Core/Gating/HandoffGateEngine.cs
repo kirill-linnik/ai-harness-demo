@@ -16,7 +16,13 @@ public enum HandoffActionType
     RequestRevision,
     Release,
     OutcomeResolution,
-    CustomerReview
+    CustomerReview,
+
+    /// <summary>
+    /// The separate informed-consent gate for waiver-required residual risks. It is deliberately
+    /// distinct from <see cref="CustomerReview"/>: a granted waiver is never product acceptance.
+    /// </summary>
+    CustomerWaiver
 }
 
 public enum HandoffBlastRadius
@@ -156,6 +162,10 @@ public sealed class HandoffGateEngine : IDisposable
         {
             return HandoffTrustLevel.Gated;
         }
+        if (actionType == HandoffActionType.CustomerWaiver)
+        {
+            return HandoffTrustLevel.Gated;
+        }
         lock (_lock)
         {
             return _trustLevels.GetValueOrDefault(actionType, HandoffTrustLevel.Shadow);
@@ -170,11 +180,18 @@ public sealed class HandoffGateEngine : IDisposable
             throw new InvalidOperationException(
                 "CustomerReview is human-gated and must remain at Gated trust.");
         }
+        if (actionType == HandoffActionType.CustomerWaiver &&
+            trustLevel != HandoffTrustLevel.Gated)
+        {
+            throw new InvalidOperationException(
+                "CustomerWaiver is human-gated and must remain at Gated trust.");
+        }
         if (trustLevel == HandoffTrustLevel.Auto &&
             actionType is
                 HandoffActionType.Release or
                 HandoffActionType.OutcomeResolution or
-                HandoffActionType.CustomerReview)
+                HandoffActionType.CustomerReview or
+                HandoffActionType.CustomerWaiver)
         {
             throw new InvalidOperationException(
                 $"{actionType} is human-gated and can never receive automatic trust.");
@@ -218,7 +235,8 @@ public sealed class HandoffGateEngine : IDisposable
     {
         lock (_lock)
         {
-            var trustLevel = proposal.ActionType == HandoffActionType.CustomerReview
+            var trustLevel = proposal.ActionType is
+                HandoffActionType.CustomerReview or HandoffActionType.CustomerWaiver
                 ? HandoffTrustLevel.Gated
                 : _trustLevels.GetValueOrDefault(
                     proposal.ActionType,
@@ -446,7 +464,8 @@ public sealed class HandoffGateEngine : IDisposable
         {
             return HandoffGateDecision.BlockedKillSwitch;
         }
-        if (proposal.ActionType == HandoffActionType.CustomerReview)
+        if (proposal.ActionType is
+            HandoffActionType.CustomerReview or HandoffActionType.CustomerWaiver)
         {
             return HandoffGateDecision.AwaitingHumanApproval;
         }
@@ -481,6 +500,9 @@ public sealed class HandoffGateEngine : IDisposable
         HandoffGateDecision.AwaitingHumanApproval
             when proposal.ActionType == HandoffActionType.CustomerReview =>
             "Customer review requires an explicit durable human decision.",
+        HandoffGateDecision.AwaitingHumanApproval
+            when proposal.ActionType == HandoffActionType.CustomerWaiver =>
+            "Waiver-required residual risks need explicit informed customer consent before review.",
         HandoffGateDecision.AwaitingHumanApproval =>
             "The proposal is gated because its trust level or blast radius requires human approval.",
         HandoffGateDecision.AutoApproved

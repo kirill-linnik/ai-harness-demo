@@ -96,6 +96,17 @@ export function HistoryPage() {
                     <td>
                       <StatusPill status={item.flowStatus} />
                       <br />
+                      {item.readinessLabel && (
+                        <>
+                          <span
+                            className={`readiness-chip readiness-${item.readinessState}`}
+                            data-readiness-state={item.readinessState}
+                          >
+                            {item.readinessLabel}
+                          </span>
+                          <br />
+                        </>
+                      )}
                       <span className="muted">
                         {item.customerBlockerMessage ||
                         (item.review.decision

@@ -18,6 +18,7 @@ import { OutcomeResolutionCard } from "./OutcomeResolutionCard";
 import { OutcomeVerificationPanel } from "./OutcomeVerificationPanel";
 import { BlockedFlowCard } from "./BlockedFlowCard";
 import { ReviewCard } from "./ReviewCard";
+import { ReadinessPanel } from "./ReadinessPanel";
 
 export function FlowPage() {
   const { id } = useParams<{ id: string }>();
@@ -220,6 +221,7 @@ export function FlowPage() {
         )}
       </div>
       {!studioFlow && <OutcomeVerificationPanel outcome={flow.outcomeVerification} />}
+      {flow.deliveryReadiness && <ReadinessPanel flow={flow} />}
       <section className="factory-detail-grid">
         <div className="card detail-panel">
           <div className="card-header">

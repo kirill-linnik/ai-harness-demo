@@ -216,6 +216,66 @@ immutable and `Blocked`; repair actions create a linked flow rather than mutatin
 - Delivery refinement also reuses the flow workspace and snapshot.
 - Delivery acceptance is durable authorization; only then is the one planned Publish semantic root
   materialized.
+
+### Host-derived Delivery readiness
+
+`studio-v2` Delivery flows carry a separate host-owned readiness aggregate. It is the only
+authorization input for review, waiver, acceptance, publication, and final approval; agent prose and
+`HANDOFF_STATUS: COMPLETE` are display and diagnostics only.
+
+- The Team Lead's Delivery `team-plan-v1` must declare `AcceptanceCriteria` (`DeliveryAcceptancePlan`,
+  stable `AC-000` ids). The host hashes the plan and persists it as
+  `delivery.acceptance-plan-recorded`.
+- The plan step with the `Verify` duty must return a strict `outcome-qa-v2` document. The host
+  injects the exact acceptance plan hash, the planned criteria, and the host-issued evidence
+  registry into that turn's assignment, then validates exhaustive criterion coverage, exact enum
+  casing, duplicate properties, bounds, evidence-identifier membership, and risk classification,
+  derives the verdict itself, and persists the exact bytes as `delivery.readiness-qa-recorded`. An
+  invalid contract fails the turn closed.
+- Evidence identifiers are host-owned. Each completed `BeforeReview` worker step, and the
+  verification step itself before dispatch, records `delivery.readiness-evidence-recorded` with
+  deterministic `EV-Snnn-nnn` identifiers derived from the host execution record and its observed
+  tool calls. Membership in that registry is mandatory, so a fabricated identifier can never
+  authorize a verified criterion and an empty registry fails closed.
+- After the candidate is sealed, `DeliveryReadinessPolicy` derives one of `ReadyToApprove`,
+  `NeedsCustomerWaiver`, `NeedsRefinement`, or `Blocked` in that precedence and writes an immutable
+  `DeliveryReadinessSnapshotRecord` bound one-to-one to a `ReviewedCandidateRecord`. Unique partial
+  indexes allow exactly one active snapshot and one active reviewed candidate per flow.
+- `WorkflowEngine` opens an ordinary `CustomerReview` only for `ReadyToApprove`. A
+  `NeedsCustomerWaiver` result opens the separate `CustomerWaiver` gate; `NeedsRefinement` and
+  `Blocked` open no customer gate at all and record a typed blocker.
+- `POST /api/flows/{flowId}/readiness-waiver` records immutable `ReadinessWaiverRecord` receipts for
+  the exact enumerated `WaiverRequired` risk ids, then re-derives the same QA facts and opens the
+  ordinary review. Acceptance criteria and `Blocking` risks are schema-invalid waiver targets.
+- Review, waiver, and publication requests carry `reviewedCandidateId`, `readinessRevision`, and
+  `readinessContractHash`. For a Delivery readiness flow all three are mandatory; an omitted value
+  is a stale tab and returns `readiness.review-stale`. A stale or non-ready binding returns an
+  RFC 9457 `409` with a stable `code` (`readiness.not-ready`, `readiness.waiver-required`,
+  `readiness.waiver-not-applicable`, `readiness.candidate-stale`, `readiness.review-stale`,
+  `readiness.reconciliation-required`, `readiness.publication-not-authorized`) and never resolves a
+  gate.
+- `POST /api/flows/{flowId}/readiness-resolution` is the typed way out of a non-releasable state.
+  `NeedsRefinement` accepts only `RequestRefinement` (queues a new iteration); `Blocked` accepts
+  `Continue` (re-queues the same iteration), `Replan` (new iteration), or `Abandon` (delegated to
+  the durable abandonment service). Every resolution supersedes the active readiness snapshot and
+  candidate binding, and none of them can accept a result, grant a waiver, or resolve a gate.
+- `LoadCurrentAsync` rejects a readiness row whose persisted state or hash disagrees with its
+  canonical contract JSON, so durable state edited outside the derivation path fails closed.
+- Restart reconciliation never transitions a studio-v2 Delivery flow to `Approved` directly. A
+  publication that completed inside the crash window is reauthorized against the current readiness,
+  accepted review, and journal binding and then completed through `CompletePublishedDelivery`;
+  otherwise a denial event is recorded and the flow stays unapproved.
+- `VerifiedCandidatePublisher` re-reads the readiness rows before any token lookup, Git command, or
+  journal mutation, stamps `ReviewedCandidateId`, `ReadinessSnapshotId`, `ReadinessContractHash`,
+  `CustomerReviewGateId`, and `WaiverSetHash` onto every `ReviewedPublicationRecord`, and
+  `PublishedOutcomeVerifier` rechecks the same binding after remote verification.
+- `FlowLifecycleCoordinator.Transition` refuses `Approved` for a `studio-v2` Delivery flow.
+  `OpenWaiverReview`, `OpenCustomerReview`, `QueueApprovedPublication`, and
+  `CompletePublishedDelivery` are the only guarded paths, and each requires the derived state plus an
+  exact candidate binding.
+- Startup reconciliation is fail-closed and idempotent: a pre-readiness `studio-v2` Delivery flow
+  with review history gains a `LegacyUnverified` snapshot, any unresolved review is superseded, and
+  the projection renders **Published - readiness unverified** under `Blocked` instead of green.
 - The exact candidate is sealed before the review gate: all repository HEAD/tree identities plus
   bounded scaffold/preview identity are persisted as `reviewed-candidate-v1`, tied to flow,
   iteration, outcome owner, plan-step key, and outcome-contract hash.

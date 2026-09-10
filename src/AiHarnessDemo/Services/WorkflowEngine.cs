@@ -40,7 +40,8 @@ public sealed class WorkflowEngine(
     IReviewedCandidateService? reviewedCandidateService = null,
     ReviewCoordinator? reviewCoordinator = null,
     LinkedFlowCoordinator? linkedFlowCoordinator = null,
-    AgentManifestStager? manifestStager = null)
+    AgentManifestStager? manifestStager = null,
+    DeliveryReadinessService? deliveryReadinessService = null)
 {
     internal const string ReleaseCandidateLabel = "Prepare customer release candidate";
     internal const string ApprovedPublicationLabel = "Publish customer-approved outcome";
@@ -113,6 +114,8 @@ public sealed class WorkflowEngine(
             : new ReviewedCandidateService(candidateFingerprintService));
     private readonly ReviewCoordinator? _reviewCoordinator =
         reviewCoordinator;
+    private readonly DeliveryReadinessService _readiness =
+        deliveryReadinessService ?? new DeliveryReadinessService();
     private readonly LinkedFlowCoordinator? _linkedFlows =
         linkedFlowCoordinator;
     private readonly AgentManifestStager _manifestStager =
@@ -1270,6 +1273,34 @@ public sealed class WorkflowEngine(
             await database.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             return;
+        }
+        if (DeliveryReadinessService.AppliesTo(storedFlow) &&
+            plan.Document.AcceptanceCriteria is { Count: > 0 } acceptanceCriteria)
+        {
+            var acceptancePlan = new DeliveryAcceptancePlan(
+                DeliveryAcceptancePlan.CurrentVersion,
+                acceptanceCriteria);
+            var acceptanceData = DeliveryReadinessService.SerializeAcceptancePlan(
+                acceptancePlan,
+                flow.Iteration,
+                contractSource?.Id ?? Guid.Empty);
+            if (!await database.FlowEvents.AnyAsync(
+                    item =>
+                        item.FlowRunId == flow.Id &&
+                        item.Type == DeliveryReadinessService.AcceptancePlanEventType &&
+                        item.DataJson == acceptanceData,
+                    cancellationToken))
+            {
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = contractSource?.Id,
+                    Type = DeliveryReadinessService.AcceptancePlanEventType,
+                    Message =
+                        $"Recorded {acceptanceCriteria.Count} planned Delivery acceptance criteria for iteration {flow.Iteration}.",
+                    DataJson = acceptanceData
+                });
+            }
         }
 
         var snapshotById = snapshots.ToDictionary(
@@ -4153,8 +4184,14 @@ public sealed class WorkflowEngine(
                     learning.TimesApplied++;
                 }
 
+                var readinessAssignment =
+                    await PrepareDeliveryVerificationAssignmentAsync(
+                        database,
+                        flow,
+                        step,
+                        cancellationToken);
                 var (outcomeContext, outcomeContract) =
-                    BuildOutcomePrompt(flow, step);
+                    BuildOutcomePrompt(flow, step, readinessAssignment);
                 await database.SaveChangesAsync(cancellationToken);
                 executionContext = new AgentExecutionContext(
                     flow.Id,
@@ -4237,7 +4274,10 @@ public sealed class WorkflowEngine(
                     StudioDependencyOutputs: studioDependencyOutputs,
                     IsOutcomeOwner: step.IsOutcomeOwner,
                     PlanStepKey: step.PlanStepKey,
-                    FlowKind: flow.Kind);
+                    FlowKind: flow.Kind,
+                    RequiresDeliveryReadinessQa:
+                        DeliveryReadinessService.AppliesTo(flow) &&
+                        IsDeliveryVerificationStep(step));
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -4358,19 +4398,94 @@ public sealed class WorkflowEngine(
         }
 
         if (!handoff.IsPushback &&
-            string.Equals(
-                context.AgentRole,
-                "quality-engineer",
-                StringComparison.Ordinal) &&
-            ContainsExplicitFailedQualityVerdict(output))
+            context.RequiresDeliveryReadinessQa &&
+            !DeliveryReadinessPolicy.ContainsQaContract(output))
         {
             return
-                "Quality Engineer paired HANDOFF_STATUS: COMPLETE with an explicit failing or not-release-ready verdict.";
+                $"The Delivery verification turn must return exactly one strict {DeliveryReadinessPolicy.QaVersion} " +
+                $"block between {DeliveryReadinessPolicy.QaBeginMarker} and {DeliveryReadinessPolicy.QaEndMarker}.";
         }
         return null;
     }
 
-    private static bool ContainsExplicitFailedQualityVerdict(string output) =>
+    /// <summary>
+    /// A Delivery verification step is the planned owner of the strict <c>outcome-qa-v2</c> contract.
+    /// It is identified from the persisted plan duties, never from an agent role name or prose.
+    /// </summary>
+    internal static bool IsDeliveryVerificationStep(FlowStep step)
+    {
+        ArgumentNullException.ThrowIfNull(step);
+        return step.PlanStage == PlanStage.BeforeReview &&
+               step.InvocationKind == ExecutionInvocationKind.Worker &&
+               ReadPlanDuties(step.PlanDutiesJson).Contains(PlanDuty.Verify);
+    }
+
+    /// <summary>
+    /// Validates and durably records the strict <c>outcome-qa-v2</c> contract emitted by a Delivery
+    /// verification turn. Contract errors fail the step instead of being interpreted charitably.
+    /// </summary>
+    private static async Task RecordDeliveryQaContractAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        string output,
+        CancellationToken cancellationToken)
+    {
+        var events = await database.FlowEvents
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                (item.Type == DeliveryReadinessService.AcceptancePlanEventType ||
+                 item.Type == DeliveryReadinessService.EvidenceEventType))
+            .ToListAsync(cancellationToken);
+        var (plan, planHash, planErrors) =
+            DeliveryReadinessService.TryReadAcceptancePlan(events, flow.Iteration);
+        if (plan is null)
+        {
+            throw new InvalidOperationException(
+                "A Delivery verification turn cannot be accepted without planned acceptance " +
+                "criteria: " + string.Join("; ", planErrors));
+        }
+
+        // Membership in the host-owned registry is mandatory here, so a fabricated identifier
+        // fails the turn instead of quietly authorizing a verified criterion.
+        var parsed = DeliveryReadinessPolicy.ParseQaOutput(
+            output,
+            plan,
+            planHash,
+            DeliveryReadinessService.KnownEvidenceIds(events, flow.Iteration));
+        var data = DeliveryReadinessService.SerializeQa(
+            parsed,
+            flow.Iteration,
+            step.Id,
+            step.AgentRole);
+        if (await database.FlowEvents.AnyAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.FlowStepId == step.Id &&
+                    item.Type == DeliveryReadinessService.QaEventType &&
+                    item.DataJson == data,
+                cancellationToken))
+        {
+            return;
+        }
+        var derived = DeliveryReadinessPolicy.DeriveVerdict(parsed.Document);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = DeliveryReadinessService.QaEventType,
+            Message =
+                $"Recorded a strict {DeliveryReadinessPolicy.QaVersion} result with a host-derived verdict of {derived}.",
+            DataJson = data
+        });
+    }
+
+    /// <summary>
+    /// Non-authoritative prose diagnostics. These strings are recorded for operators only; they can
+    /// never fail, pass, or gate a candidate, because authorization comes from typed criterion
+    /// results in the readiness snapshot.
+    /// </summary>
+    internal static bool ContainsContradictoryQualityProse(string output) =>
         output.ReplaceLineEndings("\n")
             .Split('\n')
             .Select(line => line.Trim().Trim('*', '_', '`').Trim())
@@ -6195,6 +6310,32 @@ public sealed class WorkflowEngine(
         }
         var studioPublication =
             ReviewCoordinator.IsStudioPublicationStep(flow, step);
+        if (!pushedBack && DeliveryReadinessService.AppliesTo(flow) &&
+            step.PlanStage == PlanStage.BeforeReview &&
+            step.InvocationKind == ExecutionInvocationKind.Worker)
+        {
+            // The host mints evidence identifiers from its own execution records, so a later
+            // verification turn can only cite observations the host actually made.
+            await RecordDeliveryEvidenceAsync(
+                database,
+                flow,
+                step,
+                await database.AgentToolCalls
+                    .Where(item => item.FlowStepId == step.Id)
+                    .ToListAsync(cancellationToken),
+                cancellationToken);
+            await database.SaveChangesAsync(cancellationToken);
+        }
+        if (!pushedBack && DeliveryReadinessService.AppliesTo(flow) &&
+            IsDeliveryVerificationStep(step))
+        {
+            await RecordDeliveryQaContractAsync(
+                database,
+                flow,
+                step,
+                result.Output,
+                cancellationToken);
+        }
         var legacyPublication =
             flow.ContractVersion == "legacy-v1" &&
             step.RemotePublicationAllowed;
@@ -7670,7 +7811,21 @@ public sealed class WorkflowEngine(
                 {
                     if (flow.Status != FlowStatus.Approved)
                     {
-                        _lifecycle.Transition(flow, FlowStatus.Approved);
+                        // Crash-window recovery must reauthorize from the durable readiness,
+                        // review, and publication-journal binding instead of transitioning a
+                        // studio-v2 Delivery flow to Approved directly.
+                        var authorized = await TryCompleteRecoveredDeliveryAsync(
+                            database,
+                            flow,
+                            accepted,
+                            latestPublication,
+                            cancellationToken);
+                        if (!authorized)
+                        {
+                            await database.SaveChangesAsync(cancellationToken);
+                            await transaction.CommitAsync(cancellationToken);
+                            continue;
+                        }
                         flow.CompletedAt ??=
                             latestPublication.CompletedAt ??
                             DateTimeOffset.UtcNow;
@@ -10155,17 +10310,28 @@ public sealed class WorkflowEngine(
 
     private static (string Context, string Contract) BuildOutcomePrompt(
         FlowRun flow,
-        FlowStep step)
+        FlowStep step,
+        DeliveryVerificationAssignment? readiness = null)
     {
         if (flow.ContractVersion == "studio-v2")
         {
-            return step.IsOutcomeOwner
-                ? (
-                    "You are the final outcome owner. Consolidate the confirmed goal and the completed plan-step evidence into the customer-review result.",
-                    FlowOutcomeResponseContract())
-                : (
-                    "The accepted dynamic team plan defines this step's duties and outcome ownership.",
-                    "No flow-outcome document is required because this is not the final outcome-owner step.");
+            var ownerContext = step.IsOutcomeOwner
+                ? "You are the final outcome owner. Consolidate the confirmed goal and the completed plan-step evidence into the customer-review result."
+                : "The accepted dynamic team plan defines this step's duties and outcome ownership.";
+            var ownerContract = step.IsOutcomeOwner
+                ? FlowOutcomeResponseContract()
+                : "No flow-outcome document is required because this is not the final outcome-owner step.";
+            if (readiness is null)
+            {
+                return (ownerContext, ownerContract);
+            }
+            return (
+                ownerContext +
+                Environment.NewLine + Environment.NewLine +
+                BuildDeliveryVerificationContext(readiness),
+                ownerContract +
+                Environment.NewLine + Environment.NewLine +
+                DeliveryQaResponseContract(readiness.PlanHash));
         }
         if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
         {
@@ -10205,6 +10371,60 @@ public sealed class WorkflowEngine(
                 ? DeliveryEvidenceOutcomeContract()
                 : "No acceptance criterion is assigned to this role; no outcome-evidence document is required.");
     }
+
+    /// <summary>
+    /// The exact host-computed inputs a Delivery verification turn must work from: the planned
+    /// criteria, the acceptance plan hash it must echo verbatim, and the complete set of evidence
+    /// identifiers the host issued. Nothing outside this set is a valid evidence reference.
+    /// </summary>
+    internal static string BuildDeliveryVerificationContext(
+        DeliveryVerificationAssignment readiness)
+    {
+        var criteria = string.Join(
+            Environment.NewLine,
+            readiness.Plan.Criteria.Select(criterion =>
+                $"- {criterion.Id} (customerVisible={criterion.CustomerVisible.ToString().ToLowerInvariant()}; " +
+                $"owners={string.Join('/', criterion.OwnerRoles ?? [])}; " +
+                $"evidenceKinds={string.Join('/', (criterion.EvidenceKinds ?? []).Select(kind => kind.ToString()))}): " +
+                $"{criterion.Requirement} | verification: {criterion.Verification}"));
+        var evidence = readiness.Evidence.Count == 0
+            ? "- (none: the host issued no evidence identifiers, so no criterion can be verified)"
+            : string.Join(
+                Environment.NewLine,
+                readiness.Evidence.Select(item =>
+                    $"- {item.EvidenceId} [{item.Kind}] {item.Locator}: {item.Summary}"));
+        return $"""
+            You additionally own the Delivery verification duty for this iteration.
+
+            AcceptancePlanHash (copy this value verbatim into the outcome-qa-v2 document):
+            {readiness.PlanHash}
+
+            Planned acceptance criteria ({readiness.Plan.Criteria.Count}); report exactly one result for each:
+            {criteria}
+
+            Host-issued evidence identifiers you may cite ({readiness.Evidence.Count}); any other identifier is rejected:
+            {evidence}
+            """;
+    }
+
+    internal static string DeliveryQaResponseContract(string acceptancePlanHash) => $$"""
+        Also output exactly one strict JSON document between these standalone sentinels:
+        {{DeliveryReadinessPolicy.QaBeginMarker}}
+        {"Version":"{{DeliveryReadinessPolicy.QaVersion}}","AcceptancePlanHash":"{{acceptancePlanHash}}","Verdict":"PASS|FAIL|BLOCKED","Criteria":[{"CriterionId":"AC-001","Outcome":"Verified|Failed|Blocked","EvidenceIds":["EV-S000-000"],"Rationale":"what the host-observed evidence shows","Remediation":null,"ResponsibleRoles":[]}],"ResidualRisks":[]}
+        {{DeliveryReadinessPolicy.QaEndMarker}}
+        Property names and enum casing are exact. Provide exactly one Criteria entry per planned
+        criterion identifier, referencing only host-issued evidence identifiers. Outcome is
+        Verified, Failed, or Blocked. Verified has no responsible roles or remediation. Failed names
+        at least one responsible role and includes remediation. Blocked includes remediation and may
+        omit responsible roles only for a clearly external blocker. Each ResidualRisks entry needs RiskId matching RR-000,
+        Classification NonBlockingDisclosure, WaiverRequired, or Blocking, Severity Low, Medium,
+        High, or Critical, Statement, Impact, EvidenceIds, CriterionIds, and PreMortemFindingId
+        (null or matching PM-000). Never reclassify a failed or blocked criterion as a residual
+        risk. Verdict must be BLOCKED when any criterion is Blocked or any risk is Blocking, PASS
+        only when every criterion is Verified, and FAIL otherwise; the host derives the same value
+        and rejects a mismatch. A COMPLETE handoff marker or a confident summary never makes a
+        candidate releasable.
+        """;
 
     internal static string FlowOutcomeResponseContract() => $$"""
         After the HANDOFF_STATUS marker and concise handoff, output exactly one strict JSON document between these standalone sentinels:
@@ -10790,6 +11010,325 @@ public sealed class WorkflowEngine(
         await database.SaveChangesAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Handles a Delivery result whose host-derived readiness is not
+    /// <see cref="DeliveryReadinessState.ReadyToApprove"/>. It opens the separate waiver gate for
+    /// <see cref="DeliveryReadinessState.NeedsCustomerWaiver"/> and otherwise opens no customer gate
+    /// at all, so neither acceptance nor publication can be reached from a non-ready assessment.
+    /// </summary>
+    private async Task OpenNonReadyDeliveryStateAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep owner,
+        DeliveryReadinessBinding readiness,
+        ParsedFlowOutcome normalizedOutcome,
+        CancellationToken cancellationToken)
+    {
+        var currentStepIds = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .Select(step => step.Id)
+            .ToHashSet();
+        foreach (var stale in flow.GateRecords.Where(gate =>
+                     !gate.Resolved &&
+                     gate.ActionType is HandoffActionType.CustomerReview
+                         or HandoffActionType.CustomerWaiver &&
+                     currentStepIds.Contains(gate.FlowStepId) &&
+                     (gate.ActionType != HandoffActionType.CustomerWaiver ||
+                      readiness.State != DeliveryReadinessState.NeedsCustomerWaiver))
+                     .ToList())
+        {
+            var superseded = handoffGate.PrepareSupersession(
+                stale,
+                "harness",
+                $"Superseded because host-derived readiness is '{readiness.State}'.");
+            ApplyGateResolution(superseded, stale);
+            handoffGate.RestoreHistory([superseded]);
+        }
+
+        if (readiness.State == DeliveryReadinessState.NeedsCustomerWaiver)
+        {
+            var existing = flow.GateRecords.SingleOrDefault(gate =>
+                !gate.Resolved &&
+                gate.ActionType == HandoffActionType.CustomerWaiver &&
+                currentStepIds.Contains(gate.FlowStepId));
+            if (existing is null)
+            {
+                var waiverGate = handoffGate.SubmitProposal(new HandoffProposal
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = owner.Id,
+                    ActionType = HandoffActionType.CustomerWaiver,
+                    Summary = normalizedOutcome.Document.Summary,
+                    Evidence = string.Join(
+                        Environment.NewLine,
+                        readiness.Contract.Risks
+                            .Where(risk =>
+                                risk.Classification ==
+                                DeliveryRiskClassification.WaiverRequired)
+                            .Select(risk =>
+                                $"{risk.RiskId} [{risk.Severity}] {risk.Statement} -> {risk.Impact}")),
+                    BlastRadius = HandoffBlastRadius.High
+                });
+                if (waiverGate.Decision != HandoffGateDecision.AwaitingHumanApproval)
+                {
+                    throw new InvalidOperationException(
+                        "CustomerWaiver must always produce a human-gated decision.");
+                }
+                flow.GateRecords.Add(waiverGate);
+                database.Entry(waiverGate).State = EntityState.Added;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = owner.Id,
+                    Type = "gate.customer-waiver-created",
+                    Message =
+                        $"Harness opened the separate customer waiver gate for {readiness.Contract.RequiredWaiverRiskIds.Count} disclosed risk(s).",
+                    DataJson = JsonSerializer.Serialize(new
+                    {
+                        Version = "delivery-readiness-waiver-gate-v1",
+                        SnapshotId = readiness.Record.Id,
+                        readiness.Revision,
+                        readiness.ContractHash,
+                        ReviewedCandidateId = readiness.Candidate.Id,
+                        readiness.Contract.RequiredWaiverRiskIds
+                    })
+                });
+            }
+            _lifecycle.OpenWaiverReview(
+                flow,
+                readiness.State,
+                readiness.Record.CandidateFingerprint,
+                readiness.Candidate.CandidateFingerprint);
+            flow.OutcomeLabel = "Needs customer waiver";
+        }
+        else
+        {
+            var blocked = readiness.State == DeliveryReadinessState.Blocked;
+            _lifecycle.Transition(
+                flow,
+                blocked ? FlowStatus.Blocked : FlowStatus.WaitingForFeedback);
+            flow.OutcomeLabel = blocked ? "Blocked" : "Needs refinement";
+            flow.CurrentBlockerCode = blocked
+                ? "delivery.readiness-blocked"
+                : "delivery.readiness-needs-refinement";
+            flow.CurrentBlockerSummary =
+                $"Host-derived Delivery readiness is '{readiness.State}' at revision {readiness.Revision}.";
+            flow.CustomerBlockerMessage = blocked
+                ? "This result is blocked: at least one acceptance criterion or residual risk blocks release."
+                : "This result needs refinement before it can be reviewed for acceptance.";
+            flow.CurrentBlockerDataJson = JsonSerializer.Serialize(new
+            {
+                Version = "delivery-readiness-blocker-v1",
+                State = readiness.State.ToString(),
+                readiness.Revision,
+                readiness.ContractHash,
+                FailedCriteria = readiness.Contract.Criteria
+                    .Where(item => item.Outcome == DeliveryCriterionOutcome.Failed)
+                    .Select(item => item.CriterionId)
+                    .ToArray(),
+                BlockedCriteria = readiness.Contract.Criteria
+                    .Where(item => item.Outcome == DeliveryCriterionOutcome.Blocked)
+                    .Select(item => item.CriterionId)
+                    .ToArray(),
+                readiness.Contract.Diagnostics
+            });
+        }
+
+        flow.OutcomeUrl = string.Empty;
+        flow.UpdatedAt = DateTimeOffset.UtcNow;
+        if (!await database.FlowEvents.AnyAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.Type == "flow.readiness-not-ready" &&
+                    item.FlowStepId == owner.Id,
+                cancellationToken))
+        {
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = owner.Id,
+                Type = "flow.readiness-not-ready",
+                Message =
+                    $"No ordinary customer review was created because host-derived readiness is '{readiness.State}'.",
+                DataJson = JsonSerializer.Serialize(new
+                {
+                    Version = "delivery-readiness-not-ready-v1",
+                    State = readiness.State.ToString(),
+                    readiness.Revision,
+                    readiness.ContractHash
+                })
+            });
+        }
+        await database.SaveChangesAsync(cancellationToken);
+    }
+
+    private static void ApplyGateResolution(
+        HandoffGateRecord source,
+        HandoffGateRecord destination)
+    {
+        destination.Resolved = source.Resolved;
+        destination.Approved = source.Approved;
+        destination.ResolvedBy = source.ResolvedBy;
+        destination.ResolutionNote = source.ResolutionNote;
+        destination.ResolvedAt = source.ResolvedAt;
+        destination.ReviewDecision = source.ReviewDecision;
+    }
+
+    /// <summary>
+    /// The host-owned inputs a Delivery verification turn needs: the exact acceptance plan hash it
+    /// must echo, the criteria it must cover, and the evidence identifiers it may cite.
+    /// </summary>
+    internal sealed record DeliveryVerificationAssignment(
+        string PlanHash,
+        DeliveryAcceptancePlan Plan,
+        IReadOnlyList<DeliveryEvidenceItem> Evidence);
+
+    /// <summary>
+    /// Durably records the host-issued evidence identifiers for one plan step. It is idempotent, so
+    /// a restart or a retry never mints a second registry entry for the same observations.
+    /// </summary>
+    private static async Task RecordDeliveryEvidenceAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep step,
+        IReadOnlyList<AgentToolCall> toolCalls,
+        CancellationToken cancellationToken)
+    {
+        var entry = DeliveryReadinessService.BuildEvidence(step, toolCalls);
+        var data = DeliveryReadinessService.SerializeEvidence(entry);
+        if (await database.FlowEvents.AnyAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.FlowStepId == step.Id &&
+                    item.Type == DeliveryReadinessService.EvidenceEventType &&
+                    item.DataJson == data,
+                cancellationToken))
+        {
+            return;
+        }
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = step.Id,
+            Type = DeliveryReadinessService.EvidenceEventType,
+            Message =
+                $"Issued {entry.Items.Count} host-owned evidence identifier(s) for plan step '{step.PlanStepKey}'.",
+            DataJson = data
+        });
+    }
+
+    /// <summary>
+    /// Prepares the verification turn: pre-issues the step's own evidence identifier before
+    /// dispatch and loads the durable acceptance plan and evidence registry that the prompt must
+    /// carry. A Delivery verification turn is never dispatched without a planned criterion set.
+    /// </summary>
+    private static async Task<DeliveryVerificationAssignment?>
+        PrepareDeliveryVerificationAssignmentAsync(
+            HarnessDbContext database,
+            FlowRun flow,
+            FlowStep step,
+            CancellationToken cancellationToken)
+    {
+        if (!DeliveryReadinessService.AppliesTo(flow) ||
+            !IsDeliveryVerificationStep(step))
+        {
+            return null;
+        }
+        await RecordDeliveryEvidenceAsync(database, flow, step, [], cancellationToken);
+        await database.SaveChangesAsync(cancellationToken);
+
+        var events = await database.FlowEvents
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                (item.Type == DeliveryReadinessService.AcceptancePlanEventType ||
+                 item.Type == DeliveryReadinessService.EvidenceEventType))
+            .ToListAsync(cancellationToken);
+        var (plan, planHash, planErrors) =
+            DeliveryReadinessService.TryReadAcceptancePlan(events, flow.Iteration);
+        if (plan is null)
+        {
+            throw new InvalidOperationException(
+                "A Delivery verification turn cannot be dispatched without planned acceptance " +
+                "criteria: " + string.Join("; ", planErrors));
+        }
+        return new DeliveryVerificationAssignment(
+            planHash,
+            plan,
+            DeliveryReadinessService.ReadEvidence(events, flow.Iteration));
+    }
+
+    /// <summary>
+    /// Idempotently completes a Delivery flow whose publication finished before the crash. It
+    /// reauthorizes the current readiness, the accepted review, and the publication journal
+    /// binding, and denies safely (leaving the flow unapproved) when any of them no longer agree.
+    /// </summary>
+    private async Task<bool> TryCompleteRecoveredDeliveryAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        HandoffGateRecord accepted,
+        FlowStep publication,
+        CancellationToken cancellationToken)
+    {
+        if (!DeliveryReadinessService.AppliesTo(flow))
+        {
+            _lifecycle.Transition(flow, FlowStatus.Approved);
+            return true;
+        }
+
+        DeliveryReadinessBinding? binding;
+        string? loadFailure = null;
+        try
+        {
+            binding = await _readiness.LoadCurrentAsync(
+                database,
+                flow.Id,
+                cancellationToken);
+        }
+        catch (DeliveryReadinessConflictException exception)
+        {
+            binding = null;
+            loadFailure = exception.Message;
+        }
+        var journal = await database.ReviewedPublicationRecords
+            .Where(item => item.FlowRunId == flow.Id)
+            .ToListAsync(cancellationToken);
+        var denial =
+            loadFailure ??
+            (binding is null
+                ? "no current readiness assessment exists"
+                : binding.State != DeliveryReadinessState.ReadyToApprove
+                    ? $"the current readiness state is '{binding.State}'"
+                    : journal.Any(item =>
+                        item.Stage != ReviewedPublicationStage.Completed ||
+                        item.ReviewedCandidateId != binding.Candidate.Id ||
+                        item.ReadinessSnapshotId != binding.Record.Id ||
+                        item.CustomerReviewGateId != accepted.Id ||
+                        !string.Equals(
+                            item.ReadinessContractHash,
+                            binding.ContractHash,
+                            StringComparison.Ordinal))
+                        ? "the publication journal is not bound to the current readiness assessment"
+                        : null);
+        if (denial is not null)
+        {
+            database.FlowEvents.Add(DeliveryReadinessService.DenialEvent(
+                flow.Id,
+                publication.Id,
+                DeliveryReadinessConflicts.PublicationNotAuthorized,
+                "Restart reconciliation refused final approval because " + denial + ".",
+                binding));
+            return false;
+        }
+
+        _lifecycle.CompletePublishedDelivery(
+            flow,
+            binding!.State,
+            binding.Record.CandidateFingerprint,
+            binding.Candidate.CandidateFingerprint,
+            publicationVerified: true);
+        return true;
+    }
+
     private async Task MarkWaitingForReviewAsync(
         Guid flowId,
         CancellationToken cancellationToken)
@@ -10847,6 +11386,7 @@ public sealed class WorkflowEngine(
                 _ => throw new InvalidOperationException(
                     $"Unknown flow kind '{flow.Kind}'.")
             };
+            ReviewedCandidateIdentity? sealedIdentity = null;
             if (flow.Kind == FlowKind.Delivery)
             {
                 try
@@ -10885,6 +11425,7 @@ public sealed class WorkflowEngine(
                                 reviewedIdentity,
                                 cancellationToken);
                     }
+                    sealedIdentity = reviewedIdentity;
                 }
                 catch (Exception exception) when (
                     exception is CandidateValidationException or
@@ -11004,6 +11545,17 @@ public sealed class WorkflowEngine(
                 .Where(step => step.Iteration == flow.Iteration)
                 .Select(step => step.Id)
                 .ToHashSet();
+            DeliveryReadinessBinding? readiness = null;
+            if (flow.Kind == FlowKind.Delivery)
+            {
+                readiness = await _readiness.DeriveAndPersistAsync(
+                    database,
+                    flow,
+                    sealedIdentity
+                    ?? throw new InvalidOperationException(
+                        "A Delivery review requires a sealed reviewed candidate."),
+                    cancellationToken);
+            }
             var reviews = flow.GateRecords
                 .Where(gate =>
                     gate.ActionType == HandoffActionType.CustomerReview &&
@@ -11035,7 +11587,57 @@ public sealed class WorkflowEngine(
                         ?? throw new InvalidOperationException(
                             "Delivery acceptance is durable, but its planned publication has not completed verification.");
                 }
-                _lifecycle.Transition(flow, FlowStatus.Approved);
+                if (flow.Kind == FlowKind.Delivery)
+                {
+                    var current = readiness
+                        ?? throw new InvalidOperationException(
+                            "Delivery approval requires a current readiness assessment.");
+                    // The durable publication journal is the host's own record of remote side
+                    // effects. Whenever rows exist they must all be completed and bound to this
+                    // exact readiness, candidate, and accepted-review identity; a mismatch denies
+                    // final approval instead of silently trusting the accepted gate.
+                    var journal = await database
+                        .ReviewedPublicationRecords
+                        .Where(item => item.FlowRunId == flow.Id)
+                        .ToListAsync(cancellationToken);
+                    var verified =
+                        journal.Count == 0 ||
+                        journal.All(item =>
+                            item.Stage == ReviewedPublicationStage.Completed &&
+                            item.ReviewedCandidateId == current.Candidate.Id &&
+                            item.ReadinessSnapshotId == current.Record.Id &&
+                            item.CustomerReviewGateId == accepted.Id &&
+                            string.Equals(
+                                item.ReadinessContractHash,
+                                current.ContractHash,
+                                StringComparison.Ordinal));
+                    if (!verified)
+                    {
+                        database.FlowEvents.Add(DeliveryReadinessService.DenialEvent(
+                            flow.Id,
+                            publication?.Id ?? owner.Id,
+                            DeliveryReadinessConflicts.PublicationNotAuthorized,
+                            "Final approval was refused because the reviewed publication journal is not bound to the current readiness assessment.",
+                            current));
+                        await database.SaveChangesAsync(cancellationToken);
+                        throw new DeliveryReadinessConflictException(
+                            DeliveryReadinessConflicts.PublicationNotAuthorized,
+                            "The reviewed publication journal is not bound to the current readiness assessment.",
+                            current.State,
+                            current.Revision,
+                            current.ContractHash);
+                    }
+                    _lifecycle.CompletePublishedDelivery(
+                        flow,
+                        current.State,
+                        current.Record.CandidateFingerprint,
+                        current.Candidate.CandidateFingerprint,
+                        publicationVerified: true);
+                }
+                else
+                {
+                    _lifecycle.Transition(flow, FlowStatus.Approved);
+                }
                 flow.CompletedAt = DateTimeOffset.UtcNow;
                 flow.UpdatedAt = DateTimeOffset.UtcNow;
                 var approvalStepId = publication?.Id ?? owner.Id;
@@ -11057,6 +11659,19 @@ public sealed class WorkflowEngine(
                     });
                 }
                 await database.SaveChangesAsync(cancellationToken);
+                return;
+            }
+
+            if (readiness is not null &&
+                readiness.State is not DeliveryReadinessState.ReadyToApprove)
+            {
+                await OpenNonReadyDeliveryStateAsync(
+                    database,
+                    flow,
+                    owner,
+                    readiness,
+                    normalizedOutcome,
+                    cancellationToken);
                 return;
             }
 
@@ -11086,11 +11701,34 @@ public sealed class WorkflowEngine(
                     FlowRunId = flow.Id,
                     FlowStepId = owner.Id,
                     Type = "gate.customer-review-created",
-                    Message =
-                        "Harness created the durable generic customer-review gate."
+                    Message = readiness is null
+                        ? "Harness created the durable generic customer-review gate."
+                        : $"Harness opened the ordinary customer review from readiness revision {readiness.Revision} (ReadyToApprove).",
+                    DataJson = readiness is null
+                        ? null
+                        : JsonSerializer.Serialize(new
+                        {
+                            Version = "delivery-readiness-review-opened-v1",
+                            SnapshotId = readiness.Record.Id,
+                            readiness.Revision,
+                            readiness.ContractHash,
+                            ReviewedCandidateId = readiness.Candidate.Id,
+                            readiness.Record.CandidateFingerprint
+                        })
                 });
             }
-            _lifecycle.Transition(flow, FlowStatus.WaitingForFeedback);
+            if (readiness is null)
+            {
+                _lifecycle.Transition(flow, FlowStatus.WaitingForFeedback);
+            }
+            else
+            {
+                _lifecycle.OpenCustomerReview(
+                    flow,
+                    readiness.State,
+                    readiness.Record.CandidateFingerprint,
+                    readiness.Candidate.CandidateFingerprint);
+            }
             flow.OutcomeUrl = flow.Kind == FlowKind.Advisory
                 ? $"#/preview/{flow.Id}"
                 : string.Empty;

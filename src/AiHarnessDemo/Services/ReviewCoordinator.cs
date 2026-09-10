@@ -57,6 +57,7 @@ public sealed class ReviewCoordinator(
     CopilotSessionJournal? sessionJournal = null,
     IReviewedCandidateService? reviewedCandidateService = null,
     AgentManifestStager? manifestStager = null,
+    DeliveryReadinessService? deliveryReadinessService = null,
     ILogger<ReviewCoordinator>? logger = null)
 {
     private const int MaximumTotalRequestedChangeCharacters = 16_000;
@@ -78,6 +79,8 @@ public sealed class ReviewCoordinator(
         sessionJournal ?? new CopilotSessionJournal();
     private readonly AgentManifestStager _manifestStager =
         manifestStager ?? new AgentManifestStager();
+    private readonly DeliveryReadinessService _readiness =
+        deliveryReadinessService ?? new DeliveryReadinessService();
     private readonly ILogger<ReviewCoordinator>? _logger =
         logger;
     internal Func<string, Guid, CancellationToken, Task<CopilotSessionSnapshot>>?
@@ -212,6 +215,39 @@ public sealed class ReviewCoordinator(
                     "This flow is not waiting for the selected customer review.");
             }
 
+            DeliveryReadinessBinding? readiness = null;
+            if (DeliveryReadinessService.AppliesTo(flow))
+            {
+                // A Delivery review request must carry the complete immutable binding. An omitted
+                // value is treated as a stale tab rather than as permission to skip the check.
+                if (request.ReviewedCandidateId is null ||
+                    request.ReadinessRevision is null ||
+                    string.IsNullOrWhiteSpace(request.ReadinessContractHash))
+                {
+                    var current = await _readiness.LoadCurrentAsync(
+                        database,
+                        flow.Id,
+                        cancellationToken);
+                    throw new DeliveryReadinessConflictException(
+                        DeliveryReadinessConflicts.ReviewStale,
+                        "A Delivery review requires the current reviewed-candidate id, readiness revision, and readiness contract hash.",
+                        current?.State,
+                        current?.Revision,
+                        current?.ContractHash);
+                }
+                // Acceptance and refinement both re-read the authoritative readiness rows so a
+                // stale tab, a replayed request, or a superseded assessment cannot resolve a gate.
+                readiness = await _readiness.AuthorizeAsync(
+                    database,
+                    flow.Id,
+                    request.ReviewedCandidateId,
+                    request.ReadinessContractHash,
+                    request.ReadinessRevision,
+                    DeliveryReadinessState.ReadyToApprove,
+                    DeliveryReadinessConflicts.NotReady,
+                    cancellationToken);
+            }
+
             var now = DateTimeOffset.UtcNow;
             if (intent == ReviewIntent.Accept)
             {
@@ -245,7 +281,18 @@ public sealed class ReviewCoordinator(
                         workflow,
                         _permissionResolver);
                     publicationStepId = publication.Id;
-                    lifecycle.Transition(flow, FlowStatus.Queued);
+                    if (readiness is not null)
+                    {
+                        lifecycle.QueueApprovedPublication(
+                            flow,
+                            readiness.State,
+                            readiness.Record.CandidateFingerprint,
+                            readiness.Candidate.CandidateFingerprint);
+                    }
+                    else
+                    {
+                        lifecycle.Transition(flow, FlowStatus.Queued);
+                    }
                     flow.CompletedAt = null;
                     database.FlowEvents.Add(new FlowEvent
                     {
@@ -253,7 +300,20 @@ public sealed class ReviewCoordinator(
                         FlowStepId = publication.Id,
                         Type = "flow.approved-publication-queued",
                         Message =
-                            "Customer accepted the Delivery result; the sole planned post-approval publication step was queued."
+                            "Customer accepted the Delivery result; the sole planned post-approval publication step was queued.",
+                        DataJson = readiness is null
+                            ? null
+                            : JsonSerializer.Serialize(new
+                            {
+                                Version = "delivery-readiness-acceptance-v1",
+                                SnapshotId = readiness.Record.Id,
+                                readiness.Revision,
+                                readiness.ContractHash,
+                                ReviewedCandidateId = readiness.Candidate.Id,
+                                readiness.Record.CandidateFingerprint,
+                                readiness.WaiverSetHash,
+                                GateId = gate.Id
+                            })
                     });
                     queueFlow = true;
                 }
@@ -267,6 +327,19 @@ public sealed class ReviewCoordinator(
                     "Customer requested a refined iteration.",
                     now);
                 ApplyPreparedGate(resolvedForHistory, gate);
+                if (readiness is not null)
+                {
+                    // A refined iteration invalidates the reviewed result, so the releasable
+                    // assessment and its candidate binding are superseded in the same transaction.
+                    // Leaving them active would keep painting a green card, history row, and
+                    // readiness panel for work that is being redone.
+                    await _readiness.SupersedeCurrentAsync(
+                        database,
+                        flow.Id,
+                        reviewedStep.Id,
+                        "Superseded because the customer requested a refined iteration from the ordinary customer review.",
+                        cancellationToken);
+                }
                 ApplyRefinement(
                     flow,
                     reviewedStep,
@@ -308,6 +381,395 @@ public sealed class ReviewCoordinator(
             linkedFlowId: null,
             message: message,
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves the separate customer waiver gate. Granting a waiver is informed consent to named
+    /// disclosed risks; it is never product acceptance and never opens publication by itself. On
+    /// success the same QA facts are re-derived and the ordinary customer review is opened.
+    /// </summary>
+    public async Task<ReadinessWaiverResponse> GrantReadinessWaiverAsync(
+        Guid flowId,
+        ReadinessWaiverRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.GateId == Guid.Empty || request.ReviewedCandidateId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "A waiver requires the current waiver gate and reviewed candidate identifiers.");
+        }
+        if (request.RiskIds is null || request.RiskIds.Count == 0)
+        {
+            throw new ArgumentException("A waiver must name at least one risk.");
+        }
+        if (string.IsNullOrWhiteSpace(request.Acknowledgement))
+        {
+            throw new ArgumentException("A waiver requires a non-empty acknowledgement.");
+        }
+
+        await using var lifecycleLease =
+            await lifecycle.EnterAsync(flowId, cancellationToken);
+        HandoffGateRecord? resolvedForHistory = null;
+        HandoffGateRecord? reviewForHistory = null;
+        DeliveryReadinessBinding refreshed;
+        await using (var database =
+                     await databaseFactory.CreateDbContextAsync(cancellationToken))
+        {
+            await using var transaction =
+                await database.Database.BeginTransactionAsync(cancellationToken);
+            var flow = await database.Flows
+                           .AsSplitQuery()
+                           .Include(item => item.Steps)
+                           .Include(item => item.GateRecords)
+                           .Include(item => item.Events)
+                           .SingleOrDefaultAsync(
+                               item => item.Id == flowId,
+                               cancellationToken)
+                       ?? throw new KeyNotFoundException(
+                           $"Factory flow '{flowId}' was not found.");
+            if (!DeliveryReadinessService.AppliesTo(flow))
+            {
+                throw new InvalidOperationException(
+                    "Readiness waivers apply only to studio-v2 Delivery flows.");
+            }
+            var binding = await _readiness.AuthorizeAsync(
+                database,
+                flow.Id,
+                request.ReviewedCandidateId,
+                request.ReadinessContractHash,
+                request.ReadinessRevision,
+                DeliveryReadinessState.NeedsCustomerWaiver,
+                DeliveryReadinessConflicts.WaiverNotApplicable,
+                cancellationToken);
+            var gate = flow.GateRecords.SingleOrDefault(item => item.Id == request.GateId)
+                       ?? throw new DeliveryReadinessConflictException(
+                           DeliveryReadinessConflicts.ReviewStale,
+                           "The waiver gate is stale or does not belong to this flow.",
+                           binding.State,
+                           binding.Revision,
+                           binding.ContractHash);
+            if (gate.ActionType != HandoffActionType.CustomerWaiver)
+            {
+                throw new DeliveryReadinessConflictException(
+                    DeliveryReadinessConflicts.WaiverNotApplicable,
+                    "The selected gate is not the separate customer waiver gate.",
+                    binding.State,
+                    binding.Revision,
+                    binding.ContractHash);
+            }
+
+            await _readiness.RecordWaiversAsync(
+                database,
+                binding,
+                gate.Id,
+                request.RiskIds,
+                request.Acknowledgement!,
+                "customer",
+                cancellationToken);
+            var now = DateTimeOffset.UtcNow;
+            if (!gate.Resolved)
+            {
+                resolvedForHistory = gateEngine.PrepareResolution(
+                    gate,
+                    approved: true,
+                    "customer",
+                    "Customer acknowledged and waived the disclosed residual risks.",
+                    now);
+                ApplyPreparedGate(resolvedForHistory, gate);
+            }
+
+            var identity = ReviewedCandidateLedger.Read(flow);
+            refreshed = await _readiness.DeriveAndPersistAsync(
+                database,
+                flow,
+                identity,
+                cancellationToken);
+            if (refreshed.State == DeliveryReadinessState.ReadyToApprove)
+            {
+                var reviewedStep = flow.Steps.Single(
+                    step => step.Id == refreshed.Record.OutcomeOwnerStepId);
+                var existingReview = flow.GateRecords.SingleOrDefault(item =>
+                    !item.Resolved &&
+                    item.ActionType == HandoffActionType.CustomerReview);
+                if (existingReview is null)
+                {
+                    var review = gateEngine.SubmitProposal(new HandoffProposal
+                    {
+                        FlowRunId = flow.Id,
+                        FlowStepId = reviewedStep.Id,
+                        ActionType = HandoffActionType.CustomerReview,
+                        Summary =
+                            "Every acceptance criterion is verified and all required waivers are granted.",
+                        Evidence = string.Join(
+                            Environment.NewLine,
+                            refreshed.Contract.Criteria.Select(item =>
+                                $"{item.CriterionId} {item.Outcome}: {item.Rationale}")),
+                        BlastRadius = HandoffBlastRadius.High
+                    });
+                    flow.GateRecords.Add(review);
+                    database.Entry(review).State = EntityState.Added;
+                    reviewForHistory = review;
+                    database.FlowEvents.Add(new FlowEvent
+                    {
+                        FlowRunId = flow.Id,
+                        FlowStepId = reviewedStep.Id,
+                        Type = "gate.customer-review-created",
+                        Message =
+                            $"Harness opened the ordinary customer review after waiver receipts at readiness revision {refreshed.Revision}.",
+                        DataJson = JsonSerializer.Serialize(new
+                        {
+                            Version = "delivery-readiness-review-opened-v1",
+                            SnapshotId = refreshed.Record.Id,
+                            refreshed.Revision,
+                            refreshed.ContractHash,
+                            ReviewedCandidateId = refreshed.Candidate.Id,
+                            refreshed.WaiverSetHash
+                        })
+                    });
+                }
+                lifecycle.OpenCustomerReview(
+                    flow,
+                    refreshed.State,
+                    refreshed.Record.CandidateFingerprint,
+                    refreshed.Candidate.CandidateFingerprint);
+                flow.OutcomeLabel = "Customer review ready";
+            }
+            flow.UpdatedAt = now;
+            await database.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+
+        if (resolvedForHistory is not null)
+        {
+            gateEngine.RestoreHistory([resolvedForHistory]);
+        }
+        if (reviewForHistory is not null)
+        {
+            gateEngine.RestoreHistory([reviewForHistory]);
+        }
+        return new ReadinessWaiverResponse(
+            flowId,
+            request.GateId,
+            request.ReviewedCandidateId,
+            refreshed.Revision,
+            refreshed.ContractHash,
+            [.. request.RiskIds.OrderBy(id => id, StringComparer.Ordinal)],
+            refreshed.State == DeliveryReadinessState.ReadyToApprove
+                ? "The waived risks were recorded and the ordinary customer review is now open."
+                : $"The waived risks were recorded; readiness is now '{refreshed.State}'.");
+    }
+
+    /// <summary>
+    /// Resolves a Delivery flow whose host-derived readiness is not releasable. The action set is
+    /// bounded by the derived state: <c>NeedsRefinement</c> allows only a refinement request, and
+    /// <c>Blocked</c> allows only Continue, Replan, or Abandon. No path here can accept a result,
+    /// grant a waiver, resolve a customer-review gate, or authorize publication.
+    /// </summary>
+    public async Task<ReadinessResolutionResponse> ResolveReadinessAsync(
+        Guid flowId,
+        ReadinessResolutionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var action = request.Action
+            ?? throw new ArgumentException("A readiness resolution action is required.");
+        if (!Enum.IsDefined(action))
+        {
+            throw new ArgumentException("The readiness resolution action is not supported.");
+        }
+        if (request.ReviewedCandidateId == Guid.Empty ||
+            request.ReadinessRevision is null ||
+            string.IsNullOrWhiteSpace(request.ReadinessContractHash))
+        {
+            throw new DeliveryReadinessConflictException(
+                DeliveryReadinessConflicts.ReviewStale,
+                "A readiness resolution requires the current reviewed-candidate id, readiness revision, and readiness contract hash.");
+        }
+        var refinement = action is ReadinessResolutionAction.RequestRefinement
+            or ReadinessResolutionAction.Replan
+            ? NormalizeRefinement(request.Refinement)
+            : null;
+        if (action is ReadinessResolutionAction.Continue or ReadinessResolutionAction.Abandon &&
+            request.Refinement is not null)
+        {
+            throw new ArgumentException(
+                "Continue and Abandon cannot include a refinement payload.");
+        }
+
+        await using var lifecycleLease =
+            await lifecycle.EnterAsync(flowId, cancellationToken);
+        DeliveryReadinessState resolvedFrom;
+        FlowStatus status;
+        int iteration;
+        var queueFlow = false;
+        await using (var database =
+                     await databaseFactory.CreateDbContextAsync(cancellationToken))
+        {
+            await using var transaction =
+                await database.Database.BeginTransactionAsync(cancellationToken);
+            var flow = await database.Flows
+                           .AsSplitQuery()
+                           .Include(item => item.Steps)
+                           .Include(item => item.GateRecords)
+                           .Include(item => item.Events)
+                           .Include(item => item.PlanDocuments)
+                           .SingleOrDefaultAsync(
+                               item => item.Id == flowId,
+                               cancellationToken)
+                       ?? throw new KeyNotFoundException(
+                           $"Factory flow '{flowId}' was not found.");
+            if (!DeliveryReadinessService.AppliesTo(flow))
+            {
+                throw new InvalidOperationException(
+                    "Readiness resolution applies only to studio-v2 Delivery flows.");
+            }
+            var required = action switch
+            {
+                ReadinessResolutionAction.RequestRefinement =>
+                    DeliveryReadinessState.NeedsRefinement,
+                _ => DeliveryReadinessState.Blocked
+            };
+            var binding = action == ReadinessResolutionAction.Abandon
+                ? await _readiness.LoadCurrentAsync(database, flowId, cancellationToken)
+                  ?? throw new DeliveryReadinessConflictException(
+                      DeliveryReadinessConflicts.ReconciliationRequired,
+                      "This Delivery flow has no current host-derived readiness assessment.")
+                : await _readiness.AuthorizeAsync(
+                    database,
+                    flowId,
+                    request.ReviewedCandidateId,
+                    request.ReadinessContractHash,
+                    request.ReadinessRevision,
+                    required,
+                    DeliveryReadinessConflicts.NotReady,
+                    cancellationToken);
+            resolvedFrom = binding.State;
+            if (action == ReadinessResolutionAction.Abandon)
+            {
+                // Abandonment is executed by the durable abandonment path; this endpoint only
+                // proves the caller held the current binding.
+                await transaction.CommitAsync(cancellationToken);
+                return new ReadinessResolutionResponse(
+                    flowId,
+                    action,
+                    resolvedFrom,
+                    flow.Status,
+                    flow.Iteration,
+                    "Abandonment is authorized for the current readiness assessment.");
+            }
+            if (binding.State == DeliveryReadinessState.ReadyToApprove ||
+                binding.State == DeliveryReadinessState.NeedsCustomerWaiver)
+            {
+                throw new DeliveryReadinessConflictException(
+                    DeliveryReadinessConflicts.NotReady,
+                    "A releasable or waiver-pending assessment is resolved through review, not through readiness resolution.",
+                    binding.State,
+                    binding.Revision,
+                    binding.ContractHash);
+            }
+            if (flow.GateRecords.Any(gate =>
+                    !gate.Resolved &&
+                    gate.ActionType is HandoffActionType.CustomerReview
+                        or HandoffActionType.CustomerWaiver))
+            {
+                throw new DeliveryReadinessConflictException(
+                    DeliveryReadinessConflicts.ReviewStale,
+                    "An unresolved customer gate exists; resolve it instead of using readiness resolution.",
+                    binding.State,
+                    binding.Revision,
+                    binding.ContractHash);
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var reviewedStep = flow.Steps.SingleOrDefault(
+                                   step => step.Id == binding.Record.OutcomeOwnerStepId)
+                               ?? throw new DeliveryReadinessConflictException(
+                                   DeliveryReadinessConflicts.ReconciliationRequired,
+                                   "The readiness assessment has no durable outcome-owner step.",
+                                   binding.State,
+                                   binding.Revision,
+                                   binding.ContractHash);
+            await _readiness.SupersedeCurrentAsync(
+                database,
+                flowId,
+                reviewedStep.Id,
+                $"Superseded because the customer resolved '{binding.State}' with '{action}'.",
+                cancellationToken);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = reviewedStep.Id,
+                Type = "delivery.readiness-resolved",
+                Message =
+                    $"Customer resolved readiness '{binding.State}' with '{action}'.",
+                DataJson = JsonSerializer.Serialize(new
+                {
+                    Version = "delivery-readiness-resolution-v1",
+                    Action = action.ToString(),
+                    State = binding.State.ToString(),
+                    binding.Revision,
+                    binding.ContractHash,
+                    ReviewedCandidateId = binding.Candidate.Id
+                })
+            });
+
+            if (action == ReadinessResolutionAction.Continue)
+            {
+                lifecycle.ResolveReadinessState(
+                    flow,
+                    binding.State,
+                    DeliveryReadinessState.Blocked,
+                    binding.Record.CandidateFingerprint,
+                    binding.Candidate.CandidateFingerprint,
+                    FlowStatus.Queued);
+            }
+            else
+            {
+                // Move through the guarded readiness path first so a Blocked flow can be replanned
+                // without widening the ordinary transition table.
+                lifecycle.ResolveReadinessState(
+                    flow,
+                    binding.State,
+                    required,
+                    binding.Record.CandidateFingerprint,
+                    binding.Candidate.CandidateFingerprint,
+                    FlowStatus.Reworking);
+                ApplyRefinement(
+                    flow,
+                    reviewedStep,
+                    refinement!,
+                    now,
+                    database,
+                    lifecycle);
+            }
+            flow.CurrentBlockerCode = null;
+            flow.CurrentBlockerSummary = null;
+            flow.CurrentBlockerDataJson = null;
+            flow.CustomerBlockerMessage = null;
+            flow.OutcomeLabel = string.Empty;
+            flow.UpdatedAt = now;
+            status = flow.Status;
+            iteration = flow.Iteration;
+            queueFlow = true;
+            await database.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+
+        if (queueFlow && !flowQueue.Queue(flowId))
+        {
+            throw new InvalidOperationException(
+                "The durable readiness resolution was recorded, but the flow could not be queued.");
+        }
+        return new ReadinessResolutionResponse(
+            flowId,
+            action,
+            resolvedFrom,
+            status,
+            iteration,
+            action == ReadinessResolutionAction.Continue
+                ? "The blocked iteration was re-queued for another attempt."
+                : $"A new iteration {iteration} was queued from the customer's requested changes.");
     }
 
     private async Task<ReviewCoordinationResult> PromoteToDeliveryAsync(

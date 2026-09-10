@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using AiHarnessDemo.Core.Orchestration;
+using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Services;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
@@ -19,6 +20,8 @@ public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger)
         {
             NewWorkAdmissionException => StatusCodes.Status503ServiceUnavailable,
             IntakeAttemptException => StatusCodes.Status409Conflict,
+            DeliveryReadinessConflictException => StatusCodes.Status409Conflict,
+            DeliveryReadinessContractException => StatusCodes.Status409Conflict,
             FlowLifecycleException => StatusCodes.Status409Conflict,
             BadHttpRequestException or JsonException or FormatException =>
                 StatusCodes.Status400BadRequest,
@@ -75,6 +78,21 @@ public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger)
                 intake.FlowStatus.ToString();
             problem.Extensions["retryMessage"] =
                 intake.RetryMessage;
+        }
+        if (exception is DeliveryReadinessConflictException readiness)
+        {
+            // Stable machine-readable codes let a stale client refresh the authoritative readiness
+            // binding instead of retrying an action the server will never accept.
+            problem.Title = "The request conflicts with the current Delivery readiness.";
+            problem.Extensions["code"] = readiness.Code;
+            problem.Extensions["readinessState"] = readiness.State?.ToString();
+            problem.Extensions["readinessRevision"] = readiness.Revision;
+            problem.Extensions["readinessContractHash"] = readiness.ContractHash;
+        }
+        if (exception is DeliveryReadinessContractException contract)
+        {
+            problem.Extensions["code"] = DeliveryReadinessConflicts.ContractInvalid;
+            problem.Extensions["errors"] = contract.Errors;
         }
         httpContext.Response.StatusCode = statusCode;
         await httpContext.Response.WriteAsJsonAsync(

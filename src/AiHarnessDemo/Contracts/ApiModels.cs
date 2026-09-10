@@ -66,7 +66,9 @@ public sealed record FlowSummaryDto(
     string OutcomeLabel,
     string OutcomeUrl,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    DeliveryReadinessState? ReadinessState = null,
+    string? ReadinessLabel = null);
 
 public sealed record LinkedFlowDto(
     Guid Id,
@@ -190,7 +192,53 @@ public sealed record FlowDetailDto(
     IReadOnlyList<HandoffGateRecordDto> GateRecords,
     FlowReviewSummaryDto Review,
     ReviewPublicationStatus PublicationStatus,
-    OutcomeVerificationDto OutcomeVerification);
+    OutcomeVerificationDto OutcomeVerification,
+    DeliveryReadinessDto? DeliveryReadiness);
+
+/// <summary>
+/// The host-derived Delivery readiness projection. Clients render this instead of inferring a green
+/// result from <see cref="FlowStatus"/>, a review decision, or a publication step.
+/// </summary>
+public sealed record DeliveryReadinessDto(
+    DeliveryReadinessState State,
+    DeliveryReadinessReconciliation Reconciliation,
+    int Revision,
+    string ContractHash,
+    Guid ReviewedCandidateId,
+    string CandidateFingerprintPrefix,
+    IReadOnlyList<DeliveryReadinessCriterionDto> Criteria,
+    IReadOnlyList<DeliveryReadinessRiskDto> Risks,
+    IReadOnlyList<string> RequiredWaiverRiskIds,
+    IReadOnlyList<string> GrantedWaiverRiskIds,
+    IReadOnlyList<string> Diagnostics,
+    IReadOnlyList<DeliveryReadinessAction> AllowedActions,
+    Guid? ReviewGateId,
+    Guid? WaiverGateId,
+    string PublicationAssurance,
+    string Label);
+
+public sealed record DeliveryReadinessCriterionDto(
+    string CriterionId,
+    string Requirement,
+    DeliveryCriterionOutcome Outcome,
+    string Rationale,
+    string? Remediation,
+    IReadOnlyList<string> EvidenceIds,
+    IReadOnlyList<string> ResponsibleRoles,
+    bool CustomerVisible);
+
+public sealed record DeliveryReadinessRiskDto(
+    string RiskId,
+    DeliveryRiskClassification Classification,
+    DeliveryRiskSeverity Severity,
+    string Statement,
+    string Impact,
+    IReadOnlyList<string> EvidenceIds,
+    IReadOnlyList<string> CriterionIds,
+    string SourceRole,
+    Guid SourceStepId,
+    string? PreMortemFindingId,
+    bool Waived);
 
 public sealed record OutcomeVerificationDto(
     string Status,
@@ -276,7 +324,9 @@ public sealed record HistoryItemDto(
     StepStatus Status,
     long DurationMilliseconds,
     DateTimeOffset? StartedAt,
-    string PushbackReason);
+    string PushbackReason,
+    DeliveryReadinessState? ReadinessState = null,
+    string? ReadinessLabel = null);
 
 public sealed record HarnessStatsDto(
     int TotalFlows,
@@ -561,7 +611,8 @@ public static class ApiMappings
 
     public static FlowDetailDto ToDetailDto(
         this FlowRun flow,
-        string? reviewedPreviewUrl = null)
+        string? reviewedPreviewUrl = null,
+        DeliveryReadinessDto? deliveryReadiness = null)
     {
         var outcomeState = string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson)
             ? null
@@ -664,7 +715,106 @@ public static class ApiMappings
                 .ToList(),
             flow.ToReviewSummaryDto(),
             ReviewCoordinator.GetPublicationStatus(flow),
-            ToOutcomeVerificationDto(flow));
+            ToOutcomeVerificationDto(flow),
+            deliveryReadiness);
+    }
+
+    /// <summary>
+    /// Projects the durable readiness binding into the exact customer-visible state. Nothing here is
+    /// inferred from status or prose, and an unreconciled historical result is projected as Blocked
+    /// with a non-green publication assurance label.
+    /// </summary>
+    public static DeliveryReadinessDto ToDeliveryReadinessDto(
+        DeliveryReadinessBinding binding,
+        FlowRun flow)
+    {
+        ArgumentNullException.ThrowIfNull(binding);
+        ArgumentNullException.ThrowIfNull(flow);
+        var legacy =
+            binding.Record.Reconciliation != DeliveryReadinessReconciliation.Current;
+        var state = legacy ? DeliveryReadinessState.Blocked : binding.State;
+        var granted = binding.Waivers
+            .Select(item => item.RiskId)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(item => item, StringComparer.Ordinal)
+            .ToArray();
+        var currentStepIds = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .Select(step => step.Id)
+            .ToHashSet();
+        var reviewGate = flow.GateRecords
+            .Where(gate =>
+                gate.ActionType == HandoffActionType.CustomerReview &&
+                !gate.Resolved &&
+                currentStepIds.Contains(gate.FlowStepId))
+            .OrderByDescending(gate => gate.DecidedAt)
+            .FirstOrDefault();
+        var waiverGate = flow.GateRecords
+            .Where(gate =>
+                gate.ActionType == HandoffActionType.CustomerWaiver &&
+                !gate.Resolved &&
+                currentStepIds.Contains(gate.FlowStepId))
+            .OrderByDescending(gate => gate.DecidedAt)
+            .FirstOrDefault();
+        return new DeliveryReadinessDto(
+            state,
+            binding.Record.Reconciliation,
+            binding.Revision,
+            binding.ContractHash,
+            binding.Candidate.Id,
+            binding.Record.CandidateFingerprint.Length > 19
+                ? binding.Record.CandidateFingerprint[..19]
+                : binding.Record.CandidateFingerprint,
+            binding.Contract.Criteria
+                .Select(item => new DeliveryReadinessCriterionDto(
+                    item.CriterionId,
+                    item.Requirement,
+                    item.Outcome,
+                    item.Rationale,
+                    item.Remediation,
+                    item.EvidenceIds,
+                    item.ResponsibleRoles,
+                    item.CustomerVisible))
+                .ToList(),
+            binding.Contract.Risks
+                .Select(item => new DeliveryReadinessRiskDto(
+                    item.RiskId,
+                    item.Classification,
+                    item.Severity,
+                    item.Statement,
+                    item.Impact,
+                    item.EvidenceIds,
+                    item.CriterionIds,
+                    item.SourceRole,
+                    item.SourceStepId,
+                    item.PreMortemFindingId,
+                    granted.Contains(item.RiskId, StringComparer.Ordinal)))
+                .ToList(),
+            binding.Contract.RequiredWaiverRiskIds,
+            granted,
+            legacy
+                ? [
+                    "this Delivery result predates host-derived readiness verification and " +
+                    "was never proven against typed acceptance criteria"
+                ]
+                : binding.Contract.Diagnostics,
+            DeliveryReadinessPolicy.AllowedActions(state),
+            state == DeliveryReadinessState.ReadyToApprove ? reviewGate?.Id : null,
+            state == DeliveryReadinessState.NeedsCustomerWaiver ? waiverGate?.Id : null,
+            legacy
+                ? "Published - readiness unverified"
+                : state == DeliveryReadinessState.ReadyToApprove
+                    ? "Publication authorization is bound to this readiness assessment"
+                    : "Publication is not authorized",
+            legacy
+                ? "Published - readiness unverified"
+                : state switch
+                {
+                    DeliveryReadinessState.ReadyToApprove => "Ready to approve",
+                    DeliveryReadinessState.NeedsCustomerWaiver => "Needs customer waiver",
+                    DeliveryReadinessState.NeedsRefinement => "Needs refinement",
+                    _ => "Blocked"
+                });
     }
 
     public static FlowOutcomeDto? ToFlowOutcomeDto(this FlowRun flow)

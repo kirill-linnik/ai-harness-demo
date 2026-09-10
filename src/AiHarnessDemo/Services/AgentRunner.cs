@@ -66,7 +66,8 @@ public sealed record AgentExecutionContext(
     AdvisoryPromotionContext? PromotionContext = null,
     bool IsOutcomeOwner = false,
     string PlanStepKey = "",
-    FlowKind? FlowKind = null);
+    FlowKind? FlowKind = null,
+    bool RequiresDeliveryReadinessQa = false);
 
 public sealed record AgentExecutionResult(
     string Output,

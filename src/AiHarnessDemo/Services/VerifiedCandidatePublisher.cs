@@ -20,6 +20,17 @@ public interface IVerifiedCandidatePublisher
 }
 
 /// <summary>
+/// The exact readiness identity that authorized one publication. Every value is read from durable
+/// rows immediately before the first remote side effect and stamped onto the publication journal.
+/// </summary>
+public sealed record DeliveryReadinessPublicationAuthorization(
+    Guid ReviewedCandidateId,
+    Guid ReadinessSnapshotId,
+    string ReadinessContractHash,
+    Guid CustomerReviewGateId,
+    string WaiverSetHash);
+
+/// <summary>
 /// Performs remote side effects from the immutable candidate manifest. The Release Engineer still
 /// supplies the publication turn, but its Copilot process remains push-guarded for governed flows.
 /// </summary>
@@ -81,12 +92,19 @@ public sealed partial class VerifiedCandidatePublisher(
                 flow,
                 publicationStep,
                 publicationRootId);
+            // Publication is irreversible, so the authoritative readiness rows are re-read here,
+            // before any GitHub token lookup, Git command, or journal mutation can happen.
+            var readiness = await AuthorizeReadinessAsync(
+                flow,
+                authorization,
+                cancellationToken);
             candidateFingerprintService.ValidateWorkspaceRoot(flow);
             return await PublishReviewedCandidateAsync(
                 flow,
                 publicationRootId,
                 outcome,
                 authorization,
+                readiness,
                 cancellationToken);
         }
         candidateFingerprintService.ValidateWorkspaceRoot(flow);
@@ -266,11 +284,92 @@ public sealed partial class VerifiedCandidatePublisher(
             ReviewedCandidateLedger.Read(flow, outcomeOwnerStep.Id));
     }
 
+    /// <summary>
+    /// Re-reads the authoritative readiness, candidate, waiver, and accepted-review rows from the
+    /// database and refuses publication unless every binding still matches exactly. A denial is
+    /// recorded as a durable event before the exception propagates.
+    /// </summary>
+    private async Task<DeliveryReadinessPublicationAuthorization> AuthorizeReadinessAsync(
+        FlowRun flow,
+        ReviewedPublicationAuthorization authorization,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var readinessService = new DeliveryReadinessService();
+        DeliveryReadinessBinding? binding = null;
+        string? failure = null;
+        try
+        {
+            binding = await readinessService.AuthorizeAsync(
+                database,
+                flow.Id,
+                expectedCandidateId: null,
+                expectedContractHash: null,
+                expectedRevision: null,
+                DeliveryReadinessState.ReadyToApprove,
+                DeliveryReadinessConflicts.PublicationNotAuthorized,
+                cancellationToken);
+        }
+        catch (DeliveryReadinessConflictException exception)
+        {
+            failure = exception.Message;
+        }
+        if (binding is not null &&
+            !string.Equals(
+                binding.Record.CandidateFingerprint,
+                authorization.Identity.Fingerprint,
+                StringComparison.Ordinal))
+        {
+            failure =
+                "The readiness assessment is not bound to the candidate sealed for this publication.";
+        }
+        var acceptedGate = await database.GateRecords
+            .Where(gate =>
+                gate.FlowRunId == flow.Id &&
+                gate.ActionType == HandoffActionType.CustomerReview &&
+                gate.Resolved &&
+                gate.Approved == true &&
+                gate.ReviewDecision == ReviewDecision.Accepted &&
+                gate.FlowStepId == authorization.OutcomeOwnerStepId)
+            .OrderByDescending(gate => gate.ResolvedAt)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (binding is not null && acceptedGate is null)
+        {
+            failure =
+                "Publication requires an accepted ordinary customer review; a waiver is not acceptance.";
+        }
+        if (failure is not null || binding is null || acceptedGate is null)
+        {
+            database.FlowEvents.Add(DeliveryReadinessService.DenialEvent(
+                flow.Id,
+                authorization.OutcomeOwnerStepId,
+                DeliveryReadinessConflicts.PublicationNotAuthorized,
+                "Publication was refused before any remote side effect: " +
+                (failure ?? "no current readiness authorization exists."),
+                binding));
+            await database.SaveChangesAsync(cancellationToken);
+            throw new DeliveryReadinessConflictException(
+                DeliveryReadinessConflicts.PublicationNotAuthorized,
+                failure ?? "No current readiness authorization exists for this publication.",
+                binding?.State,
+                binding?.Revision,
+                binding?.ContractHash);
+        }
+        return new DeliveryReadinessPublicationAuthorization(
+            binding.Candidate.Id,
+            binding.Record.Id,
+            binding.ContractHash,
+            acceptedGate.Id,
+            binding.WaiverSetHash);
+    }
+
     private async Task<string> PublishReviewedCandidateAsync(
         FlowRun flow,
         Guid publicationRootId,
         OutcomeType outcome,
         ReviewedPublicationAuthorization authorization,
+        DeliveryReadinessPublicationAuthorization readiness,
         CancellationToken cancellationToken)
     {
         var identity = authorization.Identity;
@@ -310,6 +409,13 @@ public sealed partial class VerifiedCandidatePublisher(
                     repository,
                     cancellationToken);
             }
+            // The readiness binding is stamped onto every durable publication intent before any
+            // remote side effect, so a later reader can prove which assessment authorized it.
+            await BindReadinessAuthorizationAsync(
+                flow.Id,
+                publicationRootId,
+                readiness,
+                cancellationToken);
             // Every repository intent is durable before validation invokes local
             // Git. Validation still precedes every remote publication side effect.
             var candidate = await reviewedCandidateService.VerifyAsync(
@@ -339,6 +445,7 @@ public sealed partial class VerifiedCandidatePublisher(
                         publicationRootId,
                         identity,
                         candidate,
+                        readiness,
                         cancellationToken),
                 OutcomeType.PullRequest =>
                     await PublishReviewedPullRequestsAsync(
@@ -346,6 +453,7 @@ public sealed partial class VerifiedCandidatePublisher(
                         publicationRootId,
                         identity,
                         candidate,
+                        readiness,
                         cancellationToken),
                 _ => throw new UnreachableException()
             };
@@ -356,11 +464,67 @@ public sealed partial class VerifiedCandidatePublisher(
         }
     }
 
+    /// <summary>
+    /// Records the exact readiness, reviewed-candidate, accepted-review, and waiver-set identity on
+    /// every durable publication row for this publication root.
+    /// </summary>
+    private async Task BindReadinessAuthorizationAsync(
+        Guid flowId,
+        Guid publicationRootId,
+        DeliveryReadinessPublicationAuthorization readiness,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var records = await database.ReviewedPublicationRecords
+            .Where(item =>
+                item.FlowRunId == flowId &&
+                item.PublicationRootId == publicationRootId)
+            .ToListAsync(cancellationToken);
+        var changed = false;
+        foreach (var record in records)
+        {
+            if (record.ReviewedCandidateId != Guid.Empty &&
+                (record.ReviewedCandidateId != readiness.ReviewedCandidateId ||
+                 !string.Equals(
+                     record.ReadinessContractHash,
+                     readiness.ReadinessContractHash,
+                     StringComparison.Ordinal)))
+            {
+                throw new DeliveryReadinessConflictException(
+                    DeliveryReadinessConflicts.PublicationNotAuthorized,
+                    "The durable publication intent is bound to a different readiness assessment.");
+            }
+            if (record.ReviewedCandidateId == readiness.ReviewedCandidateId &&
+                record.ReadinessSnapshotId == readiness.ReadinessSnapshotId &&
+                record.CustomerReviewGateId == readiness.CustomerReviewGateId &&
+                string.Equals(
+                    record.WaiverSetHash,
+                    readiness.WaiverSetHash,
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+            record.ReviewedCandidateId = readiness.ReviewedCandidateId;
+            record.ReadinessSnapshotId = readiness.ReadinessSnapshotId;
+            record.ReadinessContractHash = readiness.ReadinessContractHash;
+            record.CustomerReviewGateId = readiness.CustomerReviewGateId;
+            record.WaiverSetHash = readiness.WaiverSetHash;
+            record.UpdatedAt = DateTimeOffset.UtcNow;
+            changed = true;
+        }
+        if (changed)
+        {
+            await database.SaveChangesAsync(cancellationToken);
+        }
+    }
+
     private async Task<string> PublishReviewedCommitsAsync(
         FlowRun flow,
         Guid publicationRootId,
         ReviewedCandidateIdentity identity,
         OutcomeCandidateSnapshot candidate,
+        DeliveryReadinessPublicationAuthorization readiness,
         CancellationToken cancellationToken)
     {
         foreach (var repository in candidate.Manifest.Repositories)
@@ -397,6 +561,11 @@ public sealed partial class VerifiedCandidatePublisher(
                 pullRequestUrl: null,
                 cancellationToken);
         }
+        await BindReadinessAuthorizationAsync(
+            flow.Id,
+            publicationRootId,
+            readiness,
+            cancellationToken);
         return await CompleteReviewedPublicationAsync(
             flow,
             publicationRootId,
@@ -413,6 +582,7 @@ public sealed partial class VerifiedCandidatePublisher(
         Guid publicationRootId,
         ReviewedCandidateIdentity identity,
         OutcomeCandidateSnapshot candidate,
+        DeliveryReadinessPublicationAuthorization readiness,
         CancellationToken cancellationToken)
     {
         var pullRequests = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -597,6 +767,11 @@ public sealed partial class VerifiedCandidatePublisher(
                 cancellationToken);
         }
 
+        await BindReadinessAuthorizationAsync(
+            flow.Id,
+            publicationRootId,
+            readiness,
+            cancellationToken);
         return await CompleteReviewedPublicationAsync(
             flow,
             publicationRootId,

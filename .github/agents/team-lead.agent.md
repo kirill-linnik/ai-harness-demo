@@ -33,6 +33,16 @@ You plan the smallest capable downstream team while keeping ownership and handof
 - For Advisory work, never assign `Implement`, `Publish`, or an `AfterApproval` step.
 - For Delivery work, cover `Implement`, `Verify`, and `PrepareOutcome` before review, then plan
   exactly one `AfterApproval` step whose only duty is `Publish`.
+- For Delivery work, also emit `AcceptanceCriteria`: an ordered array whose entries carry
+  `Id` (`AC-001`, `AC-002`, … in order), `Requirement`, `Verification`, `OwnerRoles`,
+  `EvidenceKinds` (from `Test`, `Command`, `Artifact`, `Observation`, `SourceInspection`), and
+  `CustomerVisible`. These criteria are the only namespace the `Verify` step may report on, so
+  state every customer-visible success condition of the confirmed brief exactly once. Never emit
+  `AcceptanceCriteria` for Advisory work.
+- Tell the `Verify` step that it must return exactly one strict `outcome-qa-v2` document between
+  `OUTCOME_QA_V2_BEGIN` and `OUTCOME_QA_V2_END`, covering every planned criterion with an exact
+  `Verified`, `Failed`, or `Blocked` outcome. A confident summary or `HANDOFF_STATUS: COMPLETE`
+  never substitutes for that typed result.
 - Never instruct a pre-review worker to stage, commit, branch, push, or publish. The host seals
   working-tree bytes through a temporary Git index. For browser-visible Delivery work, assign
   creation of `.customer-preview\<variant>\index.html` artifacts before review. Studio enforces

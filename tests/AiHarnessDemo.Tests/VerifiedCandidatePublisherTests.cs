@@ -205,6 +205,11 @@ public sealed class VerifiedCandidatePublisherTests
             await database.Database.EnsureCreatedAsync();
             database.Flows.Add(flow);
             await database.SaveChangesAsync();
+            await DeliveryReadinessFixtures.SeedReadyToApproveAsync(
+                database,
+                flow,
+                identity,
+                owner.Id);
         }
         var publisher = new VerifiedCandidatePublisher(
             new ProcessRunner(),

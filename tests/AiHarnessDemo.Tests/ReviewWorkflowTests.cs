@@ -1,4 +1,5 @@
 using System.Text.Json;
+using AiHarnessDemo.Api;
 using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
@@ -186,15 +187,13 @@ public sealed class ReviewWorkflowTests
             before.Steps.Single(step => step.IsOutcomeOwner).Id,
             permissionSnapshot.FlowStepId);
 
-        var first = await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        var first = await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
                 Intent = ReviewIntent.Accept
             });
-        var duplicate = await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        var duplicate = await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
@@ -268,8 +267,7 @@ public sealed class ReviewWorkflowTests
 
         var exception =
             await Assert.ThrowsAsync<PublicationPolicyConflictException>(
-                () => harness.Reviews.ReviewAsync(
-                    harness.FlowId,
+                () => harness.ReviewAsync(
                     new DirectReviewRequest
                     {
                         GateId = review.Id,
@@ -308,8 +306,7 @@ public sealed class ReviewWorkflowTests
             (await harness.LoadFlowAsync()).GateRecords,
             gate => gate.ActionType ==
                     HandoffActionType.CustomerReview);
-        await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
@@ -433,8 +430,8 @@ public sealed class ReviewWorkflowTests
                     }
                     : null
             };
-            await harness.Reviews.ReviewAsync(harness.FlowId, request);
-            await harness.Reviews.ReviewAsync(harness.FlowId, request);
+            await harness.ReviewAsync(request);
+            await harness.ReviewAsync(request);
             Assert.True(harness.Queue.Queue(harness.FlowId));
             Assert.True(harness.Queue.Queue(harness.FlowId));
 
@@ -504,13 +501,13 @@ public sealed class ReviewWorkflowTests
             Intent = ReviewIntent.Accept
         };
 
-        await harness.Reviews.ReviewAsync(harness.FlowId, request);
+        await harness.ReviewAsync(request);
         Assert.Equal(
             harness.FlowId,
             await harness.Queue.Reader.ReadAsync());
         harness.Queue.MarkDequeued();
 
-        await harness.Reviews.ReviewAsync(harness.FlowId, request);
+        await harness.ReviewAsync(request);
 
         Assert.Equal(
             harness.FlowId,
@@ -541,8 +538,7 @@ public sealed class ReviewWorkflowTests
         }
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            harness.Reviews.ReviewAsync(
-                harness.FlowId,
+            harness.ReviewAsync(
                 new DirectReviewRequest
                 {
                     GateId = review.Id,
@@ -571,8 +567,7 @@ public sealed class ReviewWorkflowTests
         var review = Assert.Single(
             (await harness.LoadFlowAsync()).GateRecords,
             gate => gate.ActionType == HandoffActionType.CustomerReview);
-        await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
@@ -636,8 +631,7 @@ public sealed class ReviewWorkflowTests
             (await harness.LoadFlowAsync()).GateRecords,
             gate => gate.ActionType ==
                     HandoffActionType.CustomerReview);
-        await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
@@ -696,8 +690,7 @@ public sealed class ReviewWorkflowTests
         var review = Assert.Single(
             (await harness.LoadFlowAsync()).GateRecords,
             gate => gate.ActionType == HandoffActionType.CustomerReview);
-        await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
@@ -732,8 +725,7 @@ public sealed class ReviewWorkflowTests
             (await harness.LoadFlowAsync()).GateRecords,
             gate => gate.ActionType ==
                     HandoffActionType.CustomerReview);
-        await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
@@ -767,8 +759,7 @@ public sealed class ReviewWorkflowTests
             (await harness.LoadFlowAsync()).GateRecords,
             gate => gate.ActionType ==
                     HandoffActionType.CustomerReview);
-        await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        await harness.ReviewAsync(
             new DirectReviewRequest
             {
                 GateId = review.Id,
@@ -824,15 +815,12 @@ public sealed class ReviewWorkflowTests
                 ]
             }
         };
-        var refinement = await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        var refinement = await harness.ReviewAsync(
             refinementRequest);
-        var replay = await harness.Reviews.ReviewAsync(
-            harness.FlowId,
+        var replay = await harness.ReviewAsync(
             refinementRequest);
         var differentReplay = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => harness.Reviews.ReviewAsync(
-                harness.FlowId,
+            () => harness.ReviewAsync(
                 new DirectReviewRequest
                 {
                     GateId = firstReview.Id,
@@ -1131,6 +1119,871 @@ public sealed class ReviewWorkflowTests
             item => item.Role == ConversationRole.ProductManager);
     }
 
+    [Fact]
+    public async Task DeliveryReadiness_FailedCriterionWithCompleteMarkerCreatesNoReviewOrPublication()
+    {
+        // R10: reproduce the incident. The verification turn reports HANDOFF_STATUS: COMPLETE and
+        // confident prose while its typed criterion result is Failed.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context => DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext, outcome: DeliveryCriterionOutcome.Failed);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.DoesNotContain(
+            flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        Assert.DoesNotContain(
+            flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerWaiver);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        Assert.Equal(0, harness.PublicationVerifier.Calls);
+        Assert.Equal("delivery.readiness-needs-refinement", flow.CurrentBlockerCode);
+
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var readiness = Assert.Single(
+            await database.DeliveryReadinessSnapshots
+                .Where(item => item.FlowRunId == harness.FlowId && item.Active)
+                .ToListAsync());
+        Assert.Equal(DeliveryReadinessState.NeedsRefinement, readiness.State);
+        var contract = DeliveryReadinessPolicy.DeserializeSnapshot(readiness.ContractJson);
+        Assert.Equal(
+            DeliveryCriterionOutcome.Failed,
+            Assert.Single(contract.Criteria).Outcome);
+
+        // A direct API caller cannot convert the failure into acceptance or a waiver.
+        var conflict = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.GrantReadinessWaiverAsync(
+                harness.FlowId,
+                new ReadinessWaiverRequest
+                {
+                    GateId = Guid.NewGuid(),
+                    ReviewedCandidateId = Guid.NewGuid(),
+                    ReadinessRevision = readiness.Revision,
+                    ReadinessContractHash = readiness.ContractHash,
+                    RiskIds = ["AC-001"],
+                    Acknowledgement = "I accept the risk."
+                }));
+        Assert.Equal(
+            DeliveryReadinessConflicts.CandidateStale,
+            conflict.Code);
+        Assert.NotEqual(FlowStatus.Approved, (await harness.LoadFlowAsync()).Status);
+    }
+
+    [Fact]
+    public async Task DeliveryReadiness_BlockedCriterionBlocksTheFlowWithoutAnyCustomerGate()
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context => DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext, outcome: DeliveryCriterionOutcome.Blocked);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Blocked, flow.Status);
+        Assert.Equal("delivery.readiness-blocked", flow.CurrentBlockerCode);
+        Assert.Empty(flow.GateRecords.Where(gate =>
+            gate.ActionType is HandoffActionType.CustomerReview
+                or HandoffActionType.CustomerWaiver));
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+    }
+
+    [Fact]
+    public async Task DeliveryReadiness_WaiverRequiredRiskOpensOnlyTheSeparateWaiverGate()
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context => DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext, risks: [("RR-001", DeliveryRiskClassification.WaiverRequired)]);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        var waiverGate = Assert.Single(
+            flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerWaiver);
+        Assert.False(waiverGate.Resolved);
+        Assert.DoesNotContain(
+            flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+
+        DeliveryReadinessSnapshotRecord readiness;
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            readiness = await database.DeliveryReadinessSnapshots
+                .SingleAsync(item => item.FlowRunId == harness.FlowId && item.Active);
+        }
+        Assert.Equal(DeliveryReadinessState.NeedsCustomerWaiver, readiness.State);
+
+        Guid candidateId;
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            candidateId = (await database.ReviewedCandidateRecords
+                .SingleAsync(item => item.FlowRunId == harness.FlowId && item.Active)).Id;
+        }
+
+        // A criterion is a schema-invalid waiver target and a stale revision is a typed conflict.
+        var criterionWaiver = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.GrantReadinessWaiverAsync(
+                harness.FlowId,
+                Waiver(waiverGate.Id, candidateId, readiness, ["AC-001"])));
+        Assert.Equal(
+            DeliveryReadinessConflicts.WaiverNotApplicable,
+            criterionWaiver.Code);
+        var staleWaiver = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.GrantReadinessWaiverAsync(
+                harness.FlowId,
+                new ReadinessWaiverRequest
+                {
+                    GateId = waiverGate.Id,
+                    ReviewedCandidateId = candidateId,
+                    ReadinessRevision = readiness.Revision + 7,
+                    ReadinessContractHash = readiness.ContractHash,
+                    RiskIds = ["RR-001"],
+                    Acknowledgement = "I accept the disclosed risk."
+                }));
+        Assert.Equal(DeliveryReadinessConflicts.ReviewStale, staleWaiver.Code);
+
+        var granted = await harness.Reviews.GrantReadinessWaiverAsync(
+            harness.FlowId,
+            Waiver(waiverGate.Id, candidateId, readiness, ["RR-001"]));
+        Assert.Equal(["RR-001"], granted.WaivedRiskIds);
+
+        var afterWaiver = await harness.LoadFlowAsync();
+        var review = Assert.Single(
+            afterWaiver.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        Assert.False(review.Resolved);
+        Assert.True(
+            Assert.Single(
+                afterWaiver.GateRecords,
+                gate => gate.ActionType == HandoffActionType.CustomerWaiver).Resolved);
+
+        await using var verifyDatabase = await harness.Factory.CreateDbContextAsync();
+        var refreshed = await verifyDatabase.DeliveryReadinessSnapshots
+            .SingleAsync(item => item.FlowRunId == harness.FlowId && item.Active);
+        Assert.Equal(DeliveryReadinessState.ReadyToApprove, refreshed.State);
+        Assert.Equal(2, refreshed.Revision);
+        Assert.Single(await verifyDatabase.ReadinessWaiverRecords
+            .Where(item => item.FlowRunId == harness.FlowId)
+            .ToListAsync());
+
+        // Replaying the same waiver after readiness advanced is a typed conflict, not a second
+        // receipt and not an acceptance.
+        var replay = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.GrantReadinessWaiverAsync(
+                harness.FlowId,
+                Waiver(waiverGate.Id, candidateId, readiness, ["RR-001"])));
+        Assert.Equal(DeliveryReadinessConflicts.CandidateStale, replay.Code);
+        Assert.Single(await verifyDatabase.ReadinessWaiverRecords
+            .Where(item => item.FlowRunId == harness.FlowId)
+            .ToListAsync());
+    }
+
+    [Fact]
+    public async Task DeliveryReadiness_NonBlockingDisclosureStaysReadyAndRestartIsIdempotent()
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context => DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext, risks: [("RR-001", DeliveryRiskClassification.NonBlockingDisclosure)]);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var first = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, first.Status);
+        Assert.Single(
+            first.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+
+        string hash;
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var readiness = await database.DeliveryReadinessSnapshots
+                .SingleAsync(item => item.FlowRunId == harness.FlowId && item.Active);
+            Assert.Equal(DeliveryReadinessState.ReadyToApprove, readiness.State);
+            hash = readiness.ContractHash;
+        }
+
+        // Restart reconciliation repeats the derivation from durable rows and produces no new
+        // revision, gate, or event when the facts are unchanged.
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        await using var afterRestart = await harness.Factory.CreateDbContextAsync();
+        var rows = await afterRestart.DeliveryReadinessSnapshots
+            .Where(item => item.FlowRunId == harness.FlowId)
+            .ToListAsync();
+        Assert.Single(rows);
+        Assert.Equal(hash, rows[0].ContractHash);
+        Assert.Single(
+            (await harness.LoadFlowAsync()).GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+    }
+
+    [Fact]
+    public async Task DeliveryReadiness_InvalidQaContractFailsTheVerificationTurnClosed()
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        // Exact enum casing is part of the contract; a lowercase outcome is not "close enough".
+        harness.Runner.QaBlockOverride = context => DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext).Replace("\"Verified\"", "\"verified\"", StringComparison.Ordinal);
+
+        try
+        {
+            await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        }
+        catch (Exception exception) when (exception is not Xunit.Sdk.XunitException)
+        {
+            // The verification turn fails closed; the assertions below prove nothing advanced.
+        }
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.DoesNotContain(
+            flow.GateRecords,
+            gate => gate.ActionType is HandoffActionType.CustomerReview
+                or HandoffActionType.CustomerWaiver);
+        Assert.NotEqual(FlowStatus.Approved, flow.Status);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        Assert.Empty(await database.DeliveryReadinessSnapshots
+            .Where(item => item.FlowRunId == harness.FlowId)
+            .ToListAsync());
+    }
+
+    private static ReadinessWaiverRequest Waiver(
+        Guid gateId,
+        Guid candidateId,
+        DeliveryReadinessSnapshotRecord readiness,
+        IReadOnlyList<string> riskIds) =>
+        new()
+        {
+            GateId = gateId,
+            ReviewedCandidateId = candidateId,
+            ReadinessRevision = readiness.Revision,
+            ReadinessContractHash = readiness.ContractHash,
+            RiskIds = riskIds,
+            Acknowledgement = "I acknowledge and accept the disclosed residual risk."
+        };
+
+    [Fact]
+    public void DeliveryReadinessPolicy_DerivesStateFromTypedFactsOnly()
+    {
+        var verified = Criterion(DeliveryCriterionOutcome.Verified);
+        var failed = Criterion(DeliveryCriterionOutcome.Failed);
+        var blocked = Criterion(DeliveryCriterionOutcome.Blocked);
+        var waiverRisk = Risk(DeliveryRiskClassification.WaiverRequired);
+        var blockingRisk = Risk(DeliveryRiskClassification.Blocking);
+        var disclosure = Risk(DeliveryRiskClassification.NonBlockingDisclosure);
+
+        Assert.Equal(
+            DeliveryReadinessState.ReadyToApprove,
+            DeliveryReadinessPolicy.DeriveState([verified], [disclosure], [], []));
+        Assert.Equal(
+            DeliveryReadinessState.NeedsCustomerWaiver,
+            DeliveryReadinessPolicy.DeriveState([verified], [waiverRisk], [], []));
+        Assert.Equal(
+            DeliveryReadinessState.ReadyToApprove,
+            DeliveryReadinessPolicy.DeriveState(
+                [verified],
+                [waiverRisk],
+                [],
+                [waiverRisk.RiskId]));
+        Assert.Equal(
+            DeliveryReadinessState.NeedsRefinement,
+            DeliveryReadinessPolicy.DeriveState([failed], [], [], []));
+        Assert.Equal(
+            DeliveryReadinessState.NeedsRefinement,
+            DeliveryReadinessPolicy.DeriveState([], [], [], []));
+        Assert.Equal(
+            DeliveryReadinessState.NeedsRefinement,
+            DeliveryReadinessPolicy.DeriveState([verified], [], ["a plan gap"], []));
+        Assert.Equal(
+            DeliveryReadinessState.Blocked,
+            DeliveryReadinessPolicy.DeriveState([blocked], [], [], []));
+        Assert.Equal(
+            DeliveryReadinessState.Blocked,
+            DeliveryReadinessPolicy.DeriveState([verified], [blockingRisk], [], []));
+
+        // A failed criterion can never be waived into readiness, even if it is also named as a
+        // waived risk identifier.
+        Assert.Equal(
+            DeliveryReadinessState.NeedsRefinement,
+            DeliveryReadinessPolicy.DeriveState(
+                [failed],
+                [waiverRisk],
+                [],
+                [waiverRisk.RiskId, failed.CriterionId]));
+
+        Assert.Equal(
+            [DeliveryReadinessAction.Accept, DeliveryReadinessAction.RequestRefinement],
+            DeliveryReadinessPolicy.AllowedActions(
+                DeliveryReadinessState.ReadyToApprove));
+        Assert.Equal(
+            [DeliveryReadinessAction.RequestRefinement],
+            DeliveryReadinessPolicy.AllowedActions(
+                DeliveryReadinessState.NeedsRefinement));
+        Assert.DoesNotContain(
+            DeliveryReadinessAction.Accept,
+            DeliveryReadinessPolicy.AllowedActions(
+                DeliveryReadinessState.NeedsCustomerWaiver));
+        Assert.DoesNotContain(
+            DeliveryReadinessAction.GrantWaiver,
+            DeliveryReadinessPolicy.AllowedActions(DeliveryReadinessState.Blocked));
+    }
+
+    [Fact]
+    public void DeliveryReadinessQa_VerifiedCriteriaRequireNoResponsibleRoles()
+    {
+        var plan = DeliveryReadinessFixtures.Plan();
+        var planHash = DeliveryReadinessPolicy.HashAcceptancePlan(plan);
+        var prompt =
+            $"AcceptancePlanHash: {planHash}{Environment.NewLine}" +
+            "- AC-001 (Observation): verify the result" + Environment.NewLine +
+            "- EV-S010-000 [Observation] host-observed verification";
+
+        var parsed = DeliveryReadinessPolicy.ParseQaOutput(
+            DeliveryReadinessFixtures.QaBlockFromPrompt(prompt),
+            plan,
+            planHash,
+            ["EV-S010-000"]);
+
+        Assert.Equal(OutcomeQaVerdict.PASS, parsed.Document.Verdict);
+        Assert.Empty(Assert.Single(parsed.Document.Criteria!).ResponsibleRoles!);
+
+        var invalid = DeliveryReadinessFixtures.QaBlockFromPrompt(prompt)
+            .Replace(
+                "\"ResponsibleRoles\":[]",
+                "\"ResponsibleRoles\":[\"external-delivery\"]",
+                StringComparison.Ordinal);
+        var exception = Assert.Throws<DeliveryReadinessContractException>(() =>
+            DeliveryReadinessPolicy.ParseQaOutput(
+                invalid,
+                plan,
+                planHash,
+                ["EV-S010-000"]));
+        Assert.Contains(
+            "Verified outcome cannot name responsible roles",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DeliveryLifecycle_ApprovedIsUnreachableOutsideTheGuardedCompletion()
+    {
+        var lifecycle = new FlowLifecycleCoordinator();
+        var flow = new FlowRun
+        {
+            Title = "Guarded delivery",
+            OriginalRequest = "Guard the approval path.",
+            Kind = FlowKind.Delivery,
+            ContractVersion = "studio-v2",
+            Status = FlowStatus.Running
+        };
+
+        Assert.Throws<FlowLifecycleException>(
+            () => lifecycle.Transition(flow, FlowStatus.Approved));
+        Assert.Throws<FlowLifecycleException>(
+            () => lifecycle.OpenCustomerReview(
+                flow,
+                DeliveryReadinessState.NeedsRefinement,
+                "sha256:" + new string('a', 64),
+                "sha256:" + new string('a', 64)));
+        Assert.Throws<FlowLifecycleException>(
+            () => lifecycle.OpenCustomerReview(
+                flow,
+                DeliveryReadinessState.ReadyToApprove,
+                "sha256:" + new string('a', 64),
+                "sha256:" + new string('b', 64)));
+        Assert.Throws<FlowLifecycleException>(
+            () => lifecycle.CompletePublishedDelivery(
+                flow,
+                DeliveryReadinessState.ReadyToApprove,
+                "sha256:" + new string('a', 64),
+                "sha256:" + new string('a', 64),
+                publicationVerified: false));
+
+        Assert.True(lifecycle.OpenCustomerReview(
+            flow,
+            DeliveryReadinessState.ReadyToApprove,
+            "sha256:" + new string('a', 64),
+            "sha256:" + new string('a', 64)));
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.True(lifecycle.CompletePublishedDelivery(
+            flow,
+            DeliveryReadinessState.ReadyToApprove,
+            "sha256:" + new string('a', 64),
+            "sha256:" + new string('a', 64),
+            publicationVerified: true));
+        Assert.Equal(FlowStatus.Approved, flow.Status);
+    }
+
+    private static DeliveryReadinessCriterion Criterion(
+        DeliveryCriterionOutcome outcome) =>
+        new(
+            "AC-001",
+            "The result satisfies the confirmed brief.",
+            outcome,
+            ["EV-001"],
+            "The host-observed check produced this result.",
+            outcome == DeliveryCriterionOutcome.Verified ? null : "Fix and re-verify.",
+            ["external-delivery"],
+            true);
+
+    private static DeliveryReadinessRisk Risk(
+        DeliveryRiskClassification classification) =>
+        new(
+            "RR-001",
+            classification,
+            DeliveryRiskSeverity.Medium,
+            "A disclosed residual risk remains.",
+            "The customer may observe a bounded degradation.",
+            ["EV-RISK"],
+            [],
+            "quality-engineer",
+            Guid.NewGuid(),
+            null);
+
+    [Fact]
+    public async Task DeliveryVerificationPrompt_CarriesHostComputedPlanHashCriteriaAndEvidence()
+    {
+        // Finding 1 and 5: the production prompt must carry the host-computed acceptance plan
+        // hash, the planned criteria, and the host-issued evidence registry. The scripted agent
+        // echoes them back, so the flow only reaches review when the host really injected them.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var verification = Assert.Single(
+            harness.Runner.Contexts,
+            context => context.RequiresDeliveryReadinessQa);
+        var injectedHash = DeliveryReadinessFixtures.PlanHashFromPrompt(
+            verification.OutcomeContext);
+        Assert.Equal(DeliveryReadinessFixtures.PlanHash(), injectedHash);
+        Assert.Equal(
+            ["AC-001"],
+            DeliveryReadinessFixtures.CriterionIdsFromPrompt(verification.OutcomeContext));
+        Assert.NotEmpty(
+            DeliveryReadinessFixtures.EvidenceIdsFromPrompt(verification.OutcomeContext));
+        Assert.Contains(
+            DeliveryReadinessPolicy.QaBeginMarker,
+            verification.OutcomeContract,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            injectedHash,
+            verification.OutcomeContract,
+            StringComparison.Ordinal);
+
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var flow = await harness.LoadFlowAsync();
+        var registry = DeliveryReadinessService.KnownEvidenceIds(
+            flow.Events,
+            flow.Iteration);
+        Assert.NotEmpty(registry);
+        var readiness = await database.DeliveryReadinessSnapshots
+            .SingleAsync(item => item.FlowRunId == harness.FlowId && item.Active);
+        Assert.Equal(DeliveryReadinessState.ReadyToApprove, readiness.State);
+        Assert.Equal(injectedHash, readiness.AcceptancePlanHash);
+        var contract = DeliveryReadinessPolicy.DeserializeSnapshot(readiness.ContractJson);
+        Assert.All(
+            contract.Criteria,
+            criterion => Assert.All(
+                criterion.EvidenceIds,
+                evidenceId => Assert.Contains(evidenceId, registry)));
+    }
+
+    [Fact]
+    public async Task FabricatedEvidenceId_CannotReachReadyToApproveThroughTheEngine()
+    {
+        // Finding 5: an identifier the host never issued fails the verification turn closed, so it
+        // can never become a verified criterion or a releasable readiness state.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                evidenceOverride: ["EV-S999-999"]);
+
+        try
+        {
+            await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        }
+        catch (Exception exception) when (exception is not Xunit.Sdk.XunitException)
+        {
+            // The turn fails closed; the assertions below prove nothing advanced.
+        }
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.DoesNotContain(
+            flow.GateRecords,
+            gate => gate.ActionType is HandoffActionType.CustomerReview
+                or HandoffActionType.CustomerWaiver);
+        Assert.NotEqual(FlowStatus.Approved, flow.Status);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        Assert.DoesNotContain(
+            await database.DeliveryReadinessSnapshots
+                .Where(item => item.FlowRunId == harness.FlowId)
+                .ToListAsync(),
+            item => item.State == DeliveryReadinessState.ReadyToApprove);
+    }
+
+    [Fact]
+    public async Task DeliveryReview_WithoutTheImmutableBinding_ReturnsAStaleConflict()
+    {
+        // Finding 4: an omitted binding value is a stale tab, not permission to skip the check.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var flow = await harness.LoadFlowAsync();
+        var review = Assert.Single(
+            flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+
+        var conflict = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.ReviewAsync(
+                harness.FlowId,
+                new DirectReviewRequest
+                {
+                    GateId = review.Id,
+                    Intent = ReviewIntent.Accept
+                }));
+
+        Assert.Equal(DeliveryReadinessConflicts.ReviewStale, conflict.Code);
+        Assert.Equal(DeliveryReadinessState.ReadyToApprove, conflict.State);
+        Assert.NotNull(conflict.Revision);
+        Assert.False(
+            (await harness.LoadFlowAsync()).GateRecords.Single(gate =>
+                gate.ActionType == HandoffActionType.CustomerReview).Resolved);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+    }
+
+    [Fact]
+    public async Task NeedsRefinement_ResolvesThroughTheTypedRefinementPathIntoANewIteration()
+    {
+        // Finding 3: NeedsRefinement is not a dead end, and its resolution never accepts anything.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                outcome: DeliveryCriterionOutcome.Failed);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var (candidateId, revision, hash) = await harness.ReadinessBindingAsync();
+        var blocked = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.ResolveReadinessAsync(
+                harness.FlowId,
+                new ReadinessResolutionRequest
+                {
+                    ReviewedCandidateId = candidateId,
+                    ReadinessRevision = revision,
+                    ReadinessContractHash = hash,
+                    Action = ReadinessResolutionAction.Continue
+                }));
+        Assert.Equal(DeliveryReadinessConflicts.NotReady, blocked.Code);
+
+        var resolved = await harness.Reviews.ResolveReadinessAsync(
+            harness.FlowId,
+            new ReadinessResolutionRequest
+            {
+                ReviewedCandidateId = candidateId,
+                ReadinessRevision = revision,
+                ReadinessContractHash = hash,
+                Action = ReadinessResolutionAction.RequestRefinement,
+                Refinement = new DirectReviewRefinement
+                {
+                    RequestedChanges = ["Make the archive error state distinguishable."]
+                }
+            });
+
+        Assert.Equal(DeliveryReadinessState.NeedsRefinement, resolved.ResolvedFrom);
+        Assert.Equal(2, resolved.Iteration);
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Reworking, flow.Status);
+        Assert.Equal(2, flow.Iteration);
+        Assert.Null(flow.CurrentBlockerCode);
+        Assert.DoesNotContain(
+            flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        Assert.Empty(await database.DeliveryReadinessSnapshots
+            .Where(item => item.FlowRunId == harness.FlowId && item.Active)
+            .ToListAsync());
+    }
+
+    [Fact]
+    public async Task Blocked_ResolvesThroughContinueWithoutAnyAcceptOrWaiverBypass()
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                outcome: DeliveryCriterionOutcome.Blocked);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        Assert.Equal(FlowStatus.Blocked, (await harness.LoadFlowAsync()).Status);
+
+        var (candidateId, revision, hash) = await harness.ReadinessBindingAsync();
+        var refinementConflict = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.ResolveReadinessAsync(
+                harness.FlowId,
+                new ReadinessResolutionRequest
+                {
+                    ReviewedCandidateId = candidateId,
+                    ReadinessRevision = revision,
+                    ReadinessContractHash = hash,
+                    Action = ReadinessResolutionAction.RequestRefinement,
+                    Refinement = new DirectReviewRefinement
+                    {
+                        RequestedChanges = ["Unblock the release."]
+                    }
+                }));
+        Assert.Equal(DeliveryReadinessConflicts.NotReady, refinementConflict.Code);
+
+        var resolved = await harness.Reviews.ResolveReadinessAsync(
+            harness.FlowId,
+            new ReadinessResolutionRequest
+            {
+                ReviewedCandidateId = candidateId,
+                ReadinessRevision = revision,
+                ReadinessContractHash = hash,
+                Action = ReadinessResolutionAction.Continue
+            });
+
+        Assert.Equal(DeliveryReadinessState.Blocked, resolved.ResolvedFrom);
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Queued, flow.Status);
+        Assert.Equal(1, flow.Iteration);
+        Assert.Null(flow.CurrentBlockerCode);
+        Assert.DoesNotContain(
+            flow.GateRecords,
+            gate => gate.ActionType is HandoffActionType.CustomerReview
+                or HandoffActionType.CustomerWaiver);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        Assert.Contains(
+            flow.Events,
+            item => item.Type == "delivery.readiness-resolved");
+    }
+
+    [Fact]
+    public async Task CompletedPublicationBeforeApproval_RecoversThroughTheGuardedCompletion()
+    {
+        // Finding 2: a crash between a completed publication and final approval must reauthorize
+        // rather than transition directly, and must deny safely when the binding no longer agrees.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var beforeReview = await harness.LoadFlowAsync();
+        var review = Assert.Single(
+            beforeReview.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        await harness.ReviewAsync(new DirectReviewRequest
+        {
+            GateId = review.Id,
+            Intent = ReviewIntent.Accept
+        });
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        Assert.Equal(FlowStatus.Approved, (await harness.LoadFlowAsync()).Status);
+
+        // Rewind to the exact crash window: publication completed, flow not yet Approved.
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var stored = await database.Flows.SingleAsync(
+                item => item.Id == harness.FlowId);
+            stored.Status = FlowStatus.Queued;
+            stored.CompletedAt = null;
+            await database.SaveChangesAsync();
+        }
+
+        var recovered = await harness.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+        Assert.DoesNotContain(harness.FlowId, recovered);
+        var afterRecovery = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Approved, afterRecovery.Status);
+        Assert.Contains(
+            afterRecovery.Events,
+            item => item.Type == "flow.recovery-publication-completed");
+
+        // Now break the binding and rewind again: recovery must refuse to approve.
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var stored = await database.Flows.SingleAsync(
+                item => item.Id == harness.FlowId);
+            stored.Status = FlowStatus.Queued;
+            stored.CompletedAt = null;
+            var readiness = await database.DeliveryReadinessSnapshots
+                .SingleAsync(item => item.FlowRunId == harness.FlowId && item.Active);
+            readiness.State = DeliveryReadinessState.NeedsRefinement;
+            await database.SaveChangesAsync();
+        }
+
+        _ = await harness.Engine.RecoverInterruptedFlowsAsync(CancellationToken.None);
+        var denied = await harness.LoadFlowAsync();
+        Assert.NotEqual(FlowStatus.Approved, denied.Status);
+        Assert.Contains(
+            denied.Events,
+            item => item.Type == DeliveryReadinessService.DeniedEventType);
+    }
+
+    [Fact]
+    public async Task GrantedWaiverReceipts_SurviveReDerivationIntoProjectionsAndPublication()
+    {
+        // Receipts are written against the pre-waiver assessment and the grant deliberately
+        // re-derives a new revision. They must still be enumerated by the projection, the binding,
+        // and the publication waiver-set hash rather than being orphaned by the new contract hash.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                risks: [("RR-001", DeliveryRiskClassification.WaiverRequired)]);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var beforeWaiver = await harness.LoadFlowAsync();
+        var waiverGate = Assert.Single(
+            beforeWaiver.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerWaiver);
+        var (candidateId, revision, hash) = await harness.ReadinessBindingAsync();
+        var emptyWaiverSetHash = DeliveryReadinessPolicy.HashWaiverSet(hash, []);
+
+        await harness.Reviews.GrantReadinessWaiverAsync(
+            harness.FlowId,
+            new ReadinessWaiverRequest
+            {
+                GateId = waiverGate.Id,
+                ReviewedCandidateId = candidateId,
+                ReadinessRevision = revision,
+                ReadinessContractHash = hash,
+                RiskIds = ["RR-001"],
+                Acknowledgement = "I acknowledge and accept the disclosed residual risk."
+            });
+
+        var afterWaiver = await harness.LoadFlowAsync();
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var binding = await new DeliveryReadinessService().LoadCurrentAsync(
+                database,
+                harness.FlowId);
+            Assert.NotNull(binding);
+            Assert.Equal(DeliveryReadinessState.ReadyToApprove, binding!.State);
+            Assert.NotEqual(hash, binding.ContractHash);
+
+            // The receipt is still bound to the re-derived assessment.
+            Assert.Equal(["RR-001"], binding.Waivers.Select(item => item.RiskId));
+            Assert.NotEqual(emptyWaiverSetHash, binding.WaiverSetHash);
+            Assert.Equal(
+                DeliveryReadinessPolicy.HashWaiverSet(
+                    binding.ContractHash,
+                    ["RR-001"]),
+                binding.WaiverSetHash);
+            Assert.NotEqual(
+                DeliveryReadinessPolicy.HashWaiverSet(binding.ContractHash, []),
+                binding.WaiverSetHash);
+
+            var dto = ApiMappings.ToDeliveryReadinessDto(binding, afterWaiver);
+            Assert.Equal(["RR-001"], dto.GrantedWaiverRiskIds);
+            Assert.True(Assert.Single(dto.Risks).Waived);
+        }
+
+        // Acceptance and publication carry the same non-empty waiver-set identity.
+        var review = Assert.Single(
+            afterWaiver.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        await harness.ReviewAsync(new DirectReviewRequest
+        {
+            GateId = review.Id,
+            Intent = ReviewIntent.Accept
+        });
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        await using var verification = await harness.Factory.CreateDbContextAsync();
+        var acceptanceEvent = Assert.Single(
+            await verification.FlowEvents
+                .Where(item =>
+                    item.FlowRunId == harness.FlowId &&
+                    item.Type == "flow.approved-publication-queued")
+                .ToListAsync());
+        Assert.Contains("\"WaiverSetHash\"", acceptanceEvent.DataJson);
+        Assert.DoesNotContain(emptyWaiverSetHash, acceptanceEvent.DataJson);
+        Assert.Contains(
+            DeliveryReadinessPolicy.HashWaiverSet(
+                (await verification.DeliveryReadinessSnapshots
+                    .SingleAsync(item =>
+                        item.FlowRunId == harness.FlowId && item.Active)).ContractHash,
+                ["RR-001"]),
+            acceptanceEvent.DataJson);
+    }
+
+    [Fact]
+    public async Task OrdinaryReviewRefinement_SupersedesTheReleasableReadinessAndCandidate()
+    {
+        // A refined iteration invalidates the reviewed result. Leaving the ReadyToApprove rows
+        // active would keep painting a green card, history row, and readiness panel.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var beforeRefinement = await harness.LoadFlowAsync();
+        var review = Assert.Single(
+            beforeRefinement.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            Assert.Equal(
+                DeliveryReadinessState.ReadyToApprove,
+                (await database.DeliveryReadinessSnapshots
+                    .SingleAsync(item =>
+                        item.FlowRunId == harness.FlowId && item.Active)).State);
+        }
+
+        await harness.ReviewAsync(new DirectReviewRequest
+        {
+            GateId = review.Id,
+            Intent = ReviewIntent.RequestRefinement,
+            Refinement = new DirectReviewRefinement
+            {
+                RequestedChanges = ["Narrow the result to checkout resilience."]
+            }
+        });
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Reworking, flow.Status);
+        Assert.Equal(2, flow.Iteration);
+
+        await using var verification = await harness.Factory.CreateDbContextAsync();
+        Assert.Contains(
+            flow.Events,
+            item => item.Type == DeliveryReadinessService.SupersededEventType);
+        Assert.Empty(await verification.DeliveryReadinessSnapshots
+            .Where(item => item.FlowRunId == harness.FlowId && item.Active)
+            .ToListAsync());
+        Assert.Empty(await verification.ReviewedCandidateRecords
+            .Where(item => item.FlowRunId == harness.FlowId && item.Active)
+            .ToListAsync());
+        var superseded = Assert.Single(
+            await verification.DeliveryReadinessSnapshots
+                .Where(item => item.FlowRunId == harness.FlowId)
+                .ToListAsync());
+        Assert.False(superseded.Active);
+        Assert.NotNull(superseded.SupersededAt);
+
+        // Every projection stops advertising a releasable result.
+        Assert.Null(await DemoApi.LoadReadinessDtoAsync(
+            harness.Factory,
+            new DeliveryReadinessService(),
+            flow,
+            CancellationToken.None));
+        var labels = await DemoApi.LoadReadinessLabelsAsync(
+            verification,
+            [harness.FlowId],
+            CancellationToken.None);
+        Assert.Empty(labels);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+    }
+
     private sealed class ReviewHarness : IAsyncDisposable
     {
         private ReviewHarness(
@@ -1390,6 +2243,49 @@ public sealed class ReviewWorkflowTests
                 .SingleAsync(item => item.Id == FlowId);
         }
 
+        /// <summary>
+        /// Submits a review with the current immutable readiness binding attached. A Delivery
+        /// readiness flow rejects a request that omits it, so tests must echo the server's values
+        /// exactly as a browser does.
+        /// </summary>
+        public async Task<ReviewCoordinationResult> ReviewAsync(
+            DirectReviewRequest request)
+        {
+            await using var database = await Factory.CreateDbContextAsync();
+            var readiness = await database.DeliveryReadinessSnapshots
+                .AsNoTracking()
+                .SingleOrDefaultAsync(item => item.FlowRunId == FlowId && item.Active);
+            var candidate = await database.ReviewedCandidateRecords
+                .AsNoTracking()
+                .SingleOrDefaultAsync(item => item.FlowRunId == FlowId && item.Active);
+            var bound = readiness is null || candidate is null
+                ? request
+                : new DirectReviewRequest
+                {
+                    GateId = request.GateId,
+                    Intent = request.Intent,
+                    Refinement = request.Refinement,
+                    ReviewedCandidateId = candidate.Id,
+                    ReadinessRevision = readiness.Revision,
+                    ReadinessContractHash = readiness.ContractHash
+                };
+            return await Reviews.ReviewAsync(FlowId, bound);
+        }
+
+        /// <summary>The current immutable readiness binding a client must echo back.</summary>
+        public async Task<(Guid CandidateId, int Revision, string ContractHash)>
+            ReadinessBindingAsync()
+        {
+            await using var database = await Factory.CreateDbContextAsync();
+            var readiness = await database.DeliveryReadinessSnapshots
+                .AsNoTracking()
+                .SingleAsync(item => item.FlowRunId == FlowId && item.Active);
+            var candidate = await database.ReviewedCandidateRecords
+                .AsNoTracking()
+                .SingleAsync(item => item.FlowRunId == FlowId && item.Active);
+            return (candidate.Id, readiness.Revision, readiness.ContractHash);
+        }
+
         public async Task SetPostApprovalMaximumAsync(
             ExecutionPermissionProfile maximum)
         {
@@ -1488,6 +2384,7 @@ public sealed class ReviewWorkflowTests
                         dependsOn: ["prepare"])
                 ],
                 PreMortemCheckpoints = [],
+                AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
                 MissingQualification = null
             };
 
@@ -1578,6 +2475,9 @@ public sealed class ReviewWorkflowTests
 
         public string? PublicationOutputOverride { get; set; }
 
+        /// <summary>Optional strict <c>outcome-qa-v2</c> block for a scripted readiness case.</summary>
+        public Func<AgentExecutionContext, string>? QaBlockOverride { get; set; }
+
         public Task<AgentExecutionResult> ExecuteAsync(
             AgentExecutionContext context,
             CancellationToken cancellationToken = default)
@@ -1636,6 +2536,16 @@ public sealed class ReviewWorkflowTests
                     """ +
                     Environment.NewLine +
                     FlowOutcomeParser.EndSentinel;
+            }
+            if (context.RequiresDeliveryReadinessQa)
+            {
+                // The block is built from the host-rendered prompt, so it is only valid when the
+                // production path actually injected the plan hash, criteria, and evidence ids.
+                output +=
+                    Environment.NewLine +
+                    (QaBlockOverride?.Invoke(context) ??
+                     DeliveryReadinessFixtures.QaBlockFromPrompt(
+                         context.OutcomeContext));
             }
             return Task.FromResult(new AgentExecutionResult(
                 output,

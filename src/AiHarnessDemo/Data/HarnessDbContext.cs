@@ -31,6 +31,15 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
     public DbSet<ReviewedPublicationRecord> ReviewedPublicationRecords =>
         Set<ReviewedPublicationRecord>();
 
+    public DbSet<DeliveryReadinessSnapshotRecord> DeliveryReadinessSnapshots =>
+        Set<DeliveryReadinessSnapshotRecord>();
+
+    public DbSet<ReviewedCandidateRecord> ReviewedCandidateRecords =>
+        Set<ReviewedCandidateRecord>();
+
+    public DbSet<ReadinessWaiverRecord> ReadinessWaiverRecords =>
+        Set<ReadinessWaiverRecord>();
+
     public DbSet<HarnessLearning> Learnings => Set<HarnessLearning>();
 
     public DbSet<HandoffGateRecord> GateRecords => Set<HandoffGateRecord>();
@@ -280,6 +289,12 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.Property(item => item.PullRequestUrl)
                 .HasMaxLength(1_024)
                 .HasDefaultValue(string.Empty);
+            entity.Property(item => item.ReadinessContractHash)
+                .HasMaxLength(128)
+                .HasDefaultValue(string.Empty);
+            entity.Property(item => item.WaiverSetHash)
+                .HasMaxLength(128)
+                .HasDefaultValue(string.Empty);
             entity.HasIndex(item => new
                 {
                     item.FlowRunId,
@@ -287,6 +302,86 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
                     item.RelativePath
                 })
                 .HasDatabaseName("IX_ReviewedPublicationRecords_Repository")
+                .IsUnique();
+            entity.HasOne<FlowRun>()
+                .WithMany()
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<DeliveryReadinessSnapshotRecord>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.State).HasConversion<string>();
+            entity.Property(item => item.Reconciliation).HasConversion<string>();
+            entity.Property(item => item.CandidateFingerprint).HasMaxLength(128);
+            entity.Property(item => item.AcceptancePlanHash).HasMaxLength(128);
+            entity.Property(item => item.OutcomeContractHash).HasMaxLength(128);
+            entity.Property(item => item.QaContractHash)
+                .HasMaxLength(128)
+                .HasDefaultValue(string.Empty);
+            entity.Property(item => item.ContractHash).HasMaxLength(128);
+            entity.HasIndex(item => new
+                {
+                    item.FlowRunId,
+                    item.Iteration,
+                    item.Revision
+                })
+                .HasDatabaseName("IX_DeliveryReadinessSnapshots_Revision")
+                .IsUnique();
+            entity.HasIndex(item => item.FlowRunId)
+                .HasDatabaseName("IX_DeliveryReadinessSnapshots_Active")
+                .IsUnique()
+                .HasFilter("\"Active\" = 1");
+            entity.HasOne<FlowRun>()
+                .WithMany()
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ReviewedCandidateRecord>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.CandidateFingerprint).HasMaxLength(128);
+            entity.Property(item => item.OutcomeContractHash).HasMaxLength(128);
+            entity.Property(item => item.AcceptancePlanHash).HasMaxLength(128);
+            entity.Property(item => item.ReadinessContractHash).HasMaxLength(128);
+            entity.HasIndex(item => new
+                {
+                    item.FlowRunId,
+                    item.Iteration,
+                    item.CandidateFingerprint,
+                    item.ReadinessContractHash
+                })
+                .HasDatabaseName("IX_ReviewedCandidateRecords_Identity")
+                .IsUnique();
+            entity.HasIndex(item => item.FlowRunId)
+                .HasDatabaseName("IX_ReviewedCandidateRecords_Active")
+                .IsUnique()
+                .HasFilter("\"Active\" = 1");
+            entity.HasOne<FlowRun>()
+                .WithMany()
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ReadinessWaiverRecord>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.RiskId).HasMaxLength(32);
+            entity.Property(item => item.Actor).HasMaxLength(200);
+            entity.Property(item => item.Acknowledgement).HasMaxLength(4_000);
+            entity.Property(item => item.ReadinessContractHash).HasMaxLength(128);
+            entity.HasIndex(item => new
+                {
+                    item.ReviewedCandidateId,
+                    item.ReadinessContractHash,
+                    item.RiskId
+                })
+                .HasDatabaseName("IX_ReadinessWaiverRecords_Receipt")
                 .IsUnique();
             entity.HasOne<FlowRun>()
                 .WithMany()
@@ -395,6 +490,7 @@ public static class DatabaseInitializer
         await EnsureRoutingSchemaAsync(database);
         await EnsureSliceOneSchemaAsync(database);
         await EnsureReviewedPublicationSchemaAsync(database);
+        await EnsureDeliveryReadinessSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         var settings = await database.Settings.SingleOrDefaultAsync();
@@ -425,6 +521,18 @@ public static class DatabaseInitializer
         await scope.ServiceProvider
             .GetRequiredService<FlowAgentSnapshotService>()
             .MigrateLegacyNonterminalAsync();
+
+        // Fail-closed reconciliation of pre-readiness studio-v2 Delivery flows. Repeating this on
+        // every start is idempotent: unique keys prevent duplicate rows, gates, and events.
+        await using (var reconciliationDatabase = await factory.CreateDbContextAsync())
+        {
+            await using var reconciliationTransaction =
+                await reconciliationDatabase.Database.BeginTransactionAsync();
+            await scope.ServiceProvider
+                .GetRequiredService<DeliveryReadinessService>()
+                .ReconcileLegacyFlowsAsync(reconciliationDatabase, gateEngine);
+            await reconciliationTransaction.CommitAsync();
+        }
     }
 
     internal static async Task EnsureSettingsSchemaAsync(
@@ -2049,6 +2157,126 @@ public static class DatabaseInitializer
             CREATE UNIQUE INDEX IF NOT EXISTS IX_ReviewedPublicationRecords_Repository
                 ON ReviewedPublicationRecords
                     (FlowRunId, PublicationRootId, RelativePath);
+            """,
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('ReviewedPublicationRecords') " +
+            "WHERE name = 'ReviewedCandidateId';",
+            "ALTER TABLE ReviewedPublicationRecords ADD COLUMN ReviewedCandidateId " +
+            "TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('ReviewedPublicationRecords') " +
+            "WHERE name = 'ReadinessSnapshotId';",
+            "ALTER TABLE ReviewedPublicationRecords ADD COLUMN ReadinessSnapshotId " +
+            "TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('ReviewedPublicationRecords') " +
+            "WHERE name = 'ReadinessContractHash';",
+            "ALTER TABLE ReviewedPublicationRecords ADD COLUMN ReadinessContractHash " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('ReviewedPublicationRecords') " +
+            "WHERE name = 'CustomerReviewGateId';",
+            "ALTER TABLE ReviewedPublicationRecords ADD COLUMN CustomerReviewGateId " +
+            "TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';",
+            cancellationToken);
+        await EnsureColumnAsync(
+            database,
+            "SELECT COUNT(*) FROM pragma_table_info('ReviewedPublicationRecords') " +
+            "WHERE name = 'WaiverSetHash';",
+            "ALTER TABLE ReviewedPublicationRecords ADD COLUMN WaiverSetHash " +
+            "TEXT NOT NULL DEFAULT '';",
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Additive, idempotent upgrade for the host-derived Delivery readiness tables. Repeating this
+    /// on an existing database creates no duplicate rows, indexes, or history.
+    /// </summary>
+    internal static async Task EnsureDeliveryReadinessSchemaAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken = default)
+    {
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE TABLE IF NOT EXISTS DeliveryReadinessSnapshots (
+                Id TEXT NOT NULL CONSTRAINT PK_DeliveryReadinessSnapshots PRIMARY KEY,
+                FlowRunId TEXT NOT NULL,
+                Iteration INTEGER NOT NULL,
+                Revision INTEGER NOT NULL,
+                State TEXT NOT NULL,
+                Reconciliation TEXT NOT NULL DEFAULT 'Current',
+                CandidateFingerprint TEXT NOT NULL,
+                AcceptancePlanHash TEXT NOT NULL,
+                OutcomeContractHash TEXT NOT NULL,
+                QaContractHash TEXT NOT NULL DEFAULT '',
+                OutcomeOwnerStepId TEXT NOT NULL,
+                QaStepId TEXT NOT NULL,
+                ContractJson TEXT NOT NULL,
+                ContractHash TEXT NOT NULL,
+                Active INTEGER NOT NULL DEFAULT 1,
+                CreatedAt INTEGER NOT NULL,
+                SupersededAt INTEGER NULL,
+                CONSTRAINT FK_DeliveryReadinessSnapshots_Flows_FlowRunId
+                    FOREIGN KEY (FlowRunId)
+                    REFERENCES Flows (Id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_DeliveryReadinessSnapshots_Revision
+                ON DeliveryReadinessSnapshots (FlowRunId, Iteration, Revision);
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_DeliveryReadinessSnapshots_Active
+                ON DeliveryReadinessSnapshots (FlowRunId)
+                WHERE Active = 1;
+
+            CREATE TABLE IF NOT EXISTS ReviewedCandidateRecords (
+                Id TEXT NOT NULL CONSTRAINT PK_ReviewedCandidateRecords PRIMARY KEY,
+                FlowRunId TEXT NOT NULL,
+                Iteration INTEGER NOT NULL,
+                CandidateFingerprint TEXT NOT NULL,
+                OutcomeOwnerStepId TEXT NOT NULL,
+                OutcomeContractHash TEXT NOT NULL,
+                AcceptancePlanHash TEXT NOT NULL,
+                ReadinessSnapshotId TEXT NOT NULL,
+                ReadinessContractHash TEXT NOT NULL,
+                IdentityJson TEXT NOT NULL,
+                Active INTEGER NOT NULL DEFAULT 1,
+                CreatedAt INTEGER NOT NULL,
+                SupersededAt INTEGER NULL,
+                CONSTRAINT FK_ReviewedCandidateRecords_Flows_FlowRunId
+                    FOREIGN KEY (FlowRunId)
+                    REFERENCES Flows (Id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_ReviewedCandidateRecords_Identity
+                ON ReviewedCandidateRecords
+                    (FlowRunId, Iteration, CandidateFingerprint, ReadinessContractHash);
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_ReviewedCandidateRecords_Active
+                ON ReviewedCandidateRecords (FlowRunId)
+                WHERE Active = 1;
+
+            CREATE TABLE IF NOT EXISTS ReadinessWaiverRecords (
+                Id TEXT NOT NULL CONSTRAINT PK_ReadinessWaiverRecords PRIMARY KEY,
+                FlowRunId TEXT NOT NULL,
+                ReviewedCandidateId TEXT NOT NULL,
+                ReadinessSnapshotId TEXT NOT NULL,
+                ReadinessContractHash TEXT NOT NULL,
+                GateId TEXT NOT NULL,
+                RiskId TEXT NOT NULL,
+                Actor TEXT NOT NULL,
+                Acknowledgement TEXT NOT NULL,
+                CreatedAt INTEGER NOT NULL,
+                CONSTRAINT FK_ReadinessWaiverRecords_Flows_FlowRunId
+                    FOREIGN KEY (FlowRunId)
+                    REFERENCES Flows (Id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_ReadinessWaiverRecords_Receipt
+                ON ReadinessWaiverRecords
+                    (ReviewedCandidateId, ReadinessContractHash, RiskId);
             """,
             cancellationToken);
     }

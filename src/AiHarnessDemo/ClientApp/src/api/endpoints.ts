@@ -27,6 +27,10 @@ import type {
   PreviewDto,
   QualificationResolutionRequest,
   QualificationResolutionResponse,
+  ReadinessResolutionRequest,
+  ReadinessResolutionResponse,
+  ReadinessWaiverRequest,
+  ReadinessWaiverResponse,
   SaveSettingsRequest,
   SettingsDto,
   ToggleAgentRequest
@@ -63,6 +67,16 @@ export const api = {
     }),
   reviewResult: (flowId: string) =>
     request<FlowReviewResultResponse>(`/api/flows/${flowId}/review-result`),
+  grantReadinessWaiver: (flowId: string, body: ReadinessWaiverRequest) =>
+    request<ReadinessWaiverResponse>(`/api/flows/${flowId}/readiness-waiver`, {
+      method: "POST",
+      body
+    }),
+  resolveReadiness: (flowId: string, body: ReadinessResolutionRequest) =>
+    request<ReadinessResolutionResponse>(`/api/flows/${flowId}/readiness-resolution`, {
+      method: "POST",
+      body
+    }),
   resolveQualification: (flowId: string, body: QualificationResolutionRequest) =>
     request<QualificationResolutionResponse>(
       `/api/flows/${flowId}/qualification-resolution`,

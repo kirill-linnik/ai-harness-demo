@@ -67,7 +67,8 @@ public sealed class ApiProjectionTests
             typeof(FlowAbandonmentService),
             typeof(PreviewArtifactCatalog),
             typeof(AdvisoryArtifactCatalog),
-            typeof(IReviewedCandidateService)
+            typeof(IReviewedCandidateService),
+            typeof(DeliveryReadinessService)
         };
         foreach (var serviceType in serviceTypes)
         {
@@ -100,6 +101,8 @@ public sealed class ApiProjectionTests
             ("POST", "/api/flows/{flowId:guid}/restart"),
             ("POST", "/api/flows/{flowId:guid}/abandon"),
             ("POST", "/api/flows/{flowId:guid}/review"),
+            ("POST", "/api/flows/{flowId:guid}/readiness-waiver"),
+            ("POST", "/api/flows/{flowId:guid}/readiness-resolution"),
             ("POST", "/api/flows/{flowId:guid}/qualification-resolution"),
             ("GET", "/api/flows/{flowId:guid}/review-result"),
             ("GET", "/api/flows/{flowId:guid}/artifacts/{artifactId}/{**path}"),

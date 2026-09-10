@@ -37,6 +37,12 @@ public static class DemoApi
         api.MapPost("/flows/{flowId:guid}/start", StartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/restart", RestartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/review", ReviewFlowAsync);
+        api.MapPost(
+            "/flows/{flowId:guid}/readiness-waiver",
+            GrantReadinessWaiverAsync);
+        api.MapPost(
+            "/flows/{flowId:guid}/readiness-resolution",
+            ResolveReadinessAsync);
         api.MapGet("/flows/{flowId:guid}/review-result", GetReviewResultAsync);
         api.MapPost(
             "/flows/{flowId:guid}/qualification-resolution",
@@ -287,7 +293,59 @@ public static class DemoApi
             .OrderByDescending(item => item.UpdatedAt)
             .Take(200)
             .ToListAsync(cancellationToken);
-        return Results.Ok(flows.Select(item => item.ToSummaryDto()));
+        var readiness = await LoadReadinessLabelsAsync(
+            database,
+            flows.Select(item => item.Id),
+            cancellationToken);
+        return Results.Ok(flows.Select(item =>
+        {
+            var summary = item.ToSummaryDto();
+            return readiness.TryGetValue(item.Id, out var state)
+                ? summary with
+                {
+                    ReadinessState = state.State,
+                    ReadinessLabel = state.Label
+                }
+                : summary;
+        }));
+    }
+
+    /// <summary>
+    /// Reads the durable readiness state for list projections. Cards and history rows must never
+    /// paint a green result from <see cref="FlowStatus"/> alone.
+    /// </summary>
+    internal static async Task<IReadOnlyDictionary<
+        Guid,
+        (DeliveryReadinessState State, string Label)>> LoadReadinessLabelsAsync(
+        HarnessDbContext database,
+        IEnumerable<Guid> flowIds,
+        CancellationToken cancellationToken)
+    {
+        var ids = flowIds.Distinct().ToArray();
+        var rows = await database.DeliveryReadinessSnapshots
+            .AsNoTracking()
+            .Where(item => item.Active && ids.Contains(item.FlowRunId))
+            .Select(item => new
+            {
+                item.FlowRunId,
+                item.State,
+                item.Reconciliation
+            })
+            .ToListAsync(cancellationToken);
+        return rows.ToDictionary(
+            item => item.FlowRunId,
+            item => item.Reconciliation != DeliveryReadinessReconciliation.Current
+                ? (DeliveryReadinessState.Blocked, "Published - readiness unverified")
+                : item.State switch
+                {
+                    DeliveryReadinessState.ReadyToApprove =>
+                        (DeliveryReadinessState.ReadyToApprove, "Ready to approve"),
+                    DeliveryReadinessState.NeedsCustomerWaiver =>
+                        (DeliveryReadinessState.NeedsCustomerWaiver, "Needs customer waiver"),
+                    DeliveryReadinessState.NeedsRefinement =>
+                        (DeliveryReadinessState.NeedsRefinement, "Needs refinement"),
+                    _ => (DeliveryReadinessState.Blocked, "Blocked")
+                });
     }
 
     private static async Task<IResult> GetFlowAsync(
@@ -295,6 +353,7 @@ public static class DemoApi
         IDbContextFactory<HarnessDbContext> databaseFactory,
         PreviewArtifactCatalog artifactCatalog,
         IReviewedCandidateService reviewedCandidateService,
+        DeliveryReadinessService readinessService,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
@@ -303,7 +362,80 @@ public static class DemoApi
             artifactCatalog,
             reviewedCandidateService,
             cancellationToken);
-        return Results.Ok(flow.ToDetailDto(reviewedPreviewUrl));
+        return Results.Ok(flow.ToDetailDto(
+            reviewedPreviewUrl,
+            await LoadReadinessDtoAsync(
+                databaseFactory,
+                readinessService,
+                flow,
+                cancellationToken)));
+    }
+
+    /// <summary>
+    /// Loads the durable readiness projection for a studio-v2 Delivery flow. A flow with no
+    /// assessment returns <c>null</c> so the client shows no readiness claim at all rather than an
+    /// optimistic one.
+    /// </summary>
+    internal static async Task<DeliveryReadinessDto?> LoadReadinessDtoAsync(
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        DeliveryReadinessService readinessService,
+        FlowRun flow,
+        CancellationToken cancellationToken)
+    {
+        if (!DeliveryReadinessService.AppliesTo(flow))
+        {
+            return null;
+        }
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var binding = await readinessService.LoadCurrentAsync(
+            database,
+            flow.Id,
+            cancellationToken);
+        return binding is null
+            ? null
+            : ApiMappings.ToDeliveryReadinessDto(binding, flow);
+    }
+
+    /// <summary>
+    /// Records the separate customer waiver for the exact disclosed waiver-required risks. A waiver
+    /// is informed consent to named risks; it never accepts the product and never publishes.
+    /// </summary>
+    private static async Task<IResult> GrantReadinessWaiverAsync(
+        Guid flowId,
+        ReadinessWaiverRequest request,
+        ReviewCoordinator reviews,
+        CancellationToken cancellationToken) =>
+        Results.Ok(await reviews.GrantReadinessWaiverAsync(
+            flowId,
+            request,
+            cancellationToken));
+
+    /// <summary>
+    /// The typed resolution path for a Delivery result that is not releasable. Abandonment is
+    /// authorized here and then executed through the existing durable abandonment service.
+    /// </summary>
+    private static async Task<IResult> ResolveReadinessAsync(
+        Guid flowId,
+        ReadinessResolutionRequest request,
+        ReviewCoordinator reviews,
+        FlowAbandonmentService abandonment,
+        CancellationToken cancellationToken)
+    {
+        var result = await reviews.ResolveReadinessAsync(
+            flowId,
+            request,
+            cancellationToken);
+        if (result.Action != ReadinessResolutionAction.Abandon)
+        {
+            return Results.Ok(result);
+        }
+        var abandoned = await abandonment.AbandonAsync(flowId, cancellationToken);
+        return Results.Ok(result with
+        {
+            Status = abandoned.Status,
+            Message = "The flow was abandoned through the durable abandonment path."
+        });
     }
 
     internal static async Task<string?> ResolveReviewedPreviewUrlAsync(
@@ -697,9 +829,16 @@ public static class DemoApi
             .Include(item => item.Steps)
             .Include(item => item.GateRecords)
             .ToDictionaryAsync(item => item.Id, cancellationToken);
+        var readinessLabels = await LoadReadinessLabelsAsync(
+            database,
+            flowIds,
+            cancellationToken);
         var history = attempts.Select(item =>
         {
             var flow = flows[item.FlowId];
+            var readiness = readinessLabels.TryGetValue(flow.Id, out var state)
+                ? state
+                : ((DeliveryReadinessState?)null, (string?)null);
             return new HistoryItemDto(
                 flow.Id,
                 flow.Title,
@@ -719,7 +858,9 @@ public static class DemoApi
                 item.StepStatus,
                 item.DurationMilliseconds,
                 item.StartedAt,
-                item.PushbackReason);
+                item.PushbackReason,
+                readiness.Item1,
+                readiness.Item2);
         }).ToList();
         return Results.Ok(history);
     }

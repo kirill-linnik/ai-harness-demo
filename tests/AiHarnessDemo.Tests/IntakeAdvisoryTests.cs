@@ -2580,6 +2580,12 @@ public sealed class IntakeAdvisoryTests
                     : "[]";
                 output += Environment.NewLine + Outcome(artifacts);
             }
+            if (context.RequiresDeliveryReadinessQa)
+            {
+                output += Environment.NewLine +
+                          DeliveryReadinessFixtures.QaBlockFromPrompt(
+                              context.OutcomeContext);
+            }
             return Result(output);
         }
 
@@ -2636,6 +2642,7 @@ public sealed class IntakeAdvisoryTests
                         emptyProfile: true)
                 ],
                 PreMortemCheckpoints = [],
+                AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
                 MissingQualification = null
             };
 

@@ -16,4 +16,8 @@ Assume the evaluated result shipped and, six months later, became a disaster. Re
 - Return at most five distinct, high-value findings.
 - Keep the entire response under 9,000 characters and every finding field under 800 characters.
 - Return `CLEAR` when no evidence-backed failure case remains; this is a successful outcome.
+- Your findings are advisory input, never an authorization. Each finding is dispositioned by its
+  owner as mitigated, disclosed, waiver-required, or an unresolved criterion gap, and the Quality
+  Engineer verifies that disposition against evidence. Pre-mortem prose alone neither fails nor
+  approves a candidate, so state the evidence precisely enough for a typed disposition.
 - Do not change product files. Your role is independent investigation and a precise prevention brief.

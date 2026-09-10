@@ -52,6 +52,21 @@ public sealed class ReviewedPublicationRecord
     public ReviewedPublicationStage Stage { get; set; } =
         ReviewedPublicationStage.Intent;
 
+    /// <summary>
+    /// The authoritative readiness binding recorded with the publication intent. Publication
+    /// authorization re-reads these values from the database before every remote side effect and
+    /// again after remote verification, so a post-review mutation cannot slip through.
+    /// </summary>
+    public Guid ReviewedCandidateId { get; set; }
+
+    public Guid ReadinessSnapshotId { get; set; }
+
+    public string ReadinessContractHash { get; set; } = string.Empty;
+
+    public Guid CustomerReviewGateId { get; set; }
+
+    public string WaiverSetHash { get; set; } = string.Empty;
+
     public string PullRequestUrl { get; set; } = string.Empty;
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;

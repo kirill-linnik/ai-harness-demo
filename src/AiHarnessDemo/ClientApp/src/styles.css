@@ -2711,3 +2711,91 @@ summary:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Host-derived Delivery readiness. Only ReadyToApprove is rendered green; every other state,
+   including an unreconciled historical result, uses an amber or red treatment. */
+.readiness-card {
+  border-left: 4px solid var(--line-strong);
+}
+
+.readiness-card.readiness-ready {
+  border-left-color: var(--green);
+}
+
+.readiness-card.readiness-waiver {
+  border-left-color: var(--amber);
+}
+
+.readiness-card.readiness-refinement {
+  border-left-color: var(--amber);
+}
+
+.readiness-card.readiness-blocked {
+  border-left-color: var(--red);
+}
+
+.status-pill.readiness-ready {
+  color: var(--green);
+}
+
+.status-pill.readiness-waiver,
+.status-pill.readiness-refinement {
+  color: var(--amber);
+}
+
+.status-pill.readiness-blocked {
+  color: var(--red);
+}
+
+.readiness-chip {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 0 8px;
+  color: var(--muted-strong);
+}
+
+.readiness-chip.readiness-ReadyToApprove {
+  color: var(--green);
+}
+
+.readiness-chip.readiness-NeedsCustomerWaiver,
+.readiness-chip.readiness-NeedsRefinement {
+  color: var(--amber);
+}
+
+.readiness-chip.readiness-Blocked {
+  color: var(--red);
+}
+
+.readiness-criteria,
+.readiness-risks,
+.readiness-diagnostics {
+  display: grid;
+  gap: 10px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.readiness-criteria li,
+.readiness-risks li {
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.readiness-criteria li[data-outcome="Failed"],
+.readiness-risks li[data-classification="WaiverRequired"] {
+  border-color: var(--amber);
+}
+
+.readiness-criteria li[data-outcome="Blocked"],
+.readiness-risks li[data-classification="Blocking"] {
+  border-color: var(--red);
+}
+
+.readiness-remediation {
+  color: var(--amber);
+}

@@ -20,6 +20,14 @@ export function FlowCard({ flow }: { flow: FlowSummaryDto }) {
       </p>
       <div className="flow-card-context">
         <span>Iteration {flow.iteration}</span>
+        {flow.readinessLabel && (
+          <span
+            className={`readiness-chip readiness-${flow.readinessState}`}
+            data-readiness-state={flow.readinessState}
+          >
+            {flow.readinessLabel}
+          </span>
+        )}
         {flow.parentFlowRunId && (
           <span>
             {statusLabel(flow.linkKind)} from {flow.parentFlowRunId.slice(0, 8)}

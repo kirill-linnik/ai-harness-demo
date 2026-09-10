@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Verification;
 
 namespace AiHarnessDemo.Core.Orchestration;
 
@@ -19,6 +20,13 @@ public sealed class TeamPlanDocument
     public IReadOnlyList<TeamPlanStep>? Steps { get; init; }
 
     public IReadOnlyList<string>? PreMortemCheckpoints { get; init; }
+
+    /// <summary>
+    /// The mandatory studio-v2 Delivery acceptance criteria. They are authored once during planning,
+    /// hashed by the host, and become the only criterion namespace that later verification and
+    /// readiness derivation may use.
+    /// </summary>
+    public IReadOnlyList<DeliveryAcceptanceCriterion>? AcceptanceCriteria { get; init; }
 
     public MissingQualification? MissingQualification { get; init; }
 }
@@ -201,6 +209,7 @@ public static class TeamPlanParser
         options.Converters.Add(new ExactStringEnumConverter<PlanDuty>());
         options.Converters.Add(new ExactStringEnumConverter<TaskTypeTag>());
         options.Converters.Add(new ExactStringEnumConverter<TaskRisk>());
+        options.Converters.Add(new ExactStringEnumConverter<OutcomeEvidenceKind>());
         return options;
     }
 
