@@ -140,6 +140,7 @@ public sealed class ReviewCoordinator(
             await using var transaction =
                 await database.Database.BeginTransactionAsync(cancellationToken);
             var flow = await database.Flows
+                           .AsSplitQuery()
                            .Include(item => item.Steps)
                            .Include(item => item.GateRecords)
                            .Include(item => item.Events)
@@ -2139,6 +2140,7 @@ public sealed class ReviewCoordinator(
             .Include(item => item.ToolCalls)
             .SingleAsync(item => item.Id == prepared.Step.Id, cancellationToken);
         var flow = await database.Flows
+            .AsSplitQuery()
             .Include(item => item.Events)
             .Include(item => item.Messages)
             .Include(item => item.Steps)
@@ -3192,6 +3194,8 @@ public sealed class ReviewCoordinator(
         seedLines.Add("Requested changes:");
         seedLines.AddRange(requestedChanges.Select(change => $"- {change}"));
         var seed = string.Join(Environment.NewLine, seedLines);
+        var reviewedOutcome = FlowOutcomeParser.ParseJson(
+            flow.OutcomeContractJson).RawJson;
 
         database.FlowMessages.Add(new FlowMessage
         {
@@ -3216,7 +3220,11 @@ public sealed class ReviewCoordinator(
         });
 
         flow.ConsolidatedRequest =
-            $"{flow.ConsolidatedRequest.TrimEnd()}{Environment.NewLine}{Environment.NewLine}{seed}";
+            $"{seed}{Environment.NewLine}{Environment.NewLine}" +
+            $"Current reviewed flow-outcome-v1 JSON:{Environment.NewLine}{reviewedOutcome}" +
+            $"{Environment.NewLine}{Environment.NewLine}" +
+            $"Previous confirmed brief:{Environment.NewLine}" +
+            flow.ConsolidatedRequest.TrimEnd();
         flow.Iteration++;
         lifecycle.Transition(flow, FlowStatus.Reworking);
         flow.OutcomeOwnerPlanStepKey = null;

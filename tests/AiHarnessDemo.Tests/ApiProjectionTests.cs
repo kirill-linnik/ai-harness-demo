@@ -466,7 +466,14 @@ public sealed class ApiProjectionTests
                     leaveOpen: true)
                 .ReadToEndAsync();
 
-            Assert.Equal("<h1>sealed preview</h1>", body);
+            Assert.Contains(
+                "data-ai-harness-preview-bootstrap",
+                body,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "<h1>sealed preview</h1>",
+                body,
+                StringComparison.Ordinal);
             Assert.Equal(2, verifier.VerifyCalls);
         }
         finally

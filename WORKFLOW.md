@@ -25,18 +25,18 @@ agent:
   max_retry_backoff_ms: 3000
 copilot:
   command: copilot
-  turn_timeout_ms: 1200000
+  turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
-  maximum_quality_stall_timeout_ms: 900000
+  maximum_quality_stall_timeout_ms: 1800000
 outcome_verification:
   enabled: true
   max_rounds: 3
 studio:
   version: 1
   planning:
-    max_steps: 24
+    max_steps: 12
     max_dependencies_per_step: 8
-    max_assignment_characters: 4000
+    max_assignment_characters: 900
   flow_kinds:
     advisory:
       required_duties:

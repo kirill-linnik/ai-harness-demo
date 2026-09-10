@@ -169,7 +169,10 @@ public sealed record CandidateManifest(
     string AcceptancePlanHash,
     IReadOnlyList<CandidateRepositoryManifest> Repositories,
     IReadOnlyList<CandidateScaffoldFile> TrustedScaffoldFiles,
-    IReadOnlyList<CandidatePreviewArtifact> PreviewArtifacts);
+    IReadOnlyList<CandidatePreviewArtifact> PreviewArtifacts)
+{
+    public const int MaximumPreviewArtifacts = 2_000;
+}
 
 public sealed record OutcomeCandidateSnapshot(
     CandidateManifest Manifest,

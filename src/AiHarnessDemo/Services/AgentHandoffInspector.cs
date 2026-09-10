@@ -10,11 +10,11 @@ internal sealed record DynamicHandoffStatus(
 
 internal static partial class AgentHandoffInspector
 {
-    private const int MaximumReasonCharacters = 600;
+    private const int MaximumReasonCharacters = 2_000;
     private const int MaximumPlanStepKeyCharacters = 120;
 
     [GeneratedRegex(
-        @"(?im)^\s*HANDOFF_STATUS\s*:\s*(COMPLETE|PUSHBACK)\s*$",
+        @"(?m)^\s*(?:#{1,6}\s*)?(?:\*{1,2}|_{1,2}|`)?HANDOFF_STATUS\s*:\s*(COMPLETE|PUSHBACK)(?:\*{1,2}|_{1,2}|`)?\s*$",
         RegexOptions.CultureInvariant)]
     private static partial Regex HandoffStatusPattern();
 
@@ -82,7 +82,7 @@ internal static partial class AgentHandoffInspector
                string.Equals(
                    matches[0].Groups[1].Value,
                    "COMPLETE",
-                   StringComparison.OrdinalIgnoreCase);
+                   StringComparison.Ordinal);
     }
 
     public static DynamicHandoffStatus ParseDynamic(string output)
@@ -93,26 +93,15 @@ internal static partial class AgentHandoffInspector
             .Split('\n')
             .Select(line => line.Trim())
             .ToArray();
-        var statuses = lines
-            .Where(line => line.StartsWith(
-                "HANDOFF_STATUS:",
-                StringComparison.Ordinal))
-            .ToArray();
-        if (statuses.Length != 1 ||
-            statuses[0] is not ("HANDOFF_STATUS: COMPLETE" or "HANDOFF_STATUS: PUSHBACK"))
+        var statuses = HandoffStatusPattern().Matches(
+            string.Join('\n', lines));
+        if (statuses.Count != 1)
         {
             throw new InvalidOperationException(
                 "studio-v2 output must contain exactly one exact " +
                 "'HANDOFF_STATUS: COMPLETE' or 'HANDOFF_STATUS: PUSHBACK' line.");
         }
-        if (!string.Equals(
-                lines.FirstOrDefault(line => line.Length > 0),
-                statuses[0],
-                StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                "The studio-v2 handoff status must be the first non-empty output line.");
-        }
+        var status = statuses[0].Groups[1].Value;
 
         var ownerLines = lines
             .Where(line => line.StartsWith(
@@ -124,7 +113,10 @@ internal static partial class AgentHandoffInspector
                 "PUSHBACK_REASON:",
                 StringComparison.Ordinal))
             .ToArray();
-        if (statuses[0] == "HANDOFF_STATUS: COMPLETE")
+        if (string.Equals(
+                status,
+                "COMPLETE",
+                StringComparison.Ordinal))
         {
             if (ownerLines.Length != 0 || reasonLines.Length != 0)
             {

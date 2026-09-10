@@ -57,6 +57,8 @@ public sealed class WorkflowEngine(
     internal const int MaximumQaContractErrorCharacters = 4_000;
     internal const int MaximumFailedOutputCharacters = 32_000;
     private const string ManualRestartLabelPrefix = "Manual restart of ";
+    private const string StudioContractCorrectionLabelPrefix =
+        "Correct invalid response from ";
     internal const string ReleaseCandidateAssignment =
         "Prepare the local outcome candidate for independent QA. Generate every browser artifact " +
         "under .customer-preview, leave every repository ready for host sealing from the actual " +
@@ -127,6 +129,31 @@ public sealed class WorkflowEngine(
                 return _activeFlows;
             }
         }
+    }
+
+    private (ValidatedTeamPlan Plan, string RawJson)
+        ParseValidatedStudioTeamPlanOutput(
+            string output,
+            TeamPlanValidationContext validationContext)
+    {
+        try
+        {
+            var handoff = AgentHandoffInspector.ParseDynamic(output);
+            if (handoff.IsPushback)
+            {
+                throw new InvalidOperationException(
+                    "Team Lead planning cannot return pushback; return Planned or MissingQualification.");
+            }
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new TeamPlanContractException([exception.Message]);
+        }
+
+        var parsed = TeamPlanParser.Parse(output);
+        return (
+            _teamPlanValidator.Validate(parsed.Document, validationContext),
+            parsed.RawJson);
     }
 
     internal Task<bool> IsRunnableAsync(
@@ -899,6 +926,10 @@ public sealed class WorkflowEngine(
             this is not acceptance of the final outcome. Do not ask another question unless the
             supplied request has no actionable customer outcome.
 
+            The current refinement is intentionally the first section of the supplied customer
+            task. Treat it as authoritative over the reviewed outcome and previous confirmed brief
+            that follow it. Never replace it with an older refinement or omit its requested changes.
+
             Return exactly one intake-v2 document. Use the existing task title, FlowKind
             {{flow.Kind}}, and a complete normalized Brief containing the updated goal, details,
             success criteria, constraints, and assumptions.
@@ -1043,9 +1074,11 @@ public sealed class WorkflowEngine(
             cancellationToken);
         try
         {
-            var parsed = TeamPlanParser.Parse(leadResult.OutputSummary);
+            var parsed = ParseValidatedStudioTeamPlanOutput(
+                leadResult.OutputSummary,
+                validationContext);
             return (
-                _teamPlanValidator.Validate(parsed.Document, validationContext),
+                parsed.Plan,
                 parsed.RawJson,
                 leadResult);
         }
@@ -1066,7 +1099,9 @@ public sealed class WorkflowEngine(
                 attempt: 2,
                 inputSummary:
                     "Your previous team-plan-v1 result was invalid. Resume the same Team Lead " +
-                    "session and return a complete replacement between the exact TEAM_PLAN_V1 " +
+                    "session and return a complete replacement under 10,000 characters. Start with " +
+                    "exactly one HANDOFF_STATUS: COMPLETE line, followed by the complete document " +
+                    "between the exact TEAM_PLAN_V1 " +
                     $"sentinels. Validation errors:{Environment.NewLine}{validationErrors}",
                 retryOfStepId: GetRetryRootId(leadResult),
                 stableSemanticRootId: GetStableSemanticRootId(leadResult),
@@ -1100,9 +1135,11 @@ public sealed class WorkflowEngine(
                 cancellationToken);
             try
             {
-                var parsed = TeamPlanParser.Parse(correction.OutputSummary);
+                var parsed = ParseValidatedStudioTeamPlanOutput(
+                    correction.OutputSummary,
+                    validationContext);
                 return (
-                    _teamPlanValidator.Validate(parsed.Document, validationContext),
+                    parsed.Plan,
                     parsed.RawJson,
                     correction);
             }
@@ -1444,6 +1481,7 @@ public sealed class WorkflowEngine(
                 .Where(step =>
                     step.IsOutcomeOwner &&
                     step.RetryOfStepId is null &&
+                    step.PreMortemReviewStepId is null &&
                     string.Equals(
                         step.PlanStepKey,
                         plan.OutcomeOwner?.Id,
@@ -1748,6 +1786,8 @@ public sealed class WorkflowEngine(
         var requiredDuties = string.Join(
             ", ",
             validationContext.RequiredDuties.Select(duty => duty.ToString()));
+        const string plannedShape =
+            """{"Version":"team-plan-v1","Disposition":"Planned","Steps":[{"Id":"inspect-current-product","AgentId":"exact-roster-id","Order":1,"Stage":"BeforeReview","Assignment":"Complete, bounded assignment including the expected handoff.","Justification":"Why this exact agent and step are needed.","DependsOn":[],"Duties":["Analyze"],"OutcomeOwner":false,"TaskProfile":{"Complexity":5,"ReasoningDepth":5,"ContextDemand":5,"ToolIntensity":3,"TaskTypeTags":["Design"],"Risk":"Low","RiskReason":"Nonempty bounded reason.","Confidence":0.8,"Rationales":["Nonempty bounded rationale."]}}],"PreMortemCheckpoints":[],"MissingQualification":null}""";
         var assignment = $$"""
             Create the dynamic downstream plan for this flow.
 
@@ -1761,7 +1801,9 @@ public sealed class WorkflowEngine(
             Select the smallest suitable team. Use only exact roster Id values. An AgentId may be
             selected in multiple distinct plan steps, but every step Id must be unique. If the
             enabled roster cannot safely satisfy the brief, return MissingQualification instead
-            of inventing an agent.
+            of inventing an agent. Workers receive the confirmed brief plus only their declared
+            current-iteration dependencies and ancestors; never assign a worker to reconstruct
+            an earlier iteration or inspect a full execution ledger.
 
             Return exactly one strict JSON object between TEAM_PLAN_V1_BEGIN and
             TEAM_PLAN_V1_END. Version is exactly team-plan-v1. Disposition is Planned or
@@ -1770,9 +1812,21 @@ public sealed class WorkflowEngine(
             MissingQualification. A MissingQualification result contains empty Steps and
             PreMortemCheckpoints plus Summary, Missing, WhyRequired, and SuggestedAgent.
 
+            A Planned result uses exactly this shape (replace the sample values):
+            {{plannedShape}}
+            Every BeforeReview TaskProfile contains exactly Complexity, ReasoningDepth,
+            ContextDemand, ToolIntensity, TaskTypeTags, Risk, RiskReason, Confidence, and
+            Rationales. Allowed TaskTypeTags are exactly CustomerDialogue, Planning,
+            Architecture, Design, Data, Implementation, Security, Quality, Documentation,
+            Release, Feedback, and CrossCutting. Do not emit a Handoff property or any other
+            step/profile property; put handoff expectations in Assignment. PreMortemCheckpoints
+            is an array of step ID strings, never checkpoint objects.
+
             Plan limits: at most {{validationContext.MaximumSteps}} steps, at most
             {{validationContext.MaximumDependenciesPerStep}} dependencies per step, and at most
             {{validationContext.MaximumAssignmentCharacters}} characters in each Assignment.
+            Keep the complete response under 10,000 characters so the standalone HANDOFF_STATUS
+            and TEAM_PLAN_V1 delimiters plus the entire JSON document are never transport-truncated.
             Assignment and Justification must be nonempty and bounded. Order values are positive
             and dependencies name only lower-order steps. Duties use exact values Analyze, Design,
             Implement, Verify, PrepareOutcome, and Publish. Stage is BeforeReview or AfterApproval.
@@ -1786,6 +1840,19 @@ public sealed class WorkflowEngine(
                 : "Delivery requires Implement, Verify, and PrepareOutcome before review plus exactly one AfterApproval Publish-only step. Never Publish before review.")}}
             The AfterApproval publication step remains planned only and will not run before durable
             customer acceptance. Its TaskProfile may be an empty object.
+            Never tell a pre-review worker to stage, commit, branch, push, or publish changes.
+            The host seals the working-tree bytes through its own temporary Git index after the
+            outcome owner completes. For a browser-visible Delivery, assign creation of static
+            review artifacts under .customer-preview\<variant>\index.html before customer review.
+            Studio serves those artifacts in a sandbox with connect-src 'none'; each preview must
+            boot and render representative product content without any network request. Bundle or
+            inline the required preview configuration, data, images, fonts, and other assets.
+            `.customer-preview` is the only generated top-level directory allowed to remain outside
+            the registered repositories. Every assignment that creates `_release`, `.previous`,
+            packaging-helper, browser-cache, report, test-result, or other temporary output must
+            explicitly remove it before handoff. Preserve every pre-existing non-repository project
+            scaffold file byte-for-byte; cleanup must never delete a trusted root file merely
+            because it resembles generated package-manager output.
 
             {{(preMortemAvailable
                 ? $"The Pre-mortem Sceptic snapshot is enabled. PreMortemCheckpoints may name justified BeforeReview step IDs; each has at most {maximumPreMortemRounds} round(s)."
@@ -3776,6 +3843,7 @@ public sealed class WorkflowEngine(
         var stopwatch = Stopwatch.StartNew();
         var remotePublicationAuthorized = false;
         ReviewedCandidateIdentity? reviewedIdentity = null;
+        var isStudioContractCorrection = false;
 
         try
         {
@@ -3790,6 +3858,9 @@ public sealed class WorkflowEngine(
                 var step = await database.FlowSteps.SingleAsync(
                     item => item.Id == stepId,
                     cancellationToken);
+                isStudioContractCorrection = step.Label.StartsWith(
+                    StudioContractCorrectionLabelPrefix,
+                    StringComparison.Ordinal);
                 if (flow.ContractVersion == "studio-v2")
                 {
                     var publicationShape =
@@ -4191,6 +4262,35 @@ public sealed class WorkflowEngine(
             attemptedResult = await agentRunner.ExecuteAsync(
                 executionContext,
                 cancellationToken);
+            var contractError = GetStudioContractCorrectionReason(
+                executionContext,
+                attemptedResult.Output);
+            if (contractError is not null)
+            {
+                if (isStudioContractCorrection)
+                {
+                    throw new InvalidOperationException(
+                        "The bounded studio-v2 response-contract correction remained invalid: " +
+                        contractError);
+                }
+                var correctionStepId =
+                    await ScheduleStudioContractCorrectionAsync(
+                        flowId,
+                        stepId,
+                        attemptedResult,
+                        contractError,
+                        DateTimeOffset.UtcNow,
+                        stopwatch.ElapsedMilliseconds,
+                        cancellationToken);
+                stopwatch.Stop();
+                return await ExecuteStepAsync(
+                    flowId,
+                    correctionStepId,
+                    workspacePath,
+                    planSummary,
+                    complexity,
+                    cancellationToken);
+            }
             stopwatch.Stop();
             return await CompleteStepAsync(
                 flowId,
@@ -4222,6 +4322,229 @@ public sealed class WorkflowEngine(
                 attemptedResult?.Output);
             throw;
         }
+    }
+
+    internal static string? GetStudioContractCorrectionReason(
+        AgentExecutionContext context,
+        string output)
+    {
+        if (!string.Equals(
+                context.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) ||
+            context.InvocationKind is not (
+                ExecutionInvocationKind.Worker or
+                ExecutionInvocationKind.Publication))
+        {
+            return null;
+        }
+
+        DynamicHandoffStatus handoff;
+        try
+        {
+            handoff = AgentHandoffInspector.ParseDynamic(output);
+            if (context.IsPreMortemRevision)
+            {
+                _ = ValidatePreMortemRevisionOutput(output);
+            }
+            if (context.IsOutcomeOwner && !handoff.IsPushback)
+            {
+                _ = FlowOutcomeParser.Parse(output);
+            }
+        }
+        catch (InvalidOperationException exception)
+        {
+            return exception.Message;
+        }
+
+        if (!handoff.IsPushback &&
+            string.Equals(
+                context.AgentRole,
+                "quality-engineer",
+                StringComparison.Ordinal) &&
+            ContainsExplicitFailedQualityVerdict(output))
+        {
+            return
+                "Quality Engineer paired HANDOFF_STATUS: COMPLETE with an explicit failing or not-release-ready verdict.";
+        }
+        return null;
+    }
+
+    private static bool ContainsExplicitFailedQualityVerdict(string output) =>
+        output.ReplaceLineEndings("\n")
+            .Split('\n')
+            .Select(line => line.Trim().Trim('*', '_', '`').Trim())
+            .Any(line =>
+                line.StartsWith(
+                    "NOT release-ready",
+                    StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith(
+                    "NOT release ready",
+                    StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith(
+                    "VERDICT: FAIL",
+                    StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith(
+                    "VERDICT: BLOCKED",
+                    StringComparison.OrdinalIgnoreCase));
+
+    private async Task<Guid> ScheduleStudioContractCorrectionAsync(
+        Guid flowId,
+        Guid stepId,
+        AgentExecutionResult result,
+        string contractError,
+        DateTimeOffset completedAt,
+        long durationMilliseconds,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        await using var transaction =
+            await database.Database.BeginTransactionAsync(cancellationToken);
+        var flow = await database.Flows
+            .AsSplitQuery()
+            .Include(item => item.Steps)
+            .Include(item => item.TaskProfiles)
+            .SingleAsync(item => item.Id == flowId, cancellationToken);
+        var source = flow.Steps.Single(item => item.Id == stepId);
+        if (source.Status != StepStatus.Running ||
+            !string.Equals(
+                flow.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "A studio-v2 response-contract correction can be scheduled only for its running source attempt.");
+        }
+
+        foreach (var later in flow.Steps.Where(item =>
+                     item.Iteration == source.Iteration &&
+                     item.Sequence > source.Sequence))
+        {
+            later.Sequence += 10;
+        }
+
+        foreach (var toolCall in result.ToolCalls)
+        {
+            database.AgentToolCalls.Add(new AgentToolCall
+            {
+                FlowStepId = source.Id,
+                ToolName = toolCall.ToolName,
+                ArgumentsSummary = toolCall.ArgumentsSummary,
+                Succeeded = toolCall.Succeeded,
+                ToolType = toolCall.ToolType,
+                NormalizedCommand = toolCall.NormalizedCommand,
+                NormalizedArguments = toolCall.NormalizedArguments,
+                WorkingDirectory = toolCall.WorkingDirectory,
+                ExitCode = toolCall.ExitCode,
+                ResultDigest = toolCall.ResultDigest,
+                ResultSummary = toolCall.ResultSummary
+            });
+        }
+        source.Status = StepStatus.Completed;
+        source.Phase = AgentRunPhase.Succeeded;
+        source.OutputSummary = result.Output;
+        source.PushbackReason = string.Empty;
+        source.ExecutionAttempts = Math.Max(
+            source.ExecutionAttempts,
+            result.ExecutionAttempts);
+        source.CompletedAt = completedAt;
+        source.DurationMilliseconds = Math.Max(1, durationMilliseconds);
+
+        var correction = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = source.Iteration,
+            Sequence = source.Sequence + 10,
+            AgentId = source.AgentId,
+            AgentName = source.AgentName,
+            AgentRole = source.AgentRole,
+            Label = StudioContractCorrectionLabelPrefix + source.AgentName,
+            PlanStepKey = source.PlanStepKey,
+            PlanDutiesJson = source.PlanDutiesJson,
+            PlanStage = source.PlanStage,
+            InvocationKind = source.InvocationKind,
+            IsOutcomeOwner = source.IsOutcomeOwner,
+            PermissionProfile = source.PermissionProfile,
+            EffectivePermissionJson = source.EffectivePermissionJson,
+            WorkflowRevision = source.WorkflowRevision,
+            Kind = source.Kind,
+            Status = StepStatus.Pending,
+            Phase = AgentRunPhase.PreparingWorkspace,
+            Attempt = flow.Steps
+                .Where(item =>
+                    item.Iteration == source.Iteration &&
+                    item.AgentId == source.AgentId)
+                .Select(item => item.Attempt)
+                .DefaultIfEmpty()
+                .Max() + 1,
+            InputSummary = BuildStudioContractCorrectionAssignment(
+                source,
+                contractError),
+            RemotePublicationAllowed = source.RemotePublicationAllowed,
+            RetryOfStepId = GetRetryRootId(source),
+            DependsOnStepId = source.DependsOnStepId,
+            PushbackRootStepId = source.PushbackRootStepId,
+            OutcomeQaRound = source.OutcomeQaRound,
+            OutcomePlanHash = source.OutcomePlanHash,
+            StableSemanticRootId = GetStableSemanticRootId(source),
+            PreMortemOriginStepId = source.PreMortemOriginStepId,
+            PreMortemTargetStepId = source.PreMortemTargetStepId,
+            PreMortemReviewStepId = source.PreMortemReviewStepId
+        };
+        flow.Steps.Add(correction);
+        database.Entry(correction).State = EntityState.Added;
+        var sourceProfile = flow.TaskProfiles.SingleOrDefault(
+            item => item.FlowStepId == source.Id);
+        if (sourceProfile is not null)
+        {
+            database.TaskProfiles.Add(
+                TaskProfileRules.CopyForStep(sourceProfile, correction.Id));
+        }
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = correction.Id,
+            Type = "agent.contract-correction-scheduled",
+            Message =
+                $"{source.AgentName} must correct one invalid studio-v2 response contract before the flow can advance.",
+            DataJson = JsonSerializer.Serialize(new
+            {
+                Version = "studio-contract-correction-v1",
+                SourceStepId = source.Id,
+                CorrectionStepId = correction.Id,
+                Error = ClipText(contractError, 2_000)
+            })
+        });
+        flow.UpdatedAt = completedAt;
+        await database.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return correction.Id;
+    }
+
+    internal static string BuildStudioContractCorrectionAssignment(
+        FlowStep source,
+        string contractError)
+    {
+        var assignment =
+            "Your previous studio-v2 response contract was invalid. Do not rerun tools or modify " +
+            "the workspace; rewrite the complete response from your existing evidence. Start with " +
+            "exactly one standalone HANDOFF_STATUS: COMPLETE or HANDOFF_STATUS: PUSHBACK line. " +
+            "For PUSHBACK, use one exact allowed current-iteration owner from the prompt plus one " +
+            "bounded PUSHBACK_REASON. Keep the entire replacement under 12,000 characters. " +
+            $"Validation error: {ClipText(contractError, 2_000)}";
+        if (source.IsOutcomeOwner)
+        {
+            assignment +=
+                " Return exactly one complete flow-outcome-v1 document with 1-24 concise, " +
+                "consolidated ImplementationDetails between the exact standalone sentinels.";
+        }
+        if (source.PreMortemReviewStepId is not null)
+        {
+            assignment +=
+                " Preserve exactly one PRE_MORTEM_DISPOSITION marker required by this revision.";
+        }
+        return assignment;
     }
 
     private static async Task<IReadOnlyList<StudioDependencyOutput>>
@@ -5804,8 +6127,17 @@ public sealed class WorkflowEngine(
                 ExecutionInvocationKind.Publication or
                 ExecutionInvocationKind.Planning)
         {
-            dynamicHandoff = AgentHandoffInspector.ParseDynamic(result.Output);
-            if (dynamicHandoff.IsPushback)
+            try
+            {
+                dynamicHandoff = AgentHandoffInspector.ParseDynamic(result.Output);
+            }
+            catch (InvalidOperationException) when (
+                step.InvocationKind == ExecutionInvocationKind.Planning)
+            {
+                // Planning contract errors are persisted and routed through the bounded
+                // Team Lead correction turn after this execution completes.
+            }
+            if (dynamicHandoff?.IsPushback == true)
             {
                 await ValidateDynamicPushbackTargetAsync(
                     database,
@@ -8200,9 +8532,38 @@ public sealed class WorkflowEngine(
                 .ToList();
             var failedStep =
                 FindUnresolvedFailure(iterationSteps) ??
-                FindUnresolvedPushback(iterationSteps) ??
+                FindUnresolvedPushback(iterationSteps);
+            var finalizationStep = FindRetryableStudioFinalizationStep(flow);
+            if (finalizationStep is not null &&
+                (failedStep is null || failedStep.Id == finalizationStep.Id))
+            {
+                finalizationStep.Status = StepStatus.Completed;
+                finalizationStep.Phase = AgentRunPhase.Succeeded;
+                finalizationStep.PushbackReason = string.Empty;
+                finalizationStep.CompletedAt ??= DateTimeOffset.UtcNow;
+                var finalizationFailureReason = flow.FailureReason;
+                _lifecycle.Transition(flow, FlowStatus.Queued);
+                flow.FailureReason = string.Empty;
+                flow.CompletedAt = null;
+                flow.OutcomeUrl = string.Empty;
+                flow.OutcomeLabel = string.Empty;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = finalizationStep.Id,
+                    Type = "flow.finalization-retry-queued",
+                    Message =
+                        $"Manual restart queued host finalization for the already-accepted outcome: {finalizationFailureReason}"
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                return flow;
+            }
+            if (failedStep is null)
+            {
                 throw new InvalidOperationException(
                     "The failed flow has no unresolved agent step to restart.");
+            }
             if (flow.ContractVersion == "legacy-v1" &&
                 flow.AgentSnapshots.Count > 0 &&
                 !flow.AgentSnapshots.Any(snapshot =>
@@ -8279,6 +8640,7 @@ public sealed class WorkflowEngine(
                 } &&
                 failedStep.Status == StepStatus.Failed &&
                 (IsPreMortemStep(failedStep) ||
+                 failedStep.PreMortemReviewStepId is not null ||
                  failedStep.Phase is AgentRunPhase.Stalled or AgentRunPhase.TimedOut) &&
                 (isOutcomeQa ||
                  CopilotReasoningHost.IsRecoverableCompletedOutput(
@@ -8588,6 +8950,47 @@ public sealed class WorkflowEngine(
         {
             _manualRestartGate.Release();
         }
+    }
+
+    internal static bool CanRetryStudioFinalization(FlowRun flow)
+        => FindRetryableStudioFinalizationStep(flow) is not null;
+
+    private static FlowStep? FindRetryableStudioFinalizationStep(FlowRun flow)
+    {
+        if (!string.Equals(
+                flow.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) ||
+            flow.Status != FlowStatus.Failed ||
+            string.IsNullOrWhiteSpace(flow.OutcomeOwnerPlanStepKey) ||
+            string.IsNullOrWhiteSpace(flow.OutcomeContractJson) ||
+            flow.GateRecords.Any(gate =>
+                gate.ActionType == HandoffActionType.CustomerReview &&
+                gate.Resolved &&
+                gate.ReviewDecision == ReviewDecision.Accepted))
+        {
+            return null;
+        }
+
+        var acceptedStepIds = flow.Events
+            .Where(flowEvent =>
+                flowEvent.Type == "outcome.contract-accepted" &&
+                flowEvent.FlowStepId is not null)
+            .Select(flowEvent => flowEvent.FlowStepId!.Value)
+            .ToHashSet();
+        return flow.Steps
+            .Where(step =>
+                step.Iteration == flow.Iteration &&
+                step.IsOutcomeOwner &&
+                acceptedStepIds.Contains(step.Id) &&
+                !string.IsNullOrWhiteSpace(step.OutputSummary) &&
+                string.Equals(
+                    step.PlanStepKey,
+                    flow.OutcomeOwnerPlanStepKey,
+                    StringComparison.Ordinal))
+            .OrderByDescending(step => step.Sequence)
+            .ThenByDescending(step => step.Attempt)
+            .FirstOrDefault();
     }
 
     private static void ResetSkippedStep(FlowStep step)
@@ -9808,6 +10211,10 @@ public sealed class WorkflowEngine(
         {{FlowOutcomeParser.BeginSentinel}}
         {"Version":"flow-outcome-v1","Goal":"the confirmed customer goal","Summary":"the concise customer-review result","ImplementationDetails":["specific evidence, recommendation, or delivered behavior"],"Artifacts":[]}
         {{FlowOutcomeParser.EndSentinel}}
+        Keep the complete response under 12,000 characters. ImplementationDetails must contain
+        1-24 concise consolidated entries; merge overlapping evidence instead of appending a
+        transcript. Put the standalone HANDOFF_STATUS line and opening sentinel near the beginning
+        so no required envelope marker can be displaced by a long response.
         Property names and casing are exact. Goal, Summary, and every ImplementationDetails item are required and customer-facing. Include 1-24 implementation details. Artifacts is always required. Advisory may declare only bounded text/plain, text/markdown, text/csv, or application/json artifacts with relative non-traversing paths; the host writes validated artifacts after proving the guarded source snapshot is unchanged. Do not write Advisory artifacts or source files yourself. Delivery normally uses an empty Artifacts list. Do not emit either sentinel more than once or inside a Markdown fence.
         """;
 
@@ -9913,7 +10320,8 @@ public sealed class WorkflowEngine(
         "Assume this result was adopted and, six months later, became a disaster. " +
         "Independently reconstruct what failed, what the result missed, and the precise prevention. " +
         "Research the isolated workspace and authoritative sources as needed. Report no more than " +
-        "five findings, and report CLEAR when no evidence-backed failure case remains." +
+        "five findings, and report CLEAR when no evidence-backed failure case remains. Keep the " +
+        "entire response under 9,000 characters and each finding field under 800 characters." +
         $"{Environment.NewLine}{Environment.NewLine}" +
         $"Evaluated agent: {target.AgentName} ({target.AgentRole})" +
         $"{Environment.NewLine}Evaluated model: " +
@@ -9933,6 +10341,26 @@ public sealed class WorkflowEngine(
         var ownsImplementation = contractVersion == "studio-v2"
             ? ReadPlanDuties(planDutiesJson).Contains(PlanDuty.Implement)
             : agentRole is "software-engineer" or "data-engineer" or "release-engineer";
+        var preparesOutcome = contractVersion == "studio-v2" &&
+                              ReadPlanDuties(planDutiesJson).Contains(
+                                  PlanDuty.PrepareOutcome);
+        var safeReviewOutput = reviewOutput
+            .Replace(
+                TeamPlanParser.BeginSentinel,
+                "[team plan begin marker]",
+                StringComparison.Ordinal)
+            .Replace(
+                TeamPlanParser.EndSentinel,
+                "[team plan end marker]",
+                StringComparison.Ordinal)
+            .Replace(
+                FlowOutcomeParser.BeginSentinel,
+                "[flow outcome begin marker]",
+                StringComparison.Ordinal)
+            .Replace(
+                FlowOutcomeParser.EndSentinel,
+                "[flow outcome end marker]",
+                StringComparison.Ordinal);
         return
         "The Pre-mortem Sceptic found evidence that this result could fail within six months. " +
         "Resume your original work and investigate every finding. Accept, reject, or narrow each " +
@@ -9943,13 +10371,19 @@ public sealed class WorkflowEngine(
               "complete plan, design, or review handoff and assign justified corrections to the " +
               "responsible downstream owner. Stop tool use once that handoff is evidence-based. ") +
         "Return the complete current deliverable or plan, not a delta. " +
-        "The next agent must be able to rely on this response alone. Preserve the normal role " +
+        "The next agent must be able to rely on this response alone. " +
+        (preparesOutcome
+            ? "outcome contract: return exactly 1-24 consolidated ImplementationDetails in the " +
+              "complete flow-outcome-v1 document. Replace the previous document; merge overlapping " +
+              "old and new findings instead of appending entries, and never exceed 24 details. "
+            : string.Empty) +
+        "Preserve the normal role " +
         "completion contract and end with exactly one disposition marker: " +
         $"{PreMortemRules.AdjustedDisposition} when the complete result materially changed, or " +
         $"{PreMortemRules.UnchangedDisposition} when no material change was justified." +
         $"{Environment.NewLine}{Environment.NewLine}" +
         $"Sceptic output:{Environment.NewLine}" +
-        reviewOutput;
+        safeReviewOutput;
     }
 
     private static IReadOnlySet<PlanDuty> ReadPlanDuties(string json)
@@ -10365,6 +10799,7 @@ public sealed class WorkflowEngine(
         await using var database =
             await databaseFactory.CreateDbContextAsync(cancellationToken);
         var flow = await database.Flows
+            .AsSplitQuery()
             .Include(item => item.Steps)
             .Include(item => item.GateRecords)
             .Include(item => item.Events)

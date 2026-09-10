@@ -17,22 +17,7 @@ public sealed class CandidateFingerprintTests
     {
         using var workspace = CandidateWorkspace.Create();
         var flow = workspace.Flow;
-        flow.ContractVersion = "studio-v2";
-        flow.Kind = FlowKind.Delivery;
-        flow.OutcomeOwnerPlanStepKey = "outcome";
-        flow.OutcomeContractJson =
-            """{"Version":"flow-outcome-v1","Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["Changed tracked product bytes."],"Artifacts":[]}""";
-        flow.Events.Add(new FlowEvent
-        {
-            FlowRunId = flow.Id,
-            Type = StudioWorkspaceRepositoryMapLedger.EventType,
-            Message = "Fixture trusted repository map.",
-            DataJson = StudioWorkspaceRepositoryMapLedger.Serialize(
-                StudioWorkspaceRepositoryMapLedger.Create(
-                    flow,
-                    flow.WorkspacePath,
-                    [new WorkspaceRepositoryIdentity(".", string.Empty)]))
-        });
+        ConfigureReviewedFlow(flow);
         await File.WriteAllTextAsync(
             Path.Combine(workspace.Root, "tracked.txt"),
             "reviewed bytes");
@@ -74,6 +59,90 @@ public sealed class CandidateFingerprintTests
         await File.WriteAllTextAsync(
             Path.Combine(workspace.Root, "tracked.txt"),
             "unreviewed bytes");
+        await Assert.ThrowsAsync<CandidateValidationException>(
+            () => service.VerifyAsync(flow, identity));
+    }
+
+    [Fact]
+    public async Task ReviewedPreviewVerification_IsSingleFlightAcrossConcurrentRequests()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var flow = workspace.Flow;
+        ConfigureReviewedFlow(flow);
+        var fingerprints = new CandidateFingerprintService(
+            new ProcessRunner(),
+            TimeProvider.System);
+        var identity = await new ReviewedCandidateService(fingerprints)
+            .SealAsync(
+                flow,
+                Guid.NewGuid(),
+                "outcome",
+                flow.OutcomeContractJson);
+        var restartedService = new ReviewedCandidateService(fingerprints);
+
+        var verifications = await Task.WhenAll(
+            Enumerable.Range(0, 16)
+                .Select(_ => restartedService.VerifyPreviewAsync(
+                    flow,
+                    identity)));
+
+        Assert.All(
+            verifications,
+            verification => Assert.Same(verifications[0], verification));
+    }
+
+    [Fact]
+    public async Task ReviewedPreviewVerification_DoesNotCacheFailure()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var flow = workspace.Flow;
+        ConfigureReviewedFlow(flow);
+        var fingerprints = new CandidateFingerprintService(
+            new ProcessRunner(),
+            TimeProvider.System);
+        var identity = await new ReviewedCandidateService(fingerprints)
+            .SealAsync(
+                flow,
+                Guid.NewGuid(),
+                "outcome",
+                flow.OutcomeContractJson);
+        var restartedService = new ReviewedCandidateService(fingerprints);
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "tracked.txt"),
+            "unreviewed bytes");
+
+        await Assert.ThrowsAsync<CandidateValidationException>(
+            () => restartedService.VerifyPreviewAsync(flow, identity));
+
+        workspace.Git("restore", "tracked.txt");
+        var verified = await restartedService.VerifyPreviewAsync(
+            flow,
+            identity);
+        Assert.Equal(identity.Fingerprint, verified.Fingerprint);
+    }
+
+    [Fact]
+    public async Task ReviewedPreviewCache_DoesNotBypassPublicationVerification()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var flow = workspace.Flow;
+        ConfigureReviewedFlow(flow);
+        var service = new ReviewedCandidateService(
+            new CandidateFingerprintService(
+                new ProcessRunner(),
+                TimeProvider.System));
+        var identity = await service.SealAsync(
+            flow,
+            Guid.NewGuid(),
+            "outcome",
+            flow.OutcomeContractJson);
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "tracked.txt"),
+            "unreviewed bytes");
+
+        var preview = await service.VerifyPreviewAsync(flow, identity);
+
+        Assert.Equal(identity.Fingerprint, preview.Fingerprint);
         await Assert.ThrowsAsync<CandidateValidationException>(
             () => service.VerifyAsync(flow, identity));
     }
@@ -505,21 +574,29 @@ public sealed class CandidateFingerprintTests
         Assert.Contains("config", exception.Message);
     }
 
-    [Fact]
-    public async Task Candidate_AllowsDocumentedIgnoredBuildOutput()
+    [Theory]
+    [InlineData("bin/Debug/test.dll")]
+    [InlineData(".playwright-browsers/chromium/debug.log")]
+    [InlineData("test-results/retry/error-context.md")]
+    [InlineData("playwright-report/index.html")]
+    public async Task Candidate_AllowsDocumentedIgnoredBuildOutput(
+        string relativePath)
     {
         using var workspace = CandidateWorkspace.Create();
         await File.WriteAllTextAsync(
             Path.Combine(workspace.Root, "sample.csproj"),
             """<Project Sdk="Microsoft.NET.Sdk" />""");
+        var topLevel = relativePath.Split('/')[0];
         await File.WriteAllTextAsync(
             Path.Combine(workspace.Root, ".gitignore"),
-            "bin/\n");
+            $"{topLevel}/{Environment.NewLine}");
         workspace.Git("add", ".gitignore", "sample.csproj");
         workspace.Git("commit", "--quiet", "-m", "ignore build output");
-        var output = Path.Combine(workspace.Root, "bin", "Debug");
-        Directory.CreateDirectory(output);
-        await File.WriteAllTextAsync(Path.Combine(output, "test.dll"), "transient");
+        var output = Path.Combine(
+            workspace.Root,
+            relativePath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+        await File.WriteAllTextAsync(output, "transient");
         var service = new CandidateFingerprintService(
             new ProcessRunner(),
             TimeProvider.System);
@@ -1194,6 +1271,35 @@ public sealed class CandidateFingerprintTests
     }
 
     [Fact]
+    public async Task HostSeal_RemovesTrackedPlaywrightBrowserCache()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var browserCache = Path.Combine(
+            workspace.Root,
+            ".playwright-browsers",
+            "chromium",
+            "debug.log");
+        Directory.CreateDirectory(Path.GetDirectoryName(browserCache)!);
+        await File.WriteAllTextAsync(browserCache, "transient browser output");
+        workspace.Git("add", ".playwright-browsers");
+        workspace.Git("commit", "--quiet", "-m", "accidentally track browser cache");
+        var service = new CandidateFingerprintService(
+            new ProcessRunner(),
+            TimeProvider.System);
+
+        _ = await service.SealAsync(workspace.Flow);
+
+        Assert.DoesNotContain(
+            ".playwright-browsers/chromium/debug.log",
+            workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD")
+                .ReplaceLineEndings("\n")
+                .Split(
+                    '\n',
+                    StringSplitOptions.RemoveEmptyEntries |
+                    StringSplitOptions.TrimEntries));
+    }
+
+    [Fact]
     public async Task HostSeal_IncludesTrackedDeletion()
     {
         using var workspace = CandidateWorkspace.Create();
@@ -1595,6 +1701,26 @@ public sealed class CandidateFingerprintTests
         flow.OutcomeVerificationJson =
             OutcomeVerificationRules.SerializeAggregate(state);
         return flow;
+    }
+
+    private static void ConfigureReviewedFlow(FlowRun flow)
+    {
+        flow.ContractVersion = "studio-v2";
+        flow.Kind = FlowKind.Delivery;
+        flow.OutcomeOwnerPlanStepKey = "outcome";
+        flow.OutcomeContractJson =
+            """{"Version":"flow-outcome-v1","Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["Changed tracked product bytes."],"Artifacts":[]}""";
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = StudioWorkspaceRepositoryMapLedger.EventType,
+            Message = "Fixture trusted repository map.",
+            DataJson = StudioWorkspaceRepositoryMapLedger.Serialize(
+                StudioWorkspaceRepositoryMapLedger.Create(
+                    flow,
+                    flow.WorkspacePath,
+                    [new WorkspaceRepositoryIdentity(".", string.Empty)]))
+        });
     }
 
     private static string Digest(char value) => $"sha256:{new string(value, 64)}";

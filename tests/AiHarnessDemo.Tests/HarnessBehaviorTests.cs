@@ -12,6 +12,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.AspNetCore.Http;
+using System.Text;
 
 namespace AiHarnessDemo.Tests;
 
@@ -453,8 +454,12 @@ public sealed class PreviewArtifactCatalogTests
         Assert.Contains("sandbox allow-scripts", artifactPolicy);
         Assert.DoesNotContain("allow-same-origin", artifactPolicy);
         Assert.Contains("connect-src 'none'", artifactPolicy);
+        Assert.Contains(
+            "script-src 'self' 'unsafe-inline' data: blob:",
+            artifactPolicy);
         Assert.Contains("form-action 'none'", artifactPolicy);
         Assert.Contains("frame-src 'none'", artifactPolicy);
+        Assert.DoesNotContain("navigate-to", artifactPolicy);
         Assert.DoesNotContain("sandbox", viewPolicy);
         Assert.Contains("default-src 'none'", viewPolicy);
         Assert.Contains("style-src 'unsafe-inline'", viewPolicy);
@@ -463,8 +468,14 @@ public sealed class PreviewArtifactCatalogTests
         Assert.Contains("form-action 'none'", viewPolicy);
         Assert.Contains("object-src 'none'", viewPolicy);
         Assert.Contains("base-uri 'none'", viewPolicy);
-        Assert.Contains("navigate-to 'none'", viewPolicy);
+        Assert.DoesNotContain("navigate-to", viewPolicy);
         Assert.Contains("frame-ancestors 'none'", viewPolicy);
+        Assert.Equal(
+            "*",
+            artifactContext.Response.Headers["Access-Control-Allow-Origin"]);
+        Assert.Equal(
+            "cross-origin",
+            artifactContext.Response.Headers["Cross-Origin-Resource-Policy"]);
         Assert.Equal(
             "noopener-allow-popups",
             artifactContext.Response.Headers["Cross-Origin-Opener-Policy"]);
@@ -481,6 +492,41 @@ public sealed class PreviewArtifactCatalogTests
             "nosniff",
             viewContext.Response.Headers["X-Content-Type-Options"]);
         Assert.Equal("no-store", viewContext.Response.Headers.CacheControl);
+    }
+
+    [Fact]
+    public void PreviewCompatibilityLayer_InjectsStorageBeforeApplicationScripts()
+    {
+        var source = Encoding.UTF8.GetBytes(
+            "<!doctype html><html><head><script>window.localStorage.getItem('x')</script></head><body></body></html>");
+
+        var transformed = Encoding.UTF8.GetString(
+            DemoApi.ApplyPreviewCompatibilityLayer(
+                source,
+                "text/html; charset=utf-8"));
+
+        var bootstrap = transformed.IndexOf(
+            "data-ai-harness-preview-bootstrap",
+            StringComparison.Ordinal);
+        var application = transformed.IndexOf(
+            "<script>window.localStorage",
+            StringComparison.Ordinal);
+        Assert.True(bootstrap >= 0);
+        Assert.True(bootstrap < application);
+        Assert.Contains(
+            "Object.defineProperty(window, name",
+            transformed,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "allow-same-origin",
+            transformed,
+            StringComparison.Ordinal);
+        Assert.Equal(
+            transformed,
+            Encoding.UTF8.GetString(
+                DemoApi.ApplyPreviewCompatibilityLayer(
+                    Encoding.UTF8.GetBytes(transformed),
+                    "text/html")));
     }
 
     [Fact]

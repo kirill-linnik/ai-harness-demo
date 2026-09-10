@@ -1815,6 +1815,49 @@ public sealed partial class CopilotReasoningHost(
                   $"{Environment.NewLine}{Environment.NewLine}{handoffs}"
                 : handoffs);
         }
+        if (string.Equals(
+                context.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) &&
+            context.InvocationKind is
+                ExecutionInvocationKind.Worker or
+                ExecutionInvocationKind.Publication)
+        {
+            var pushbackOwners = context.StudioDependencyOutputs?
+                .Select(item => item.PlanStepKey)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(item => item, StringComparer.Ordinal)
+                .ToArray() ?? [];
+            roleContext.Add(
+                "## Pushback boundary" +
+                Environment.NewLine +
+                Environment.NewLine +
+                (pushbackOwners.Length == 0
+                    ? "This step has no valid earlier dependency or ancestor. Do not emit HANDOFF_STATUS: PUSHBACK; complete the assigned work from the confirmed brief."
+                    : "PUSHBACK_OWNER_STEP_ID may name only one of these exact current-iteration plan-step IDs: " +
+                      string.Join(", ", pushbackOwners) +
+                      ". Never name a prior-iteration or inferred step."));
+        }
+        if (string.Equals(
+                context.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) &&
+            context.InvocationKind == ExecutionInvocationKind.Worker &&
+            string.Equals(
+                context.AgentRole,
+                "quality-engineer",
+                StringComparison.Ordinal))
+        {
+            roleContext.Add(
+                "## Quality verdict handoff" +
+                Environment.NewLine +
+                Environment.NewLine +
+                "HANDOFF_STATUS: COMPLETE is allowed only when every required check is release-ready. " +
+                "If any required check fails and the pushback boundary lists an owner, return " +
+                "HANDOFF_STATUS: PUSHBACK with one exact allowed PUSHBACK_OWNER_STEP_ID and a bounded " +
+                "PUSHBACK_REASON. Never pair COMPLETE with FAIL, NOT release-ready, or an informal " +
+                "Next owner instruction.");
+        }
         if (stagedPromotion is not null)
         {
             roleContext.Add(
@@ -2501,6 +2544,7 @@ public sealed partial class CopilotReasoningHost(
               {"Version":"pre-mortem-findings-v1","Findings":[{"FailureMode":"specific six-month failure chain","Evidence":"verifiable files, commands, observations, or authoritative URLs","MissedSignal":"current fact the evaluated result missed","Prevention":"precise change that breaks the failure chain"}]}
               PRE_MORTEM_FINDINGS_V1_END
               CLEAR requires an empty Findings array. FINDINGS requires 1-5 entries. Every entry needs concrete evidence; omit speculative, generic, duplicate, stylistic, or already-covered concerns.
+              Keep the entire response under 9,000 characters and every finding field under 800 characters.
               Do not emit HANDOFF_STATUS, PUSHBACK, or PRE_MORTEM_DISPOSITION markers.
               """,
             "product-manager" => """

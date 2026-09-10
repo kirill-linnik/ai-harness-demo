@@ -1833,9 +1833,11 @@ public static class OutcomeVerificationRules
         }
         else
         {
-            if (candidate.Manifest.PreviewArtifacts.Count > 100)
+            if (candidate.Manifest.PreviewArtifacts.Count >
+                CandidateManifest.MaximumPreviewArtifacts)
             {
-                errors.Add("candidate previewArtifacts exceeds 100 files");
+                errors.Add(
+                    $"candidate previewArtifacts exceeds {CandidateManifest.MaximumPreviewArtifacts} files");
             }
             var previewArtifacts = candidate.Manifest.PreviewArtifacts
                 .Where(item => item is not null)

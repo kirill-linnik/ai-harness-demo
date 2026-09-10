@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Verification;
@@ -53,11 +54,22 @@ public interface IReviewedCandidateService
         FlowRun flow,
         ReviewedCandidateIdentity identity,
         CancellationToken cancellationToken = default);
+
+    Task<OutcomeCandidateSnapshot> VerifyPreviewAsync(
+        FlowRun flow,
+        ReviewedCandidateIdentity identity,
+        CancellationToken cancellationToken = default) =>
+        VerifyAsync(flow, identity, cancellationToken);
 }
 
 public sealed class ReviewedCandidateService(
     CandidateFingerprintService fingerprints) : IReviewedCandidateService
 {
+    private readonly ConcurrentDictionary<
+        string,
+        Lazy<Task<OutcomeCandidateSnapshot>>> _previewVerifications =
+            new(StringComparer.Ordinal);
+
     public async Task<ReviewedCandidateIdentity> SealAsync(
         FlowRun flow,
         Guid outcomeOwnerStepId,
@@ -115,7 +127,46 @@ public sealed class ReviewedCandidateService(
                 .ToArray(),
             snapshot.PreparedAt);
         ReviewedCandidateLedger.Validate(identity);
+        CachePreviewVerification(identity, snapshot);
         return identity;
+    }
+
+    public async Task<OutcomeCandidateSnapshot> VerifyPreviewAsync(
+        FlowRun flow,
+        ReviewedCandidateIdentity identity,
+        CancellationToken cancellationToken = default)
+    {
+        ReviewedCandidateLedger.ValidateForFlow(flow, identity);
+        _ = StudioWorkspaceRepositoryMapLedger.Read(flow);
+
+        var key = PreviewVerificationKey(identity);
+        var verification = _previewVerifications.GetOrAdd(
+            key,
+            _ => new Lazy<Task<OutcomeCandidateSnapshot>>(
+                () => VerifyAsync(
+                    flow,
+                    identity,
+                    CancellationToken.None),
+                LazyThreadSafetyMode.ExecutionAndPublication));
+        try
+        {
+            return await verification.Value.WaitAsync(cancellationToken);
+        }
+        catch
+        {
+            if (verification.IsValueCreated &&
+                verification.Value.IsCompleted &&
+                !verification.Value.IsCompletedSuccessfully)
+            {
+                _previewVerifications.TryRemove(
+                    new KeyValuePair<
+                        string,
+                        Lazy<Task<OutcomeCandidateSnapshot>>>(
+                        key,
+                        verification));
+            }
+            throw;
+        }
     }
 
     public async Task<OutcomeCandidateSnapshot> VerifyAsync(
@@ -125,6 +176,7 @@ public sealed class ReviewedCandidateService(
     {
         ArgumentNullException.ThrowIfNull(identity);
         ReviewedCandidateLedger.Validate(identity);
+        ReviewedCandidateLedger.ValidateForFlow(flow, identity);
         ReviewedCandidateLedger.ValidateContext(
             flow,
             identity.OutcomeOwnerStepId,
@@ -174,6 +226,20 @@ public sealed class ReviewedCandidateService(
         }
         return current;
     }
+
+    private void CachePreviewVerification(
+        ReviewedCandidateIdentity identity,
+        OutcomeCandidateSnapshot snapshot)
+    {
+        _previewVerifications[PreviewVerificationKey(identity)] =
+            new Lazy<Task<OutcomeCandidateSnapshot>>(
+                () => Task.FromResult(snapshot),
+                LazyThreadSafetyMode.ExecutionAndPublication);
+    }
+
+    private static string PreviewVerificationKey(
+        ReviewedCandidateIdentity identity) =>
+        $"{identity.FlowId:D}:{identity.Iteration}:{identity.Fingerprint}";
 }
 
 public static class ReviewedCandidateLedger

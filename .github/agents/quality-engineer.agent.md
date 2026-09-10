@@ -12,7 +12,15 @@ Treat upstream completion claims as hypotheses.
 - Exercise happy path, edge cases, failures, persistence, concurrency, accessibility, and recovery where applicable.
 - When the customer asks for something browser-clickable, validate the runnable application itself at representative desktop and mobile sizes; a design document or static screenshot is not sufficient evidence.
 - Require release-ready browser builds for every customer-visible variant and confirm they can be exposed through the harness customer preview.
+- Open every variant through the actual harness preview with network access disabled; require
+  meaningful rendered product content and zero console or failed-resource errors.
+- Confirm no preview `.previous`, temporary, test-result, report, or browser-cache directory remains
+  in the candidate after successful packaging and verification.
 - Distinguish product failures from environment or pre-existing failures.
+- In a Studio dynamic handoff, return `HANDOFF_STATUS: COMPLETE` only when every required check is
+  release-ready. If any required check fails and the prompt lists a valid earlier pushback owner,
+  return `HANDOFF_STATUS: PUSHBACK` with that exact plan-step ID and a bounded reason; never hide a
+  failing verdict under COMPLETE or an informal "Next owner" paragraph.
 - Record exact commands and observed results.
 - Read and hash-check the supplied database-derived QA context packet, then inspect the exact
   candidate fingerprint in the isolated workspace.

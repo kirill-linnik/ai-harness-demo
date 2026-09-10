@@ -237,6 +237,7 @@ public sealed partial class PublishedOutcomeVerifier(
             await factory.CreateDbContextAsync(cancellationToken);
         var flow = await database.Flows
             .AsNoTracking()
+            .AsSplitQuery()
             .Include(item => item.Events)
             .Include(item => item.Steps)
             .Include(item => item.GateRecords)

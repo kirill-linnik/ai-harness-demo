@@ -431,6 +431,55 @@ public sealed class PermissionProfileResolverTests
 public sealed class PromptStagingTests
 {
     [Fact]
+    public async Task StagedManifest_PublishesAndCleansTheSessionScopedCliAgent()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"agent-manifest-staging-{Guid.NewGuid():N}");
+        var sessionId = Guid.NewGuid();
+        try
+        {
+            var staged = await new AgentManifestStager().StageAsync(
+                root,
+                Manifest(),
+                sessionId);
+            var manifestPath = Assert.Single(
+                Directory.GetFiles(
+                    Path.Combine(staged.Root, ".github", "agents"),
+                    "*.agent.md"));
+            var publishedPath = Path.Combine(
+                root,
+                "agents",
+                $"{staged.AgentId}.agent.md");
+            var content = await File.ReadAllTextAsync(manifestPath);
+
+            Assert.True(File.Exists(publishedPath));
+            Assert.Equal(
+                content,
+                await File.ReadAllTextAsync(publishedPath));
+            Assert.Contains(
+                $"name: \"Account Manager\"{Environment.NewLine}",
+                content,
+                StringComparison.Ordinal);
+
+            Assert.True(
+                new AgentManifestStager().CleanupSessionRoot(
+                    root,
+                    sessionId,
+                    staged.Root));
+            Assert.False(File.Exists(publishedPath));
+            Assert.False(Directory.Exists(staged.Root));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
     public async Task LargePrompt_IsStagedAndCliContainsOnlyBoundedReference()
     {
         var root = Path.Combine(
@@ -1033,12 +1082,48 @@ public sealed class AgentHandoffInspectorTests
     [InlineData("PRE_MORTEM_DISPOSITION: UNCHANGED", false)]
     [InlineData("HANDOFF_STATUS: PUSHBACK\nPRE_MORTEM_DISPOSITION: UNCHANGED", false)]
     [InlineData("HANDOFF_STATUS: COMPLETE\nPRE_MORTEM_DISPOSITION: UNCHANGED", true)]
+    [InlineData("**HANDOFF_STATUS: COMPLETE**\nDecision\nDone.", true)]
+    [InlineData("`HANDOFF_STATUS: COMPLETE`\nDecision\nDone.", true)]
+    [InlineData("## HANDOFF_STATUS: COMPLETE\nDecision\nDone.", true)]
     [InlineData("HANDOFF_STATUS: COMPLETE\nHANDOFF_STATUS: COMPLETE", false)]
     public void CompleteStatus_RequiresOneExplicitCompleteMarker(
         string output,
         bool expected)
     {
         Assert.Equal(expected, AgentHandoffInspector.HasCompleteStatus(output));
+    }
+
+    [Fact]
+    public void DynamicStatus_AllowsPreambleWhenTheMarkerIsUniqueAndExact()
+    {
+        var status = AgentHandoffInspector.ParseDynamic(
+            """
+            Repository context inspected before planning.
+
+            **HANDOFF_STATUS: COMPLETE**
+
+            TEAM_PLAN_V1_BEGIN
+            {}
+            TEAM_PLAN_V1_END
+            """);
+
+        Assert.False(status.IsPushback);
+        Assert.Null(status.OwnerPlanStepKey);
+        Assert.Null(status.Reason);
+    }
+
+    [Fact]
+    public void DynamicPushback_AllowsDetailedBoundedReason()
+    {
+        var reason = new string('r', 1_200);
+        var status = AgentHandoffInspector.ParseDynamic(
+            $"HANDOFF_STATUS: PUSHBACK{Environment.NewLine}" +
+            $"PUSHBACK_OWNER_STEP_ID: build-preview{Environment.NewLine}" +
+            $"PUSHBACK_REASON: {reason}");
+
+        Assert.True(status.IsPushback);
+        Assert.Equal("build-preview", status.OwnerPlanStepKey);
+        Assert.Equal(reason, status.Reason);
     }
 
     [Fact]

@@ -44,7 +44,8 @@ public sealed class CandidateFingerprintService(
     ICandidateSealFaultInjector? sealFaultInjector = null,
     WorkflowDefinitionProvider? workflowProvider = null)
 {
-    public const int MaximumPreviewFiles = 100;
+    public const int MaximumPreviewFiles =
+        CandidateManifest.MaximumPreviewArtifacts;
     public const long MaximumPreviewBytes = 100L * 1024 * 1024;
     private const string SealJournalVersion = "candidate-seal-journal-v1";
 
@@ -58,6 +59,9 @@ public sealed class CandidateFingerprintService(
         "build",
         "coverage",
         "TestResults",
+        "test-results",
+        "playwright-report",
+        ".playwright-browsers",
         ".next",
         ".vite",
         ".vs",
@@ -2615,6 +2619,10 @@ public sealed class CandidateFingerprintService(
     private static bool IsApprovedGeneratedPath(string path) =>
         path.Equals(".customer-preview", StringComparison.Ordinal) ||
         path.StartsWith(".customer-preview/", StringComparison.Ordinal) ||
+        path.Equals(".playwright-browsers", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWith(
+            ".playwright-browsers/",
+            StringComparison.OrdinalIgnoreCase) ||
         path.Equals(".ai-harness/outcome-verification", StringComparison.Ordinal) ||
         path.StartsWith(
             ".ai-harness/outcome-verification/",

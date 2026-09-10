@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using AiHarnessDemo.Core.Orchestration;
 
 namespace AiHarnessDemo.Core.Reasoning;
 
@@ -49,7 +50,7 @@ public static class PreMortemRules
     public const int MaximumFindings = 5;
 
     private const int MaximumFindingTextLength = 1_200;
-    private const int MaximumReviewOutputCharacters = 8_000;
+    public const int MaximumReviewOutputCharacters = 10_000;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = false,
@@ -217,25 +218,25 @@ public static class PreMortemRules
         string endSentinel,
         string label)
     {
-        var begin = output.IndexOf(beginSentinel, StringComparison.Ordinal);
-        var end = output.IndexOf(endSentinel, StringComparison.Ordinal);
-        if (begin < 0 || end < 0 || end <= begin)
+        var begins = MachineContractSentinels.FindStandalone(
+            output,
+            beginSentinel);
+        var ends = MachineContractSentinels.FindStandalone(
+            output,
+            endSentinel);
+        if (begins.Count == 0 || ends.Count == 0 ||
+            ends[0] <= begins[0])
         {
             throw new PreMortemValidationException(
                 [$"output must contain exact {beginSentinel}/{endSentinel} sentinels"]);
         }
-        if (output.IndexOf(
-                beginSentinel,
-                begin + beginSentinel.Length,
-                StringComparison.Ordinal) >= 0 ||
-            output.IndexOf(
-                endSentinel,
-                end + endSentinel.Length,
-                StringComparison.Ordinal) >= 0)
+        if (begins.Count != 1 || ends.Count != 1)
         {
             throw new PreMortemValidationException(
                 [$"{label} sentinels must occur exactly once"]);
         }
+        var begin = begins[0];
+        var end = ends[0];
 
         try
         {

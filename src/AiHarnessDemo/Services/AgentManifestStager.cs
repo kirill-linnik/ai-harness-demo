@@ -71,9 +71,25 @@ public sealed class AgentManifestStager
             $"---{Environment.NewLine}{Environment.NewLine}" +
             snapshot.Instructions.Trim() +
             Environment.NewLine;
-        await File.WriteAllTextAsync(
-            Path.Combine(agentsDirectory, $"{stagedId}.agent.md"),
-            content,
+        var fileName = $"{stagedId}.agent.md";
+        var contentBytes = Utf8WithoutBom.GetBytes(content);
+        await WriteOrValidateOwnedFileAsync(
+            Path.Combine(agentsDirectory, fileName),
+            contentBytes,
+            "The staged snapshot agent definition",
+            cancellationToken);
+
+        // Copilot CLI 1.0.83 resolves custom-agent IDs from its personal agents directory.
+        // --add-dir still grants access to staged prompts and seeds, but does not make an
+        // additional directory's agent definition selectable in non-interactive execution.
+        var cliAgentsDirectory = Path.Combine(
+            Path.GetFullPath(copilotHome),
+            "agents");
+        Directory.CreateDirectory(cliAgentsDirectory);
+        await WriteOrValidateOwnedFileAsync(
+            Path.Combine(cliAgentsDirectory, fileName),
+            contentBytes,
+            "The session-scoped Copilot agent definition",
             cancellationToken);
         return new StagedAgentManifest(root, stagedId);
     }
@@ -114,6 +130,7 @@ public sealed class AgentManifestStager
             definitionsRoot,
             "The staged-agent definitions directory is a reparse point.");
         EnsureOwnedTreeHasNoReparsePoints(expectedRoot);
+        RemovePublishedCliAgent(copilotHome, expectedRoot, sessionId);
         Directory.Delete(expectedRoot, recursive: true);
         return true;
     }
@@ -578,6 +595,107 @@ public sealed class AgentManifestStager
         await stream.WriteAsync(content, cancellationToken);
         await stream.FlushAsync(cancellationToken);
         stream.Flush(flushToDisk: true);
+    }
+
+    private static async Task WriteOrValidateOwnedFileAsync(
+        string path,
+        ReadOnlyMemory<byte> content,
+        string description,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await WriteDurablyAsync(path, content, cancellationToken);
+            return;
+        }
+        catch (IOException) when (File.Exists(path))
+        {
+            EnsureNotReparsePoint(
+                path,
+                $"{description} is a reparse point.");
+            var existing = await File.ReadAllBytesAsync(
+                path,
+                cancellationToken);
+            if (existing.AsSpan().SequenceEqual(content.Span))
+            {
+                return;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"{description} already exists with different content.");
+    }
+
+    private static void RemovePublishedCliAgent(
+        string copilotHome,
+        string sessionRoot,
+        Guid sessionId)
+    {
+        var stagedAgentsDirectory = Path.Combine(
+            sessionRoot,
+            ".github",
+            "agents");
+        if (!Directory.Exists(stagedAgentsDirectory))
+        {
+            return;
+        }
+        EnsureNotReparsePoint(
+            stagedAgentsDirectory,
+            "The staged-agent definitions directory is a reparse point.");
+
+        var stagedDefinitions = Directory.GetFiles(
+            stagedAgentsDirectory,
+            "*.agent.md",
+            SearchOption.TopDirectoryOnly);
+        if (stagedDefinitions.Length > 1)
+        {
+            throw new InvalidOperationException(
+                "The staged-agent session root contains multiple agent definitions.");
+        }
+        if (stagedDefinitions.Length == 0)
+        {
+            return;
+        }
+
+        var stagedDefinition = stagedDefinitions[0];
+        var fileName = Path.GetFileName(stagedDefinition);
+        var expectedSuffix = $"-{sessionId:N}.agent.md";
+        if (!fileName.StartsWith("harness-", StringComparison.Ordinal) ||
+            !fileName.EndsWith(expectedSuffix, StringComparison.Ordinal) ||
+            fileName.AsSpan(
+                    "harness-".Length,
+                    fileName.Length -
+                    "harness-".Length -
+                    expectedSuffix.Length)
+                .ContainsAnyExcept(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"))
+        {
+            throw new InvalidOperationException(
+                "The staged-agent definition does not belong to the requested Copilot session.");
+        }
+
+        var cliAgentsDirectory = Path.Combine(
+            Path.GetFullPath(copilotHome),
+            "agents");
+        var publishedDefinition = Path.Combine(
+            cliAgentsDirectory,
+            fileName);
+        EnsureContained(cliAgentsDirectory, publishedDefinition);
+        if (!File.Exists(publishedDefinition))
+        {
+            return;
+        }
+        EnsureNotReparsePoint(
+            publishedDefinition,
+            "The session-scoped Copilot agent definition is a reparse point.");
+        if (!File.ReadAllBytes(stagedDefinition)
+                .AsSpan()
+                .SequenceEqual(File.ReadAllBytes(publishedDefinition)))
+        {
+            throw new InvalidOperationException(
+                "The session-scoped Copilot agent definition changed before cleanup.");
+        }
+        File.Delete(publishedDefinition);
     }
 
     private static string ComputeSha256(ReadOnlySpan<byte> content) =>

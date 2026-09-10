@@ -853,6 +853,29 @@ public sealed class ReviewWorkflowTests
         Assert.Contains("materially different", differentReplay.Message);
         Assert.Equal(FlowStatus.Reworking, refinement.Flow.Status);
         Assert.Equal(first.WorkspacePath, refinement.Flow.WorkspacePath);
+        Assert.StartsWith(
+            "Customer refinement for iteration 1:",
+            refinement.Flow.ConsolidatedRequest,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Current reviewed flow-outcome-v1 JSON:",
+            refinement.Flow.ConsolidatedRequest,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Previous confirmed brief:",
+            refinement.Flow.ConsolidatedRequest,
+            StringComparison.Ordinal);
+        Assert.True(
+            refinement.Flow.ConsolidatedRequest.IndexOf(
+                "Current reviewed flow-outcome-v1 JSON:",
+                StringComparison.Ordinal) <
+            refinement.Flow.ConsolidatedRequest.IndexOf(
+                "Previous confirmed brief:",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            FlowOutcomeParser.Version,
+            refinement.Flow.ConsolidatedRequest,
+            StringComparison.Ordinal);
         Assert.Equal(
             ReviewDecision.RefinementRequested,
             refinement.Flow.GateRecords.Single(gate =>

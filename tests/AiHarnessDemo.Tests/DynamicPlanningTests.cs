@@ -88,6 +88,26 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
+    public void OutcomeParser_AllowsInlineSentinelNamesButRejectsDuplicateStandaloneLines()
+    {
+        var valid = """
+            FLOW_OUTCOME_V1_BEGIN
+            {"Version":"flow-outcome-v1","Goal":"Assess","Summary":"Verified to close with FLOW_OUTCOME_V1_END.","ImplementationDetails":["Keep FLOW_OUTCOME_V1_BEGIN and FLOW_OUTCOME_V1_END as standalone protocol lines."],"Artifacts":[]}
+            FLOW_OUTCOME_V1_END
+            """;
+
+        var parsed = FlowOutcomeParser.Parse(valid);
+
+        Assert.Contains(
+            FlowOutcomeParser.EndSentinel,
+            parsed.Document.Summary,
+            StringComparison.Ordinal);
+        Assert.Throws<FlowOutcomeContractException>(() =>
+            FlowOutcomeParser.Parse(
+                valid + Environment.NewLine + FlowOutcomeParser.EndSentinel));
+    }
+
+    [Fact]
     public void Validator_AllowsArbitraryIdsSubsetAndRepeatedAgents()
     {
         var document = AdvisoryPlan(
@@ -588,6 +608,57 @@ public sealed class DynamicPlanningTests
             context => context.AgentId == "team-lead").Task;
         Assert.Contains("\"Id\": \"unused-specialist\"", teamLeadTask);
         Assert.DoesNotContain("\"Id\": \"disabled-specialist\"", teamLeadTask);
+    }
+
+    [Fact]
+    public async Task StudioV2_InvalidWorkerContract_IsCorrectedWithoutFailingFlow()
+    {
+        var plan = AdvisoryPlan(
+            Step(
+                "answer",
+                "generalist",
+                10,
+                [PlanDuty.Analyze, PlanDuty.PrepareOutcome],
+                owner: true));
+        await using var harness = await DynamicHarness.CreateAsync(
+            FlowKind.Advisory,
+            plan,
+            [Snapshot("generalist")]);
+        harness.Runner.InvalidFirstContractAgentId = "generalist";
+
+        await harness.Engine.RunAsync(
+            harness.FlowId,
+            CancellationToken.None);
+
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var flow = await database.Flows
+            .AsSplitQuery()
+            .Include(item => item.Steps)
+            .Include(item => item.Events)
+            .SingleAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.DoesNotContain(
+            flow.Steps,
+            item => item.Status == StepStatus.Failed);
+        var attempts = flow.Steps
+            .Where(item => item.PlanStepKey == "answer")
+            .OrderBy(item => item.Attempt)
+            .ToArray();
+        Assert.Equal(2, attempts.Length);
+        Assert.Equal(
+            "Response omitted the studio-v2 machine envelope.",
+            attempts[0].OutputSummary);
+        Assert.StartsWith(
+            "Correct invalid response from ",
+            attempts[1].Label,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "1-24 concise",
+            attempts[1].InputSummary,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            flow.Events,
+            item => item.Type == "agent.contract-correction-scheduled");
     }
 
     [Fact]
@@ -1159,6 +1230,195 @@ public sealed class DynamicPlanningTests
         }
     }
 
+    [Theory]
+    [InlineData(ExecutionInvocationKind.Worker)]
+    [InlineData(ExecutionInvocationKind.Publication)]
+    public void StudioExecutionPrompt_ListsOnlyValidPushbackOwners(
+        ExecutionInvocationKind invocationKind)
+    {
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "product-designer",
+            "Product Designer",
+            "product-designer",
+            "model",
+            "high",
+            1,
+            "Prepare the selected direction.",
+            "Repository facts.",
+            @"C:\source",
+            @"C:\workspace",
+            Guid.NewGuid(),
+            OutcomeType.Commit,
+            "Plan",
+            [],
+            [],
+            ContractVersion: "studio-v2",
+            InvocationKind: invocationKind,
+            StudioDependencyOutputs:
+            [
+                new StudioDependencyOutput(
+                    "current-analysis",
+                    "analyst",
+                    StudioDependencyKind.Direct,
+                    1,
+                    1,
+                    20,
+                    "Current analysis.")
+            ]);
+
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Prepare the design.",
+            context.WorkspacePath);
+
+        Assert.Contains(
+            "PUSHBACK_OWNER_STEP_ID may name only one of these exact current-iteration plan-step IDs: current-analysis.",
+            values["role.context"],
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "prior-iteration",
+            values["handoffs"],
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void StudioQualityPrompt_RequiresPushbackForFailedChecks()
+    {
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "quality-engineer",
+            "Quality Engineer",
+            "quality-engineer",
+            "model",
+            "high",
+            1,
+            "Verify the redesign.",
+            "Repository facts.",
+            @"C:\source",
+            @"C:\workspace",
+            Guid.NewGuid(),
+            OutcomeType.Commit,
+            "Plan",
+            [],
+            [],
+            ContractVersion: "studio-v2",
+            InvocationKind: ExecutionInvocationKind.Worker,
+            StudioDependencyOutputs:
+            [
+                new StudioDependencyOutput(
+                    "implement-redesign",
+                    "software-engineer",
+                    StudioDependencyKind.Direct,
+                    1,
+                    1,
+                    20,
+                    "Implementation complete.")
+            ]);
+
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Verify the redesign.",
+            context.WorkspacePath);
+
+        Assert.Contains(
+            "HANDOFF_STATUS: COMPLETE is allowed only when every required check is release-ready",
+            values["role.context"],
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "PUSHBACK_OWNER_STEP_ID",
+            values["role.context"],
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void StudioContractCorrection_DetectsContradictoryQualityVerdict()
+    {
+        var context = StudioWorkerContext(
+            "quality-engineer",
+            isOutcomeOwner: false);
+
+        var reason = WorkflowEngine.GetStudioContractCorrectionReason(
+            context,
+            """
+            `HANDOFF_STATUS: COMPLETE`
+
+            ## Decision
+            NOT release-ready. Two required checks failed.
+            """);
+
+        Assert.Contains(
+            "failing or not-release-ready verdict",
+            reason,
+            StringComparison.Ordinal);
+        Assert.Null(WorkflowEngine.GetStudioContractCorrectionReason(
+            context,
+            """
+            HANDOFF_STATUS: PUSHBACK
+            PUSHBACK_OWNER_STEP_ID: implement-redesign
+            PUSHBACK_REASON: Two required checks failed.
+            """));
+        Assert.Null(WorkflowEngine.GetStudioContractCorrectionReason(
+            context,
+            """
+            HANDOFF_STATUS: COMPLETE
+            The prior result was NOT release-ready; the listed defects are now fixed and every check passes.
+            """));
+    }
+
+    [Fact]
+    public void StudioContractCorrection_RequiresCompleteOutcomeEnvelope()
+    {
+        var context = StudioWorkerContext(
+            "quality-engineer",
+            isOutcomeOwner: true);
+        var invalid = WorkflowEngine.GetStudioContractCorrectionReason(
+            context,
+            "HANDOFF_STATUS: COMPLETE\nThe checks passed.");
+        var valid = WorkflowEngine.GetStudioContractCorrectionReason(
+            context,
+            """
+            HANDOFF_STATUS: COMPLETE
+            FLOW_OUTCOME_V1_BEGIN
+            {"Version":"flow-outcome-v1","Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["All required checks passed."],"Artifacts":[]}
+            FLOW_OUTCOME_V1_END
+            """);
+
+        Assert.Contains(
+            FlowOutcomeParser.BeginSentinel,
+            invalid,
+            StringComparison.Ordinal);
+        Assert.Null(valid);
+    }
+
+    [Fact]
+    public void StudioContractCorrectionAssignment_IsBoundedAndPreservesContracts()
+    {
+        var source = new FlowStep
+        {
+            FlowRunId = Guid.NewGuid(),
+            Iteration = 1,
+            Sequence = 20,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Label = "Verify",
+            IsOutcomeOwner = true,
+            PreMortemReviewStepId = Guid.NewGuid()
+        };
+
+        var assignment = WorkflowEngine.BuildStudioContractCorrectionAssignment(
+            source,
+            new string('e', 4_000));
+
+        Assert.Contains("under 12,000 characters", assignment);
+        Assert.Contains("1-24 concise", assignment);
+        Assert.Contains("PRE_MORTEM_DISPOSITION", assignment);
+        Assert.True(assignment.Length < 3_000);
+    }
+
     [Fact]
     public async Task StudioV2_RejectsPushbackTargetThatIsNotAnAncestor()
     {
@@ -1552,6 +1812,33 @@ public sealed class DynamicPlanningTests
         }
     }
 
+    private static AgentExecutionContext StudioWorkerContext(
+        string role,
+        bool isOutcomeOwner) =>
+        new(
+            Guid.NewGuid(),
+            1,
+            role,
+            role,
+            role,
+            "model",
+            "high",
+            1,
+            "Complete the work.",
+            "Repository facts.",
+            @"C:\source",
+            @"C:\workspace",
+            Guid.NewGuid(),
+            OutcomeType.Commit,
+            "Plan",
+            [],
+            [],
+            ContractVersion: "studio-v2",
+            InvocationKind: ExecutionInvocationKind.Worker,
+            IsOutcomeOwner: isOutcomeOwner,
+            PlanStepKey: "verify-redesign",
+            FlowKind: FlowKind.Delivery);
+
     private sealed class DynamicAgentRunner(
         string validPlan,
         bool invalidFirstPlan,
@@ -1564,6 +1851,8 @@ public sealed class DynamicPlanningTests
         public Func<AgentExecutionContext, Task>? AfterResult { get; set; }
 
         public bool FailFirstPreMortem { get; set; }
+
+        public string? InvalidFirstContractAgentId { get; set; }
 
         public async Task<AgentExecutionResult> ExecuteAsync(
             AgentExecutionContext context,
@@ -1609,6 +1898,14 @@ public sealed class DynamicPlanningTests
                     {"Version":"pre-mortem-findings-v1","Findings":[]}
                     {{PreMortemRules.FindingsEndSentinel}}
                     """;
+            }
+            else if (string.Equals(
+                         context.AgentId,
+                         InvalidFirstContractAgentId,
+                         StringComparison.Ordinal) &&
+                     count == 1)
+            {
+                output = "Response omitted the studio-v2 machine envelope.";
             }
             else if (pushbackOwner is not null &&
                      context.AgentId == "reviewer" &&

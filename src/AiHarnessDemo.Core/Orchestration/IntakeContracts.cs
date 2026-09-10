@@ -97,41 +97,27 @@ public static class IntakeV2Parser
                 [$"output must contain at most {MaximumDocumentCharacters} characters"]);
         }
 
-        var begin = output.IndexOf(BeginSentinel, StringComparison.Ordinal);
-        var end = output.IndexOf(EndSentinel, StringComparison.Ordinal);
-        if (begin < 0 || end < 0 || end <= begin ||
-            !IsStandaloneSentinel(output, begin, BeginSentinel) ||
-            !IsStandaloneSentinel(output, end, EndSentinel))
+        var begins = MachineContractSentinels.FindStandalone(
+            output,
+            BeginSentinel);
+        var ends = MachineContractSentinels.FindStandalone(
+            output,
+            EndSentinel);
+        if (begins.Count == 0 || ends.Count == 0 ||
+            ends[0] <= begins[0])
         {
             throw new IntakeV2ContractException(
                 [$"output must contain exact {BeginSentinel}/{EndSentinel} sentinels"]);
         }
-        if (output.IndexOf(
-                BeginSentinel,
-                begin + BeginSentinel.Length,
-                StringComparison.Ordinal) >= 0 ||
-            output.IndexOf(
-                EndSentinel,
-                end + EndSentinel.Length,
-                StringComparison.Ordinal) >= 0)
+        if (begins.Count != 1 || ends.Count != 1)
         {
             throw new IntakeV2ContractException(
                 ["intake v2 sentinels must occur exactly once"]);
         }
+        var begin = begins[0];
+        var end = ends[0];
 
         return ParseJson(output[(begin + BeginSentinel.Length)..end].Trim());
-    }
-
-    private static bool IsStandaloneSentinel(
-        string output,
-        int index,
-        string sentinel)
-    {
-        var beforeLine = index == 0 || output[index - 1] is '\r' or '\n';
-        var afterIndex = index + sentinel.Length;
-        var afterLine = afterIndex == output.Length ||
-                        output[afterIndex] is '\r' or '\n';
-        return beforeLine && afterLine;
     }
 
     public static ParsedIntakeV2 ParseJson(string json)

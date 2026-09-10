@@ -1,6 +1,7 @@
 using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Data;
 using AiHarnessDemo.Services;
@@ -206,6 +207,25 @@ public sealed class PreMortemContractTests
     }
 
     [Fact]
+    public void Review_AllowsBoundedOutputAboveEightThousandCharacters()
+    {
+        var padding = new string('x', 1_100);
+        var findings = string.Join(
+            ",",
+            Enumerable.Range(1, 2).Select(index =>
+                $$"""{"FailureMode":"failure {{index}} {{padding}}","Evidence":"evidence {{index}} {{padding}}","MissedSignal":"signal {{index}} {{padding}}","Prevention":"prevention {{index}} {{padding}}"}"""));
+        var review = $$"""
+            PRE_MORTEM_STATUS: FINDINGS
+            PRE_MORTEM_FINDINGS_V1_BEGIN
+            {"Version":"pre-mortem-findings-v1","Findings":[{{findings}}]}
+            PRE_MORTEM_FINDINGS_V1_END
+            """;
+
+        Assert.InRange(review.Length, 8_001, PreMortemRules.MaximumReviewOutputCharacters);
+        Assert.True(PreMortemRules.ParseReview(review).HasFindings);
+    }
+
+    [Fact]
     public void RevisionAssignment_PreservesEveryValidatedFinding()
     {
         var findings = string.Join(
@@ -241,6 +261,36 @@ public sealed class PreMortemContractTests
 
         Assert.Contains("Do not implement downstream product corrections", designer);
         Assert.Contains("make the focused corrections owned by this role", engineer);
+    }
+
+    [Fact]
+    public void RevisionAssignment_SanitizesNestedMachineContractSentinels()
+    {
+        var assignment = WorkflowEngine.BuildPreMortemRevisionAssignment(
+            $"""
+             PRE_MORTEM_STATUS: FINDINGS
+             The prior result mentioned {TeamPlanParser.BeginSentinel},
+             {TeamPlanParser.EndSentinel}, {FlowOutcomeParser.BeginSentinel}, and
+             {FlowOutcomeParser.EndSentinel}.
+             """,
+            "product-designer",
+            """["Design","PrepareOutcome"]""",
+            "studio-v2");
+
+        Assert.DoesNotContain(TeamPlanParser.BeginSentinel, assignment);
+        Assert.DoesNotContain(TeamPlanParser.EndSentinel, assignment);
+        Assert.DoesNotContain(FlowOutcomeParser.BeginSentinel, assignment);
+        Assert.DoesNotContain(FlowOutcomeParser.EndSentinel, assignment);
+        Assert.Contains("[team plan begin marker]", assignment);
+        Assert.Contains("[flow outcome end marker]", assignment);
+        Assert.Contains(
+            "exactly 1-24 consolidated ImplementationDetails",
+            assignment,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "merge overlapping old and new findings",
+            assignment,
+            StringComparison.Ordinal);
     }
 
     [Theory]

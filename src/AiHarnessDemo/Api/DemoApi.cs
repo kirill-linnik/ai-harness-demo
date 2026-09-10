@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace AiHarnessDemo.Api;
 
@@ -925,8 +926,21 @@ public static class DemoApi
                 filePath,
                 reviewedSnapshot,
                 cancellationToken);
+            bytes = ApplyPreviewCompatibilityLayer(bytes, contentType);
             return Results.File(
                 bytes,
+                contentType,
+                enableRangeProcessing: true);
+        }
+        if (contentType.StartsWith(
+                "text/html",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var bytes = await File.ReadAllBytesAsync(
+                filePath,
+                cancellationToken);
+            return Results.File(
+                ApplyPreviewCompatibilityLayer(bytes, contentType),
                 contentType,
                 enableRangeProcessing: true);
         }
@@ -952,7 +966,7 @@ public static class DemoApi
         }
 
         var identity = ReviewedCandidateLedger.Read(flow);
-        return await reviewedCandidateService.VerifyAsync(
+        return await reviewedCandidateService.VerifyPreviewAsync(
             flow,
             identity,
             cancellationToken);
@@ -1001,6 +1015,81 @@ public static class DemoApi
         return bytes;
     }
 
+    internal static byte[] ApplyPreviewCompatibilityLayer(
+        byte[] bytes,
+        string contentType)
+    {
+        ArgumentNullException.ThrowIfNull(bytes);
+        ArgumentException.ThrowIfNullOrWhiteSpace(contentType);
+        if (!contentType.StartsWith(
+                "text/html",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return bytes;
+        }
+
+        var document = Encoding.UTF8.GetString(bytes);
+        const string marker = "data-ai-harness-preview-bootstrap";
+        if (document.Contains(marker, StringComparison.Ordinal))
+        {
+            return bytes;
+        }
+        const string bootstrap = """
+            <script data-ai-harness-preview-bootstrap>
+            (() => {
+              const createStorage = () => {
+                const values = new Map();
+                return {
+                  get length() { return values.size; },
+                  clear() { values.clear(); },
+                  getItem(key) {
+                    const normalized = String(key);
+                    return values.has(normalized) ? values.get(normalized) : null;
+                  },
+                  key(index) {
+                    const keys = Array.from(values.keys());
+                    return Number.isInteger(index) && index >= 0 && index < keys.length
+                      ? keys[index]
+                      : null;
+                  },
+                  removeItem(key) { values.delete(String(key)); },
+                  setItem(key, value) { values.set(String(key), String(value)); }
+                };
+              };
+              for (const name of ["localStorage", "sessionStorage"]) {
+                let available = false;
+                try {
+                  const storage = window[name];
+                  const probe = "__ai_harness_preview_probe__";
+                  storage.setItem(probe, probe);
+                  storage.removeItem(probe);
+                  available = true;
+                } catch {}
+                if (!available) {
+                  Object.defineProperty(window, name, {
+                    configurable: true,
+                    value: createStorage()
+                  });
+                }
+              }
+            })();
+            </script>
+            """;
+        var head = document.IndexOf("<head", StringComparison.OrdinalIgnoreCase);
+        if (head >= 0)
+        {
+            var headEnd = document.IndexOf('>', head);
+            if (headEnd >= 0)
+            {
+                document = document.Insert(
+                    headEnd + 1,
+                    Environment.NewLine + bootstrap);
+                return Encoding.UTF8.GetBytes(document);
+            }
+        }
+        return Encoding.UTF8.GetBytes(bootstrap + Environment.NewLine + document);
+    }
+
     internal static IResult GetIsolatedPreviewView(
         Guid flowId,
         string artifactId,
@@ -1037,14 +1126,16 @@ public static class DemoApi
     {
         response.Headers["Content-Security-Policy"] =
             "sandbox allow-scripts; default-src 'self' data: blob:; " +
-            "script-src 'self' 'unsafe-inline' blob:; " +
+            "script-src 'self' 'unsafe-inline' data: blob:; " +
             "style-src 'self' 'unsafe-inline' data:; " +
             "img-src 'self' data: blob:; font-src 'self' data:; " +
             "media-src 'self' data: blob:; connect-src 'none'; " +
             "form-action 'none'; object-src 'none'; base-uri 'none'; " +
             "frame-src 'none'; child-src 'none'; worker-src 'none'; " +
-            "manifest-src 'none'; navigate-to 'none'; frame-ancestors 'self'";
+            "manifest-src 'none'; frame-ancestors 'self'";
         ApplyCommonPreviewSecurityHeaders(response);
+        response.Headers["Access-Control-Allow-Origin"] = "*";
+        response.Headers["Cross-Origin-Resource-Policy"] = "cross-origin";
     }
 
     internal static void ApplyIsolatedPreviewViewSecurityHeaders(
@@ -1053,7 +1144,7 @@ public static class DemoApi
         response.Headers["Content-Security-Policy"] =
             "default-src 'none'; frame-src 'self'; " +
             "style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; " +
-            "object-src 'none'; base-uri 'none'; navigate-to 'none'; " +
+            "object-src 'none'; base-uri 'none'; " +
             "frame-ancestors 'none'";
         ApplyCommonPreviewSecurityHeaders(response);
     }

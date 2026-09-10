@@ -328,6 +328,58 @@ public sealed class IntakeAdvisoryTests
 
             Assert.Equal(assignment, teamLeadValues["task"]);
             Assert.Contains(
+                "\"Complexity\":5",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "array of step ID strings",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "Do not emit a Handoff property",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "CustomerDialogue, Planning,",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "Never tell a pre-review worker to stage, commit, branch, push, or publish",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                @".customer-preview\<variant>\index.html",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "connect-src 'none'",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "without any network request",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "complete response under 10,000 characters",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "the only generated top-level directory allowed",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "`_release`, `.previous`",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "Preserve every pre-existing non-repository project",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "scaffold file byte-for-byte",
+                assignment,
+                StringComparison.Ordinal);
+            Assert.Contains(
                 teamLeadFlow.ConsolidatedRequest,
                 stagedTeamLeadText,
                 StringComparison.Ordinal);

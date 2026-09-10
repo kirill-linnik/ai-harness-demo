@@ -109,25 +109,25 @@ public static class ReviewFeedbackParser
                 [$"output must contain at most {MaximumDocumentCharacters} characters"]);
         }
 
-        var begin = output.IndexOf(BeginSentinel, StringComparison.Ordinal);
-        var end = output.IndexOf(EndSentinel, StringComparison.Ordinal);
-        if (begin < 0 || end < 0 || end <= begin)
+        var begins = MachineContractSentinels.FindStandalone(
+            output,
+            BeginSentinel);
+        var ends = MachineContractSentinels.FindStandalone(
+            output,
+            EndSentinel);
+        if (begins.Count == 0 || ends.Count == 0 ||
+            ends[0] <= begins[0])
         {
             throw new ReviewFeedbackContractException(
                 [$"output must contain exact {BeginSentinel}/{EndSentinel} sentinels"]);
         }
-        if (output.IndexOf(
-                BeginSentinel,
-                begin + BeginSentinel.Length,
-                StringComparison.Ordinal) >= 0 ||
-            output.IndexOf(
-                EndSentinel,
-                end + EndSentinel.Length,
-                StringComparison.Ordinal) >= 0)
+        if (begins.Count != 1 || ends.Count != 1)
         {
             throw new ReviewFeedbackContractException(
                 ["review feedback sentinels must occur exactly once"]);
         }
+        var begin = begins[0];
+        var end = ends[0];
 
         return ParseJson(output[(begin + BeginSentinel.Length)..end].Trim());
     }

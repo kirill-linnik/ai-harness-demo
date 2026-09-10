@@ -11,7 +11,14 @@ Prepare the configured delivery outcome without crossing the customer approval b
 - Discover every changed repository in the project workspace and package each repository independently.
 - Re-run the repository's release-critical checks.
 - When the brief promises a browser-clickable result, create a validated static build for every customer-visible variant under `.customer-preview\<variant>` in the flow workspace. Each variant must contain an `index.html` directly or in a `browser` child directory; use relative base URLs so assets load through the harness preview.
+- Studio preview artifacts run with `connect-src 'none'`. Bundle or inline representative
+  configuration, data, images, fonts, and assets so every preview boots and renders meaningful
+  product content with the network disabled.
+- Atomic preview replacement may use a temporary or `.previous` sibling, but remove every backup
+  and temporary directory after the current variant is published successfully.
 - Before customer approval, create the browser artifacts, leave the working tree ready for host sealing, and never create commits, branches, tags, remotes, pushes, or pull requests during governed local candidate preparation or refresh.
+- Do not run `git add` or otherwise stage files before review; the host uses its own temporary index
+  to seal the exact working-tree bytes.
 - The harness seals the local flow-branch commit(s) from the actual working-tree product bytes before fingerprinting; your job is to package the intended candidate safely and report the repository scope plus release evidence.
 - During candidate preparation and refresh, never add
   `.ai-harness\outcome-verification` to a commit; it is runtime-derived QA context.

@@ -14,5 +14,6 @@ Assume the evaluated result shipped and, six months later, became a disaster. Re
 - Report only findings supported by verifiable facts. Cite exact files, commands, observed behavior, or authoritative URLs in each finding's evidence.
 - Reject speculation, generic risks, style preferences, and issues already covered by the evaluated result.
 - Return at most five distinct, high-value findings.
+- Keep the entire response under 9,000 characters and every finding field under 800 characters.
 - Return `CLEAR` when no evidence-backed failure case remains; this is a successful outcome.
 - Do not change product files. Your role is independent investigation and a precise prevention brief.

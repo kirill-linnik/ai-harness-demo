@@ -206,6 +206,54 @@ public sealed class CopilotSessionJournalTests
 public sealed class WorkflowRestartRecoveryTests
 {
     [Fact]
+    public void CompletedStudioOutcome_AllowsFinalizationRetry()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Review-ready delivery",
+            OriginalRequest = "Deliver the redesign.",
+            ConsolidatedRequest = "Deliver the redesign.",
+            RepositoryPath = @"C:\source",
+            WorkspacePath = @"C:\workspace",
+            BranchName = "ai-harness/review-ready",
+            Kind = FlowKind.Delivery,
+            ContractVersion = "studio-v2",
+            Status = FlowStatus.Failed,
+            OutcomeOwnerPlanStepKey = "verify-outcome",
+            OutcomeContractJson =
+                """{"Version":"flow-outcome-v1","Goal":"Deliver","Summary":"Ready","ImplementationDetails":["Verified"],"Artifacts":[]}"""
+        };
+        var outcomeOwner = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = 30,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Label = "Verify outcome",
+            PlanStepKey = "verify-outcome",
+            IsOutcomeOwner = true,
+            Status = StepStatus.Failed,
+            OutputSummary =
+                "HANDOFF_STATUS: COMPLETE\nFLOW_OUTCOME_V1_BEGIN\n{}\nFLOW_OUTCOME_V1_END"
+        };
+        flow.Steps.Add(outcomeOwner);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = outcomeOwner.Id,
+            Type = "outcome.contract-accepted",
+            Message = "Accepted the required flow outcome."
+        });
+
+        Assert.True(WorkflowEngine.CanRetryStudioFinalization(flow));
+
+        flow.OutcomeContractJson = string.Empty;
+        Assert.False(WorkflowEngine.CanRetryStudioFinalization(flow));
+    }
+
+    [Fact]
     public async Task RecoveryDiscoversAndCompletesAFinishedCopilotSession()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
