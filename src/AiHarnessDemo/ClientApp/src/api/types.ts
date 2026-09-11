@@ -836,13 +836,23 @@ export interface PreviewDto {
   status: FlowStatus;
   outcomeLabel: string;
   outcomeResult: FlowOutcomeDto | null;
+  historicalDeliveryEvidence: HistoricalDeliveryEvidenceDto | null;
   artifacts: PreviewArtifactDto[];
   deliveredBy: FlowStepDto[];
   review: FlowReviewSummaryDto;
   publicationStatus: ReviewPublicationStatus;
   outcomeVerification: OutcomeVerificationDto;
+  deliveryReadiness: DeliveryReadinessDto | null;
   generatedAt: string;
 }
+
+export type DemoCapability = "Available" | "OfflineOnly";
+export type DemoInstanceState =
+  | "Stopped"
+  | "Starting"
+  | "Running"
+  | "Unhealthy"
+  | "Failed";
 
 export interface PreviewArtifactDto {
   id: string;
@@ -853,4 +863,39 @@ export interface PreviewArtifactDto {
   byteLength: number | null;
   downloadUrl: string | null;
   interactive: boolean;
+  demoCapability: DemoCapability;
+  demoInstanceId: string | null;
+  demoState: DemoInstanceState;
+  demoUrl: string | null;
+  demoFailureDetail: string | null;
+  demoCandidateFingerprint: string | null;
+  demoManifestHash: string | null;
+}
+
+export interface HistoricalDeliveryEvidenceDto {
+  nonAuthoritative: true;
+  items: HistoricalDeliveryEvidenceItemDto[];
+}
+
+export interface HistoricalDeliveryEvidenceItemDto {
+  kind: string;
+  agentName: string;
+  label: string;
+  markdown: string;
+  completedAt: string | null;
+}
+
+export interface DemoMutationRequest {
+  candidateFingerprint: string;
+  manifestHash: string;
+}
+
+export interface DemoRuntimeStatus {
+  capability: DemoCapability;
+  instanceId: string | null;
+  state: DemoInstanceState;
+  stableUrl: string | null;
+  failureDetail: string | null;
+  candidateFingerprint: string | null;
+  manifestHash: string | null;
 }

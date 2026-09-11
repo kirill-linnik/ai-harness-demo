@@ -40,6 +40,8 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
     public DbSet<ReadinessWaiverRecord> ReadinessWaiverRecords =>
         Set<ReadinessWaiverRecord>();
 
+    public DbSet<DemoInstanceRecord> DemoInstances => Set<DemoInstanceRecord>();
+
     public DbSet<HarnessLearning> Learnings => Set<HarnessLearning>();
 
     public DbSet<HandoffGateRecord> GateRecords => Set<HandoffGateRecord>();
@@ -389,6 +391,42 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
+        modelBuilder.Entity<DemoInstanceRecord>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.ArtifactId).HasMaxLength(120);
+            entity.Property(item => item.CandidateFingerprint).HasMaxLength(128);
+            entity.Property(item => item.ManifestHash).HasMaxLength(128);
+            entity.Property(item => item.ManifestRelativePath).HasMaxLength(1_024);
+            entity.Property(item => item.State).HasConversion<string>();
+            entity.Property(item => item.ProcessName).HasMaxLength(200);
+            entity.Property(item => item.WorkspacePath).HasMaxLength(2_048);
+            entity.Property(item => item.WorkingDirectory).HasMaxLength(2_048);
+            entity.Property(item => item.LaunchProfile).HasMaxLength(64);
+            entity.Property(item => item.LaunchIdentity).HasMaxLength(128);
+            entity.Property(item => item.FailureDetail).HasMaxLength(4_000);
+            entity.HasIndex(item => new
+                {
+                    item.FlowRunId,
+                    item.ArtifactId,
+                    item.CandidateFingerprint,
+                    item.ManifestHash
+                })
+                .HasDatabaseName("IX_DemoInstances_Binding")
+                .IsUnique();
+            entity.HasIndex(item => item.AssignedPort)
+                .HasDatabaseName("IX_DemoInstances_ActivePort")
+                .IsUnique()
+                .HasFilter(
+                    "\"AssignedPort\" IS NOT NULL AND \"State\" IN ('Starting','Running','Unhealthy')");
+            entity.HasIndex(item => new { item.FlowRunId, item.ArtifactId });
+            entity.HasOne(item => item.FlowRun)
+                .WithMany(flow => flow.DemoInstances)
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
         modelBuilder.Entity<ModelCatalogSnapshot>(entity =>
         {
             entity.HasKey(item => item.Id);
@@ -491,6 +529,7 @@ public static class DatabaseInitializer
         await EnsureSliceOneSchemaAsync(database);
         await EnsureReviewedPublicationSchemaAsync(database);
         await EnsureDeliveryReadinessSchemaAsync(database);
+        await EnsureDemoRuntimeSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         var settings = await database.Settings.SingleOrDefaultAsync();
@@ -2277,6 +2316,56 @@ public static class DatabaseInitializer
             CREATE UNIQUE INDEX IF NOT EXISTS IX_ReadinessWaiverRecords_Receipt
                 ON ReadinessWaiverRecords
                     (ReviewedCandidateId, ReadinessContractHash, RiskId);
+            """,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Additive, idempotent live-demo runtime schema. The active-port partial index prevents this
+    /// harness from recording two active owners for one port; OS availability is still checked
+    /// because other processes are outside SQLite's authority.
+    /// </summary>
+    internal static async Task EnsureDemoRuntimeSchemaAsync(
+        HarnessDbContext database,
+        CancellationToken cancellationToken = default)
+    {
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE TABLE IF NOT EXISTS DemoInstances (
+                Id TEXT NOT NULL CONSTRAINT PK_DemoInstances PRIMARY KEY,
+                FlowRunId TEXT NOT NULL,
+                ArtifactId TEXT NOT NULL,
+                CandidateFingerprint TEXT NOT NULL,
+                ManifestHash TEXT NOT NULL,
+                ManifestRelativePath TEXT NOT NULL,
+                State TEXT NOT NULL DEFAULT 'Stopped',
+                ProcessId INTEGER NULL,
+                ProcessStartIdentity INTEGER NULL,
+                ProcessName TEXT NOT NULL DEFAULT '',
+                AssignedPort INTEGER NULL,
+                WorkspacePath TEXT NOT NULL,
+                WorkingDirectory TEXT NOT NULL,
+                LaunchProfile TEXT NOT NULL,
+                LaunchIdentity TEXT NOT NULL,
+                FailureDetail TEXT NOT NULL DEFAULT '',
+                CreatedAt INTEGER NOT NULL,
+                UpdatedAt INTEGER NOT NULL,
+                StartedAt INTEGER NULL,
+                LastHealthCheckAt INTEGER NULL,
+                StoppedAt INTEGER NULL,
+                CONSTRAINT FK_DemoInstances_Flows_FlowRunId
+                    FOREIGN KEY (FlowRunId)
+                    REFERENCES Flows (Id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_DemoInstances_Binding
+                ON DemoInstances
+                    (FlowRunId, ArtifactId, CandidateFingerprint, ManifestHash);
+            CREATE INDEX IF NOT EXISTS IX_DemoInstances_FlowRunId_ArtifactId
+                ON DemoInstances (FlowRunId, ArtifactId);
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_DemoInstances_ActivePort
+                ON DemoInstances (AssignedPort)
+                WHERE AssignedPort IS NOT NULL
+                  AND State IN ('Starting','Running','Unhealthy');
             """,
             cancellationToken);
     }

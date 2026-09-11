@@ -357,6 +357,55 @@ public sealed class ReviewWorkflowTests
         Assert.Equal(0, harness.PublicationVerifier.Calls);
     }
 
+    [Fact]
+    public async Task FlowWorker_RetriesFailedDemoRevocationBeforeExecution()
+    {
+        var queue = new FlowQueue();
+        var flowId = Guid.NewGuid();
+        var preflightAttempts = 0;
+        var executions = 0;
+        var executed = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Task PrepareAsync(Guid _, CancellationToken __)
+        {
+            if (Interlocked.Increment(ref preflightAttempts) == 1)
+            {
+                throw new InvalidOperationException(
+                    "Synthetic demo revocation failure.");
+            }
+            return Task.CompletedTask;
+        }
+
+        Task RunAsync(Guid _, CancellationToken __)
+        {
+            Interlocked.Increment(ref executions);
+            executed.TrySetResult();
+            return Task.CompletedTask;
+        }
+
+        using var worker = new FlowWorker(
+            queue,
+            RunAsync,
+            _ => Task.FromResult<IReadOnlyList<Guid>>([]),
+            (_, _) => Task.FromResult(true),
+            NullLogger<FlowWorker>.Instance,
+            PrepareAsync);
+        await worker.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(queue.Queue(flowId));
+            await executed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(2, preflightAttempts);
+            Assert.Equal(1, executions);
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
+    }
+
     [Theory]
     [InlineData(ReviewIntent.Accept)]
     [InlineData(ReviewIntent.RequestRefinement)]
@@ -840,6 +889,15 @@ public sealed class ReviewWorkflowTests
             replay.Review.GateId);
         Assert.Contains("materially different", differentReplay.Message);
         Assert.Equal(FlowStatus.Reworking, refinement.Flow.Status);
+        Assert.Equal(
+            harness.FlowId,
+            Assert.Single(harness.DemoRevoker.FlowIds));
+        Assert.All(
+            harness.DemoRevoker.QueuePendingAtRevoke,
+            Assert.True);
+        Assert.All(
+            harness.DemoRevoker.CancellationCanBeCanceled,
+            Assert.False);
         Assert.Equal(first.WorkspacePath, refinement.Flow.WorkspacePath);
         Assert.StartsWith(
             "Customer refinement for iteration 1:",
@@ -899,7 +957,7 @@ public sealed class ReviewWorkflowTests
     }
 
     [Fact]
-    public async Task LegacyReleaseGate_RemainsReadableAndUsesLegacyDecisionPath()
+    public async Task LegacyUnverifiedReleaseGate_RemainsReadableButApprovalIsBlocked()
     {
         await using var harness =
             await ReviewHarness.CreateAsync(FlowKind.Advisory);
@@ -967,60 +1025,25 @@ public sealed class ReviewWorkflowTests
             candidateFingerprint: string.Empty,
             feedback: string.Empty);
 
-        Assert.Equal(ReleaseDecisionOutcome.Approved, decision.Outcome);
-        FlowStep publication;
+        Assert.Equal(ReleaseDecisionOutcome.Conflict, decision.Outcome);
+        Assert.Contains(
+            "cannot be approved",
+            decision.Message,
+            StringComparison.OrdinalIgnoreCase);
         await using (var database =
                      await harness.Factory.CreateDbContextAsync())
         {
-            publication = await database.FlowSteps
+            Assert.DoesNotContain(
+                await database.FlowSteps
                 .AsNoTracking()
-                .SingleAsync(step =>
+                .Where(step =>
                     step.FlowRunId == legacyFlow.Id &&
                     step.AgentRole == "release-engineer" &&
-                    step.Status == StepStatus.Pending);
+                    step.Status == StepStatus.Pending)
+                .ToListAsync(),
+                _ => true);
         }
-        Assert.True(publication.RemotePublicationAllowed);
-        Assert.Equal(
-            ExecutionInvocationKind.Publication,
-            publication.InvocationKind);
-        Assert.Equal(PlanStage.AfterApproval, publication.PlanStage);
-        Assert.Equal("""["Publish"]""", publication.PlanDutiesJson);
-        Assert.Equal(
-            ExecutionPermissionProfile.Publish,
-            publication.PermissionProfile);
 
-        var permission =
-            await CopilotReasoningHost.ResolveAndPersistPermissionAsync(
-                new AgentExecutionContext(
-                    legacyFlow.Id,
-                    legacyFlow.Iteration,
-                    publication.AgentId,
-                    publication.AgentName,
-                    publication.AgentRole,
-                    "model",
-                    "high",
-                    publication.Attempt,
-                    publication.InputSummary,
-                    legacyFlow.RepositoryKnowledge,
-                    legacyFlow.RepositoryPath,
-                    legacyFlow.WorkspacePath,
-                    Guid.NewGuid(),
-                    legacyFlow.Outcome,
-                    "Publish the approved legacy outcome.",
-                    [],
-                    [],
-                    FlowStepId: publication.Id,
-                    ContractVersion: "legacy-v1",
-                    InvocationKind:
-                        ExecutionInvocationKind.Publication),
-                harness.WorkflowProvider.GetEffective(),
-                new PermissionProfileResolver(),
-                harness.Factory,
-                CancellationToken.None);
-        Assert.Equal(
-            ExecutionPermissionProfile.Publish,
-            permission.Profile);
-        Assert.True(permission.AllowRemotePublication);
     }
 
     [Theory]
@@ -1999,7 +2022,8 @@ public sealed class ReviewWorkflowTests
             RecordingReviewedCandidateService reviewedCandidates,
             WorkflowEngine engine,
             ReviewCoordinator reviews,
-            FlowQueue queue)
+            FlowQueue queue,
+            RecordingDemoRuntimeRevoker demoRevoker)
         {
             Root = root;
             WorkspacePath = workspacePath;
@@ -2014,6 +2038,7 @@ public sealed class ReviewWorkflowTests
             Engine = engine;
             Reviews = reviews;
             Queue = queue;
+            DemoRevoker = demoRevoker;
         }
 
         public string Root { get; }
@@ -2041,6 +2066,8 @@ public sealed class ReviewWorkflowTests
         public ReviewCoordinator Reviews { get; }
 
         public FlowQueue Queue { get; }
+
+        public RecordingDemoRuntimeRevoker DemoRevoker { get; }
 
         public static async Task<ReviewHarness> CreateAsync(
             FlowKind kind,
@@ -2187,6 +2214,7 @@ public sealed class ReviewWorkflowTests
             var reviewedCandidates = new RecordingReviewedCandidateService();
             var flowQueue = new FlowQueue();
             var lifecycle = new FlowLifecycleCoordinator();
+            var demoRevoker = new RecordingDemoRuntimeRevoker(flowQueue);
             var engine = new WorkflowEngine(
                 factory,
                 catalog,
@@ -2210,7 +2238,8 @@ public sealed class ReviewWorkflowTests
                 gate,
                 flowQueue,
                 lifecycle,
-                workflowProvider);
+                workflowProvider,
+                demoRuntimeRevoker: demoRevoker);
             return new ReviewHarness(
                 root,
                 workspacePath,
@@ -2224,7 +2253,8 @@ public sealed class ReviewWorkflowTests
                 reviewedCandidates,
                 engine,
                 reviews,
-                flowQueue);
+                flowQueue,
+                demoRevoker);
         }
 
         public async Task<FlowRun> LoadFlowAsync()
@@ -2241,6 +2271,26 @@ public sealed class ReviewWorkflowTests
                 .Include(item => item.PlanDocuments)
                 .Include(item => item.TaskProfiles)
                 .SingleAsync(item => item.Id == FlowId);
+        }
+
+        public sealed class RecordingDemoRuntimeRevoker(FlowQueue queue)
+            : IDemoRuntimeRevoker
+        {
+            public List<Guid> FlowIds { get; } = [];
+            public List<bool> QueuePendingAtRevoke { get; } = [];
+            public List<bool> CancellationCanBeCanceled { get; } = [];
+
+            public Task RevokeFlowAsync(
+                Guid flowId,
+                string reason,
+                CancellationToken cancellationToken = default)
+            {
+                FlowIds.Add(flowId);
+                QueuePendingAtRevoke.Add(queue.PendingCount > 0);
+                CancellationCanBeCanceled.Add(
+                    cancellationToken.CanBeCanceled);
+                return Task.CompletedTask;
+            }
         }
 
         /// <summary>

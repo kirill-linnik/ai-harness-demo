@@ -60,6 +60,22 @@ public static class DemoApi
         api.MapGet("/learnings", GetLearningsAsync);
         api.MapGet("/previews/{flowId:guid}", GetPreviewAsync);
         api.MapGet(
+            "/previews/{flowId:guid}/artifacts/{artifactId}/demo",
+            GetDemoStatusAsync);
+        api.MapPost(
+            "/previews/{flowId:guid}/artifacts/{artifactId}/demo/start",
+            StartDemoAsync);
+        api.MapPost(
+            "/previews/{flowId:guid}/artifacts/{artifactId}/demo/restart",
+            RestartDemoAsync);
+        api.MapPost(
+            "/previews/{flowId:guid}/artifacts/{artifactId}/demo/stop",
+            StopDemoAsync);
+        api.MapMethods(
+            "/demos/{instanceId:guid}/{**path}",
+            ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            ProxyDemoAsync);
+        api.MapGet(
             "/previews/{flowId:guid}/artifacts/{artifactId}/view",
             GetIsolatedPreviewView);
         api.MapGet(
@@ -886,7 +902,9 @@ public static class DemoApi
         WorkflowEngine workflowEngine,
         FlowQueue flowQueue,
         IReviewedCandidateService reviewedCandidateService,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        [FromServices] DeliveryReadinessService? readinessService = null,
+        [FromServices] DemoRuntimeManager? demoRuntime = null)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
         if (flow.Status is not (FlowStatus.WaitingForFeedback or FlowStatus.Approved))
@@ -941,8 +959,10 @@ public static class DemoApi
             .Select(item => item.ToDto(outcomeState))
             .ToList();
         var outcomeVerification = flow.ToOutcomeVerificationDto();
-        var artifacts = flow.Kind == FlowKind.Advisory
-            ? advisoryArtifactCatalog.Discover(flow)
+        List<PreviewArtifactDto> artifacts;
+        if (flow.Kind == FlowKind.Advisory)
+        {
+            artifacts = advisoryArtifactCatalog.Discover(flow)
                 .Select(item =>
                 {
                     var artifactId = ApiMappings.AdvisoryArtifactId(item.Path);
@@ -962,15 +982,57 @@ public static class DemoApi
                             artifactId,
                             item.Path,
                             download: true),
-                        Interactive: false);
+                        Interactive: false,
+                        DemoCapability.OfflineOnly,
+                        null,
+                        DemoInstanceState.Stopped,
+                        null,
+                        null,
+                        null,
+                        null);
                 })
-                .ToList()
-            : (reviewedSnapshot is null
+                .ToList();
+        }
+        else
+        {
+            var discovered = reviewedSnapshot is null
                 ? artifactCatalog.Discover(flow)
                 : artifactCatalog.DiscoverVerified(
                     flow,
-                    reviewedSnapshot.Manifest.PreviewArtifacts))
-                .Select(item => new PreviewArtifactDto(
+                    reviewedSnapshot.Manifest.PreviewArtifacts);
+            artifacts = [];
+            foreach (var item in discovered)
+            {
+                DemoRuntimeStatus status;
+                try
+                {
+                    status = demoRuntime is null
+                        ? new DemoRuntimeStatus(
+                            DemoCapability.OfflineOnly,
+                            null,
+                            DemoInstanceState.Stopped,
+                            null,
+                            null,
+                            null,
+                            null)
+                        : await demoRuntime.GetStatusAsync(
+                            flow.Id,
+                            item.Id,
+                            cancellationToken);
+                }
+                catch (CustomerDemoContractException exception)
+                {
+                    status = new DemoRuntimeStatus(
+                        DemoCapability.OfflineOnly,
+                        null,
+                        DemoInstanceState.Failed,
+                        null,
+                        "The sealed live-demo manifest is invalid: " +
+                        exception.Message,
+                        reviewedSnapshot?.Fingerprint,
+                        null);
+                }
+                artifacts.Add(new PreviewArtifactDto(
                     item.Id,
                     item.Label,
                     item.Url,
@@ -978,8 +1040,16 @@ public static class DemoApi
                     "text/html",
                     null,
                     null,
-                    Interactive: true))
-                .ToList();
+                    Interactive: true,
+                    status.Capability,
+                    status.InstanceId,
+                    status.State,
+                    status.StableUrl,
+                    status.FailureDetail,
+                    status.CandidateFingerprint,
+                    status.ManifestHash));
+            }
+        }
         if (outcomeVerification.PreviewRequired && artifacts.Count == 0)
         {
             throw new InvalidOperationException(
@@ -996,11 +1066,19 @@ public static class DemoApi
             flow.Status,
             flow.OutcomeLabel,
             flow.ToFlowOutcomeDto(),
+            flow.ToHistoricalDeliveryEvidenceDto(),
             artifacts,
             deliveredBy,
             flow.ToReviewSummaryDto(),
             ReviewCoordinator.GetPublicationStatus(flow),
             outcomeVerification,
+            readinessService is null
+                ? null
+                : await LoadReadinessDtoAsync(
+                    databaseFactory,
+                    readinessService,
+                    flow,
+                    cancellationToken),
             flow.UpdatedAt));
     }
 
@@ -1090,6 +1168,63 @@ public static class DemoApi
             contentType,
             enableRangeProcessing: true);
     }
+
+    private static async Task<IResult> GetDemoStatusAsync(
+        Guid flowId,
+        string artifactId,
+        [FromServices] DemoRuntimeManager runtime,
+        CancellationToken cancellationToken) =>
+        Results.Ok(await runtime.GetStatusAsync(
+            flowId,
+            artifactId,
+            cancellationToken));
+
+    private static async Task<IResult> StartDemoAsync(
+        Guid flowId,
+        string artifactId,
+        DemoMutationRequest request,
+        [FromServices] DemoRuntimeManager runtime,
+        CancellationToken cancellationToken) =>
+        Results.Ok(await runtime.StartAsync(
+            flowId,
+            artifactId,
+            request.CandidateFingerprint,
+            request.ManifestHash,
+            cancellationToken));
+
+    private static async Task<IResult> RestartDemoAsync(
+        Guid flowId,
+        string artifactId,
+        DemoMutationRequest request,
+        [FromServices] DemoRuntimeManager runtime,
+        CancellationToken cancellationToken) =>
+        Results.Ok(await runtime.RestartAsync(
+            flowId,
+            artifactId,
+            request.CandidateFingerprint,
+            request.ManifestHash,
+            cancellationToken));
+
+    private static async Task<IResult> StopDemoAsync(
+        Guid flowId,
+        string artifactId,
+        DemoMutationRequest request,
+        [FromServices] DemoRuntimeManager runtime,
+        CancellationToken cancellationToken) =>
+        Results.Ok(await runtime.StopAsync(
+            flowId,
+            artifactId,
+            request.CandidateFingerprint,
+            request.ManifestHash,
+            cancellationToken));
+
+    private static Task ProxyDemoAsync(
+        Guid instanceId,
+        string? path,
+        HttpContext context,
+        [FromServices] DemoReverseProxy proxy,
+        CancellationToken cancellationToken) =>
+        proxy.ProxyAsync(instanceId, path, context, cancellationToken);
 
     internal static async Task<OutcomeCandidateSnapshot?>
         EnsureStudioDeliveryPreviewCurrentAsync(

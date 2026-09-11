@@ -20,7 +20,8 @@ public sealed partial class FeedbackCoordinator(
     FlowLifecycleCoordinator lifecycle,
     CandidateFingerprintService? candidateFingerprintService = null,
     WorkflowDefinitionProvider? workflowProvider = null,
-    FlowAgentSnapshotService? flowAgentSnapshotService = null)
+    FlowAgentSnapshotService? flowAgentSnapshotService = null,
+    IDemoRuntimeRevoker? demoRuntimeRevoker = null)
 {
     [GeneratedRegex(
         @"(?im)^\s*REWORK_TARGET_ROLES\s*:\s*(?<roles>NONE|[a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)\s*$")]
@@ -397,6 +398,13 @@ public sealed partial class FeedbackCoordinator(
             throw new InvalidOperationException(
             "This flow is awaiting outcome resolution, not customer release approval.");
         }
+        if (approve && string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        {
+            return new FlowDecisionResponse(
+                ReleaseDecisionOutcome.Conflict,
+                flow.ToDetailDto(),
+                "Legacy-unverified results cannot be approved. Rebuild and verify the preview before approval.");
+        }
 
         var currentStepIds = flow.Steps
             .Where(step => step.Iteration == flow.Iteration)
@@ -528,6 +536,13 @@ public sealed partial class FeedbackCoordinator(
                 {
                     throw new InvalidOperationException(
                         "Unable to queue stale-candidate refresh.");
+                }
+                if (demoRuntimeRevoker is not null)
+                {
+                    await demoRuntimeRevoker.RevokeFlowAsync(
+                        flow.Id,
+                        "Live demos were revoked because the reviewed candidate became stale.",
+                        CancellationToken.None);
                 }
                 return new FlowDecisionResponse(
                     ReleaseDecisionOutcome.RefreshQueued,
@@ -747,6 +762,15 @@ public sealed partial class FeedbackCoordinator(
                 approve
                     ? "Unable to queue the customer-approved release publication."
                     : "Unable to queue the revised factory flow.");
+        }
+        if (demoRuntimeRevoker is not null)
+        {
+            await demoRuntimeRevoker.RevokeFlowAsync(
+                flow.Id,
+                approve
+                    ? "Live demos were revoked before approved publication."
+                    : "Live demos were revoked before rebuilding the refined preview.",
+                CancellationToken.None);
         }
         if (approve)
         {

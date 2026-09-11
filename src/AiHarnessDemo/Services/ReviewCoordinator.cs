@@ -58,7 +58,8 @@ public sealed class ReviewCoordinator(
     IReviewedCandidateService? reviewedCandidateService = null,
     AgentManifestStager? manifestStager = null,
     DeliveryReadinessService? deliveryReadinessService = null,
-    ILogger<ReviewCoordinator>? logger = null)
+    ILogger<ReviewCoordinator>? logger = null,
+    IDemoRuntimeRevoker? demoRuntimeRevoker = null)
 {
     private const int MaximumTotalRequestedChangeCharacters = 16_000;
     internal const string FeedbackClassificationPlanStepPrefix =
@@ -135,6 +136,7 @@ public sealed class ReviewCoordinator(
             await lifecycle.EnterAsync(flowId, cancellationToken);
         HandoffGateRecord? resolvedForHistory = null;
         var queueFlow = false;
+        var revokeDemos = false;
         Guid? publicationStepId = null;
 
         await using (var database =
@@ -351,6 +353,8 @@ public sealed class ReviewCoordinator(
             }
 
             flow.UpdatedAt = now;
+            revokeDemos = flow.Status is not (
+                FlowStatus.WaitingForFeedback or FlowStatus.Approved);
             await database.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
         }
@@ -363,6 +367,13 @@ public sealed class ReviewCoordinator(
         {
             throw new InvalidOperationException(
                 "The durable review decision was recorded, but the flow could not be queued.");
+        }
+        if (revokeDemos && demoRuntimeRevoker is not null)
+        {
+            await demoRuntimeRevoker.RevokeFlowAsync(
+                flowId,
+                "Live demos were revoked because the reviewed flow moved to a new lifecycle phase.",
+                CancellationToken.None);
         }
 
         var message = intent == ReviewIntent.Accept
@@ -760,6 +771,14 @@ public sealed class ReviewCoordinator(
         {
             throw new InvalidOperationException(
                 "The durable readiness resolution was recorded, but the flow could not be queued.");
+        }
+        if (demoRuntimeRevoker is not null &&
+            status is not (FlowStatus.WaitingForFeedback or FlowStatus.Approved))
+        {
+            await demoRuntimeRevoker.RevokeFlowAsync(
+                flowId,
+                "Live demos were revoked because readiness resolution invalidated the reviewed preview.",
+                CancellationToken.None);
         }
         return new ReadinessResolutionResponse(
             flowId,

@@ -2026,6 +2026,79 @@ public sealed class LocalRequestGuardTests
 
         Assert.True(LocalRequestGuard.IsValid(context.Request));
     }
+
+    [Fact]
+    public async Task OpaqueCandidateMutation_CannotReachPrivilegedLifecycleEndpoint()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = HttpMethods.Post;
+        context.Request.Path =
+            $"/api/previews/{Guid.NewGuid():D}/artifacts/demo/demo/start";
+        context.Request.Headers.Origin = "null";
+        context.Response.Body = new MemoryStream();
+        var reached = false;
+
+        await LocalRequestGuard.ApplyAsync(
+            context,
+            _ =>
+            {
+                reached = true;
+                return Task.CompletedTask;
+            });
+
+        Assert.False(reached);
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("POST")]
+    [InlineData("PUT")]
+    [InlineData("PATCH")]
+    [InlineData("DELETE")]
+    public async Task ExactDemoProxyRoute_AllowsOpaqueApplicationTraffic(
+        string method)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = method;
+        context.Request.Path =
+            $"/api/demos/{Guid.NewGuid():D}/api/items";
+        context.Request.Headers.Origin = "null";
+        var reached = false;
+
+        await LocalRequestGuard.ApplyAsync(
+            context,
+            _ =>
+            {
+                reached = true;
+                return Task.CompletedTask;
+            });
+
+        Assert.True(reached);
+    }
+
+    [Theory]
+    [InlineData("/api/demos/not-a-guid/api/items")]
+    [InlineData("/api/demos/00000000-0000-0000-0000-000000000000x/api/items")]
+    [InlineData("/api/previews/00000000-0000-0000-0000-000000000000/artifacts/demo/demo/stop")]
+    public async Task LookalikeAndLifecycleRoutes_RemainGuarded(string path)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = HttpMethods.Delete;
+        context.Request.Path = path;
+        context.Response.Body = new MemoryStream();
+        var reached = false;
+
+        await LocalRequestGuard.ApplyAsync(
+            context,
+            _ =>
+            {
+                reached = true;
+                return Task.CompletedTask;
+            });
+
+        Assert.False(reached);
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+    }
 }
 
 public sealed class RepositoryContextGateTests

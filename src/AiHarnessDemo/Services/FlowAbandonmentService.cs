@@ -80,7 +80,8 @@ public sealed class FlowAbandonmentService(
     IFlowSessionCleaner sessionCleaner,
     IWorkspaceManager workspaceManager,
     FlowLifecycleCoordinator lifecycle,
-    ILogger<FlowAbandonmentService> logger)
+    ILogger<FlowAbandonmentService> logger,
+    IDemoRuntimeRevoker? demoRuntimeRevoker = null)
 {
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim>
         _abandonmentLocks = new();
@@ -167,6 +168,13 @@ public sealed class FlowAbandonmentService(
         try
         {
             await executionController.CancelAsync(flow.Id, CancellationToken.None);
+            if (demoRuntimeRevoker is not null)
+            {
+                await demoRuntimeRevoker.RevokeFlowAsync(
+                    flow.Id,
+                    "Live demos were revoked because the flow is being abandoned.",
+                    CancellationToken.None);
+            }
             var processes = await processCleaner.StopAsync(
                 flow.WorkspacePath,
                 CancellationToken.None);

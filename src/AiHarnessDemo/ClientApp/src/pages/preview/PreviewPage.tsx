@@ -1,6 +1,10 @@
 import { type MouseEvent, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useNavigate, useParams } from "react-router-dom";
 import { useDecideFlowMutation, usePreviewQuery } from "../../api/queries";
+import { api } from "../../api/endpoints";
+import type { DemoRuntimeStatus } from "../../api/types";
 import { FatalScreen } from "../../components/FatalScreen";
 import { BootScreen } from "../../components/BootScreen";
 import { BackIcon, CheckIcon, ExternalIcon, RefreshIcon } from "../../lib/icons";
@@ -37,6 +41,9 @@ export function PreviewPage() {
   const decideFlow = useDecideFlowMutation();
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState("");
+  const [demoPending, setDemoPending] = useState<string | null>(null);
+  const [demoError, setDemoError] = useState<string | null>(null);
+  const [demoOverrides, setDemoOverrides] = useState<Record<string, DemoRuntimeStatus>>({});
 
   if (previewQuery.isLoading) return <BootScreen />;
 
@@ -59,10 +66,75 @@ export function PreviewPage() {
   const advisory = preview.kind === "Advisory";
 
   const contributors = preview.deliveredBy.filter(step => step.status === "Completed");
-  const selectedArtifact =
+  const selectedArtifactBase =
     preview.artifacts.find(artifact => artifact.id === selectedArtifactId) ??
     preview.artifacts[0];
+  const selectedDemo = selectedArtifactBase
+    ? demoOverrides[selectedArtifactBase.id] ?? {
+        capability: selectedArtifactBase.demoCapability,
+        instanceId: selectedArtifactBase.demoInstanceId,
+        state: selectedArtifactBase.demoState,
+        stableUrl: selectedArtifactBase.demoUrl,
+        failureDetail: selectedArtifactBase.demoFailureDetail,
+        candidateFingerprint: selectedArtifactBase.demoCandidateFingerprint,
+        manifestHash: selectedArtifactBase.demoManifestHash
+      }
+    : null;
+  const selectedArtifact = selectedArtifactBase
+    ? {
+        ...selectedArtifactBase,
+        demoCapability: selectedDemo!.capability,
+        demoInstanceId: selectedDemo!.instanceId,
+        demoState: selectedDemo!.state,
+        demoUrl: selectedDemo!.stableUrl,
+        demoFailureDetail: selectedDemo!.failureDetail,
+        demoCandidateFingerprint: selectedDemo!.candidateFingerprint,
+        demoManifestHash: selectedDemo!.manifestHash
+      }
+    : undefined;
   const deciding = decideFlow.isPending;
+
+  async function mutateDemo(action: "start" | "restart" | "stop") {
+    if (
+      !id ||
+      !selectedArtifact ||
+      !selectedArtifact.demoCandidateFingerprint ||
+      !selectedArtifact.demoManifestHash
+    ) {
+      setDemoError("The sealed demo binding is unavailable. Refresh or rebuild the reviewed preview.");
+      return;
+    }
+    setDemoPending(action);
+    setDemoError(null);
+    try {
+      const body = {
+        candidateFingerprint: selectedArtifact.demoCandidateFingerprint,
+        manifestHash: selectedArtifact.demoManifestHash
+      };
+      const result =
+        action === "start"
+          ? await api.startDemo(id, selectedArtifact.id, body)
+          : action === "restart"
+            ? await api.restartDemo(id, selectedArtifact.id, body)
+            : await api.stopDemo(id, selectedArtifact.id, body);
+      setDemoOverrides(current => ({ ...current, [selectedArtifact.id]: result }));
+      toast(
+        action === "stop"
+          ? "Live demo stopped."
+          : action === "restart"
+            ? "Live demo restarted."
+            : "Live demo is running.",
+        "success"
+      );
+      await previewQuery.refetch();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setDemoError(message);
+      toast(message, "error");
+    } finally {
+      setDemoPending(null);
+    }
+  }
 
   async function decide(approve: boolean) {
     if (!id) return;
@@ -188,6 +260,58 @@ export function PreviewPage() {
             </ul>
           </section>
         )}
+        {!legacyPreview && preview.deliveryReadiness && (
+          <section className="preview-outcome-summary" aria-labelledby="preview-readiness-heading">
+            <div className="eyebrow">Delivery readiness</div>
+            <h2 id="preview-readiness-heading">{preview.deliveryReadiness.label}</h2>
+            <p>{preview.deliveryReadiness.publicationAssurance}</p>
+            <h3>Acceptance criteria</h3>
+            <ul>
+              {preview.deliveryReadiness.criteria.map(criterion => (
+                <li key={criterion.criterionId}>
+                  <strong>{criterion.criterionId} · {criterion.outcome}</strong>{" "}
+                  {criterion.requirement}
+                  {criterion.evidenceIds.length > 0 && (
+                    <small> Evidence: {criterion.evidenceIds.join(", ")}</small>
+                  )}
+                </li>
+              ))}
+            </ul>
+            {preview.deliveryReadiness.risks.length > 0 && (
+              <>
+                <h3>Residual risks</h3>
+                <ul>
+                  {preview.deliveryReadiness.risks.map(risk => (
+                    <li key={risk.riskId}>
+                      <strong>{risk.riskId} · {risk.classification}</strong> {risk.statement}
+                      {risk.evidenceIds.length > 0 && (
+                        <small> Evidence: {risk.evidenceIds.join(", ")}</small>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </section>
+        )}
+        {legacyPreview && preview.historicalDeliveryEvidence && (
+          <section className="preview-outcome-summary" aria-labelledby="historical-evidence-heading">
+            <div className="eyebrow">Non-authoritative</div>
+            <h2 id="historical-evidence-heading">Historical delivery evidence</h2>
+            <p>
+              This bounded projection preserves completed historical handoffs for customer context.
+              It does not prove readiness or authorize publication.
+            </p>
+            {preview.historicalDeliveryEvidence.items.map(item => (
+              <article key={`${item.kind}:${item.agentName}`} className="detail-markdown">
+                <h3>{item.kind} · {item.agentName}</h3>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>
+                  {item.markdown}
+                </ReactMarkdown>
+              </article>
+            ))}
+          </section>
+        )}
         <section className="delivery-strip">
           {contributors.map(step => (
             <div className="delivery-person" key={step.id}>
@@ -206,9 +330,7 @@ export function PreviewPage() {
               <h2 id="preview-result-heading">
                 {advisory
                   ? "Advisory artifacts"
-                  : legacyPreview
-                    ? "Interactive result"
-                    : "Delivery artifacts"}
+                  : "Reviewed preview"}
               </h2>
             </div>
             {selectedArtifact?.interactive && (
@@ -285,6 +407,81 @@ export function PreviewPage() {
                     : "This outcome does not require a browser artifact; review the verified criterion matrix above."}
             </div>
           )}
+          {!advisory && selectedArtifact && (
+            <section className="live-demo-controls" aria-label={`${selectedArtifact.label} live demo`}>
+              <div>
+                <div className="eyebrow">Non-authoritative live demo</div>
+                <p className="muted">
+                  Live demo health and interactions never affect Delivery readiness, approval, or publication.
+                </p>
+              </div>
+              {selectedArtifact.demoCapability === "OfflineOnly" ? (
+                <div className="pushback-callout">
+                  <strong>Offline preview only</strong>
+                  <p>
+                    No valid sealed customer-demo-v1 manifest is available for this reviewed candidate.
+                  </p>
+                  {((legacyPreview && reviewedOutcome.releaseGateId) ||
+                    (!legacyPreview && preview.review.available && !preview.review.resolved)) ? (
+                    <a className="button" href={`#/factory/${preview.flowId}`}>
+                      <RefreshIcon /> Rebuild and verify preview
+                    </a>
+                  ) : (
+                    <span className="muted">
+                      Rebuild is unavailable because there is no current safe review or refinement action.
+                    </span>
+                  )}
+                  {selectedArtifact.demoFailureDetail && (
+                    <p role="alert">{selectedArtifact.demoFailureDetail}</p>
+                  )}
+                </div>
+              ) : selectedArtifact.demoState === "Running" && selectedArtifact.demoUrl ? (
+                <div className="feedback-actions">
+                  <a
+                    className="button primary"
+                    href={selectedArtifact.demoUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <ExternalIcon /> Open live demo
+                  </a>
+                  <button
+                    className="button"
+                    disabled={demoPending !== null}
+                    onClick={() => void mutateDemo("restart")}
+                  >
+                    <RefreshIcon /> {demoPending === "restart" ? "Restarting..." : "Restart demo"}
+                  </button>
+                  <button
+                    className="button danger"
+                    disabled={demoPending !== null}
+                    onClick={() => void mutateDemo("stop")}
+                  >
+                    {demoPending === "stop" ? "Stopping..." : "Stop demo"}
+                  </button>
+                </div>
+              ) : (
+                <div className="feedback-actions">
+                  <button
+                    className="button primary"
+                    disabled={demoPending !== null || selectedArtifact.demoState === "Starting"}
+                    onClick={() => void mutateDemo("start")}
+                  >
+                    {demoPending === "start" || selectedArtifact.demoState === "Starting"
+                      ? "Starting demo..."
+                      : selectedArtifact.demoState === "Failed" ||
+                          selectedArtifact.demoState === "Unhealthy"
+                        ? "Retry start"
+                        : "Start demo"}
+                  </button>
+                  {selectedArtifact.demoFailureDetail && (
+                    <span role="alert">{selectedArtifact.demoFailureDetail}</span>
+                  )}
+                </div>
+              )}
+              {demoError && <p role="alert">{demoError}</p>}
+            </section>
+          )}
         </section>
         {!legacyPreview && preview.status === "WaitingForFeedback" && (
           <section className="preview-decision" aria-labelledby="studio-review-heading">
@@ -303,10 +500,10 @@ export function PreviewPage() {
           </section>
         )}
         {legacyPreview && preview.status === "WaitingForFeedback" &&
-          (preview.outcomeVerification.legacyUnverified ||
-            (preview.outcomeVerification.releaseReady &&
+          !preview.outcomeVerification.legacyUnverified &&
+          (preview.outcomeVerification.releaseReady &&
               (!preview.outcomeVerification.previewRequired ||
-                preview.artifacts.length > 0))) &&
+                preview.artifacts.length > 0)) &&
           preview.outcomeVerification.releaseGateId && (
           <section className="preview-decision" aria-labelledby="customer-decision-heading">
             <div>
@@ -346,6 +543,41 @@ export function PreviewPage() {
             </div>
           </section>
         )}
+        {legacyPreview &&
+          preview.status === "WaitingForFeedback" &&
+          preview.outcomeVerification.legacyUnverified &&
+          preview.outcomeVerification.releaseGateId && (
+            <section className="preview-decision" aria-labelledby="legacy-refinement-heading">
+              <div>
+                <div className="eyebrow">Historical result</div>
+                <h2 id="legacy-refinement-heading">Approval is unavailable</h2>
+                <p className="muted">
+                  This legacy result has no authoritative QA PASS. Request a rebuild and verification;
+                  historical prose cannot authorize publication.
+                </p>
+              </div>
+              <label className="field" htmlFor="preview-feedback">
+                <span>What should change?</span>
+                <textarea
+                  id="preview-feedback"
+                  rows={3}
+                  value={feedback}
+                  placeholder="Describe the rebuild or correction required."
+                  onChange={event => setFeedback(event.target.value)}
+                />
+              </label>
+              <div className="feedback-actions">
+                <AbandonFlowButton flowId={preview.flowId} />
+                <button
+                  className="button danger"
+                  disabled={deciding}
+                  onClick={() => void decide(false)}
+                >
+                  <RefreshIcon /> {deciding ? "Working..." : "Request changes"}
+                </button>
+              </div>
+            </section>
+          )}
         {legacyPreview && preview.outcomeVerification.status === "AwaitingHumanResolution" && (
           <section className="preview-decision" aria-labelledby="verification-resolution-heading">
             <div>

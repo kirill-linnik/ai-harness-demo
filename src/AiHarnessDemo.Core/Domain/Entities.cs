@@ -147,6 +147,15 @@ public enum StepStatus
     Skipped
 }
 
+public enum DemoInstanceState
+{
+    Stopped,
+    Starting,
+    Running,
+    Unhealthy,
+    Failed
+}
+
 public enum FlowStepKind
 {
     Standard,
@@ -309,6 +318,60 @@ public sealed class FlowRun
     public List<FlowAgentSnapshot> AgentSnapshots { get; set; } = [];
 
     public List<FlowPlanDocument> PlanDocuments { get; set; } = [];
+
+    public List<DemoInstanceRecord> DemoInstances { get; set; } = [];
+}
+
+/// <summary>
+/// Durable ownership and lifecycle record for a non-authoritative live demo. Candidate and manifest
+/// identities are immutable for the row; mutable process fields describe only the currently owned
+/// attempt for that binding.
+/// </summary>
+public sealed class DemoInstanceRecord
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid FlowRunId { get; set; }
+
+    public FlowRun? FlowRun { get; set; }
+
+    public string ArtifactId { get; set; } = string.Empty;
+
+    public string CandidateFingerprint { get; set; } = string.Empty;
+
+    public string ManifestHash { get; set; } = string.Empty;
+
+    public string ManifestRelativePath { get; set; } = string.Empty;
+
+    public DemoInstanceState State { get; set; } = DemoInstanceState.Stopped;
+
+    public int? ProcessId { get; set; }
+
+    public long? ProcessStartIdentity { get; set; }
+
+    public string ProcessName { get; set; } = string.Empty;
+
+    public int? AssignedPort { get; set; }
+
+    public string WorkspacePath { get; set; } = string.Empty;
+
+    public string WorkingDirectory { get; set; } = string.Empty;
+
+    public string LaunchProfile { get; set; } = string.Empty;
+
+    public string LaunchIdentity { get; set; } = string.Empty;
+
+    public string FailureDetail { get; set; } = string.Empty;
+
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    public DateTimeOffset? StartedAt { get; set; }
+
+    public DateTimeOffset? LastHealthCheckAt { get; set; }
+
+    public DateTimeOffset? StoppedAt { get; set; }
 }
 
 public sealed class FlowStep

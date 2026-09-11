@@ -18,6 +18,7 @@ public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger)
     {
         var statusCode = exception switch
         {
+            DemoRuntimeException runtimeException => runtimeException.StatusCode,
             NewWorkAdmissionException => StatusCodes.Status503ServiceUnavailable,
             IntakeAttemptException => StatusCodes.Status409Conflict,
             DeliveryReadinessConflictException => StatusCodes.Status409Conflict,
@@ -93,6 +94,15 @@ public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger)
         {
             problem.Extensions["code"] = DeliveryReadinessConflicts.ContractInvalid;
             problem.Extensions["errors"] = contract.Errors;
+        }
+        if (exception is DemoRuntimeException demo)
+        {
+            problem.Title = "The live demo operation could not be completed.";
+            problem.Extensions["code"] = demo.Code;
+        }
+        if (LocalRequestGuard.IsExactDemoProxyRoute(httpContext.Request.Path))
+        {
+            DemoReverseProxy.ApplyIsolationHeaders(httpContext.Response);
         }
         httpContext.Response.StatusCode = statusCode;
         await httpContext.Response.WriteAsJsonAsync(

@@ -20,6 +20,7 @@ const preview: PreviewDto = {
   status: "WaitingForFeedback",
   outcomeLabel: "Pull request candidate",
   outcomeResult: null,
+  historicalDeliveryEvidence: null,
   artifacts: [
     {
       id: "eu",
@@ -29,7 +30,14 @@ const preview: PreviewDto = {
       mediaType: "text/html",
       byteLength: null,
       downloadUrl: null,
-      interactive: true
+      interactive: true,
+      demoCapability: "OfflineOnly",
+      demoInstanceId: null,
+      demoState: "Stopped",
+      demoUrl: null,
+      demoFailureDetail: null,
+      demoCandidateFingerprint: null,
+      demoManifestHash: null
     },
     {
       id: "ee",
@@ -39,7 +47,14 @@ const preview: PreviewDto = {
       mediaType: "text/html",
       byteLength: null,
       downloadUrl: null,
-      interactive: true
+      interactive: true,
+      demoCapability: "OfflineOnly",
+      demoInstanceId: null,
+      demoState: "Stopped",
+      demoUrl: null,
+      demoFailureDetail: null,
+      demoCandidateFingerprint: null,
+      demoManifestHash: null
     }
   ],
   deliveredBy: [],
@@ -90,6 +105,7 @@ const preview: PreviewDto = {
     verifiedAt: "2026-09-03T11:55:00Z",
     humanResolutionGate: null
   },
+  deliveryReadiness: null,
   generatedAt: "2026-09-03T12:00:00Z"
 };
 
@@ -123,7 +139,7 @@ describe("PreviewPage", () => {
   it("embeds the delivered artifact and lets the customer approve it", async () => {
     const decide = vi.spyOn(api, "decideFlow").mockResolvedValue({
       outcome: "Approved",
-      flow: {} as never,
+      flow: { id: flowId } as never,
       message: "Customer approval was recorded and publication was queued."
     });
     renderPage();
@@ -146,7 +162,11 @@ describe("PreviewPage", () => {
       })
     );
     expect(
-      await screen.findByText("Execution details", {}, { timeout: 5_000 })
+      await screen.findByText(
+        "Execution details",
+        { selector: "div" },
+        { timeout: 5_000 }
+      )
     ).toBeInTheDocument();
   });
 
@@ -301,7 +321,11 @@ describe("PreviewPage", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText(/Approval recorded/i)).not.toBeInTheDocument();
     expect(
-      await screen.findByText("Execution details", {}, { timeout: 5_000 })
+      await screen.findByText(
+        "Execution details",
+        { selector: "div" },
+        { timeout: 5_000 }
+      )
     ).toBeInTheDocument();
   });
 
@@ -403,7 +427,14 @@ describe("PreviewPage", () => {
           mediaType: "text/markdown",
           byteLength: 128,
           downloadUrl: `${advisoryArtifactUrl}?download=true`,
-          interactive: false
+          interactive: false,
+          demoCapability: "OfflineOnly",
+          demoInstanceId: null,
+          demoState: "Stopped",
+          demoUrl: null,
+          demoFailureDetail: null,
+          demoCandidateFingerprint: null,
+          demoManifestHash: null
         }
       ],
       review: {
@@ -433,5 +464,255 @@ describe("PreviewPage", () => {
       "href",
       `#/factory/${flowId}`
     );
+  });
+
+  it("renders dffc-shaped historical evidence and removes legacy-unverified approval", async () => {
+    renderPage({
+      ...preview,
+      flowId: "dffc6813-6600-433b-acb0-2da5a5165113",
+      historicalDeliveryEvidence: {
+        nonAuthoritative: true,
+        items: [
+          {
+            kind: "Implementation",
+            agentName: "Software Engineer",
+            label: "Correct implementation",
+            markdown: "## Changed\n\nThe **offline preview** was corrected.",
+            completedAt: "2026-09-01T10:00:00Z"
+          },
+          {
+            kind: "Quality verification",
+            agentName: "Quality Engineer",
+            label: "Verify",
+            markdown: "- Focused checks passed",
+            completedAt: "2026-09-01T11:00:00Z"
+          },
+          {
+            kind: "Release package",
+            agentName: "Release Engineer",
+            label: "Package",
+            markdown: "Packaged immutable artifacts.",
+            completedAt: "2026-09-01T12:00:00Z"
+          }
+        ]
+      },
+      outcomeVerification: {
+        ...preview.outcomeVerification,
+        status: "LegacyUnverified",
+        legacyUnverified: true,
+        releaseReady: false,
+        candidateFingerprint: "",
+        candidateFingerprintPrefix: ""
+      }
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Historical delivery evidence" })
+    ).toBeInTheDocument();
+    expect(screen.getByText("offline preview")).toBeInTheDocument();
+    expect(screen.getByText(/does not prove readiness or authorize publication/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Approval is unavailable" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve and publish" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request changes" })).toBeInTheDocument();
+  });
+
+  it("shows normalized studio details and typed readiness evidence and risks", async () => {
+    renderPage({
+      ...preview,
+      contractVersion: "studio-v2",
+      outcomeResult: {
+        goal: "Deliver a self-contained reviewed build.",
+        summary: "The candidate is sealed and testable.",
+        implementationDetails: ["Bundled representative content."],
+        artifacts: []
+      },
+      deliveryReadiness: {
+        state: "ReadyToApprove",
+        reconciliation: "Current",
+        revision: 1,
+        contractHash: "sha256:ready",
+        reviewedCandidateId: "11111111-1111-4111-8111-111111111111",
+        candidateFingerprintPrefix: "sha256:candidate",
+        criteria: [
+          {
+            criterionId: "AC-001",
+            requirement: "Reviewed preview renders offline.",
+            outcome: "Verified",
+            rationale: "Observed by QA.",
+            remediation: null,
+            evidenceIds: ["EV-S001-001"],
+            responsibleRoles: ["quality-engineer"],
+            customerVisible: true
+          }
+        ],
+        risks: [
+          {
+            riskId: "RISK-001",
+            classification: "NonBlockingDisclosure",
+            severity: "Low",
+            statement: "Live demo is illustrative.",
+            impact: "No readiness impact.",
+            evidenceIds: ["EV-S001-001"],
+            criterionIds: ["AC-001"],
+            sourceRole: "quality-engineer",
+            sourceStepId: "22222222-2222-4222-8222-222222222222",
+            preMortemFindingId: null,
+            waived: false
+          }
+        ],
+        requiredWaiverRiskIds: [],
+        grantedWaiverRiskIds: [],
+        diagnostics: [],
+        allowedActions: ["Accept"],
+        reviewGateId: "33333333-3333-4333-8333-333333333333",
+        waiverGateId: null,
+        publicationAssurance: "Bound to this reviewed candidate.",
+        label: "Ready to approve"
+      }
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Deliver a self-contained reviewed build." })
+    ).toBeInTheDocument();
+    expect(screen.getByText(/AC-001 · Verified/)).toBeInTheDocument();
+    expect(screen.getAllByText(/EV-S001-001/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/RISK-001 · NonBlockingDisclosure/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Reviewed preview" })).toBeInTheDocument();
+  });
+
+  it("labels artifacts offline-only and routes rebuild through the current review", async () => {
+    renderPage({
+      ...preview,
+      contractVersion: "studio-v2",
+      review: {
+        gateId: "99999999-9999-4999-8999-999999999999",
+        available: true,
+        resolved: false,
+        approved: null,
+        decision: null,
+        publicationStatus: "AwaitingApproval"
+      }
+    });
+
+    expect(await screen.findByText("Offline preview only")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Rebuild and verify preview" })).toHaveAttribute(
+      "href",
+      `#/factory/${flowId}`
+    );
+    expect(screen.getByText(/never affect Delivery readiness/i)).toBeInTheDocument();
+  });
+
+  it("starts a sealed demo and opens its stable harness URL", async () => {
+    const candidateFingerprint = "sha256:candidate";
+    const manifestHash = "sha256:manifest";
+    const start = vi.spyOn(api, "startDemo").mockResolvedValue({
+      capability: "Available",
+      instanceId: "11111111-1111-4111-8111-111111111111",
+      state: "Running",
+      stableUrl: "/api/demos/11111111-1111-4111-8111-111111111111/",
+      failureDetail: null,
+      candidateFingerprint,
+      manifestHash
+    });
+    renderPage({
+      ...preview,
+      artifacts: [
+        {
+          ...preview.artifacts[0],
+          demoCapability: "Available",
+          demoCandidateFingerprint: candidateFingerprint,
+          demoManifestHash: manifestHash
+        }
+      ]
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start demo" }));
+    await waitFor(() =>
+      expect(start).toHaveBeenCalledWith(flowId, "eu", {
+        candidateFingerprint,
+        manifestHash
+      })
+    );
+    expect(await screen.findByRole("link", { name: "Open live demo" })).toHaveAttribute(
+      "href",
+      "/api/demos/11111111-1111-4111-8111-111111111111/"
+    );
+  });
+
+  it("restarts and stops a running demo with controls disabled during mutations", async () => {
+    const candidateFingerprint = "sha256:candidate";
+    const manifestHash = "sha256:manifest";
+    const running = {
+      ...preview.artifacts[0],
+      demoCapability: "Available" as const,
+      demoInstanceId: "11111111-1111-4111-8111-111111111111",
+      demoState: "Running" as const,
+      demoUrl: "/api/demos/11111111-1111-4111-8111-111111111111/",
+      demoCandidateFingerprint: candidateFingerprint,
+      demoManifestHash: manifestHash
+    };
+    const restart = vi.spyOn(api, "restartDemo").mockResolvedValue({
+      capability: "Available",
+      instanceId: running.demoInstanceId,
+      state: "Running",
+      stableUrl: running.demoUrl,
+      failureDetail: null,
+      candidateFingerprint,
+      manifestHash
+    });
+    const stop = vi.spyOn(api, "stopDemo").mockResolvedValue({
+      capability: "Available",
+      instanceId: running.demoInstanceId,
+      state: "Stopped",
+      stableUrl: running.demoUrl,
+      failureDetail: null,
+      candidateFingerprint,
+      manifestHash
+    });
+    renderPage({ ...preview, artifacts: [running] });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Restart demo" }));
+    await waitFor(() => expect(restart).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Stop demo" }));
+    await waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("button", { name: "Start demo" })).toBeInTheDocument();
+  });
+
+  it("offers Retry start after failure and surfaces mutation errors", async () => {
+    vi.spyOn(api, "startDemo").mockRejectedValue(new Error("Health check timed out."));
+    renderPage({
+      ...preview,
+      artifacts: [
+        {
+          ...preview.artifacts[0],
+          demoCapability: "Available",
+          demoState: "Failed",
+          demoFailureDetail: "Previous startup failed.",
+          demoCandidateFingerprint: "sha256:candidate",
+          demoManifestHash: "sha256:manifest"
+        }
+      ]
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Retry start" }));
+    expect((await screen.findAllByText("Health check timed out.")).length).toBeGreaterThan(0);
+    expect(screen.getByText("Previous startup failed.")).toBeInTheDocument();
+  });
+
+  it("disables start while the durable demo state is Starting", async () => {
+    renderPage({
+      ...preview,
+      artifacts: [
+        {
+          ...preview.artifacts[0],
+          demoCapability: "Available",
+          demoState: "Starting",
+          demoCandidateFingerprint: "sha256:candidate",
+          demoManifestHash: "sha256:manifest"
+        }
+      ]
+    });
+
+    expect(await screen.findByRole("button", { name: "Starting demo..." })).toBeDisabled();
   });
 });

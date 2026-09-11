@@ -126,6 +126,22 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
   `Replan`, or `Abandon`. None of them can accept a result or waive a risk.
 - Review acceptance, publication authorization, remote verification, and final approval each re-read
   the same durable readiness, candidate, waiver, and review identifiers before acting.
+- Browser-visible deliveries always include a self-contained `.customer-preview\<variant>` reviewed
+  preview that renders with `connect-src 'none'`. A live demo is a separate, non-authoritative
+  convenience and is never readiness or publication evidence.
+- Only when the confirmed assignment explicitly requests a live demo, the outcome owner must include
+  `.customer-preview\<variant>\customer-demo.json` before candidate sealing. The strict
+  `customer-demo-v1` object uses exactly `Version`, `ArtifactId`, `LaunchProfile`,
+  `WorkingDirectory`, `Arguments`, `HealthPath`, and `StartupTimeoutSeconds`; unknown or
+  case-mismatched fields fail. `Arguments` is an array with exactly one `{port}` token.
+  `LaunchProfile` is one of `npm`, `dotnet`, or `python`; executable paths, shell command strings,
+  and package acquisition are forbidden. `npm` uses only `run <safe-script>` plus optional `--`
+  application arguments, `python` uses only the bound `http.server` profile, and `dotnet` uses the
+  constrained `run` profile with an optional workspace-contained project. Never reconstruct launch
+  instructions from prose or tool history.
+  npm application arguments must contain exactly one explicit `--host`, `--listen`, or `--bind`
+  option, in split or equals form, whose value is exactly `127.0.0.1`; wildcard, hostname,
+  duplicate, conflicting, and unknown host-affecting options are rejected.
 
 ## Current outcome-verification assignment
 

@@ -667,7 +667,7 @@ public sealed class RoutingObservationTests
 public sealed class ApprovalGatedReleaseTests
 {
     [Fact]
-    public async Task Approval_QueuesPublicationInsteadOfClosingTheFlow()
+    public async Task LegacyUnverifiedApproval_IsRejectedWithoutPublication()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -695,23 +695,18 @@ public sealed class ApprovalGatedReleaseTests
             feedback: string.Empty,
             CancellationToken.None);
 
-        Assert.Equal(ReleaseDecisionOutcome.Approved, updated.Outcome);
-        Assert.Equal(FlowStatus.Queued, updated.Flow.Status);
+        Assert.Equal(ReleaseDecisionOutcome.Conflict, updated.Outcome);
+        Assert.Equal(FlowStatus.WaitingForFeedback, updated.Flow.Status);
         Assert.Null(updated.Flow.CompletedAt);
         Assert.Equal($"#/preview/{flow.Id}", updated.Flow.OutcomeUrl);
-        var publication = Assert.Single(
+        Assert.DoesNotContain(
             updated.Flow.Steps,
             step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
-        Assert.Equal(StepStatus.Pending, publication.Status);
-        Assert.Contains(
-            WorkflowEngine.ApprovedPublicationAssignment(OutcomeType.PullRequest),
-            publication.InputSummary);
-        Assert.True(queue.Reader.TryRead(out var queuedFlowId));
-        Assert.Equal(flow.Id, queuedFlowId);
+        Assert.False(queue.Reader.TryRead(out _));
         await using var database = await databaseFactory.CreateDbContextAsync();
         var resolvedGate = await database.GateRecords.SingleAsync();
-        Assert.True(resolvedGate.Resolved);
-        Assert.True(resolvedGate.Approved);
+        Assert.False(resolvedGate.Resolved);
+        Assert.Null(resolvedGate.Approved);
     }
 
     [Fact]

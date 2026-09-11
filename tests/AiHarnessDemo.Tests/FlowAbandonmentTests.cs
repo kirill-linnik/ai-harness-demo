@@ -101,6 +101,7 @@ public sealed class FlowAbandonmentTests
         await File.WriteAllTextAsync(
             Path.Combine(siblingRoot, "keep.txt"),
             "unrelated");
+        var demoRevoker = new RecordingDemoRuntimeRevoker();
         var service = new FlowAbandonmentService(
             databaseFactory,
             new FakeExecutionController(),
@@ -110,13 +111,15 @@ public sealed class FlowAbandonmentTests
                 new AgentManifestStager()),
             new FakeWorkspaceManager(),
             new FlowLifecycleCoordinator(),
-            NullLogger<FlowAbandonmentService>.Instance);
+            NullLogger<FlowAbandonmentService>.Instance,
+            demoRevoker);
 
         var first = await service.AbandonAsync(flowId);
         var repeated = await service.AbandonAsync(flowId);
 
         Assert.Equal(FlowStatus.Abandoned, first.Status);
         Assert.Equal(FlowStatus.Abandoned, repeated.Status);
+        Assert.Equal(flowId, Assert.Single(demoRevoker.FlowIds));
         Assert.False(Directory.Exists(ownedRoot));
         Assert.True(Directory.Exists(siblingRoot));
         Directory.Delete(root, recursive: true);
@@ -416,6 +419,20 @@ public sealed class FlowAbandonmentTests
         {
             Cancelled = true;
             return Task.FromResult(true);
+        }
+    }
+
+    private sealed class RecordingDemoRuntimeRevoker : IDemoRuntimeRevoker
+    {
+        public List<Guid> FlowIds { get; } = [];
+
+        public Task RevokeFlowAsync(
+            Guid flowId,
+            string reason,
+            CancellationToken cancellationToken = default)
+        {
+            FlowIds.Add(flowId);
+            return Task.CompletedTask;
         }
     }
 

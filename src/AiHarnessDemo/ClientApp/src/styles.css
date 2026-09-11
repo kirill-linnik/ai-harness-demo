@@ -2367,6 +2367,18 @@ summary:focus-visible {
   margin: 4px 0 0;
 }
 
+.live-demo-controls {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.live-demo-controls p {
+  margin: 4px 0 0;
+}
+
 .preview-artifact-tabs {
   max-width: 100%;
   overflow-x: auto;

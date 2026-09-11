@@ -14,6 +14,14 @@ Prepare the configured delivery outcome without crossing the customer approval b
 - Studio preview artifacts run with `connect-src 'none'`. Bundle or inline representative
   configuration, data, images, fonts, and assets so every preview boots and renders meaningful
   product content with the network disabled.
+- A live demo never replaces that offline reviewed preview and never contributes to readiness or
+  publication. Only when the assignment explicitly requests a live demo, write
+  `.customer-preview\<variant>\customer-demo.json` before sealing. Use exactly these case-sensitive
+  fields: `Version: "customer-demo-v1"`, matching `ArtifactId`, an approved `LaunchProfile`
+  (`npm`, `dotnet`, or `python`), workspace-relative `WorkingDirectory`, string-array
+  `Arguments` with exactly one `{port}` placeholder, loopback `HealthPath`, and bounded
+  `StartupTimeoutSeconds`. Never write an executable path, a shell command string, or infer launch
+  instructions from prose. Arguments must explicitly bind to `127.0.0.1`, never a wildcard.
 - Atomic preview replacement may use a temporary or `.previous` sibling, but remove every backup
   and temporary directory after the current variant is published successfully.
 - Before customer approval, create the browser artifacts, leave the working tree ready for host sealing, and never create commits, branches, tags, remotes, pushes, or pull requests during governed local candidate preparation or refresh.

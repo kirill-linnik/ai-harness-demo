@@ -124,13 +124,15 @@ export function FeedbackCard({ flow }: { flow: FlowDetailDto }) {
           >
             <RefreshIcon /> {decideFlow.isPending ? "Queuing..." : "Re-do with feedback"}
           </button>
-          <button
-            className="button success"
-            disabled={decideFlow.isPending || !flow.outcomeVerification.releaseGateId}
-            onClick={() => void decide(true)}
-          >
-            <CheckIcon /> {decideFlow.isPending ? "Queuing publication..." : "Approve and publish"}
-          </button>
+          {!flow.outcomeVerification.legacyUnverified && (
+            <button
+              className="button success"
+              disabled={decideFlow.isPending || !flow.outcomeVerification.releaseGateId}
+              onClick={() => void decide(true)}
+            >
+              <CheckIcon /> {decideFlow.isPending ? "Queuing publication..." : "Approve and publish"}
+            </button>
+          )}
         </div>
       </div>
     </section>

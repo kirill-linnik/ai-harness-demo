@@ -68,7 +68,9 @@ public sealed class ApiProjectionTests
             typeof(PreviewArtifactCatalog),
             typeof(AdvisoryArtifactCatalog),
             typeof(IReviewedCandidateService),
-            typeof(DeliveryReadinessService)
+            typeof(DeliveryReadinessService),
+            typeof(DemoRuntimeManager),
+            typeof(DemoReverseProxy)
         };
         foreach (var serviceType in serviceTypes)
         {
@@ -107,6 +109,11 @@ public sealed class ApiProjectionTests
             ("GET", "/api/flows/{flowId:guid}/review-result"),
             ("GET", "/api/flows/{flowId:guid}/artifacts/{artifactId}/{**path}"),
             ("GET", "/api/previews/{flowId:guid}"),
+            ("GET", "/api/previews/{flowId:guid}/artifacts/{artifactId}/demo"),
+            ("POST", "/api/previews/{flowId:guid}/artifacts/{artifactId}/demo/start"),
+            ("POST", "/api/previews/{flowId:guid}/artifacts/{artifactId}/demo/restart"),
+            ("POST", "/api/previews/{flowId:guid}/artifacts/{artifactId}/demo/stop"),
+            ("GET", "/api/demos/{instanceId:guid}/{**path}"),
             ("GET", "/api/previews/{flowId:guid}/artifacts/{artifactId}/{**path}")
         };
 
@@ -678,6 +685,8 @@ public sealed class ApiProjectionTests
             NullLogger<ApiExceptionHandler>.Instance);
         var lifecycleContext = NewContext("/api/flows/flow/review");
         var admissionContext = NewContext("/api/intake");
+        var demoContext = NewContext(
+            $"/api/demos/{Guid.NewGuid():D}/missing.js");
 
         Assert.True(await handler.TryHandleAsync(
             lifecycleContext,
@@ -705,6 +714,20 @@ public sealed class ApiProjectionTests
                 .GetProperty("failures")
                 .EnumerateArray()
                 .Select(item => item.GetString()));
+
+        Assert.True(await handler.TryHandleAsync(
+            demoContext,
+            new DemoRuntimeException(
+                DemoConflictCodes.InvalidTransition,
+                "The demo is stopped."),
+            CancellationToken.None));
+        Assert.Equal(
+            DemoReverseProxy.IsolationPolicy,
+            demoContext.Response.Headers.ContentSecurityPolicy);
+        Assert.DoesNotContain(
+            "allow-same-origin",
+            demoContext.Response.Headers.ContentSecurityPolicy.ToString(),
+            StringComparison.Ordinal);
     }
 
     [Fact]

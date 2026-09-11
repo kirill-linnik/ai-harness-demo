@@ -524,11 +524,13 @@ public sealed record PreviewDto(
     FlowStatus Status,
     string OutcomeLabel,
     FlowOutcomeDto? OutcomeResult,
+    HistoricalDeliveryEvidenceDto? HistoricalDeliveryEvidence,
     IReadOnlyList<PreviewArtifactDto> Artifacts,
     IReadOnlyList<FlowStepDto> DeliveredBy,
     FlowReviewSummaryDto Review,
     ReviewPublicationStatus PublicationStatus,
     OutcomeVerificationDto OutcomeVerification,
+    DeliveryReadinessDto? DeliveryReadiness,
     DateTimeOffset GeneratedAt);
 
 public sealed record PreviewArtifactDto(
@@ -539,7 +541,29 @@ public sealed record PreviewArtifactDto(
     string? MediaType,
     int? ByteLength,
     string? DownloadUrl,
-    bool Interactive);
+    bool Interactive,
+    DemoCapability DemoCapability,
+    Guid? DemoInstanceId,
+    DemoInstanceState DemoState,
+    string? DemoUrl,
+    string? DemoFailureDetail,
+    string? DemoCandidateFingerprint,
+    string? DemoManifestHash);
+
+public sealed record HistoricalDeliveryEvidenceDto(
+    bool NonAuthoritative,
+    IReadOnlyList<HistoricalDeliveryEvidenceItemDto> Items);
+
+public sealed record HistoricalDeliveryEvidenceItemDto(
+    string Kind,
+    string AgentName,
+    string Label,
+    string Markdown,
+    DateTimeOffset? CompletedAt);
+
+public sealed record DemoMutationRequest(
+    string CandidateFingerprint,
+    string ManifestHash);
 
 public sealed record FlowOutcomeDto(
     string Goal,
@@ -965,6 +989,61 @@ public static class ApiMappings
                     item.Confidence,
                     item.Reason))
                 .ToList());
+
+    /// <summary>
+    /// Bounded display-only projection for historical flows that never produced flow-outcome-v1.
+    /// Role prose is not parsed and never contributes to readiness or publication authorization.
+    /// </summary>
+    public static HistoricalDeliveryEvidenceDto?
+        ToHistoricalDeliveryEvidenceDto(this FlowRun flow)
+    {
+        if (!string.Equals(flow.ContractVersion, "legacy-v1", StringComparison.Ordinal) ||
+            flow.ToFlowOutcomeDto() is not null)
+        {
+            return null;
+        }
+
+        var requestedRoles = new[]
+        {
+            (Role: "software-engineer", Kind: "Implementation"),
+            (Role: "quality-engineer", Kind: "Quality verification"),
+            (Role: "release-engineer", Kind: "Release package")
+        };
+        var items = requestedRoles
+            .Select(requested =>
+                flow.Steps
+                    .Where(step =>
+                        step.Status == StepStatus.Completed &&
+                        string.Equals(
+                            step.AgentRole,
+                            requested.Role,
+                            StringComparison.Ordinal) &&
+                        !string.IsNullOrWhiteSpace(step.OutputSummary))
+                    .OrderByDescending(step => step.CompletedAt)
+                    .ThenByDescending(step => step.Iteration)
+                    .ThenByDescending(step => step.Sequence)
+                    .ThenByDescending(step => step.Attempt)
+                    .Select(step => new HistoricalDeliveryEvidenceItemDto(
+                        requested.Kind,
+                        step.AgentName,
+                        string.IsNullOrWhiteSpace(step.Label)
+                            ? requested.Kind
+                            : step.Label,
+                        step.OutputSummary.Length <= 20_000
+                            ? step.OutputSummary
+                            : step.OutputSummary[..20_000] +
+                              "\n\n_[Historical output truncated by Studio]_",
+                        step.CompletedAt))
+                    .FirstOrDefault())
+            .Where(item => item is not null)
+            .Cast<HistoricalDeliveryEvidenceItemDto>()
+            .ToList();
+        return items.Count == 0
+            ? null
+            : new HistoricalDeliveryEvidenceDto(
+                NonAuthoritative: true,
+                items);
+    }
 
     public static LearningDto ToDto(this HarnessLearning learning) =>
         new(

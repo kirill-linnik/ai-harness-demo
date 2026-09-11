@@ -294,6 +294,64 @@ authorization input for review, waiver, acceptance, publication, and final appro
   then rechecks the same candidate bytes.
 - Failed publication retains authorization and is retried only through explicit manual restart.
 
+### Reviewed previews and non-authoritative live demos
+
+The reviewed preview and live demo have deliberately different trust boundaries:
+
+- `.customer-preview\<variant>` remains part of the sealed candidate manifest. Studio rechecks every
+  reviewed file length and SHA-256 digest and serves it with `connect-src 'none'`; this immutable,
+  network-disabled representation is the customer-review artifact.
+- A live demo is opt-in convenience only. It does not contribute evidence, readiness, waiver,
+  acceptance, publication authorization, or final approval. Legacy candidates without a sealed
+  manifest remain offline-preview-only.
+- The only launch source is a sealed
+  `.customer-preview\<variant>\customer-demo.json`. `customer-demo-v1` rejects unknown, duplicate,
+  missing, or case-mismatched properties and accepts only `Version`, `ArtifactId`, `LaunchProfile`,
+  `WorkingDirectory`, `Arguments`, `HealthPath`, and `StartupTimeoutSeconds`. Arguments contain
+  exactly one `{port}` token. npm application arguments structurally require exactly one explicit
+  `--host`, `--listen`, or `--bind` option whose value is exactly `127.0.0.1`; wildcard, hostname,
+  duplicate, conflicting, substring-only, and unknown host-affecting forms fail. Paths remain under
+  the flow workspace.
+- `CustomerDemoLaunchPolicy` centrally maps the approved `npm`, `dotnet`, and `python` profiles to
+  resolved host executables. `npx` and package acquisition are unsupported. Each profile has a
+  strict argument grammar; manifests cannot name an executable, shell string, host-affecting
+  switch, or path outside the workspace.
+  Candidate code still executes with the local user's authority, which is why launch is explicit,
+  loopback-only, bounded, and never automatic. This generic policy does not attempt dependency
+  installation; missing tools or dependencies fail visibly.
+- `DemoInstanceRecord` persists the exact candidate/manifest binding, workspace and launch identity,
+  PID plus process-start identity, assigned port, state, health timestamps, and bounded diagnostics.
+  A unique binding index provides one row per candidate artifact; a partial unique index prevents
+  two active Studio records from claiming one port.
+- `DemoRuntimeManager` serializes operations per flow/artifact. It probes a bounded configurable
+  loopback range, claims the port durably, starts a structured `ProcessStartInfo.ArgumentList`,
+  injects the selected port, and requires a bounded HTTP health check. Before `Running`, reuse,
+  reconciliation, or proxy access, the host also verifies that the exact `127.0.0.1` listener is
+  owned by the recorded process or its descendant; wildcard, foreign, mixed, and unverifiable
+  listeners fail closed. Failure stops only the identity-matched owned process and persists
+  `Failed`.
+- Startup reconciliation handles each active row independently. It validates the exact candidate,
+  manifest, workspace, launch, PID/start, and health binding once and caches a proxy lease; stale
+  owned processes are stopped, ownership mismatches are never killed, and Studio never auto-starts
+  demos.
+- `/api/demos/{instanceId}/{**path}` uses only that reconciled lease, exact persisted equality,
+  process and live listener ownership, and cached health to proxy to the persisted loopback port.
+  It does not walk workspace links or revalidate the reviewed candidate per asset. Health checks
+  are rate-limited, require consecutive failures, and emit only actual state transitions.
+- Every proxy response, including redirects and failures, applies CSP `sandbox` without
+  `allow-same-origin` and uses `Cross-Origin-Resource-Policy: cross-origin` so subresources remain
+  loadable from the sandbox's opaque origin. Opaque-origin CORS is terminated at the proxy and
+  translated to the owned upstream origin, preserving proxied `POST`, `PUT`, `PATCH`, and `DELETE`
+  without giving candidate JavaScript harness-origin authority. Redirects stay under the stable
+  instance prefix and trailing slashes are preserved. WebSockets are intentionally unsupported.
+- Customer decisions queue durable work before the best-effort immediate revocation call.
+  `FlowWorker` independently repeats and confirms revocation before any queued execution; a
+  transient revocation failure leaves the flow queued and retries without invoking an agent.
+- Every state change appends a `FlowEvent`. Harness lifecycle mutations use the
+  `X-AI-Harness-Request` local-request guard; only the exact instance proxy route is exempt for
+  opaque-origin application traffic. Stale candidate or manifest identities return typed
+  conflicts.
+
 Promotion transfers only a bounded `advisory-promotion-seed-v1` containing the accepted goal and
 implementation details. It does not copy messages, tools, sessions, steps, plan documents, events,
 or the parent workspace. The child runs normal Account Manager and Team Lead stages with a fresh

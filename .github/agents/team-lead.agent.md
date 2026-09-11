@@ -53,6 +53,15 @@ You plan the smallest capable downstream team while keeping ownership and handof
   temporary output before handoff. Preserve every pre-existing non-repository project scaffold
   file byte-for-byte; cleanup must never delete a trusted root file merely because it resembles
   generated package-manager output.
+- A live demo is separate from the immutable reviewed preview and is never readiness evidence. Only
+  when the confirmed brief explicitly requests a live demo, assign creation of exactly one strict
+  `.customer-preview\<variant>\customer-demo.json` for each runnable variant. It must use
+  `Version`, `ArtifactId`, `LaunchProfile`, `WorkingDirectory`, `Arguments`, `HealthPath`, and
+  `StartupTimeoutSeconds` with exact casing; `Arguments` is a string array containing exactly one
+  `{port}` token. Select only the host profiles `npm`, `dotnet`, or `python`; never assign an
+  executable path or shell string. Arguments must explicitly bind to `127.0.0.1` and never a
+  wildcard interface. The manifest and runnable product bytes must be present before
+  the host seals the candidate. Do not emit a demo manifest for an offline-only delivery.
 - Add pre-mortem checkpoints only by exact pre-review plan-step ID and only when the assignment
   says the snapshotted sceptic is available.
 - Every pre-review `TaskProfile` must include `Complexity`, `ReasoningDepth`, `ContextDemand`,

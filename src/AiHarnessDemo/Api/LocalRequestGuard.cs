@@ -19,6 +19,7 @@ public static class LocalRequestGuard
     {
         var stateChanging =
             context.Request.Path.StartsWithSegments("/api") &&
+            !IsExactDemoProxyRoute(context.Request.Path) &&
             (
                 HttpMethods.IsPost(context.Request.Method) ||
                 HttpMethods.IsPut(context.Request.Method) ||
@@ -39,5 +40,23 @@ public static class LocalRequestGuard
         }
 
         await next(context);
+    }
+
+    internal static bool IsExactDemoProxyRoute(PathString path)
+    {
+        var value = path.Value;
+        const string prefix = "/api/demos/";
+        if (value is null ||
+            !value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var remainder = value[prefix.Length..];
+        var separator = remainder.IndexOf('/');
+        var instance = separator < 0
+            ? remainder
+            : remainder[..separator];
+        return Guid.TryParseExact(instance, "D", out _);
     }
 }

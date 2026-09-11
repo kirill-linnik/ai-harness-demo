@@ -54,6 +54,31 @@ builder.Services.AddSingleton<PreviewArtifactCatalog>();
 builder.Services.AddSingleton<AdvisoryArtifactCatalog>();
 builder.Services.AddSingleton<CandidateFingerprintService>();
 builder.Services.AddSingleton<IReviewedCandidateService, ReviewedCandidateService>();
+builder.Services.AddSingleton<ISealedDemoManifestService, SealedDemoManifestService>();
+builder.Services.AddSingleton<IDemoProcessLauncher, SystemDemoProcessLauncher>();
+builder.Services.AddSingleton<IDemoHealthProbe, HttpDemoHealthProbe>();
+builder.Services.AddSingleton(_ =>
+{
+    var section = builder.Configuration.GetSection("DemoRuntime");
+    return new DemoRuntimeOptions
+    {
+        FirstPort = section.GetValue<int?>("FirstPort") ?? 43100,
+        LastPort = section.GetValue<int?>("LastPort") ?? 43299,
+        MaximumPortAttempts =
+            section.GetValue<int?>("MaximumPortAttempts") ?? 40,
+        HealthPollMilliseconds =
+            section.GetValue<int?>("HealthPollMilliseconds") ?? 200,
+        ProxyHealthCacheMilliseconds =
+            section.GetValue<int?>("ProxyHealthCacheMilliseconds") ?? 2_000,
+        ConsecutiveHealthFailureThreshold =
+            section.GetValue<int?>("ConsecutiveHealthFailureThreshold") ?? 3
+    };
+});
+builder.Services.AddSingleton<DemoRuntimeManager>();
+builder.Services.AddSingleton<IDemoRuntimeRevoker>(
+    services => services.GetRequiredService<DemoRuntimeManager>());
+builder.Services.AddHostedService<DemoRuntimeShutdownService>();
+builder.Services.AddSingleton<DemoReverseProxy>();
 builder.Services.AddSingleton<OutcomeVerificationContextBuilder>();
 builder.Services.AddSingleton<IVerifiedCandidatePublisher, VerifiedCandidatePublisher>();
 builder.Services.AddSingleton<IWorkspaceProcessCleaner, WorkspaceProcessCleaner>();
@@ -107,6 +132,9 @@ await app.Services
 await app.Services
     .GetRequiredService<FlowAbandonmentService>()
     .ResumePendingAsync();
+await app.Services
+    .GetRequiredService<DemoRuntimeManager>()
+    .ReconcileAsync();
 
 app.UseExceptionHandler();
 app.Use(LocalRequestGuard.ApplyAsync);

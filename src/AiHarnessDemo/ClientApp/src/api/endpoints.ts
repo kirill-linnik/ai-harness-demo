@@ -12,6 +12,8 @@ import type {
   DirectoryListingDto,
   DirectReviewRequest,
   DirectReviewResponse,
+  DemoMutationRequest,
+  DemoRuntimeStatus,
   FeedbackRequest,
   FeedbackResponse,
   FlowDetailDto,
@@ -100,5 +102,24 @@ export const api = {
     }),
   history: () => request<HistoryItemDto[]>("/api/history"),
   learnings: () => request<LearningDto[]>("/api/learnings"),
-  preview: (flowId: string) => request<PreviewDto>(`/api/previews/${flowId}`)
+  preview: (flowId: string) => request<PreviewDto>(`/api/previews/${flowId}`),
+  demoStatus: (flowId: string, artifactId: string) =>
+    request<DemoRuntimeStatus>(
+      `/api/previews/${flowId}/artifacts/${encodeURIComponent(artifactId)}/demo`
+    ),
+  startDemo: (flowId: string, artifactId: string, body: DemoMutationRequest) =>
+    request<DemoRuntimeStatus>(
+      `/api/previews/${flowId}/artifacts/${encodeURIComponent(artifactId)}/demo/start`,
+      { method: "POST", body }
+    ),
+  restartDemo: (flowId: string, artifactId: string, body: DemoMutationRequest) =>
+    request<DemoRuntimeStatus>(
+      `/api/previews/${flowId}/artifacts/${encodeURIComponent(artifactId)}/demo/restart`,
+      { method: "POST", body }
+    ),
+  stopDemo: (flowId: string, artifactId: string, body: DemoMutationRequest) =>
+    request<DemoRuntimeStatus>(
+      `/api/previews/${flowId}/artifacts/${encodeURIComponent(artifactId)}/demo/stop`,
+      { method: "POST", body }
+    )
 };

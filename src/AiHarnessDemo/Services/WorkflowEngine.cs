@@ -12074,6 +12074,7 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
 {
     private readonly FlowQueue _queue;
     private readonly Func<Guid, CancellationToken, Task> _runFlowAsync;
+    private readonly Func<Guid, CancellationToken, Task>? _prepareFlowAsync;
     private readonly Func<CancellationToken, Task<IReadOnlyList<Guid>>>
         _recoverFlowsAsync;
     private readonly Func<Guid, CancellationToken, Task<bool>> _isRunnableAsync;
@@ -12086,13 +12087,21 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
     public FlowWorker(
         FlowQueue queue,
         WorkflowEngine engine,
-        ILogger<FlowWorker> logger)
+        ILogger<FlowWorker> logger,
+        IDemoRuntimeRevoker? demoRuntimeRevoker = null)
         : this(
             queue,
             engine.RunAsync,
             engine.RecoverInterruptedFlowsAsync,
             engine.IsRunnableAsync,
-            logger)
+            logger,
+            demoRuntimeRevoker is null
+                ? null
+                : (flowId, cancellationToken) =>
+                    demoRuntimeRevoker.RevokeFlowAsync(
+                        flowId,
+                        "Live demos were revoked by the execution preflight.",
+                        cancellationToken))
     {
     }
 
@@ -12101,13 +12110,15 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         Func<Guid, CancellationToken, Task> runFlowAsync,
         Func<CancellationToken, Task<IReadOnlyList<Guid>>> recoverFlowsAsync,
         Func<Guid, CancellationToken, Task<bool>> isRunnableAsync,
-        ILogger<FlowWorker> logger)
+        ILogger<FlowWorker> logger,
+        Func<Guid, CancellationToken, Task>? prepareFlowAsync = null)
     {
         _queue = queue;
         _runFlowAsync = runFlowAsync;
         _recoverFlowsAsync = recoverFlowsAsync;
         _isRunnableAsync = isRunnableAsync;
         _logger = logger;
+        _prepareFlowAsync = prepareFlowAsync;
     }
 
     internal bool HasPendingRerun(Guid flowId)
@@ -12262,7 +12273,7 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         Task task;
         try
         {
-            task = _runFlowAsync(flowId, source.Token);
+            task = RunPreparedAsync(flowId, source.Token);
         }
         catch (Exception exception)
         {
@@ -12271,6 +12282,41 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         state.Cancellation = source;
         state.ActiveTask = task;
         return (task, source);
+    }
+
+    private async Task RunPreparedAsync(
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        if (_prepareFlowAsync is not null)
+        {
+            try
+            {
+                await _prepareFlowAsync(flowId, cancellationToken);
+            }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning(
+                    exception,
+                    "Flow {FlowId} execution preflight failed; durable work will be retried.",
+                    flowId);
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                if (!_queue.Queue(flowId))
+                {
+                    throw new InvalidOperationException(
+                        $"Flow {flowId} execution preflight failed and could not be re-queued.",
+                        exception);
+                }
+                return;
+            }
+        }
+
+        await _runFlowAsync(flowId, cancellationToken);
     }
 
     private async Task ObserveAsync(

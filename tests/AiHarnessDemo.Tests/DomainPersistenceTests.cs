@@ -24,6 +24,7 @@ public sealed class DomainPersistenceTests
 
         Assert.True(await TableExistsAsync(connection, "FlowAgentSnapshots"));
         Assert.True(await TableExistsAsync(connection, "FlowPlanDocuments"));
+        Assert.True(await TableExistsAsync(connection, "DemoInstances"));
         Assert.Equal(
             IntakeV2Parser.MaximumJsonCharacters,
             database.Model.FindEntityType(typeof(FlowEvent))!
@@ -41,6 +42,14 @@ public sealed class DomainPersistenceTests
             "SELECT COUNT(*) FROM pragma_index_list('FlowPlanDocuments') " +
             "WHERE name = 'IX_FlowPlanDocuments_FlowRunId_Iteration' AND [unique] = 1;";
         Assert.Equal(1L, Convert.ToInt64(await indexProbe.ExecuteScalarAsync()));
+
+        await using var demoIndexProbe = connection.CreateCommand();
+        demoIndexProbe.CommandText =
+            "SELECT COUNT(*) FROM pragma_index_list('DemoInstances') " +
+            "WHERE name = 'IX_DemoInstances_ActivePort' AND [unique] = 1;";
+        Assert.Equal(
+            1L,
+            Convert.ToInt64(await demoIndexProbe.ExecuteScalarAsync()));
     }
 
     [Fact]
@@ -147,8 +156,10 @@ public sealed class DomainPersistenceTests
         await using var database = CreateDatabase(connection);
         await DatabaseInitializer.EnsureFlowRunSchemaAsync(database);
         await DatabaseInitializer.EnsureSliceOneSchemaAsync(database);
+        await DatabaseInitializer.EnsureDemoRuntimeSchemaAsync(database);
         await DatabaseInitializer.EnsureFlowRunSchemaAsync(database);
         await DatabaseInitializer.EnsureSliceOneSchemaAsync(database);
+        await DatabaseInitializer.EnsureDemoRuntimeSchemaAsync(database);
 
         database.ChangeTracker.Clear();
         var flow = await database.Flows
@@ -169,6 +180,7 @@ public sealed class DomainPersistenceTests
         Assert.Equal(AgentDefinitionStatus.Valid, agent.DefinitionStatus);
         Assert.True(agent.Switchable);
         Assert.Empty(await database.FlowAgentSnapshots.ToListAsync());
+        Assert.True(await TableExistsAsync(connection, "DemoInstances"));
     }
 
     [Fact]
