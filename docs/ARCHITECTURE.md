@@ -94,10 +94,14 @@ active or Blocked -> Abandoning -> Abandoned
 Running -> Approved               (verified post-approval publication)
 ```
 
-Restart has one additional guarded operation, `Running | Reworking -> Queued`, used only after
-interrupted attempts have been reconciled. API handlers and coordinators do not assign
-`FlowRun.Status` directly. Step state plus append-only `FlowEvent` entries make execution,
-materialization, recovery, review, failure, and cleanup visible.
+Recovery has one additional guarded operation, `Running | Reworking -> Queued`, used only after
+interrupted attempts have been reconciled. The flow detail page exposes this as an explicit escape
+hatch for execution that stopped progressing after system sleep, terminal loss, or another runtime
+interruption. It cancels only that flow's worker, inspects the persisted Copilot journal, and
+requeues the same attempt with its workspace, session identity, workflow revision, and effective
+permission ceiling intact. API handlers and coordinators do not assign `FlowRun.Status` directly.
+Step state plus append-only `FlowEvent` entries make execution, materialization, recovery, review,
+failure, and cleanup visible.
 
 ### Advisory lifecycle
 
@@ -421,6 +425,7 @@ At startup, `CopilotSessionJournal` and `WorkflowEngine` reconcile:
 | --- | --- |
 | Completed valid journal attempt | Complete the existing `FlowStep` once and continue downstream. |
 | Interrupted resumable attempt | Stop only a verified orphan process, retain the session ID, reset the same attempt to pending, and queue it once. |
+| Live flow manually recovered after suspend or terminal loss | Cancel only its current worker, run the same journal reconciliation, preserve the attempt contract and workspace, and requeue it. |
 | Linked Intake with a pending initial Account Manager step | Execute that exact durable step once through the normal intake coordinator. |
 | Linked Intake with a running initial Account Manager step | Apply a current valid journal result, resume the verified interrupted session, or record a visible manual-retry failure. |
 | Failed attempt | Stay `Failed` until explicit manual restart. |

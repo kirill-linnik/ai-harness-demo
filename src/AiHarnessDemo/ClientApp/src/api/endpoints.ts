@@ -62,6 +62,8 @@ export const api = {
     request<FlowDetailDto>(`/api/flows/${flowId}/start`, { method: "POST", body: {} }),
   restartFlow: (flowId: string) =>
     request<FlowDetailDto>(`/api/flows/${flowId}/restart`, { method: "POST", body: {} }),
+  recoverFlow: (flowId: string) =>
+    request<FlowDetailDto>(`/api/flows/${flowId}/recover`, { method: "POST", body: {} }),
   reviewFlow: (flowId: string, body: DirectReviewRequest) =>
     request<DirectReviewResponse>(`/api/flows/${flowId}/review`, {
       method: "POST",

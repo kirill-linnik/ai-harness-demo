@@ -114,6 +114,8 @@ builder.Services.AddSingleton<ReviewCoordinator>();
 builder.Services.AddSingleton<FlowWorker>();
 builder.Services.AddSingleton<IFlowExecutionController>(
     services => services.GetRequiredService<FlowWorker>());
+builder.Services.AddSingleton<IFlowRecoveryController>(
+    services => services.GetRequiredService<FlowWorker>());
 builder.Services.AddSingleton<FlowAbandonmentService>();
 builder.Services.AddHostedService(
     services => services.GetRequiredService<FlowWorker>());

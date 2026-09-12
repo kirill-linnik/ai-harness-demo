@@ -7620,7 +7620,7 @@ public sealed class WorkflowEngine(
             FlowStepId = stepId,
             Type = "step.interrupted",
             Message =
-                $"{step.AgentName} was interrupted by host shutdown; its Copilot session will be reconciled on restart."
+                $"{step.AgentName} was interrupted before completion; its persisted Copilot session will be reconciled before execution continues."
         });
         await database.SaveChangesAsync(cancellationToken);
     }
@@ -8103,6 +8103,44 @@ public sealed class WorkflowEngine(
         });
     }
 
+    private static IQueryable<InterruptedStepCandidate> QueryInterruptedSteps(
+        HarnessDbContext database,
+        Guid? flowId = null) =>
+        from step in database.FlowSteps.AsNoTracking()
+        join flow in database.Flows.AsNoTracking()
+            on step.FlowRunId equals flow.Id
+        where (!flowId.HasValue || step.FlowRunId == flowId.Value) &&
+              step.Status == StepStatus.Running &&
+              (step.InvocationKind !=
+                   ExecutionInvocationKind.ReviewClassification ||
+               !database.FlowEvents.Any(flowEvent =>
+                   flowEvent.FlowStepId == step.Id &&
+                   flowEvent.Type ==
+                   ReviewCoordinator.FeedbackRequestEventType)) &&
+              (flow.Status == FlowStatus.Queued ||
+               flow.Status == FlowStatus.Running ||
+               flow.Status == FlowStatus.Reworking)
+        select new InterruptedStepCandidate(
+            step.Id,
+            step.FlowRunId,
+            step.Iteration,
+            step.AgentId,
+            step.AgentName,
+            step.AgentRole,
+            step.PlanStepKey,
+            flow.WorkspacePath,
+            step.StartedAt,
+            step.CopilotSessionId,
+            step.CopilotSessionHome,
+            step.PreMortemReviewStepId != null,
+            step.Kind == FlowStepKind.OutcomeQa,
+            step.ExecutionPrompt,
+            step.WorkflowRevision,
+            flow.ContractVersion,
+            step.InvocationKind,
+            step.IsOutcomeOwner,
+            flow.Kind);
+
     internal async Task<IReadOnlyList<Guid>> RecoverInterruptedFlowsAsync(
         CancellationToken cancellationToken)
     {
@@ -8110,41 +8148,7 @@ public sealed class WorkflowEngine(
         List<InterruptedStepCandidate> failedStalledSteps;
         await using (var database = await databaseFactory.CreateDbContextAsync(cancellationToken))
         {
-            interruptedSteps = await (
-                    from step in database.FlowSteps.AsNoTracking()
-                    join flow in database.Flows.AsNoTracking()
-                        on step.FlowRunId equals flow.Id
-                    where step.Status == StepStatus.Running &&
-                          (step.InvocationKind !=
-                               ExecutionInvocationKind.ReviewClassification ||
-                           !database.FlowEvents.Any(flowEvent =>
-                               flowEvent.FlowStepId == step.Id &&
-                               flowEvent.Type ==
-                               ReviewCoordinator
-                                   .FeedbackRequestEventType)) &&
-                          (flow.Status == FlowStatus.Queued ||
-                           flow.Status == FlowStatus.Running ||
-                           flow.Status == FlowStatus.Reworking)
-                    select new InterruptedStepCandidate(
-                        step.Id,
-                        step.FlowRunId,
-                        step.Iteration,
-                        step.AgentId,
-                        step.AgentName,
-                        step.AgentRole,
-                        step.PlanStepKey,
-                        flow.WorkspacePath,
-                        step.StartedAt,
-                        step.CopilotSessionId,
-                        step.CopilotSessionHome,
-                        step.PreMortemReviewStepId != null,
-                        step.Kind == FlowStepKind.OutcomeQa,
-                        step.ExecutionPrompt,
-                        step.WorkflowRevision,
-                        flow.ContractVersion,
-                        step.InvocationKind,
-                        step.IsOutcomeOwner,
-                        flow.Kind))
+            interruptedSteps = await QueryInterruptedSteps(database)
                 .ToListAsync(cancellationToken);
             failedStalledSteps = await (
                     from step in database.FlowSteps.AsNoTracking()
@@ -8411,6 +8415,104 @@ public sealed class WorkflowEngine(
             interruptedSteps.Count + failedStalledSteps.Count,
             resumedFlowIds.Count);
         return resumedFlowIds.ToList();
+    }
+
+    internal async Task RecoverActiveFlowAsync(
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await _manualRestartGate.WaitAsync(cancellationToken);
+        try
+        {
+            List<InterruptedStepCandidate> interruptedSteps;
+            await using (var database =
+                         await databaseFactory.CreateDbContextAsync(cancellationToken))
+            {
+                interruptedSteps = await QueryInterruptedSteps(database, flowId)
+                    .ToListAsync(cancellationToken);
+            }
+
+            foreach (var candidate in interruptedSteps)
+            {
+                try
+                {
+                    await RecoverInterruptedStepAsync(candidate, cancellationToken);
+                }
+                catch (OperationCanceledException) when (
+                    cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    logger.LogError(
+                        exception,
+                        "Manual recovery could not reconcile interrupted step {StepId} in flow {FlowId}.",
+                        candidate.StepId,
+                        candidate.FlowId);
+                    await AddEventAsync(
+                        candidate.FlowId,
+                        candidate.StepId,
+                        "step.recovery-failed",
+                        $"Manual interrupted-session recovery failed: {exception.Message}",
+                        CancellationToken.None);
+                    await MarkStepFailedAsync(
+                        candidate.StepId,
+                        exception,
+                        durationMilliseconds: null,
+                        CancellationToken.None,
+                        (exception as CompletedJournalContractException)?.Output);
+                    await MarkFailedAsync(
+                        candidate.FlowId,
+                        exception.Message,
+                        CancellationToken.None);
+                    throw new InvalidOperationException(
+                        "The interrupted execution could not be recovered and the flow was moved to Failed.",
+                        exception);
+                }
+            }
+
+            await using var lifecycleLease =
+                await _lifecycle.EnterAsync(flowId, cancellationToken);
+            await using var flowDatabase =
+                await databaseFactory.CreateDbContextAsync(cancellationToken);
+            var flow = await flowDatabase.Flows
+                           .Include(item => item.Events)
+                           .SingleOrDefaultAsync(
+                               item => item.Id == flowId,
+                               cancellationToken)
+                       ?? throw new KeyNotFoundException(
+                           $"Factory flow '{flowId}' was not found.");
+            if (flow.Status is not (
+                    FlowStatus.Queued or
+                    FlowStatus.Running or
+                    FlowStatus.Reworking))
+            {
+                throw new FlowLifecycleException(
+                    flow.Id,
+                    flow.Status,
+                    FlowStatus.Queued,
+                    "manual recovery applies only to queued, running, or reworking flows");
+            }
+
+            _lifecycle.RequeueAfterRecovery(flow);
+            flow.FailureReason = string.Empty;
+            flow.CompletedAt = null;
+            flow.UpdatedAt = DateTimeOffset.UtcNow;
+            flowDatabase.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                Type = "flow.manual-recovery-queued",
+                Message = interruptedSteps.Count == 0
+                    ? "Operator recovery re-queued the persisted flow after execution stopped progressing."
+                    : "Operator recovery reconciled the interrupted Copilot session and returned the flow to the queue."
+            });
+            await flowDatabase.SaveChangesAsync(cancellationToken);
+        }
+        finally
+        {
+            _manualRestartGate.Release();
+        }
     }
 
     private async Task<bool> TryRecoverCompletedFailedStepAsync(
@@ -12220,11 +12322,22 @@ public interface IFlowExecutionController
         CancellationToken cancellationToken = default);
 }
 
-public sealed class FlowWorker : BackgroundService, IFlowExecutionController
+public interface IFlowRecoveryController
+{
+    Task RecoverAsync(
+        Guid flowId,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class FlowWorker :
+    BackgroundService,
+    IFlowExecutionController,
+    IFlowRecoveryController
 {
     private readonly FlowQueue _queue;
     private readonly Func<Guid, CancellationToken, Task> _runFlowAsync;
     private readonly Func<Guid, CancellationToken, Task>? _prepareFlowAsync;
+    private readonly Func<Guid, CancellationToken, Task>? _recoverFlowAsync;
     private readonly Func<CancellationToken, Task<IReadOnlyList<Guid>>>
         _recoverFlowsAsync;
     private readonly Func<Guid, CancellationToken, Task<bool>> _isRunnableAsync;
@@ -12232,6 +12345,7 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
     private readonly Lock _stateLock = new();
     private readonly Dictionary<Guid, FlowDispatchState> _states = [];
     private readonly HashSet<Guid> _blocked = [];
+    private readonly HashSet<Guid> _recovering = [];
     private bool _stopping;
 
     public FlowWorker(
@@ -12251,7 +12365,8 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
                     demoRuntimeRevoker.RevokeFlowAsync(
                         flowId,
                         "Live demos were revoked by the execution preflight.",
-                        cancellationToken))
+                        cancellationToken),
+            engine.RecoverActiveFlowAsync)
     {
     }
 
@@ -12261,7 +12376,8 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         Func<CancellationToken, Task<IReadOnlyList<Guid>>> recoverFlowsAsync,
         Func<Guid, CancellationToken, Task<bool>> isRunnableAsync,
         ILogger<FlowWorker> logger,
-        Func<Guid, CancellationToken, Task>? prepareFlowAsync = null)
+        Func<Guid, CancellationToken, Task>? prepareFlowAsync = null,
+        Func<Guid, CancellationToken, Task>? recoverFlowAsync = null)
     {
         _queue = queue;
         _runFlowAsync = runFlowAsync;
@@ -12269,6 +12385,7 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         _isRunnableAsync = isRunnableAsync;
         _logger = logger;
         _prepareFlowAsync = prepareFlowAsync;
+        _recoverFlowAsync = recoverFlowAsync;
     }
 
     internal bool HasPendingRerun(Guid flowId)
@@ -12343,6 +12460,93 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         return source is not null;
     }
 
+    public async Task RecoverAsync(
+        Guid flowId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!await _isRunnableAsync(flowId, cancellationToken))
+        {
+            throw new InvalidOperationException(
+                "Only a queued, running, or reworking flow can be recovered.");
+        }
+
+        CancellationTokenSource? source;
+        Task? task;
+        lock (_stateLock)
+        {
+            if (_stopping)
+            {
+                throw new InvalidOperationException(
+                    "Flow recovery is unavailable while the worker is stopping.");
+            }
+            if (_blocked.Contains(flowId))
+            {
+                throw new InvalidOperationException(
+                    "A flow being abandoned cannot be recovered.");
+            }
+            if (!_recovering.Add(flowId))
+            {
+                throw new InvalidOperationException(
+                    $"Flow {flowId} recovery is already in progress.");
+            }
+
+            if (_states.TryGetValue(flowId, out var state))
+            {
+                source = state.Cancellation;
+                task = state.ActiveTask;
+            }
+            else
+            {
+                source = null;
+                task = null;
+            }
+        }
+
+        try
+        {
+            source?.Cancel();
+            if (task is not null)
+            {
+                try
+                {
+                    await task.WaitAsync(
+                        TimeSpan.FromSeconds(30),
+                        CancellationToken.None);
+                }
+                catch (OperationCanceledException) when (
+                    source?.IsCancellationRequested == true)
+                {
+                    // The interrupted attempt remains durable and is reconciled below.
+                }
+                catch (TimeoutException exception)
+                {
+                    throw new InvalidOperationException(
+                        $"Flow {flowId} did not stop within the recovery deadline.",
+                        exception);
+                }
+            }
+
+            await (_recoverFlowAsync
+                   ?? throw new InvalidOperationException(
+                       "No active-flow recovery operation is configured."))(
+                flowId,
+                CancellationToken.None);
+        }
+        finally
+        {
+            lock (_stateLock)
+            {
+                _recovering.Remove(flowId);
+            }
+        }
+
+        if (!_queue.Queue(flowId))
+        {
+            throw new InvalidOperationException(
+                $"Flow {flowId} was recovered but could not be queued.");
+        }
+    }
+
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         CancellationTokenSource[] sources;
@@ -12392,7 +12596,9 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         FlowDispatchState? state = null;
         lock (_stateLock)
         {
-            if (_stopping || _blocked.Contains(flowId))
+            if (_stopping ||
+                _blocked.Contains(flowId) ||
+                _recovering.Contains(flowId))
             {
                 return;
             }
@@ -12483,7 +12689,7 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
         catch (OperationCanceledException)
         {
             _logger.LogInformation(
-                "Factory flow {FlowId} was canceled during shutdown",
+                "Factory flow {FlowId} execution was canceled.",
                 flowId);
         }
         catch (Exception exception)
@@ -12505,7 +12711,8 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
                     state.Cancellation = null;
                     if (_stopping ||
                         stoppingToken.IsCancellationRequested ||
-                        _blocked.Contains(flowId))
+                        _blocked.Contains(flowId) ||
+                        _recovering.Contains(flowId))
                     {
                         _states.Remove(flowId);
                     }
@@ -12584,7 +12791,8 @@ public sealed class FlowWorker : BackgroundService, IFlowExecutionController
                 }
                 if (_stopping ||
                     stoppingToken.IsCancellationRequested ||
-                    _blocked.Contains(flowId))
+                    _blocked.Contains(flowId) ||
+                    _recovering.Contains(flowId))
                 {
                     _states.Remove(flowId);
                     return;

@@ -212,6 +212,18 @@ export function useRestartFlowMutation() {
   });
 }
 
+export function useRecoverFlowMutation() {
+  const queryClient = useQueryClient();
+  const invalidateProjection = useInvalidateProjection();
+  return useMutation({
+    mutationFn: (flowId: string) => api.recoverFlow(flowId),
+    onSuccess: flow => {
+      queryClient.setQueryData(queryKeys.flow(flow.id), flow);
+      return invalidateProjection(flow.id);
+    }
+  });
+}
+
 export function useSendFeedbackMutation() {
   const queryClient = useQueryClient();
   const invalidateProjection = useInvalidateProjection();

@@ -36,6 +36,7 @@ public static class DemoApi
         api.MapGet("/flows/{flowId:guid}", GetFlowAsync);
         api.MapPost("/flows/{flowId:guid}/start", StartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/restart", RestartFlowAsync);
+        api.MapPost("/flows/{flowId:guid}/recover", RecoverFlowAsync);
         api.MapPost("/flows/{flowId:guid}/review", ReviewFlowAsync);
         api.MapPost(
             "/flows/{flowId:guid}/readiness-waiver",
@@ -703,6 +704,20 @@ public static class DemoApi
             throw new InvalidOperationException("Unable to queue the restarted factory flow.");
         }
 
+        return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
+    }
+
+    private static async Task<IResult> RecoverFlowAsync(
+        Guid flowId,
+        IFlowRecoveryController recoveryController,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        CancellationToken cancellationToken)
+    {
+        await recoveryController.RecoverAsync(flowId, cancellationToken);
+        var flow = await LoadFlowAsync(
+            databaseFactory,
+            flowId,
+            CancellationToken.None);
         return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
     }
 

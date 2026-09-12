@@ -509,6 +509,130 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     [Fact]
+    public async Task ManualRecovery_PreservesTheInterruptedAttemptContract()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false,
+            persistSessionId: true,
+            contractVersion: "studio-v2");
+        Guid stepId;
+        const string effectivePermission =
+            """{"Profile":"ReadOnlySource","AllowedTools":["read"]}""";
+        await using (var database =
+                     await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var configuredStep = await database.FlowSteps.SingleAsync();
+            stepId = configuredStep.Id;
+            configuredStep.PermissionProfile =
+                ExecutionPermissionProfile.ReadOnlySource;
+            configuredStep.EffectivePermissionJson = effectivePermission;
+            await database.SaveChangesAsync();
+        }
+
+        await fixture.Engine.RecoverActiveFlowAsync(
+            fixture.FlowId,
+            CancellationToken.None);
+
+        await using var verification =
+            await fixture.DatabaseFactory.CreateDbContextAsync();
+        var flow = await verification.Flows
+            .Include(item => item.Steps)
+            .Include(item => item.Events)
+            .SingleAsync();
+        var recoveredStep = Assert.Single(flow.Steps);
+        Assert.Equal(FlowStatus.Queued, flow.Status);
+        Assert.Equal(stepId, recoveredStep.Id);
+        Assert.Equal(StepStatus.Pending, recoveredStep.Status);
+        Assert.Equal(
+            AgentRunPhase.CanceledByReconciliation,
+            recoveredStep.Phase);
+        Assert.Equal(fixture.SessionId, recoveredStep.CopilotSessionId);
+        Assert.Equal(
+            "Original durable execution prompt.",
+            recoveredStep.ExecutionPrompt);
+        Assert.Equal(new string('A', 64), recoveredStep.WorkflowRevision);
+        Assert.Equal(
+            ExecutionPermissionProfile.ReadOnlySource,
+            recoveredStep.PermissionProfile);
+        Assert.Equal(
+            effectivePermission,
+            recoveredStep.EffectivePermissionJson);
+        Assert.Contains(
+            flow.Events,
+            item => item.Type == "flow.manual-recovery-queued");
+    }
+
+    [Fact]
+    public async Task FlowWorker_ManualRecoveryCancelsAndRequeuesOneExecution()
+    {
+        var queue = new FlowQueue();
+        var flowId = Guid.NewGuid();
+        var firstStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstCanceled = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumed = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var runCount = 0;
+        var recoveryCount = 0;
+
+        async Task RunAsync(Guid _, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref runCount) == 1)
+            {
+                firstStarted.TrySetResult();
+                try
+                {
+                    await Task.Delay(
+                        Timeout.InfiniteTimeSpan,
+                        cancellationToken);
+                }
+                catch (OperationCanceledException) when (
+                    cancellationToken.IsCancellationRequested)
+                {
+                    firstCanceled.TrySetResult();
+                    throw;
+                }
+            }
+            else
+            {
+                resumed.TrySetResult();
+            }
+        }
+
+        Task RecoverAsync(Guid _, CancellationToken __)
+        {
+            Assert.True(firstCanceled.Task.IsCompleted);
+            Interlocked.Increment(ref recoveryCount);
+            return Task.CompletedTask;
+        }
+
+        using var worker = new FlowWorker(
+            queue,
+            RunAsync,
+            _ => Task.FromResult<IReadOnlyList<Guid>>([]),
+            (_, _) => Task.FromResult(true),
+            NullLogger<FlowWorker>.Instance,
+            recoverFlowAsync: RecoverAsync);
+        await worker.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(queue.Queue(flowId));
+            await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await worker.RecoverAsync(flowId, CancellationToken.None);
+            await resumed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(2, Volatile.Read(ref runCount));
+            Assert.Equal(1, Volatile.Read(ref recoveryCount));
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task StudioV2Recovery_MissingPersistedPromptFailsClosedBeforeRerun()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(

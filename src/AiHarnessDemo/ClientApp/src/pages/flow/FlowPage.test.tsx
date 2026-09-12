@@ -314,6 +314,73 @@ afterEach(() => {
 });
 
 describe("FlowPage manual restart", () => {
+  it("offers guarded recovery for an execution stalled after suspension", async () => {
+    const running: FlowDetailDto = {
+      ...failedFlow(),
+      status: "Running",
+      failureReason: "",
+      completedAt: null,
+      steps: [
+        step({
+          status: "Running",
+          phase: "StreamingTurn",
+          completedAt: null
+        })
+      ]
+    };
+    const recovered: FlowDetailDto = {
+      ...running,
+      status: "Queued",
+      steps: [
+        step({
+          status: "Pending",
+          phase: "CanceledByReconciliation",
+          completedAt: null
+        })
+      ]
+    };
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(recovered);
+    const recoverFlow = vi.spyOn(api, "recoverFlow").mockResolvedValue(recovered);
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false }
+      }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    queryClient.setQueryData(queryKeys.flow(flowId), running);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
+            <Routes>
+              <Route path="/factory/:id" element={<FlowPage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Recover stalled execution"
+      })
+    );
+    expect(
+      screen.getByRole("dialog", { name: "Recover this flow?" })
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Stop and recover" }));
+
+    await waitFor(() => expect(recoverFlow).toHaveBeenCalledWith(flowId));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Recover this flow?" })
+      ).not.toBeInTheDocument()
+    );
+  });
+
   it("restarts a failed task and selects the scheduled retry", async () => {
     const failed = failedFlow();
     const restarted: FlowDetailDto = {

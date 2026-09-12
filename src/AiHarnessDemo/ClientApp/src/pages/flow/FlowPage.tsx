@@ -19,6 +19,7 @@ import { OutcomeVerificationPanel } from "./OutcomeVerificationPanel";
 import { BlockedFlowCard } from "./BlockedFlowCard";
 import { ReviewCard } from "./ReviewCard";
 import { ReadinessPanel } from "./ReadinessPanel";
+import { RecoverFlowButton } from "./RecoverFlowButton";
 
 export function FlowPage() {
   const { id } = useParams<{ id: string }>();
@@ -72,6 +73,10 @@ export function FlowPage() {
     flow.status === "Approved" &&
     flow.publicationStatus === "Published" &&
     Boolean(flow.outcomeUrl);
+  const canRecoverExecution =
+    flow.status === "Queued" ||
+    flow.status === "Running" ||
+    flow.status === "Reworking";
 
   async function copyFlowLink() {
     const link = `${location.origin}${location.pathname}#/factory/${flow!.id}`;
@@ -134,6 +139,7 @@ export function FlowPage() {
           </div>
         </div>
         <div className="flow-heading-actions">
+          {canRecoverExecution && <RecoverFlowButton flowId={flow.id} />}
           {flow.status !== "Approved" &&
             flow.status !== "Abandoned" &&
             flow.status !== "Blocked" && (
