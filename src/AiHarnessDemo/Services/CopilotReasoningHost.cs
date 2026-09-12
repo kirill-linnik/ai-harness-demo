@@ -341,6 +341,7 @@ public sealed partial class CopilotReasoningHost(
                     request.CopilotSessionId,
                     cliPrompt,
                     permission,
+                    copilotCli.ReasoningEffortOption,
                     context.ResumeSession ||
                     context.RecoverInterruptedSession).ToList();
                 if (governedGitIsolation is not null)
@@ -646,6 +647,7 @@ public sealed partial class CopilotReasoningHost(
         Guid copilotSessionId,
         string prompt,
         EffectiveExecutionPermission permission,
+        string reasoningEffortOption = "--reasoning-effort",
         bool resumeSession = false)
     {
         ArgumentNullException.ThrowIfNull(prompt);
@@ -667,7 +669,13 @@ public sealed partial class CopilotReasoningHost(
         };
         if (!string.Equals(effort, "default", StringComparison.OrdinalIgnoreCase))
         {
-            arguments.AddRange(["--effort", effort]);
+            if (reasoningEffortOption is not (
+                    "--reasoning-effort" or "--effort"))
+            {
+                throw new InvalidOperationException(
+                    "The Copilot CLI reasoning-effort option is invalid.");
+            }
+            arguments.AddRange([reasoningEffortOption, effort]);
         }
         arguments.AddRange(
             resumeSession
@@ -825,6 +833,7 @@ public sealed partial class CopilotReasoningHost(
             copilotSessionId,
             prompt,
             permission,
+            reasoningEffortOption: "--reasoning-effort",
             resumeSession);
     }
 

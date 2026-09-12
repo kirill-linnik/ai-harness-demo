@@ -717,9 +717,9 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("--available-tools=view,grep,glob", arguments);
         Assert.Contains("--disable-builtin-mcps", arguments);
         Assert.Equal(
-            ["--effort", "low"],
+            ["--reasoning-effort", "low"],
             arguments
-                .SkipWhile(argument => argument != "--effort")
+                .SkipWhile(argument => argument != "--reasoning-effort")
                 .Take(2));
         Assert.Contains("--no-custom-instructions", arguments);
         Assert.Contains("--no-eager-powershell-resolution", arguments);
@@ -810,7 +810,7 @@ public sealed class CopilotReasoningHostTests
             Guid.Parse("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
             "Prompt");
 
-        Assert.DoesNotContain("--effort", arguments);
+        Assert.DoesNotContain("--reasoning-effort", arguments);
     }
 
     [Fact]

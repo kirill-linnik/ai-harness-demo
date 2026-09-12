@@ -211,11 +211,11 @@ public sealed class RepositoryKnowledgeSynthesizer(
                 {
                     break;
                 }
-                logger.LogWarning(
-                    exception,
-                    "Copilot repository study returned an invalid contract; requesting correction {CorrectionAttempt} of {MaximumCorrections}.",
+                logger.LogInformation(
+                    "Copilot repository study response required schema correction {CorrectionAttempt} of {MaximumCorrections}: {ContractErrors}",
                     attempt,
-                    MaximumContractAttempts - 1);
+                    MaximumContractAttempts - 1,
+                    string.Join("; ", exception.Errors));
                 prompt = BuildRepairPrompt(
                     exception.Errors,
                     repositoryPath,

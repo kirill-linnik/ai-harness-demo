@@ -1877,12 +1877,13 @@ public sealed class CopilotCliRuntimeTests
             var command = CreateCliShim(
                 root,
                 "--add-dir --acp --agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
-                "--effort --model --no-ask-user --no-custom-instructions " +
+                "--reasoning-effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
 
             Assert.True(status.Ready);
             Assert.Equal("9.8.7", status.Version);
+            Assert.Equal("--reasoning-effort", status.ReasoningEffortOption);
             Assert.True(
                 string.Equals(
                     command,
@@ -1890,6 +1891,37 @@ public sealed class CopilotCliRuntimeTests
                     StringComparison.OrdinalIgnoreCase),
                 $"Expected '{command}', resolved '{status.ResolvedPath}'.");
             Assert.Contains("non-interactive JSON execution", status.Detail);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RefreshAsync_AcceptsLegacyEffortOption()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-copilot-legacy-effort-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var command = CreateCliShim(
+                root,
+                "--add-dir --acp --agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
+                "--effort --model --no-ask-user --no-custom-instructions " +
+                "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
+            var status = await CreateRuntime(root).RefreshAsync(command);
+
+            Assert.True(status.Ready);
+            Assert.Equal("--effort", status.ReasoningEffortOption);
         }
         finally
         {
@@ -1944,7 +1976,7 @@ public sealed class CopilotCliRuntimeTests
             var command = CreateCliShim(
                 root,
                 "--agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
-                "--effort --model --no-ask-user --no-custom-instructions " +
+                "--reasoning-effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
 

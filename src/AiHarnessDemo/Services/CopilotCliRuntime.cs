@@ -10,7 +10,8 @@ public sealed record CopilotCliRuntimeStatus(
     string ResolvedPath,
     string Version,
     string Detail,
-    DateTimeOffset CheckedAt);
+    DateTimeOffset CheckedAt,
+    string ReasoningEffortOption = "--reasoning-effort");
 
 /// <summary>Validates that the configured Copilot CLI supports the non-interactive contract.</summary>
 public sealed partial class CopilotCliRuntime(
@@ -32,7 +33,6 @@ public sealed partial class CopilotCliRuntime(
         "--deny-tool",
         "--deny-url",
         "--disallow-temp-dir",
-        "--effort",
         "--model",
         "--no-ask-user",
         "--no-custom-instructions",
@@ -182,6 +182,20 @@ public sealed partial class CopilotCliRuntime(
                         option,
                         StringComparison.Ordinal))
                 .ToList();
+            var reasoningEffortOption =
+                helpResult.StandardOutput.Contains(
+                    "--reasoning-effort",
+                    StringComparison.Ordinal)
+                    ? "--reasoning-effort"
+                    : helpResult.StandardOutput.Contains(
+                        "--effort",
+                        StringComparison.Ordinal)
+                        ? "--effort"
+                        : string.Empty;
+            if (string.IsNullOrEmpty(reasoningEffortOption))
+            {
+                missingOptions.Add("--reasoning-effort (or legacy --effort)");
+            }
             if (missingOptions.Count > 0)
             {
                 return Publish(Failed(
@@ -204,7 +218,8 @@ public sealed partial class CopilotCliRuntime(
                 Detail: string.IsNullOrWhiteSpace(version)
                     ? "Copilot CLI is ready for non-interactive JSON execution."
                     : $"GitHub Copilot CLI {version} is ready for non-interactive JSON execution.",
-                CheckedAt: timeProvider.GetUtcNow());
+                CheckedAt: timeProvider.GetUtcNow(),
+                ReasoningEffortOption: reasoningEffortOption);
             return Publish(status);
         }
         finally
@@ -237,7 +252,11 @@ public sealed partial class CopilotCliRuntime(
         if (previous.Ready == status.Ready &&
             string.Equals(previous.ResolvedPath, status.ResolvedPath, StringComparison.Ordinal) &&
             string.Equals(previous.Version, status.Version, StringComparison.Ordinal) &&
-            string.Equals(previous.Detail, status.Detail, StringComparison.Ordinal))
+            string.Equals(previous.Detail, status.Detail, StringComparison.Ordinal) &&
+            string.Equals(
+                previous.ReasoningEffortOption,
+                status.ReasoningEffortOption,
+                StringComparison.Ordinal))
         {
             return status;
         }
