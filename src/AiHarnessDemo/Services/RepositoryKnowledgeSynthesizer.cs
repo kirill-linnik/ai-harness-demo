@@ -99,7 +99,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
     private const int MaximumEvidencePerFinding = 8;
     private const int MaximumEvidencePathCharacters = 400;
     private const int MaximumRecapReasonCharacters = 500;
-    private const int MaximumContractAttempts = 2;
+    private const int MaximumContractAttempts = 3;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -142,6 +142,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
         var sessionId = Guid.NewGuid();
         var prompt = BuildStudyPrompt(repositoryPath, inventory);
         var inspectedRepository = false;
+        var toolCallCount = 0;
         RepositoryKnowledgeContractException? lastContractError = null;
 
         for (var attempt = 1; attempt <= MaximumContractAttempts; attempt++)
@@ -183,6 +184,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
             }
             inspectedRepository |= parsed.ToolCalls.Any(call =>
                 call.Succeeded && ReadOnlyStudyTools.Contains(call.ToolName));
+            toolCallCount += parsed.ToolCalls.Count;
 
             try
             {
@@ -199,7 +201,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
                 logger.LogInformation(
                     "Synthesized {KnowledgeCharacters} repository-knowledge characters from {ToolCallCount} read-only tool calls.",
                     knowledge.Length,
-                    parsed.ToolCalls.Count);
+                    toolCallCount);
                 return knowledge;
             }
             catch (RepositoryKnowledgeContractException exception)
@@ -211,13 +213,18 @@ public sealed class RepositoryKnowledgeSynthesizer(
                 }
                 logger.LogWarning(
                     exception,
-                    "Copilot repository study returned an invalid contract; requesting one correction.");
-                prompt = BuildRepairPrompt(exception.Errors);
+                    "Copilot repository study returned an invalid contract; requesting correction {CorrectionAttempt} of {MaximumCorrections}.",
+                    attempt,
+                    MaximumContractAttempts - 1);
+                prompt = BuildRepairPrompt(
+                    exception.Errors,
+                    repositoryPath,
+                    inventory);
             }
         }
 
         throw new InvalidOperationException(
-            "Copilot repository study did not produce valid evidence-grounded knowledge after one correction.",
+            $"Copilot repository study did not produce valid evidence-grounded knowledge after {MaximumContractAttempts - 1} correction attempts.",
             lastContractError);
     }
 
@@ -304,6 +311,9 @@ public sealed class RepositoryKnowledgeSynthesizer(
             Every Evidence value must be an exact existing project-relative file or directory path.
             Use concise factual summaries, normally one sentence each. The Repositories array must contain
             exactly one entry for each path in this list: {{repositories}}.
+            Objects in ProductAndScope, ArchitectureAndDataFlow, TechnologyAndWorkflow,
+            ConstraintsAndConventions, and RisksAndUnknowns may contain only Summary, Basis, and
+            Evidence. Path and Purpose are valid only for objects inside Repositories.
 
             Return exactly one strict JSON object between the standalone sentinels below, with exact
             property names and no Markdown fences:
@@ -357,11 +367,19 @@ public sealed class RepositoryKnowledgeSynthesizer(
         RepositoryKnowledgeDocument document;
         try
         {
-            document = JsonSerializer.Deserialize<RepositoryKnowledgeDocument>(
-                           normalizedOutput[
-                               (begins[0] + BeginSentinel.Length)..ends[0]]
-                               .Trim(),
-                           JsonOptions)
+            var json = normalizedOutput[
+                (begins[0] + BeginSentinel.Length)..ends[0]]
+                .Trim();
+            using var jsonDocument = JsonDocument.Parse(json);
+            var shapeErrors = ValidateKnowledgeShape(
+                jsonDocument.RootElement);
+            if (shapeErrors.Count > 0)
+            {
+                throw new RepositoryKnowledgeContractException(shapeErrors);
+            }
+            document = jsonDocument.RootElement
+                           .Deserialize<RepositoryKnowledgeDocument>(
+                               JsonOptions)
                        ?? throw new RepositoryKnowledgeContractException(
                            ["repository knowledge document is null"]);
         }
@@ -622,11 +640,31 @@ public sealed class RepositoryKnowledgeSynthesizer(
 
         try
         {
-            return JsonSerializer.Deserialize<RepositoryKnowledgeRecapDocument>(
-                       normalized[
-                           (begins[0] + RecapBeginSentinel.Length)..ends[0]]
-                           .Trim(),
-                       JsonOptions)
+            var json = normalized[
+                (begins[0] + RecapBeginSentinel.Length)..ends[0]]
+                .Trim();
+            using var jsonDocument = JsonDocument.Parse(json);
+            var shapeErrors = ValidateObjectProperties(
+                jsonDocument.RootElement,
+                ["Version", "Changed", "Reason", "Knowledge"],
+                "recap");
+            if (jsonDocument.RootElement.ValueKind ==
+                    JsonValueKind.Object &&
+                jsonDocument.RootElement.TryGetProperty(
+                    "Knowledge",
+                    out var knowledge) &&
+                knowledge.ValueKind != JsonValueKind.Null)
+            {
+                shapeErrors.AddRange(
+                    ValidateKnowledgeShape(knowledge, "Knowledge"));
+            }
+            if (shapeErrors.Count > 0)
+            {
+                throw new RepositoryKnowledgeContractException(shapeErrors);
+            }
+            return jsonDocument.RootElement
+                       .Deserialize<RepositoryKnowledgeRecapDocument>(
+                           JsonOptions)
                    ?? throw new RepositoryKnowledgeContractException(
                        ["repository knowledge recap is null"]);
         }
@@ -699,6 +737,111 @@ public sealed class RepositoryKnowledgeSynthesizer(
             }
         }
         return normalized;
+    }
+
+    private static List<string> ValidateKnowledgeShape(
+        JsonElement root,
+        string label = "knowledge")
+    {
+        var errors = ValidateObjectProperties(
+            root,
+            [
+                "Version",
+                "Project",
+                "ProductAndScope",
+                "Repositories",
+                "ArchitectureAndDataFlow",
+                "TechnologyAndWorkflow",
+                "ConstraintsAndConventions",
+                "RisksAndUnknowns"
+            ],
+            label);
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            return errors;
+        }
+
+        foreach (var section in new[]
+                 {
+                     "ProductAndScope",
+                     "ArchitectureAndDataFlow",
+                     "TechnologyAndWorkflow",
+                     "ConstraintsAndConventions",
+                     "RisksAndUnknowns"
+                 })
+        {
+            if (root.TryGetProperty(section, out var findings))
+            {
+                ValidateArrayObjects(
+                    findings,
+                    ["Summary", "Basis", "Evidence"],
+                    $"{label}.{section}",
+                    errors);
+            }
+        }
+        if (root.TryGetProperty("Repositories", out var repositories))
+        {
+            ValidateArrayObjects(
+                repositories,
+                ["Path", "Purpose", "Evidence"],
+                $"{label}.Repositories",
+                errors);
+        }
+        return errors;
+    }
+
+    private static void ValidateArrayObjects(
+        JsonElement value,
+        IReadOnlyCollection<string> allowedProperties,
+        string label,
+        ICollection<string> errors)
+    {
+        if (value.ValueKind != JsonValueKind.Array)
+        {
+            errors.Add($"{label} must be an array");
+            return;
+        }
+        var index = 0;
+        foreach (var item in value.EnumerateArray())
+        {
+            foreach (var error in ValidateObjectProperties(
+                         item,
+                         allowedProperties,
+                         $"{label}[{index}]"))
+            {
+                errors.Add(error);
+            }
+            index++;
+        }
+    }
+
+    private static List<string> ValidateObjectProperties(
+        JsonElement value,
+        IReadOnlyCollection<string> allowedProperties,
+        string label)
+    {
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return [$"{label} must be an object"];
+        }
+
+        var errors = new List<string>();
+        foreach (var property in value.EnumerateObject())
+        {
+            if (allowedProperties.Contains(property.Name))
+            {
+                continue;
+            }
+            var expectedCasing = allowedProperties.FirstOrDefault(
+                allowed => string.Equals(
+                    allowed,
+                    property.Name,
+                    StringComparison.OrdinalIgnoreCase));
+            errors.Add(expectedCasing is null
+                ? $"{label} property '{property.Name}' is not allowed; expected only {string.Join(", ", allowedProperties)}"
+                : $"{label} property '{property.Name}' must use exact casing '{expectedCasing}'");
+        }
+        return errors;
     }
 
     private static string NormalizeBasis(
@@ -1201,13 +1344,37 @@ public sealed class RepositoryKnowledgeSynthesizer(
         return positions;
     }
 
-    private static string BuildRepairPrompt(IReadOnlyList<string> errors) =>
+    internal static string BuildRepairPrompt(
+        IReadOnlyList<string> errors,
+        string repositoryPath,
+        RepositoryStudyInventory inventory)
+    {
+        var projectName = Path.GetFileName(
+            Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(repositoryPath)));
+        var repositories = JsonSerializer.Serialize(
+            inventory.RepositoryPaths,
+            JsonOptions);
+        return
         $$"""
             Your repository knowledge contract was rejected for these reasons:
             {{string.Join(Environment.NewLine, errors.Select(error => $"- {error}"))}}
 
-            Correct the complete document using the repository evidence you already inspected. Return
-            exactly one strict {{Version}} JSON object between standalone {{BeginSentinel}} and
-            {{EndSentinel}} lines. Do not add commentary or Markdown fences.
+            Correct the complete document using the repository evidence you already inspected. Do not
+            return a patch or explanation. Objects in ProductAndScope, ArchitectureAndDataFlow,
+            TechnologyAndWorkflow, ConstraintsAndConventions, and RisksAndUnknowns may contain only
+            Summary, Basis, and Evidence. Path and Purpose are valid only for objects in Repositories.
+            Repositories must contain exactly one entry for each of these paths: {{repositories}}.
+
+            Return exactly one strict JSON object with this complete canonical shape, exact property
+            names, and no Markdown fences:
+            {{BeginSentinel}}
+            {"Version":"{{Version}}","Project":"{{projectName}}","ProductAndScope":[{"Summary":"durable product fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"Repositories":[{"Path":"exact detected repository path","Purpose":"repository responsibility","Evidence":["relative/path"]}],"ArchitectureAndDataFlow":[{"Summary":"durable architecture fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"TechnologyAndWorkflow":[{"Summary":"durable workflow fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"ConstraintsAndConventions":[{"Summary":"durable constraint","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"RisksAndUnknowns":[{"Summary":"material risk or unknown","Basis":"{{UnresolvedBasis}}","Evidence":["relative/path"]}]}
+            {{EndSentinel}}
+
+            RepositoryEvidence entries require at least one exact existing project-relative path.
+            UserProvided entries require Evidence:[] and are valid only for context supplied by the user.
+            Unresolved is valid only in RisksAndUnknowns. Do not add any other property.
             """;
+    }
 }

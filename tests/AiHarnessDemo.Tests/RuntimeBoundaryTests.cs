@@ -2609,6 +2609,68 @@ public sealed class RepositoryBrowserTests
     }
 
     [Fact]
+    public async Task RepositoryStudy_CorrectsFindingThatUsesRepositoryOnlyPathFields()
+    {
+        var fixture = await RepositoryStudyFixture.CreateAsync();
+        try
+        {
+            var invalid = fixture.FindingWithRepositoryFieldsContract();
+            var shapeError =
+                Assert.Throws<RepositoryKnowledgeContractException>(() =>
+                    RepositoryKnowledgeSynthesizer.ParseAndRender(
+                        invalid,
+                        fixture.Root,
+                        fixture.Inventory));
+            Assert.Contains(
+                shapeError.Errors,
+                error =>
+                    error.Contains(
+                        "knowledge.ProductAndScope[0] property 'Path' is not allowed",
+                        StringComparison.Ordinal) &&
+                    error.Contains(
+                        "Summary, Basis, Evidence",
+                        StringComparison.Ordinal));
+
+            var runner = new RepositoryStudyProcessRunner(
+                invalid,
+                fixture.ValidContract());
+            var synthesizer = new RepositoryKnowledgeSynthesizer(
+                runner,
+                NullLogger<RepositoryKnowledgeSynthesizer>.Instance);
+
+            var knowledge = await synthesizer.SynthesizeAsync(
+                "copilot",
+                new AiHarnessDemo.Core.Workflow.CopilotConfig
+                {
+                    TurnTimeoutMs = 20_000,
+                    MaximumQualityStallTimeoutMs = 10_000
+                },
+                fixture.Root,
+                fixture.Inventory,
+                CancellationToken.None);
+
+            Assert.Contains("serves the community sites", knowledge);
+            Assert.Equal(2, runner.Prompts.Count);
+            Assert.Contains(
+                "Path and Purpose are valid only for objects in Repositories",
+                runner.Prompts[1],
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "\"ProductAndScope\":[{\"Summary\"",
+                runner.Prompts[1],
+                StringComparison.Ordinal);
+            Assert.Contains(
+                shapeError.Errors[0],
+                runner.Prompts[1],
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            fixture.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task RepositoryStudy_RejectsReadmeOnlySynthesisWhenSourceAndTestsExist()
     {
         var fixture = await RepositoryStudyFixture.CreateAsync();
@@ -2844,10 +2906,25 @@ public sealed class RepositoryBrowserTests
         }
     }
 
-    private sealed class RepositoryStudyProcessRunner(string contract)
-        : ProcessRunner
+    private sealed class RepositoryStudyProcessRunner : ProcessRunner
     {
+        private readonly IReadOnlyList<string> _contracts;
+        private int _invocationIndex;
+
+        public RepositoryStudyProcessRunner(params string[] contracts)
+        {
+            if (contracts.Length == 0)
+            {
+                throw new ArgumentException(
+                    "At least one scripted repository contract is required.",
+                    nameof(contracts));
+            }
+            _contracts = contracts;
+        }
+
         public IReadOnlyList<string> Arguments { get; private set; } = [];
+
+        public List<string> Prompts { get; } = [];
 
         public override Task<ProcessResult> RunAsync(
             string executable,
@@ -2859,7 +2936,13 @@ public sealed class RepositoryBrowserTests
             TimeSpan? stallTimeout = null,
             IReadOnlyDictionary<string, string?>? environmentVariables = null)
         {
-            Arguments = arguments.ToArray();
+            var argumentArray = arguments.ToArray();
+            Arguments = argumentArray;
+            var promptIndex = Array.IndexOf(argumentArray, "-p");
+            Prompts.Add(argumentArray[promptIndex + 1]);
+            var contract = _contracts[
+                Math.Min(_invocationIndex, _contracts.Count - 1)];
+            _invocationIndex++;
             var output = string.Join(
                 Environment.NewLine,
                 JsonSerializer.Serialize(new
@@ -2963,6 +3046,12 @@ public sealed class RepositoryBrowserTests
                 architectureEvidence: [SiteSource, DataReadme],
                 technologyEvidence: [SiteManifest, SiteTest],
                 constraintEvidence: [SiteSource, SiteTest]);
+
+        public string FindingWithRepositoryFieldsContract() =>
+            ValidContract().Replace(
+                "\"Summary\":\"Study project serves the community sites.\"",
+                "\"Path\":\"site\",\"Purpose\":\"Incorrect finding shape.\"",
+                StringComparison.Ordinal);
 
         public string ChangedRecap()
         {
