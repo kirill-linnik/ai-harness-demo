@@ -777,10 +777,16 @@ public sealed partial class WorkspaceManager(
             $"{Path.GetFileName(workspacePath)}.snapshot-{Guid.NewGuid():N}");
         try
         {
+            logger.LogInformation(
+                "Preparing guarded {WorkspaceMode} snapshot {WorkspacePath} for flow {FlowId}",
+                mode,
+                workspacePath,
+                flow.Id);
             CopyGuardedSource(
                 projectPath,
                 stagingPath,
-                authorizedWorkspaceRoot);
+                authorizedWorkspaceRoot,
+                cancellationToken);
             _ = await _advisoryArtifacts.JournalGuardedSnapshotAsync(
                 flow,
                 stagingPath,
@@ -815,7 +821,8 @@ public sealed partial class WorkspaceManager(
     private static void CopyGuardedSource(
         string projectPath,
         string destinationPath,
-        string authorizedWorkspaceRoot)
+        string authorizedWorkspaceRoot,
+        CancellationToken cancellationToken)
     {
         var comparison = OperatingSystem.IsWindows()
             ? StringComparer.OrdinalIgnoreCase
@@ -832,12 +839,14 @@ public sealed partial class WorkspaceManager(
 
         while (pending.Count > 0)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var (source, destination) = pending.Pop();
             RejectReparse(source, "Advisory source directory");
             Directory.CreateDirectory(destination);
 
             foreach (var file in Directory.EnumerateFiles(source))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 RejectReparse(file, "Advisory source file");
                 if (string.Equals(
                         Path.GetFileName(file),
@@ -854,9 +863,11 @@ public sealed partial class WorkspaceManager(
 
             foreach (var directory in Directory.EnumerateDirectories(source))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var fullPath = Path.TrimEndingDirectorySeparator(
                     Path.GetFullPath(directory));
                 if (excludedRoots.Contains(fullPath) ||
+                    RepositoryAnalyzer.ShouldIgnoreDirectory(fullPath) ||
                     string.Equals(
                         Path.GetFileName(fullPath),
                         ".git",

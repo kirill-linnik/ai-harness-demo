@@ -229,6 +229,71 @@ describe("IntakePage", () => {
     expect(composer).toHaveValue(request);
   });
 
+  it("does not duplicate a pending customer message after polling observes it", async () => {
+    let resolveIntake!: (response: IntakeResponse) => void;
+    const intakeRequest = new Promise<IntakeResponse>(resolve => {
+      resolveIntake = resolve;
+    });
+    const initialFlow = confirmationFlow();
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(initialFlow);
+    vi.spyOn(api, "continueIntake").mockReturnValue(intakeRequest);
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false }
+      }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    queryClient.setQueryData(queryKeys.flow(flowId), initialFlow);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/intake/${flowId}`]}>
+            <Routes>
+              <Route path="/intake/:id" element={<IntakePage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    const confirmation = "correct";
+    fireEvent.change(screen.getByRole("textbox", { name: "Customer request" }), {
+      target: { value: confirmation }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(screen.getAllByText(confirmation)).toHaveLength(1);
+
+    const persistedFlow = {
+      ...initialFlow,
+      messages: [
+        ...initialFlow.messages,
+        {
+          id: "77777777-7777-7777-7777-777777777777",
+          role: "Customer" as const,
+          content: confirmation,
+          isQuestion: false,
+          createdAt: timestamp
+        }
+      ]
+    } satisfies FlowDetailDto;
+    act(() => {
+      queryClient.setQueryData(queryKeys.flow(flowId), persistedFlow);
+    });
+
+    expect(screen.getAllByText(confirmation)).toHaveLength(1);
+    await act(async () => {
+      resolveIntake({
+        flow: persistedFlow,
+        reply: "Thanks.",
+        readyToStart: false,
+        shouldSpeak: false
+      });
+    });
+  });
+
   it("navigates to a persisted failed intake and retries with the same flow id", async () => {
     vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
     vi.spyOn(api, "flow").mockResolvedValue(confirmationFlow());
@@ -412,9 +477,11 @@ describe("IntakePage", () => {
       </QueryClientProvider>
     );
 
-    expect(screen.getByText("Account Manager proposal")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Advisory" })).toBeInTheDocument();
-    expect(screen.getByText(/does not change or publish source code/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Proposed as Advisory" })).toBeInTheDocument();
+    expect(screen.getByText(/without changing or publishing source code/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Start voice recording" })
+    ).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Customer request"), {
       target: { value: "Please include rollout risks." }
     });

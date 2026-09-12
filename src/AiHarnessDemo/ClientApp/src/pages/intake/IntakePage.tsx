@@ -13,12 +13,17 @@ import {
 import { ApiError } from "../../api/client";
 import type { FlowMessageDto, FlowStatus } from "../../api/types";
 import { flowRoute } from "../../lib/flowRoute";
-import { MicIcon, SendIcon, waveMarkup } from "../../lib/icons";
+import { MicIcon, SendIcon } from "../../lib/icons";
 import { consumeDraftPrompt, consumeStartVoiceHint } from "../../lib/session";
 import { speak, toggleVoice } from "../../lib/voice";
 import { useToast } from "../../lib/toast";
 import { MessageBubble } from "./MessageBubble";
 import { FactoryLockedPage } from "../factory/FactoryLockedPage";
+
+interface PendingCustomerMessage {
+  message: FlowMessageDto;
+  existingMessageIds: ReadonlySet<string>;
+}
 
 export function IntakePage() {
   const params = useParams<{ id?: string }>();
@@ -32,12 +37,22 @@ export function IntakePage() {
   const continueIntake = useContinueIntakeMutation();
 
   const [message, setMessage] = useState("");
-  const [pendingMessage, setPendingMessage] = useState<FlowMessageDto | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<PendingCustomerMessage | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
   const initialized = useRef(false);
   const submitting = useRef(false);
   const messages = flow?.messages ?? [];
-  const visibleMessages = pendingMessage ? [...messages, pendingMessage] : messages;
+  const pendingMessagePersisted = pendingMessage
+    ? messages.some(item =>
+        !pendingMessage.existingMessageIds.has(item.id) &&
+        item.role === pendingMessage.message.role &&
+        item.content === pendingMessage.message.content
+      )
+    : false;
+  const visibleMessages =
+    pendingMessage && !pendingMessagePersisted
+      ? [...messages, pendingMessage.message]
+      : messages;
 
   useEffect(() => {
     if (initialized.current) return;
@@ -100,11 +115,14 @@ export function IntakePage() {
 
     submitting.current = true;
     setPendingMessage({
-      id: "pending-customer-message",
-      role: "Customer",
-      content: trimmed,
-      isQuestion: false,
-      createdAt: new Date().toISOString()
+      message: {
+        id: "pending-customer-message",
+        role: "Customer",
+        content: trimmed,
+        isQuestion: false,
+        createdAt: new Date().toISOString()
+      },
+      existingMessageIds: new Set(messages.map(item => item.id))
     });
     setMessage("");
 
@@ -202,6 +220,20 @@ export function IntakePage() {
               </div>
             )}
           </div>
+          {proposedKind && (
+            <section
+              className="intake-proposal"
+              aria-labelledby="proposed-flow-kind"
+              aria-live="polite"
+            >
+              <h4 id="proposed-flow-kind">Proposed as {proposedKind}</h4>
+              <p>
+                {proposedKind === "Advisory"
+                  ? "The team will inspect the repository and return recommendations without changing or publishing source code."
+                  : "The team will implement the change in an isolated workspace. Nothing is published until you approve the reviewed result."}
+              </p>
+            </section>
+          )}
           <div className="composer">
             <div className="composer-row">
               <button
@@ -234,57 +266,6 @@ export function IntakePage() {
               </button>
             </div>
             <div className="composer-hint">Use voice in Edge or Chrome on localhost, or type when the room is noisy.</div>
-          </div>
-        </div>
-        <div className="intake-signal" id="intake-signal">
-          <div className="orbit one"></div>
-          <div className="orbit two"></div>
-          <div className="orbit three"></div>
-          <button
-            id="intake-mic-large"
-            className="mic-button"
-            aria-label="Start voice recording"
-            onClick={() => toggleVoice("intake-message", "intake-mic-large", setMessage)}
-          >
-            <MicIcon />
-          </button>
-          {waveMarkup()}
-          <div className="intake-signal-copy">
-            <strong>
-              {confirmed
-                ? "The confirmed brief is entering the factory"
-                : awaitingConfirmation
-                  ? "Confirm the Account Manager's understanding"
-                  : "Listening for product intent"}
-            </strong>
-            <span>
-              {confirmed
-                ? "Team Lead will select the smallest capable team."
-                : awaitingConfirmation
-                  ? "Reply yes to start immediately, or explain what should change."
-                  : "Account Manager will ask only for material missing context."}
-            </span>
-            {proposedKind && (
-              <section
-                className="intake-classification"
-                aria-labelledby="proposed-flow-kind"
-                aria-live="polite"
-              >
-                <div className="eyebrow">Account Manager proposal</div>
-                <h3 id="proposed-flow-kind">{proposedKind}</h3>
-                <p>
-                  {proposedKind === "Advisory"
-                    ? "Read-only repository analysis that returns a recommendation and safe text artifacts. It does not change or publish source code."
-                    : "Implementation in an isolated workspace. Nothing is published until you accept the reviewed result."}
-                </p>
-                {awaitingConfirmation && (
-                  <small>
-                    Confirming the brief also confirms this persisted classification. To change it,
-                    describe the correction instead of confirming.
-                  </small>
-                )}
-              </section>
-            )}
           </div>
         </div>
       </section>

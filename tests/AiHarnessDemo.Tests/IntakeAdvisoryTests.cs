@@ -1195,6 +1195,25 @@ public sealed class IntakeAdvisoryTests
         var beforeWorktrees = await fixture.GitAsync("worktree", "list", "--porcelain");
         var sourceBytes = await File.ReadAllBytesAsync(
             Path.Combine(fixture.SourcePath, "source.txt"));
+        var generatedDirectories = new[]
+        {
+            "node_modules",
+            "bin",
+            "obj",
+            "dist",
+            "coverage"
+        };
+        foreach (var directory in generatedDirectories)
+        {
+            var generatedPath = Path.Combine(
+                fixture.SourcePath,
+                directory,
+                "nested");
+            Directory.CreateDirectory(generatedPath);
+            await File.WriteAllTextAsync(
+                Path.Combine(generatedPath, "generated.txt"),
+                "generated");
+        }
         var flow = fixture.Flow(FlowStatus.Intake, FlowKind.Delivery);
 
         var provisional = await fixture.Manager.PrepareAsync(flow);
@@ -1213,6 +1232,10 @@ public sealed class IntakeAdvisoryTests
             sourceBytes,
             await File.ReadAllBytesAsync(
                 Path.Combine(fixture.SourcePath, "source.txt")));
+        Assert.All(
+            generatedDirectories,
+            directory => Assert.False(
+                Directory.Exists(Path.Combine(provisional.Path, directory))));
 
         flow.WorkspacePath = provisional.Path;
         flow.Status = FlowStatus.Queued;

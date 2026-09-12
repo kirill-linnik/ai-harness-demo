@@ -36,28 +36,6 @@
   box-sizing: border-box;
 }
 
-.intake-classification {
-  width: min(390px, calc(100% - 24px));
-  margin: 22px auto 0;
-  border: 1px solid rgba(181, 167, 255, 0.24);
-  border-radius: 14px;
-  background: rgba(7, 16, 25, 0.78);
-  padding: 16px;
-  text-align: left;
-}
-
-.intake-classification h3 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.intake-classification p,
-.intake-classification small {
-  display: block;
-  margin: 8px 0 0;
-  color: var(--muted-strong);
-}
-
 html {
   min-height: 100%;
   background: var(--bg);
@@ -1109,9 +1087,7 @@ summary:focus-visible {
 }
 
 .intake-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1.12fr) minmax(330px, 0.88fr);
-  gap: 18px;
+  max-width: 1180px;
 }
 
 .conversation {
@@ -1132,7 +1108,7 @@ summary:focus-visible {
 
 .message {
   display: grid;
-  max-width: 82%;
+  max-width: min(82%, 760px);
   grid-template-columns: 34px minmax(0, 1fr);
   gap: 10px;
   align-self: flex-start;
@@ -1183,6 +1159,29 @@ summary:focus-visible {
   text-transform: uppercase;
 }
 
+.intake-proposal {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.3fr) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 24px;
+  border-top: 1px solid var(--line);
+  background: rgba(155, 135, 245, 0.035);
+  padding: 14px 22px;
+}
+
+.intake-proposal h4 {
+  margin: 0;
+  color: var(--violet-bright);
+  font-size: 13px;
+}
+
+.intake-proposal p {
+  max-width: 70ch;
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
 .composer {
   border-top: 1px solid var(--line);
   padding: 16px;
@@ -1229,40 +1228,6 @@ summary:focus-visible {
   font-size: 11px;
 }
 
-.intake-signal {
-  position: relative;
-  display: grid;
-  min-height: 540px;
-  overflow: hidden;
-  place-items: center;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background:
-    radial-gradient(circle at center, rgba(103, 91, 220, 0.14), transparent 36%),
-    rgba(10, 21, 33, 0.74);
-  padding: 30px;
-  text-align: center;
-}
-
-.intake-signal-copy {
-  position: absolute;
-  right: 28px;
-  bottom: 26px;
-  left: 28px;
-}
-
-.intake-signal-copy strong {
-  display: block;
-  font-size: 14px;
-}
-
-.intake-signal-copy span {
-  display: block;
-  margin-top: 4px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
 .wave {
   position: absolute;
   top: 48%;
@@ -1282,8 +1247,7 @@ summary:focus-visible {
   animation-play-state: paused;
 }
 
-.recording + .wave span,
-.intake-signal.listening .wave span {
+.recording + .wave span {
   animation-play-state: running;
 }
 
@@ -2656,8 +2620,6 @@ summary:focus-visible {
   .flow-grid,
   .memory-grid,
   .agent-grid,
-  .intake-layout { grid-template-columns: 1fr; }
-  .intake-signal { min-height: 390px; }
   .flow-heading { display: block; }
   .flow-heading-actions { margin-top: 14px; }
   .page-head { display: block; }
@@ -2676,6 +2638,7 @@ summary:focus-visible {
   .composer-row { grid-template-columns: auto minmax(0, 1fr); }
   .composer-row .button { grid-column: 1 / -1; }
   .message { max-width: 94%; }
+  .intake-proposal { grid-template-columns: 1fr; gap: 6px; }
   .feedback-layout { grid-template-columns: 1fr; }
   .artifact-row,
   .approval-banner {
