@@ -15,6 +15,7 @@ public sealed record RepositoryAnalysis(
 
 public sealed class RepositoryAnalyzer(
     ProcessRunner processRunner,
+    RepositoryKnowledgeSynthesizer knowledgeSynthesizer,
     RepositoryContextGate contextGate,
     IDbContextFactory<HarnessDbContext> databaseFactory,
     WorkflowDefinitionProvider workflowProvider,
@@ -116,61 +117,64 @@ public sealed class RepositoryAnalyzer(
             throw new InvalidOperationException(
                 "The selected project folder must contain at least one Git repository.");
         }
+        var workflow = workflowProvider.GetValidated();
+        var copilotCommand = workflow.Config.Copilot.Command;
+        if (!ExecutableLocator.Exists(copilotCommand, repositoryPath))
+        {
+            throw new InvalidOperationException(
+                $"Copilot CLI command '{copilotCommand}' is required to synthesize repository knowledge, but it is not available. No repository knowledge was changed.");
+        }
 
         var initSucceeded = false;
         var initMessage = "Copilot init was not requested.";
 
         if (runCopilotInit)
         {
-            var workflow = workflowProvider.GetValidated();
-            var copilotCommand = workflow.Config.Copilot.Command;
-            if (!ExecutableLocator.Exists(copilotCommand, repositoryPath))
+            try
+            {
+                var result = await processRunner.RunAsync(
+                    copilotCommand,
+                    ["init"],
+                    repositoryPath,
+                    TimeSpan.FromMilliseconds(workflow.Config.Copilot.TurnTimeoutMs),
+                    cancellationToken);
+
+                initSucceeded = result.ExitCode == 0;
+                initMessage = initSucceeded
+                    ? "Copilot CLI initialized repository instructions successfully."
+                    : $"Copilot init failed (exit {result.ExitCode}): {Tail(result.CombinedOutput, 700)}";
+
+                if (!initSucceeded)
+                {
+                    logger.LogWarning(
+                        "Copilot init failed for {RepositoryPath}: {Message}",
+                        repositoryPath,
+                        initMessage);
+                }
+            }
+            catch (Win32Exception exception)
             {
                 initMessage =
-                    $"Copilot CLI command '{copilotCommand}' is not available. " +
-                    "Static repository study completed.";
-            }
-            else
-            {
-                try
-                {
-                    var result = await processRunner.RunAsync(
-                        copilotCommand,
-                        ["init"],
-                        repositoryPath,
-                        TimeSpan.FromMilliseconds(workflow.Config.Copilot.TurnTimeoutMs),
-                        cancellationToken);
-
-                    initSucceeded = result.ExitCode == 0;
-                    initMessage = initSucceeded
-                        ? "Copilot CLI initialized repository instructions successfully."
-                        : $"Copilot init failed (exit {result.ExitCode}): {Tail(result.CombinedOutput, 700)}";
-
-                    if (!initSucceeded)
-                    {
-                        logger.LogWarning(
-                            "Copilot init failed for {RepositoryPath}: {Message}",
-                            repositoryPath,
-                            initMessage);
-                    }
-                }
-                catch (Win32Exception exception)
-                {
-                    initMessage =
-                        $"Copilot init could not be launched: {exception.Message} " +
-                        "Static repository study completed.";
-                    logger.LogWarning(
-                        exception,
-                        "Copilot init could not be launched for {RepositoryPath}.",
-                        repositoryPath);
-                }
+                    $"Copilot init could not be launched: {exception.Message}";
+                logger.LogWarning(
+                    exception,
+                    "Copilot init could not be launched for {RepositoryPath}.",
+                    repositoryPath);
             }
         }
 
-        var knowledge = await BuildKnowledgeAsync(
+        var inventory = await BuildStudyInventoryAsync(
             repositoryPath,
             gitRepositories,
             cancellationToken);
+        var knowledge = await knowledgeSynthesizer.SynthesizeAsync(
+            copilotCommand,
+            workflow.Config.Copilot,
+            repositoryPath,
+            inventory,
+            cancellationToken);
+        initMessage =
+            $"Repository knowledge synthesized from documentation, manifests, source, and tests. {initMessage}";
 
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var settings = await database.Settings.SingleAsync(cancellationToken);
@@ -252,70 +256,138 @@ public sealed class RepositoryAnalyzer(
         return locations;
     }
 
-    private static async Task<string> BuildKnowledgeAsync(
+    internal static async Task<RepositoryStudyInventory> BuildStudyInventoryAsync(
         string repositoryPath,
         IReadOnlyList<string> gitRepositories,
         CancellationToken cancellationToken)
     {
         var warnings = new List<string>();
-        var files = EnumerateSourceFiles(repositoryPath, warnings).Take(6_000).ToList();
+        var pathComparer = OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+        var files = EnumerateSourceFiles(
+                repositoryPath,
+                warnings,
+                cancellationToken)
+            .OrderBy(
+                path => Path.GetRelativePath(repositoryPath, path),
+                pathComparer)
+            .ToList();
 
         var topDirectories = Directory.EnumerateDirectories(repositoryPath)
             .Select(Path.GetFileName)
             .Where(name => name is not null && !IgnoredDirectories.Contains(name))
-            .OrderBy(name => name)
-            .Take(12)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         var frameworks = await DetectFrameworksAsync(files, cancellationToken);
         var commands = DetectCommands(files);
-        var readmePath = files.FirstOrDefault(file =>
-            string.Equals(Path.GetFileName(file), "README.md", StringComparison.OrdinalIgnoreCase));
+        var relativeFiles = files
+            .Select(path => Path.GetRelativePath(repositoryPath, path))
+            .ToList();
+        var repositoryPaths = gitRepositories
+            .Select(path => Path.GetRelativePath(repositoryPath, path))
+            .ToList();
+        var primaryFileTypes = files
+            .GroupBy(
+                path => string.IsNullOrWhiteSpace(Path.GetExtension(path))
+                    ? "[no extension]"
+                    : Path.GetExtension(path).ToLowerInvariant(),
+                StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(12)
+            .Select(group => $"{group.Key} ({group.Count()})")
+            .ToList();
+        var entryPoints = relativeFiles
+            .Where(IsStudyEntryPoint)
+            .OrderBy(path => path, pathComparer)
+            .Take(80)
+            .ToList();
 
         var builder = new StringBuilder();
-        builder.AppendLine($"# {Path.GetFileName(repositoryPath)}");
-        builder.AppendLine();
-        builder.AppendLine("## Repository facts");
+        builder.AppendLine("Deterministic inventory (seed evidence, not final knowledge):");
+        builder.AppendLine($"- Project: {Path.GetFileName(repositoryPath)}");
         builder.AppendLine(
-            $"- **Git repositories:** {string.Join(", ", gitRepositories.Select(path => RepositoryLabel(repositoryPath, path)))}");
-        builder.AppendLine($"- **Top-level areas:** {string.Join(", ", topDirectories.DefaultIfEmpty("No child directories"))}");
-        builder.AppendLine($"- **Detected stack:** {string.Join(", ", frameworks.DefaultIfEmpty("No framework manifest detected"))}");
-        builder.AppendLine();
-        builder.AppendLine("## Likely developer commands");
+            $"- Git repositories: {string.Join(", ", repositoryPaths.DefaultIfEmpty("."))}");
+        builder.AppendLine(
+            $"- Top-level areas: {string.Join(", ", topDirectories.DefaultIfEmpty("No child directories"))}");
+        builder.AppendLine(
+            $"- Detected stack hints: {string.Join(", ", frameworks.DefaultIfEmpty("No framework manifest detected"))}");
+        builder.AppendLine(
+            $"- Primary file types: {string.Join(", ", primaryFileTypes.DefaultIfEmpty("No files"))}");
+        builder.AppendLine($"- Files inventoried: {files.Count}");
+        builder.AppendLine(
+            $"- Excluded generated or dependency directories: {string.Join(", ", IgnoredDirectories.OrderBy(name => name, StringComparer.OrdinalIgnoreCase))}");
+        builder.AppendLine("- Candidate commands to verify:");
         foreach (var command in commands.DefaultIfEmpty("Inspect the repository README for project-specific commands."))
         {
-            builder.AppendLine($"- `{command}`");
+            builder.AppendLine($"  - {command}");
         }
 
-        if (readmePath is not null)
+        if (entryPoints.Count > 0)
         {
-            builder.AppendLine();
-            builder.AppendLine("## README signal");
-            builder.AppendLine(await ReadLimitedAsync(readmePath, 600, cancellationToken));
+            builder.AppendLine("- Selected documentation, manifest, and configuration entry points:");
+            foreach (var entryPoint in entryPoints)
+            {
+                builder.AppendLine($"  - {entryPoint}");
+            }
         }
 
         if (warnings.Count > 0)
         {
-            builder.AppendLine();
-            builder.AppendLine("## Study warnings");
+            builder.AppendLine("- Inventory warnings:");
             foreach (var warning in warnings)
             {
-                builder.AppendLine($"- {warning}");
+                builder.AppendLine($"  - {warning}");
             }
         }
 
-        return builder.ToString().Trim();
+        return new RepositoryStudyInventory(
+            builder.ToString().Trim(),
+            relativeFiles,
+            repositoryPaths);
+    }
+
+    private static bool IsStudyEntryPoint(string path)
+    {
+        var name = Path.GetFileName(path);
+        return name.StartsWith("README", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("AGENTS.md", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("copilot-instructions.md", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("WORKFLOW.md", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("package.json", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("package-lock.json", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("pnpm-lock.yaml", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("yarn.lock", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("bun.lock", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("angular.json", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("pyproject.toml", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("requirements.txt", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("go.mod", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("Cargo.toml", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("pom.xml", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("build.gradle", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("build.gradle.kts", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("Dockerfile", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("docker-compose.yml", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("docker-compose.yaml", StringComparison.OrdinalIgnoreCase) ||
+               path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase) ||
+               path.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase) ||
+               path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
     }
 
     private static IEnumerable<string> EnumerateSourceFiles(
         string root,
-        ICollection<string> warnings)
+        ICollection<string> warnings,
+        CancellationToken cancellationToken)
     {
         var pending = new Stack<string>();
         pending.Push(root);
 
         while (pending.Count > 0)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var current = pending.Pop();
             IEnumerable<string> directories;
             IEnumerable<string> files;
@@ -338,7 +410,8 @@ public sealed class RepositoryAnalyzer(
 
             foreach (var directory in directories)
             {
-                if (!IgnoredDirectories.Contains(Path.GetFileName(directory)))
+                if (!IgnoredDirectories.Contains(Path.GetFileName(directory)) &&
+                    CanTraverse(directory))
                 {
                     pending.Push(directory);
                 }
@@ -370,20 +443,28 @@ public sealed class RepositoryAnalyzer(
         if (names.Contains("package.json"))
         {
             frameworks.Add("Node.js");
-            var packagePath = files.First(file =>
-                string.Equals(Path.GetFileName(file), "package.json", StringComparison.OrdinalIgnoreCase));
-            var package = await ReadLimitedAsync(packagePath, 80_000, cancellationToken);
-            if (package.Contains("\"react\"", StringComparison.OrdinalIgnoreCase))
+            foreach (var packagePath in files.Where(file =>
+                         string.Equals(
+                             Path.GetFileName(file),
+                             "package.json",
+                             StringComparison.OrdinalIgnoreCase)))
             {
-                frameworks.Add("React");
-            }
-            if (package.Contains("\"vue\"", StringComparison.OrdinalIgnoreCase))
-            {
-                frameworks.Add("Vue");
-            }
-            if (package.Contains("\"@angular/", StringComparison.OrdinalIgnoreCase))
-            {
-                frameworks.Add("Angular");
+                var package = await ReadPrefixAsync(
+                    packagePath,
+                    80_000,
+                    cancellationToken);
+                if (package.Contains("\"react\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    frameworks.Add("React");
+                }
+                if (package.Contains("\"vue\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    frameworks.Add("Vue");
+                }
+                if (package.Contains("\"@angular/", StringComparison.OrdinalIgnoreCase))
+                {
+                    frameworks.Add("Angular");
+                }
             }
         }
 
@@ -446,15 +527,27 @@ public sealed class RepositoryAnalyzer(
         return commands;
     }
 
-    private static async Task<string> ReadLimitedAsync(
+    private static async Task<string> ReadPrefixAsync(
         string path,
-        int maxCharacters,
+        int maximumCharacters,
         CancellationToken cancellationToken)
     {
-        var text = await File.ReadAllTextAsync(path, cancellationToken);
-        return text.Length <= maxCharacters
-            ? text.Trim()
-            : $"{text[..maxCharacters].Trim()}\n\n[truncated by repository study]";
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4_096,
+            useAsync: true);
+        using var reader = new StreamReader(
+            stream,
+            Encoding.UTF8,
+            detectEncodingFromByteOrderMarks: true);
+        var buffer = new char[maximumCharacters];
+        var read = await reader.ReadBlockAsync(
+            buffer.AsMemory(),
+            cancellationToken);
+        return new string(buffer, 0, read);
     }
 
     private static string Tail(string text, int maxCharacters) =>
@@ -477,14 +570,6 @@ public sealed class RepositoryAnalyzer(
         {
             return false;
         }
-    }
-
-    private static string RepositoryLabel(string projectPath, string repositoryPath)
-    {
-        var relativePath = Path.GetRelativePath(projectPath, repositoryPath);
-        return relativePath == "."
-            ? Path.GetFileName(repositoryPath)
-            : relativePath;
     }
 
     private static string DriveLabel(DriveInfo drive)

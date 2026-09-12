@@ -1218,7 +1218,7 @@ public sealed class CopilotReasoningHostTests
     }
 
     [Fact]
-    public void PromptValues_KeepOnlyFocusedRoleContext()
+    public void PromptValues_PreserveCompleteReviewedRepositoryKnowledge()
     {
         var context = new AgentExecutionContext(
             Guid.NewGuid(),
@@ -1292,20 +1292,201 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("Implement the approved visual refresh", prompt);
         Assert.Contains(@"E:\worktrees\flow-123", prompt);
         Assert.Contains("Angular, Node.js", prompt);
-        Assert.Contains("### Project summary", prompt);
+        Assert.Contains(CopilotReasoningHost.RepositoryKnowledgeBegin, prompt);
+        Assert.Contains(CopilotReasoningHost.RepositoryKnowledgeEnd, prompt);
         Assert.Contains("Long README details", prompt);
+        Assert.Contains("Source files studied", prompt);
+        Assert.Contains("AI initialization", prompt);
+        Assert.Contains("README signal", prompt);
+        Assert.Contains("Installation", prompt);
+        Assert.Contains("Operations", prompt);
+        Assert.Contains("Editable harness notes", prompt);
         Assert.Contains("Architect handoff", prompt);
         Assert.Contains("Product Designer handoff", prompt);
         Assert.DoesNotContain("Team Lead handoff", prompt);
-        Assert.DoesNotContain("Source files studied", prompt);
-        Assert.DoesNotContain("AI initialization", prompt);
-        Assert.DoesNotContain("README signal", prompt);
-        Assert.DoesNotContain("Installation", prompt);
-        Assert.DoesNotContain("Operations", prompt);
-        Assert.DoesNotContain("Editable harness notes", prompt);
         Assert.DoesNotContain("Team plan", prompt);
         Assert.DoesNotContain("No prior", prompt);
         Assert.DoesNotContain(@"E:\source-project", prompt);
+    }
+
+    [Fact]
+    public void PromptValues_DoNotClipRepositoryKnowledgeByRole()
+    {
+        var requiredTail = "REPOSITORY-KNOWLEDGE-TAIL";
+        var knowledge = $"{new string('k', 20_000)}{requiredTail}";
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "account-manager",
+            "Account Manager",
+            "account-manager",
+            "gpt-5.4-mini",
+            "medium",
+            1,
+            "Clarify the request.",
+            knowledge,
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Confirm the request.",
+            [],
+            [],
+            Progress: null);
+
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Return the intake contract.",
+            context.WorkspacePath);
+        var rendered = new WorkflowPromptRenderer().Render(
+            "{{ task }}\n\n{{ role.context }}\n\n{{ agent.instructions }}",
+            values);
+        var bounded = CopilotReasoningHost.BoundRenderedPrompt(
+            context,
+            rendered);
+
+        Assert.Contains(requiredTail, values["role.context"]);
+        Assert.Contains(requiredTail, bounded);
+        Assert.Contains(knowledge, bounded);
+    }
+
+    [Theory]
+    [InlineData("product-manager", ExecutionInvocationKind.Worker, false)]
+    [InlineData("pre-mortem-sceptic", ExecutionInvocationKind.PreMortem, false)]
+    [InlineData("software-engineer", ExecutionInvocationKind.Worker, true)]
+    public void PromptValues_IncludeRepositoryKnowledgeForSpecialRoles(
+        string role,
+        ExecutionInvocationKind invocationKind,
+        bool isPreMortemRevision)
+    {
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            role,
+            role,
+            role,
+            "gpt-5.4-mini",
+            "medium",
+            1,
+            "Complete the assignment.",
+            "Reviewed repository constraint.",
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Complete the assignment.",
+            [],
+            [],
+            IsPreMortemRevision: isPreMortemRevision,
+            InvocationKind: invocationKind);
+
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Complete the role contract.",
+            context.WorkspacePath);
+
+        Assert.Contains(
+            "Reviewed repository constraint.",
+            values["role.context"]);
+    }
+
+    [Fact]
+    public void DirectPrompt_IncludesCompleteReviewedRepositoryKnowledge()
+    {
+        var knowledge = $"Architecture decisions.{Environment.NewLine}Required final detail.";
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "quality-engineer",
+            "Quality Engineer",
+            "quality-engineer",
+            "gpt-5.4-mini",
+            "medium",
+            1,
+            "Verify the result.",
+            knowledge,
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Verify the result.",
+            [],
+            [],
+            DirectPrompt: "Run the governed verification.");
+
+        var prompt = CopilotReasoningHost.BuildDirectPrompt(
+            context,
+            "Return the QA contract.",
+            context.WorkspacePath);
+
+        Assert.Contains(CopilotReasoningHost.RepositoryKnowledgeBegin, prompt);
+        Assert.Contains("Architecture decisions.", prompt);
+        Assert.Contains("Required final detail.", prompt);
+        Assert.Contains(CopilotReasoningHost.RepositoryKnowledgeEnd, prompt);
+    }
+
+    [Fact]
+    public void StudioPublication_RequiresPostImplementationKnowledgeRecap()
+    {
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "release-engineer",
+            "Release Engineer",
+            "release-engineer",
+            "gpt-5.4-mini",
+            "medium",
+            1,
+            WorkflowEngine.HostControlledPublicationAssignment,
+            "Reviewed repository knowledge.",
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Publish the accepted result.",
+            [],
+            [],
+            ContractVersion: "studio-v2",
+            InvocationKind: ExecutionInvocationKind.Publication);
+        var promptValues = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Publish the accepted result.",
+            context.WorkspacePath);
+        const string missingRecap = """
+            HANDOFF_STATUS: COMPLETE
+
+            ## Decision
+            Publication prepared.
+            """;
+        var validRecap =
+            "HANDOFF_STATUS: COMPLETE" +
+            Environment.NewLine +
+            RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
+            Environment.NewLine +
+            $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The accepted change does not alter durable repository knowledge.","Knowledge":null}""" +
+            Environment.NewLine +
+            RepositoryKnowledgeSynthesizer.RecapEndSentinel;
+
+        var error = WorkflowEngine.GetStudioContractCorrectionReason(
+            context,
+            missingRecap);
+
+        Assert.Contains(
+            RepositoryKnowledgeSynthesizer.RecapBeginSentinel,
+            error);
+        Assert.Contains(
+            RepositoryKnowledgeSynthesizer.RecapBeginSentinel,
+            promptValues["response.contract"]);
+        Assert.Null(
+            WorkflowEngine.GetStudioContractCorrectionReason(
+                context,
+                validRecap));
+        Assert.True(
+            CopilotReasoningHost.IsRecoverableCompletedOutput(
+                context.AgentRole,
+                validRecap,
+                contractVersion: context.ContractVersion,
+                invocationKind: context.InvocationKind));
     }
 
     [Fact]

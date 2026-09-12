@@ -412,6 +412,7 @@ public sealed class IncidentReplayTests
             var workspacePath = Path.Combine(root, "workspace");
             Directory.CreateDirectory(agentsDirectory);
             Directory.CreateDirectory(workspacePath);
+            Directory.CreateDirectory(Path.Combine(workspacePath, ".git"));
             await File.WriteAllTextAsync(
                 Path.Combine(root, "WORKFLOW.md"),
                 """
@@ -732,6 +733,16 @@ public sealed class IncidentReplayTests
             if (context.RequiresDeliveryReadinessQa && QaBlock is not null)
             {
                 output += Environment.NewLine + QaBlock(context);
+            }
+            if (context.InvocationKind == ExecutionInvocationKind.Publication)
+            {
+                output +=
+                    Environment.NewLine +
+                    RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
+                    Environment.NewLine +
+                    $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
+                    Environment.NewLine +
+                    RepositoryKnowledgeSynthesizer.RecapEndSentinel;
             }
             return Task.FromResult(new AgentExecutionResult(
                 output,

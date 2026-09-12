@@ -77,6 +77,32 @@ afterEach(() => {
 });
 
 describe("SettingsPage model strategy", () => {
+  it("states that the complete editable knowledge is supplied to agents", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter>
+            <SettingsPage />
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(
+      screen.getByText(
+        "An evidence-grounded, editable synthesis supplied to every agent before task-specific work."
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Copilot reconciles documentation with manifests, source, and tests. This text is passed in full; edit it to correct assumptions or add domain context."
+      )
+    ).toBeInTheDocument();
+  });
+
   it("offers only persisted Delivery outcomes", () => {
     const queryClient = new QueryClient();
     queryClient.setQueryData(queryKeys.bootstrap, bootstrap);

@@ -2501,6 +2501,296 @@ public sealed class ProcessRunnerTests
 public sealed class RepositoryBrowserTests
 {
     [Fact]
+    public async Task BuildStudyInventoryAsync_IndexesReadmesWithoutCopyingTheirBodies()
+    {
+        var project = Path.Combine(
+            Path.GetTempPath(),
+            $"ai-harness-knowledge-{Guid.NewGuid():N}");
+        var site = Path.Combine(project, "site");
+        var data = Path.Combine(project, "data");
+        var siteReadme = $"# Site{Environment.NewLine}{new string('s', 900)}SITE-README-END";
+        var dataReadme = $"# Data{Environment.NewLine}{new string('d', 900)}DATA-README-END";
+
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(site, ".git"));
+            Directory.CreateDirectory(Path.Combine(data, ".git"));
+            await File.WriteAllTextAsync(
+                Path.Combine(site, "README.md"),
+                siteReadme);
+            await File.WriteAllTextAsync(
+                Path.Combine(data, "README.md"),
+                dataReadme);
+            await File.WriteAllTextAsync(
+                Path.Combine(site, "package.json"),
+                """{"dependencies":{"@angular/core":"22.0.0"}}""");
+
+            var repositories = RepositoryAnalyzer.FindGitRepositories(project);
+            var inventory = await RepositoryAnalyzer.BuildStudyInventoryAsync(
+                project,
+                repositories,
+                CancellationToken.None);
+
+            Assert.Contains(Path.Combine("site", "README.md"), inventory.Files);
+            Assert.Contains(Path.Combine("data", "README.md"), inventory.Files);
+            Assert.Contains(Path.Combine("site", "README.md"), inventory.Summary);
+            Assert.Contains(Path.Combine("data", "README.md"), inventory.Summary);
+            Assert.DoesNotContain("SITE-README-END", inventory.Summary);
+            Assert.DoesNotContain("DATA-README-END", inventory.Summary);
+            Assert.Contains("Angular", inventory.Summary);
+            Assert.Equal(
+                [Path.Combine("data"), Path.Combine("site")],
+                inventory.RepositoryPaths);
+        }
+        finally
+        {
+            Directory.Delete(project, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RepositoryStudyArguments_AreReadOnlyAndIgnoreRepositoryInstructions()
+    {
+        var sessionId = Guid.NewGuid();
+        var arguments = RepositoryKnowledgeSynthesizer.BuildStudyArguments(
+            Environment.CurrentDirectory,
+            "Study the repository.",
+            sessionId);
+
+        Assert.Contains("--available-tools=view,grep,glob", arguments);
+        Assert.Contains("--allow-tool=view,grep,glob", arguments);
+        Assert.Contains("--deny-tool=write,shell", arguments);
+        Assert.Contains("--no-custom-instructions", arguments);
+        Assert.Contains("--disable-builtin-mcps", arguments);
+        Assert.Contains("--no-remote", arguments);
+        Assert.Contains("--no-remote-export", arguments);
+        Assert.Contains("--session-id", arguments);
+        Assert.Contains(sessionId.ToString("D"), arguments);
+        Assert.DoesNotContain("--allow-all", arguments);
+        Assert.DoesNotContain("--allow-all-tools", arguments);
+    }
+
+    [Fact]
+    public async Task RepositoryStudy_SynthesizesEvidenceGroundedEditableKnowledge()
+    {
+        var fixture = await RepositoryStudyFixture.CreateAsync();
+        try
+        {
+            var contract = fixture.ValidContract();
+            var runner = new RepositoryStudyProcessRunner(contract);
+            var synthesizer = new RepositoryKnowledgeSynthesizer(
+                runner,
+                NullLogger<RepositoryKnowledgeSynthesizer>.Instance);
+
+            var knowledge = await synthesizer.SynthesizeAsync(
+                "copilot",
+                new AiHarnessDemo.Core.Workflow.CopilotConfig
+                {
+                    TurnTimeoutMs = 20_000,
+                    MaximumQualityStallTimeoutMs = 10_000
+                },
+                fixture.Root,
+                fixture.Inventory,
+                CancellationToken.None);
+
+            Assert.Contains($"# {Path.GetFileName(fixture.Root)}", knowledge);
+            Assert.Contains("## Product and scope", knowledge);
+            Assert.Contains("## Repository map", knowledge);
+            Assert.Contains("serves the community sites", knowledge);
+            Assert.Contains($"`{fixture.SiteSource}`", knowledge);
+            Assert.DoesNotContain(fixture.ReadmeBody, knowledge);
+            Assert.Contains("--no-custom-instructions", runner.Arguments);
+            Assert.Contains("--deny-tool=write,shell", runner.Arguments);
+        }
+        finally
+        {
+            fixture.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task RepositoryStudy_RejectsReadmeOnlySynthesisWhenSourceAndTestsExist()
+    {
+        var fixture = await RepositoryStudyFixture.CreateAsync();
+        try
+        {
+            var output = fixture.Contract(
+                productEvidence: [fixture.SiteReadme],
+                architectureEvidence: [fixture.SiteReadme],
+                technologyEvidence: [fixture.SiteReadme],
+                constraintEvidence: [fixture.SiteReadme],
+                siteRepositoryEvidence: [fixture.SiteReadme],
+                riskEvidence: [fixture.SiteReadme]);
+
+            var exception = Assert.Throws<RepositoryKnowledgeContractException>(
+                () => RepositoryKnowledgeSynthesizer.ParseAndRender(
+                    output,
+                    fixture.Root,
+                    fixture.Inventory));
+
+            Assert.Contains(
+                exception.Errors,
+                error => error.Contains("source file", StringComparison.Ordinal));
+            Assert.Contains(
+                exception.Errors,
+                error => error.Contains("test file", StringComparison.Ordinal));
+            Assert.Contains(
+                exception.Errors,
+                error => error.Contains("manifest or configuration", StringComparison.Ordinal));
+        }
+        finally
+        {
+            fixture.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task RepositoryKnowledgeRecap_ReplacesTheBaselineOnlyForDurableImpact()
+    {
+        var fixture = await RepositoryStudyFixture.CreateAsync();
+        try
+        {
+            var changed = RepositoryKnowledgeSynthesizer.ParseAndRenderRecap(
+                fixture.ChangedRecap(),
+                fixture.Root,
+                fixture.Inventory,
+                Path.GetFileName(fixture.Root));
+            var unchanged = RepositoryKnowledgeSynthesizer.ParseAndRenderRecap(
+                fixture.UnchangedRecap(),
+                fixture.Root,
+                fixture.Inventory,
+                Path.GetFileName(fixture.Root));
+
+            Assert.True(changed.Changed);
+            Assert.Contains("serves the community sites", changed.Knowledge);
+            Assert.False(unchanged.Changed);
+            Assert.Null(unchanged.Knowledge);
+        }
+        finally
+        {
+            fixture.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task RepositoryKnowledge_PreservesUserProvidedFactsWithoutInventedEvidence()
+    {
+        var fixture = await RepositoryStudyFixture.CreateAsync();
+        try
+        {
+            var output = fixture.Contract(
+                productEvidence: [fixture.SiteReadme, fixture.SiteSource],
+                architectureEvidence: [fixture.SiteSource, fixture.DataReadme],
+                technologyEvidence: [fixture.SiteManifest, fixture.SiteTest],
+                constraintEvidence: [],
+                constraintBasis:
+                    RepositoryKnowledgeSynthesizer.UserProvidedBasis);
+
+            var knowledge = RepositoryKnowledgeSynthesizer.ParseAndRender(
+                output,
+                fixture.Root,
+                fixture.Inventory);
+
+            Assert.Contains(
+                "Changes must preserve the shared community-site behavior. _(User-provided)_",
+                knowledge);
+        }
+        finally
+        {
+            fixture.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task AcceptedKnowledgeRecap_DoesNotOverwriteNewerUserEdits()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"repository-recap-db-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var options = new DbContextOptionsBuilder<HarnessDbContext>()
+            .UseSqlite(
+                $"Data Source={Path.Combine(root, "recap.db")};Pooling=False")
+            .Options;
+        const string baseline = "Original reviewed knowledge.";
+        const string refreshed = "Updated accepted knowledge.";
+
+        try
+        {
+            await using var database = new HarnessDbContext(options);
+            await database.Database.EnsureCreatedAsync();
+            database.Settings.Add(new HarnessSettings
+            {
+                Id = 1,
+                RepositoryPath = root,
+                RepositoryKnowledge = baseline
+            });
+            var firstFlow = RepositoryStudyFixture.KnowledgeFlow(root, baseline);
+            var firstStep =
+                RepositoryStudyFixture.KnowledgePublicationStep(firstFlow.Id);
+            database.Flows.Add(firstFlow);
+            database.FlowSteps.Add(firstStep);
+            await database.SaveChangesAsync();
+
+            await WorkflowEngine.ApplyRepositoryKnowledgeRecapAsync(
+                database,
+                firstFlow,
+                firstStep,
+                new RepositoryKnowledgeRecap(
+                    Changed: true,
+                    Reason: "Architecture changed.",
+                    Knowledge: refreshed),
+                DateTimeOffset.UtcNow,
+                CancellationToken.None);
+            await database.SaveChangesAsync();
+            database.ChangeTracker.Clear();
+
+            var settings = await database.Settings.SingleAsync();
+            Assert.Equal(refreshed, settings.RepositoryKnowledge);
+            Assert.Contains(
+                await database.FlowEvents.ToListAsync(),
+                item => item.Type ==
+                        WorkflowEngine.RepositoryKnowledgeRefreshedEventType);
+
+            settings.RepositoryKnowledge = "User-authored newer knowledge.";
+            await database.SaveChangesAsync();
+            var secondFlow = RepositoryStudyFixture.KnowledgeFlow(root, baseline);
+            var secondStep =
+                RepositoryStudyFixture.KnowledgePublicationStep(secondFlow.Id);
+            database.Flows.Add(secondFlow);
+            database.FlowSteps.Add(secondStep);
+            await database.SaveChangesAsync();
+
+            await WorkflowEngine.ApplyRepositoryKnowledgeRecapAsync(
+                database,
+                secondFlow,
+                secondStep,
+                new RepositoryKnowledgeRecap(
+                    Changed: true,
+                    Reason: "A later architecture change.",
+                    Knowledge: "Agent-generated replacement."),
+                DateTimeOffset.UtcNow,
+                CancellationToken.None);
+            await database.SaveChangesAsync();
+            database.ChangeTracker.Clear();
+
+            Assert.Equal(
+                "User-authored newer knowledge.",
+                (await database.Settings.SingleAsync()).RepositoryKnowledge);
+            Assert.Contains(
+                await database.FlowEvents.ToListAsync(),
+                item =>
+                    item.FlowRunId == secondFlow.Id &&
+                    item.Type ==
+                    WorkflowEngine.RepositoryKnowledgeRefreshSkippedEventType);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void ListLocations_ReturnsExistingPortableEntryPoints()
     {
         var locations = RepositoryAnalyzer.ListLocations();
@@ -2552,6 +2842,279 @@ public sealed class RepositoryBrowserTests
         {
             Directory.Delete(project, recursive: true);
         }
+    }
+
+    private sealed class RepositoryStudyProcessRunner(string contract)
+        : ProcessRunner
+    {
+        public IReadOnlyList<string> Arguments { get; private set; } = [];
+
+        public override Task<ProcessResult> RunAsync(
+            string executable,
+            IEnumerable<string> arguments,
+            string workingDirectory,
+            TimeSpan timeout,
+            CancellationToken cancellationToken = default,
+            Action<string>? standardOutputLineReceived = null,
+            TimeSpan? stallTimeout = null,
+            IReadOnlyDictionary<string, string?>? environmentVariables = null)
+        {
+            Arguments = arguments.ToArray();
+            var output = string.Join(
+                Environment.NewLine,
+                JsonSerializer.Serialize(new
+                {
+                    type = "tool.execution_start",
+                    data = new
+                    {
+                        toolCallId = "study-one",
+                        toolName = "glob",
+                        arguments = new { pattern = "**/*" }
+                    }
+                }),
+                JsonSerializer.Serialize(new
+                {
+                    type = "tool.execution_complete",
+                    data = new
+                    {
+                        toolCallId = "study-one",
+                        toolName = "glob",
+                        success = true
+                    }
+                }),
+                JsonSerializer.Serialize(new
+                {
+                    type = "assistant.message",
+                    data = new { content = contract }
+                }),
+                """{"type":"result","exitCode":0}""");
+            return Task.FromResult(new ProcessResult(0, output, string.Empty));
+        }
+    }
+
+    private sealed class RepositoryStudyFixture : IDisposable
+    {
+        private RepositoryStudyFixture(
+            string root,
+            string readmeBody,
+            RepositoryStudyInventory inventory)
+        {
+            Root = root;
+            ReadmeBody = readmeBody;
+            Inventory = inventory;
+        }
+
+        public string Root { get; }
+
+        public string ReadmeBody { get; }
+
+        public RepositoryStudyInventory Inventory { get; }
+
+        public string SiteReadme => Path.Combine("site", "README.md");
+
+        public string SiteManifest => Path.Combine("site", "package.json");
+
+        public string SiteSource => Path.Combine("site", "src", "app.ts");
+
+        public string SiteTest => Path.Combine("site", "tests", "app.test.ts");
+
+        public string DataReadme => Path.Combine("data", "README.md");
+
+        public static async Task<RepositoryStudyFixture> CreateAsync()
+        {
+            var root = Path.Combine(
+                Path.GetTempPath(),
+                $"repository-study-{Guid.NewGuid():N}");
+            var site = Path.Combine(root, "site");
+            var data = Path.Combine(root, "data");
+            var readmeBody =
+                "OUTDATED README BODY THAT MUST NOT BE COPIED INTO KNOWLEDGE";
+            Directory.CreateDirectory(Path.Combine(site, ".git"));
+            Directory.CreateDirectory(Path.Combine(site, "src"));
+            Directory.CreateDirectory(Path.Combine(site, "tests"));
+            Directory.CreateDirectory(Path.Combine(data, ".git"));
+            await File.WriteAllTextAsync(
+                Path.Combine(site, "README.md"),
+                readmeBody);
+            await File.WriteAllTextAsync(
+                Path.Combine(site, "package.json"),
+                """{"scripts":{"test":"vitest run"},"dependencies":{"@angular/core":"22.0.0"}}""");
+            await File.WriteAllTextAsync(
+                Path.Combine(site, "src", "app.ts"),
+                "export const site = 'community';");
+            await File.WriteAllTextAsync(
+                Path.Combine(site, "tests", "app.test.ts"),
+                "test('site', () => expect(true).toBe(true));");
+            await File.WriteAllTextAsync(
+                Path.Combine(data, "README.md"),
+                "# Data API");
+
+            var repositories = RepositoryAnalyzer.FindGitRepositories(root);
+            var inventory = await RepositoryAnalyzer.BuildStudyInventoryAsync(
+                root,
+                repositories,
+                CancellationToken.None);
+            return new RepositoryStudyFixture(root, readmeBody, inventory);
+        }
+
+        public string ValidContract() =>
+            Contract(
+                productEvidence: [SiteReadme, SiteSource],
+                architectureEvidence: [SiteSource, DataReadme],
+                technologyEvidence: [SiteManifest, SiteTest],
+                constraintEvidence: [SiteSource, SiteTest]);
+
+        public string ChangedRecap()
+        {
+            var contract = ValidContract().ReplaceLineEndings("\n");
+            var begin = contract.IndexOf(
+                RepositoryKnowledgeSynthesizer.BeginSentinel,
+                StringComparison.Ordinal);
+            var end = contract.IndexOf(
+                RepositoryKnowledgeSynthesizer.EndSentinel,
+                StringComparison.Ordinal);
+            var knowledgeJson = contract[
+                (begin + RepositoryKnowledgeSynthesizer.BeginSentinel.Length)..end]
+                .Trim();
+            return
+                RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
+                Environment.NewLine +
+                $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":true,"Reason":"The accepted implementation changed durable architecture.","Knowledge":{{knowledgeJson}}}""" +
+                Environment.NewLine +
+                RepositoryKnowledgeSynthesizer.RecapEndSentinel;
+        }
+
+        public string UnchangedRecap() =>
+            RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
+            Environment.NewLine +
+            $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The accepted implementation does not change durable repository knowledge.","Knowledge":null}""" +
+            Environment.NewLine +
+            RepositoryKnowledgeSynthesizer.RecapEndSentinel;
+
+        public string Contract(
+            IReadOnlyList<string> productEvidence,
+            IReadOnlyList<string> architectureEvidence,
+            IReadOnlyList<string> technologyEvidence,
+            IReadOnlyList<string> constraintEvidence,
+            IReadOnlyList<string>? siteRepositoryEvidence = null,
+            IReadOnlyList<string>? riskEvidence = null,
+            string? constraintBasis = null)
+        {
+            var document = new
+            {
+                Version = RepositoryKnowledgeSynthesizer.Version,
+                Project = Path.GetFileName(Root),
+                ProductAndScope = new[]
+                {
+                    new
+                    {
+                        Summary = "Study project serves the community sites.",
+                        Basis =
+                            RepositoryKnowledgeSynthesizer.RepositoryEvidenceBasis,
+                        Evidence = productEvidence
+                    }
+                },
+                Repositories = new[]
+                {
+                    new
+                    {
+                        Path = Path.Combine("data"),
+                        Purpose = "Provides the runtime content consumed by the site.",
+                        Evidence = (IReadOnlyList<string>)[DataReadme]
+                    },
+                    new
+                    {
+                        Path = Path.Combine("site"),
+                        Purpose = "Implements and verifies the user-facing application.",
+                        Evidence = siteRepositoryEvidence ??
+                                   new[] { SiteManifest, SiteSource }
+                    }
+                },
+                ArchitectureAndDataFlow = new[]
+                {
+                    new
+                    {
+                        Summary = "The site application consumes content maintained by the data repository.",
+                        Basis =
+                            RepositoryKnowledgeSynthesizer.RepositoryEvidenceBasis,
+                        Evidence = architectureEvidence
+                    }
+                },
+                TechnologyAndWorkflow = new[]
+                {
+                    new
+                    {
+                        Summary = "The Angular application is verified with its configured test script.",
+                        Basis =
+                            RepositoryKnowledgeSynthesizer.RepositoryEvidenceBasis,
+                        Evidence = technologyEvidence
+                    }
+                },
+                ConstraintsAndConventions = new[]
+                {
+                    new
+                    {
+                        Summary = "Changes must preserve the shared community-site behavior.",
+                        Basis = constraintBasis ??
+                                RepositoryKnowledgeSynthesizer
+                                    .RepositoryEvidenceBasis,
+                        Evidence = constraintEvidence
+                    }
+                },
+                RisksAndUnknowns = new[]
+                {
+                    new
+                    {
+                        Summary = "The README claim may be stale and needs confirmation against current behavior.",
+                        Basis =
+                            RepositoryKnowledgeSynthesizer.UnresolvedBasis,
+                        Evidence = riskEvidence ??
+                                   new[] { SiteReadme, SiteSource }
+                    }
+                }
+            };
+            return
+                RepositoryKnowledgeSynthesizer.BeginSentinel +
+                Environment.NewLine +
+                JsonSerializer.Serialize(document) +
+                Environment.NewLine +
+                RepositoryKnowledgeSynthesizer.EndSentinel;
+        }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Root))
+            {
+                Directory.Delete(Root, recursive: true);
+            }
+        }
+
+        public static FlowRun KnowledgeFlow(
+            string repositoryPath,
+            string repositoryKnowledge) =>
+            new()
+            {
+                Title = "Knowledge recap",
+                OriginalRequest = "Update durable behavior.",
+                ConsolidatedRequest = "Update durable behavior.",
+                ContractVersion = "studio-v2",
+                RepositoryPath = repositoryPath,
+                RepositoryKnowledge = repositoryKnowledge,
+                WorkspacePath = repositoryPath
+            };
+
+        public static FlowStep KnowledgePublicationStep(Guid flowId) =>
+            new()
+            {
+                FlowRunId = flowId,
+                Iteration = 1,
+                Sequence = 10,
+                AgentId = "release-engineer",
+                AgentName = "Release Engineer",
+                AgentRole = "release-engineer",
+                InvocationKind = ExecutionInvocationKind.Publication,
+                PlanStage = PlanStage.AfterApproval
+            };
     }
 }
 

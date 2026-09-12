@@ -57,6 +57,12 @@ public sealed class WorkflowEngine(
         "account-manager:refinement";
     internal const int MaximumQaContractErrorCharacters = 4_000;
     internal const int MaximumFailedOutputCharacters = 32_000;
+    internal const string RepositoryKnowledgeRefreshedEventType =
+        "repository.knowledge-refreshed";
+    internal const string RepositoryKnowledgeUnchangedEventType =
+        "repository.knowledge-unchanged";
+    internal const string RepositoryKnowledgeRefreshSkippedEventType =
+        "repository.knowledge-refresh-skipped";
     private const string ManualRestartLabelPrefix = "Manual restart of ";
     private const string StudioContractCorrectionLabelPrefix =
         "Correct invalid response from ";
@@ -122,6 +128,10 @@ public sealed class WorkflowEngine(
         manifestStager ?? new AgentManifestStager();
     private readonly ConcurrentDictionary<Guid, byte> _executionClaims = new();
     private int _activeFlows;
+
+    private sealed record PreparedPublicationCompletion(
+        string VerificationOutput,
+        RepositoryKnowledgeRecap? KnowledgeRecap);
 
     internal int ActiveFlowCount
     {
@@ -4391,6 +4401,11 @@ public sealed class WorkflowEngine(
             {
                 _ = FlowOutcomeParser.Parse(output);
             }
+            if (context.InvocationKind == ExecutionInvocationKind.Publication &&
+                !handoff.IsPushback)
+            {
+                _ = RepositoryKnowledgeSynthesizer.ParseRecapEnvelope(output);
+            }
         }
         catch (InvalidOperationException exception)
         {
@@ -5573,7 +5588,7 @@ public sealed class WorkflowEngine(
         Guid? recoveredSessionId,
         CancellationToken cancellationToken)
     {
-        var governedPublicationOutput = await PrepareGovernedPublicationIfNeededAsync(
+        var preparedPublication = await PrepareGovernedPublicationIfNeededAsync(
             flowId,
             stepId,
             result,
@@ -5590,7 +5605,7 @@ public sealed class WorkflowEngine(
             completedAt,
             durationMilliseconds,
             recoveredSessionId,
-            governedPublicationOutput,
+            preparedPublication,
             cancellationToken);
         await database.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
@@ -5615,7 +5630,8 @@ public sealed class WorkflowEngine(
         return completion.Step;
     }
 
-    private async Task<string?> PrepareGovernedPublicationIfNeededAsync(
+    private async Task<PreparedPublicationCompletion?>
+        PrepareGovernedPublicationIfNeededAsync(
         Guid flowId,
         Guid stepId,
         AgentExecutionResult result,
@@ -5650,6 +5666,7 @@ public sealed class WorkflowEngine(
         {
             return null;
         }
+        RepositoryKnowledgeRecap? knowledgeRecap = null;
         if (studioReviewed)
         {
             // Remote publication is an irreversible host side effect. Validate the exact,
@@ -5665,6 +5682,40 @@ public sealed class WorkflowEngine(
                 publication.flow,
                 publication.Step,
                 cancellationToken);
+            if (string.IsNullOrWhiteSpace(publication.flow.WorkspacePath) ||
+                !Directory.Exists(publication.flow.WorkspacePath))
+            {
+                throw new InvalidOperationException(
+                    "The accepted Delivery workspace is unavailable for the post-implementation repository knowledge recap.");
+            }
+            var repositories = RepositoryAnalyzer.FindGitRepositories(
+                publication.flow.WorkspacePath);
+            if (repositories.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    "The accepted Delivery workspace contains no Git repositories for the post-implementation repository knowledge recap.");
+            }
+            var inventory = await RepositoryAnalyzer.BuildStudyInventoryAsync(
+                publication.flow.WorkspacePath,
+                repositories,
+                cancellationToken);
+            knowledgeRecap =
+                RepositoryKnowledgeSynthesizer.ParseAndRenderRecap(
+                    result.Output,
+                    publication.flow.WorkspacePath,
+                    inventory,
+                    RepositoryKnowledgeSynthesizer.ResolveProjectName(
+                        publication.flow.RepositoryKnowledge,
+                        publication.flow.RepositoryPath));
+            if (knowledgeRecap.Changed &&
+                string.Equals(
+                    knowledgeRecap.Knowledge,
+                    publication.flow.RepositoryKnowledge,
+                    StringComparison.Ordinal))
+            {
+                throw new RepositoryKnowledgeContractException(
+                    ["Changed cannot be true when the synthesized knowledge is identical to the flow baseline"]);
+            }
         }
         else if (AgentHandoffInspector.GetPushbackReason(result.Output) is not null)
         {
@@ -5673,13 +5724,16 @@ public sealed class WorkflowEngine(
             return null;
         }
 
-        return await (candidatePublisher
+        var verificationOutput = await (candidatePublisher
             ?? throw new InvalidOperationException(
                 "No verified candidate publisher is configured."))
             .PublishAsync(
                 publication.flow,
                 stepId,
                 cancellationToken);
+        return new PreparedPublicationCompletion(
+            verificationOutput,
+            knowledgeRecap);
     }
 
     private async Task<EffectiveExecutionPermission>
@@ -6213,7 +6267,7 @@ public sealed class WorkflowEngine(
         DateTimeOffset completedAt,
         long? durationMilliseconds,
         Guid? recoveredSessionId,
-        string? governedPublicationOutput,
+        PreparedPublicationCompletion? preparedPublication,
         CancellationToken cancellationToken)
     {
         var step = await database.FlowSteps.SingleAsync(
@@ -6367,7 +6421,7 @@ public sealed class WorkflowEngine(
             var verificationOutput = result.Output;
             if (studioPublication)
             {
-                verificationOutput = governedPublicationOutput
+                verificationOutput = preparedPublication?.VerificationOutput
                     ?? throw new InvalidOperationException(
                         "studio-v2 publication requires a host-controlled sealed-candidate publication record.");
                 database.FlowEvents.Add(new FlowEvent
@@ -6382,7 +6436,7 @@ public sealed class WorkflowEngine(
             else if (legacyPublication &&
                      !string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
             {
-                verificationOutput = governedPublicationOutput
+                verificationOutput = preparedPublication?.VerificationOutput
                     ?? throw new InvalidOperationException(
                         "Governed publication finalization requires a durable host publication record.");
                 database.FlowEvents.Add(new FlowEvent
@@ -6405,6 +6459,18 @@ public sealed class WorkflowEngine(
             }
             flow.OutcomeUrl = published.Url;
             flow.OutcomeLabel = published.Label;
+            if (studioPublication)
+            {
+                await ApplyRepositoryKnowledgeRecapAsync(
+                    database,
+                    flow,
+                    step,
+                    preparedPublication?.KnowledgeRecap
+                    ?? throw new InvalidOperationException(
+                        "studio-v2 publication completion has no validated repository knowledge recap."),
+                    completedAt,
+                    cancellationToken);
+            }
         }
         if (!pushedBack && flow.ContractVersion == "legacy-v1")
         {
@@ -6596,6 +6662,90 @@ public sealed class WorkflowEngine(
             elapsedMilliseconds,
             step.ExecutionAttempts,
             preparedGateUpdates);
+    }
+
+    internal static async Task ApplyRepositoryKnowledgeRecapAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep publication,
+        RepositoryKnowledgeRecap recap,
+        DateTimeOffset completedAt,
+        CancellationToken cancellationToken)
+    {
+        var recapEventTypes = new[]
+        {
+            RepositoryKnowledgeRefreshedEventType,
+            RepositoryKnowledgeUnchangedEventType,
+            RepositoryKnowledgeRefreshSkippedEventType
+        };
+        if (await database.FlowEvents.AnyAsync(
+                item =>
+                    item.FlowRunId == flow.Id &&
+                    item.FlowStepId == publication.Id &&
+                    recapEventTypes.Contains(item.Type),
+                cancellationToken))
+        {
+            return;
+        }
+
+        if (!recap.Changed)
+        {
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = publication.Id,
+                Type = RepositoryKnowledgeUnchangedEventType,
+                Message =
+                    "Post-implementation recap found no durable Repository Knowledge change.",
+                DataJson = JsonSerializer.Serialize(new
+                {
+                    Version = RepositoryKnowledgeSynthesizer.RecapVersion,
+                    recap.Reason
+                })
+            });
+            return;
+        }
+
+        var knowledge = recap.Knowledge
+            ?? throw new InvalidOperationException(
+                "A changed repository knowledge recap has no synthesized replacement.");
+        var updated = await database.Settings
+            .Where(item =>
+                item.Id == 1 &&
+                item.RepositoryPath == flow.RepositoryPath &&
+                item.RepositoryKnowledge == flow.RepositoryKnowledge)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(
+                        item => item.RepositoryKnowledge,
+                        knowledge)
+                    .SetProperty(
+                        item => item.UpdatedAt,
+                        completedAt),
+                cancellationToken);
+        var refreshed = updated == 1;
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = publication.Id,
+            Type = refreshed
+                ? RepositoryKnowledgeRefreshedEventType
+                : RepositoryKnowledgeRefreshSkippedEventType,
+            Message = refreshed
+                ? "Post-implementation recap refreshed the editable Repository Knowledge baseline for future flows."
+                : "Post-implementation recap did not overwrite Repository Knowledge because the selected repository or user-edited baseline changed after this flow started.",
+            DataJson = JsonSerializer.Serialize(new
+            {
+                Version = RepositoryKnowledgeSynthesizer.RecapVersion,
+                recap.Reason,
+                PreviousSha256 =
+                    OutcomeVerificationRules.ComputeSha256(
+                        flow.RepositoryKnowledge),
+                NewSha256 =
+                    OutcomeVerificationRules.ComputeSha256(
+                        knowledge)
+            })
+        });
     }
 
     internal static ParsedIntakeV2 ValidateStudioIntakeCompletion(

@@ -230,7 +230,9 @@ public sealed class ReviewWorkflowTests
         await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
 
         var published = await harness.LoadFlowAsync();
-        Assert.Equal(FlowStatus.Approved, published.Status);
+        Assert.True(
+            published.Status == FlowStatus.Approved,
+            published.FailureReason);
         Assert.Equal(1, harness.PublicationVerifier.Calls);
         Assert.Single(
             published.Steps,
@@ -242,6 +244,10 @@ public sealed class ReviewWorkflowTests
                 context.IsHostControlledPublication &&
                 !context.AllowRemotePublication);
         Assert.Equal(1, harness.CandidatePublisher.Calls);
+        Assert.Contains(
+            published.Events,
+            item => item.Type ==
+                    WorkflowEngine.RepositoryKnowledgeUnchangedEventType);
         Assert.DoesNotContain(
             "correction",
             publication.InputSummary,
@@ -764,7 +770,8 @@ public sealed class ReviewWorkflowTests
     [InlineData("HANDOFF_STATUS: complete")]
     [InlineData("HANDOFF_STATUS: COMPLETE\nHANDOFF_STATUS: COMPLETE")]
     [InlineData("HANDOFF_STATUS: COMPLETE\nPUSHBACK_REASON: contradictory")]
-    public async Task PublicationCompletion_RejectsMalformedHandoffBeforePublisherSideEffects(
+    [InlineData("HANDOFF_STATUS: COMPLETE\n\n## Decision\nPublication prepared without a repository knowledge recap.")]
+    public async Task PublicationCompletion_RejectsInvalidContractBeforePublisherSideEffects(
         string publicationOutput)
     {
         await using var harness =
@@ -2081,6 +2088,7 @@ public sealed class ReviewWorkflowTests
             var workspacePath = Path.Combine(root, "workspace");
             Directory.CreateDirectory(agentsDirectory);
             Directory.CreateDirectory(workspacePath);
+            Directory.CreateDirectory(Path.Combine(workspacePath, ".git"));
             await File.WriteAllTextAsync(
                 Path.Combine(root, "WORKFLOW.md"),
                 """
@@ -2596,6 +2604,16 @@ public sealed class ReviewWorkflowTests
                     (QaBlockOverride?.Invoke(context) ??
                      DeliveryReadinessFixtures.QaBlockFromPrompt(
                          context.OutcomeContext));
+            }
+            if (context.InvocationKind == ExecutionInvocationKind.Publication)
+            {
+                output +=
+                    Environment.NewLine +
+                    RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
+                    Environment.NewLine +
+                    $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
+                    Environment.NewLine +
+                    RepositoryKnowledgeSynthesizer.RecapEndSentinel;
             }
             return Task.FromResult(new AgentExecutionResult(
                 output,

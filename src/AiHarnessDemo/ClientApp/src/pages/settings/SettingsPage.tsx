@@ -88,7 +88,10 @@ export function SettingsPage() {
       const result = await analyzeRepository.mutateAsync({ path, runCopilotInit });
       setRepositoryPath(result.repositoryPath);
       setKnowledge(result.knowledge);
-      toast(result.copilotInitMessage, result.copilotInitSucceeded ? "success" : "error");
+      toast(
+        result.copilotInitMessage,
+        !runCopilotInit || result.copilotInitSucceeded ? "success" : "error"
+      );
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error), "error");
     }
@@ -292,8 +295,7 @@ export function SettingsPage() {
                 <span>
                   <strong>Run Copilot init</strong>
                   <br />
-                  Analyzes the code with read-only tools and creates or refreshes repository instructions before the
-                  harness study.
+                  Creates or refreshes repository instructions before the separate read-only knowledge synthesis.
                 </span>
               </label>
               <button
@@ -310,7 +312,7 @@ export function SettingsPage() {
             <div className="card-header">
               <div>
                 <h3>Repository knowledge</h3>
-                <p>Editable context generated from the selected source project and shared with every agent.</p>
+                <p>An evidence-grounded, editable synthesis supplied to every agent before task-specific work.</p>
               </div>
             </div>
             <div className="card-body">
@@ -324,7 +326,8 @@ export function SettingsPage() {
                   onChange={event => setKnowledge(event.target.value)}
                 />
                 <small>
-                  Correct assumptions, add domain language, and document constraints the code alone cannot reveal.
+                  Copilot reconciles documentation with manifests, source, and tests. This text is passed in full;
+                  edit it to correct assumptions or add domain context.
                 </small>
               </div>
             </div>

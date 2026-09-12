@@ -40,6 +40,7 @@ builder.Services.AddSingleton<FlowAgentSnapshotService>();
 builder.Services.AddSingleton<NewWorkAdmissionService>();
 builder.Services.AddSingleton<INewWorkAdmissionService>(
     services => services.GetRequiredService<NewWorkAdmissionService>());
+builder.Services.AddSingleton<RepositoryKnowledgeSynthesizer>();
 builder.Services.AddSingleton<RepositoryAnalyzer>();
 builder.Services.AddSingleton<IntakeCoordinator>();
 builder.Services.AddSingleton<FlowPlanner>();

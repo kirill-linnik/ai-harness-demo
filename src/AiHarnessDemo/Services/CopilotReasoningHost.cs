@@ -59,10 +59,12 @@ public sealed partial class CopilotReasoningHost(
     private const int MaximumReviewClassificationPromptCharacters =
         MaximumReviewClassificationTaskCharacters +
         ReviewFeedbackParser.MaximumDocumentCharacters;
-    private const int AccountManagerRepositoryKnowledgeCharacters = 1_000;
-    private const int DeliveryRepositoryKnowledgeCharacters = 2_000;
     private const int ProductManagerLedgerCharacters = 6_000;
     internal const int MaximumStudioDependencyContextCharacters = 3_200;
+    internal const string RepositoryKnowledgeBegin =
+        "REPOSITORY_KNOWLEDGE_V1_BEGIN";
+    internal const string RepositoryKnowledgeEnd =
+        "REPOSITORY_KNOWLEDGE_V1_END";
     internal const string StudioPlanContextBegin =
         "STUDIO_PLAN_CONTEXT_V1_BEGIN";
     internal const string StudioPlanContextEnd =
@@ -181,40 +183,6 @@ public sealed partial class CopilotReasoningHost(
         @"(?im)^- \*\*Location:\*\*\s*`[^`\r\n]+`\s*$",
         RegexOptions.CultureInvariant)]
     private static partial Regex RepositoryLocationPattern();
-
-    [GeneratedRegex(
-        @"(?ms)^## AI initialization\s*\n.*?(?=^## |\z)",
-        RegexOptions.CultureInvariant)]
-    private static partial Regex GeneratedRepositorySectionPattern();
-
-    [GeneratedRegex(
-        @"(?ms)^## README signal\s*\n(?<content>.*?)(?=^## (?:Study warnings|Editable harness notes)[^\S\n]*$|\z)",
-        RegexOptions.CultureInvariant)]
-    private static partial Regex ReadmeSignalPattern();
-
-    [GeneratedRegex(
-        @"(?m)^- \*\*(?:Project files|Source files studied|Primary file types):\*\*.*\n?",
-        RegexOptions.CultureInvariant)]
-    private static partial Regex GeneratedRepositoryDetailPattern();
-
-    [GeneratedRegex(
-        @"(?ms)^## Editable harness notes\s*\nAdd domain language, architectural constraints, release rules, and quality expectations here\. Every agent receives this shared context\.\s*\z",
-        RegexOptions.CultureInvariant)]
-    private static partial Regex EmptyRepositoryNotesPattern();
-
-    [GeneratedRegex(@"\n{3,}", RegexOptions.CultureInvariant)]
-    private static partial Regex ExcessBlankLinesPattern();
-
-    [GeneratedRegex(@"(?m)^# ([^#\n].*)$", RegexOptions.CultureInvariant)]
-    private static partial Regex RepositoryTitlePattern();
-
-    [GeneratedRegex(
-        @"(?m)^## (?:Repository profile|Repository facts)\s*\n?",
-        RegexOptions.CultureInvariant)]
-    private static partial Regex RepositoryProfileHeadingPattern();
-
-    [GeneratedRegex(@"(?m)^## ", RegexOptions.CultureInvariant)]
-    private static partial Regex RepositorySubheadingPattern();
 
     public override ReasoningHostReadiness CheckReadiness(
         CancellationToken cancellationToken = default)
@@ -1292,9 +1260,10 @@ public sealed partial class CopilotReasoningHost(
                         agentInstructions,
                         workingDirectory,
                         stagedPromotion))
-                : $"{context.DirectPrompt.Trim()}{Environment.NewLine}{Environment.NewLine}" +
-                  $"## Quality Engineer role contract{Environment.NewLine}{Environment.NewLine}" +
-                  agentInstructions.Trim());
+                : BuildDirectPrompt(
+                    context,
+                    agentInstructions,
+                    workingDirectory));
 
         if (context.FlowStepId == Guid.Empty)
         {
@@ -1399,6 +1368,9 @@ public sealed partial class CopilotReasoningHost(
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(renderedPrompt);
         var maximum = ResolveMaximumRenderedPromptCharacters(context);
+        var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
+            context.RepositoryKnowledge,
+            context.SourceProjectPath);
         if (IsStructuredLargePrompt(context))
         {
             if (renderedPrompt.Length > maximum)
@@ -1408,12 +1380,25 @@ public sealed partial class CopilotReasoningHost(
             }
             return renderedPrompt;
         }
-        return ClipPrompt(renderedPrompt, maximum);
+        var bounded = ClipPrompt(renderedPrompt, maximum);
+        if (!string.IsNullOrWhiteSpace(repositoryKnowledgeBlock) &&
+            renderedPrompt.Contains(
+                repositoryKnowledgeBlock,
+                StringComparison.Ordinal) &&
+            !bounded.Contains(
+                repositoryKnowledgeBlock,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The rendered prompt cannot fit without truncating the complete reviewed repository knowledge.");
+        }
+        return bounded;
     }
 
     internal static int ResolveMaximumRenderedPromptCharacters(
-        AgentExecutionContext context) =>
-        context.ContractVersion == "studio-v2"
+        AgentExecutionContext context)
+    {
+        var baseMaximum = context.ContractVersion == "studio-v2"
             ? context.InvocationKind switch
             {
                 ExecutionInvocationKind.Planning =>
@@ -1426,6 +1411,11 @@ public sealed partial class CopilotReasoningHost(
               ExecutionInvocationKind.ReviewClassification
                 ? 131_072
                 : MaximumPromptCharacters;
+        var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
+            context.RepositoryKnowledge,
+            context.SourceProjectPath);
+        return checked(baseMaximum + repositoryKnowledgeBlock.Length);
+    }
 
     private static bool IsStructuredLargePrompt(
         AgentExecutionContext context) =>
@@ -1630,6 +1620,11 @@ public sealed partial class CopilotReasoningHost(
                 {
                     _ = FlowOutcomeParser.Parse(output);
                 }
+                if (invocationKind == ExecutionInvocationKind.Publication &&
+                    !status.IsPushback)
+                {
+                    _ = RepositoryKnowledgeSynthesizer.ParseRecapEnvelope(output);
+                }
                 return true;
             }
             catch (InvalidOperationException)
@@ -1755,17 +1750,9 @@ public sealed partial class CopilotReasoningHost(
         var usesCompactPreMortemContext =
             isPreMortem || context.IsPreMortemRevision;
         var workspace = PrepareWorkspace(workingDirectory);
-        var repositoryFacts = isProductManager
-            ? string.Empty
-            : context.IsPreMortemRevision
-                ? string.Empty
-            : Clip(
-                PrepareRepositoryFacts(
-                    context.RepositoryKnowledge,
-                    context.SourceProjectPath),
-                isAccountManager
-                    ? AccountManagerRepositoryKnowledgeCharacters
-                    : DeliveryRepositoryKnowledgeCharacters);
+        var repositoryKnowledge = PrepareRepositoryKnowledgeContent(
+            context.RepositoryKnowledge,
+            context.SourceProjectPath);
         var studioDependencyContext =
             string.Equals(
                 context.ContractVersion,
@@ -1804,9 +1791,11 @@ public sealed partial class CopilotReasoningHost(
             : Clip(context.CustomerFeedback, 2_000);
 
         var roleContext = new List<string>();
-        if (!string.IsNullOrWhiteSpace(repositoryFacts))
+        var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
+            repositoryKnowledge);
+        if (!string.IsNullOrWhiteSpace(repositoryKnowledgeBlock))
         {
-            roleContext.Add($"## Repository facts{Environment.NewLine}{Environment.NewLine}{repositoryFacts}");
+            roleContext.Add(repositoryKnowledgeBlock);
         }
         if (!string.IsNullOrWhiteSpace(handoffs))
         {
@@ -1880,6 +1869,25 @@ public sealed partial class CopilotReasoningHost(
         {
             roleContext.Add($"## Customer feedback{Environment.NewLine}{Environment.NewLine}{feedback}");
         }
+        var responseContract = context.IsPreMortemRevision
+            ? PreMortemRevisionResponseContract()
+            : ResponseContract(
+                context.InvocationKind,
+                context.AgentRole,
+                context.ContractVersion);
+        if (string.Equals(
+                context.ContractVersion,
+                "studio-v2",
+                StringComparison.Ordinal) &&
+            context.InvocationKind == ExecutionInvocationKind.Publication)
+        {
+            responseContract +=
+                $"{Environment.NewLine}{Environment.NewLine}" +
+                RepositoryKnowledgeSynthesizer.PublicationRecapInstructions(
+                    workingDirectory,
+                    context.RepositoryKnowledge,
+                    context.SourceProjectPath);
+        }
 
         return new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -1892,18 +1900,13 @@ public sealed partial class CopilotReasoningHost(
             ["role.context"] = string.Join(
                 $"{Environment.NewLine}{Environment.NewLine}",
                 roleContext),
-            ["response.contract"] = context.IsPreMortemRevision
-                ? PreMortemRevisionResponseContract()
-                : ResponseContract(
-                    context.InvocationKind,
-                    context.AgentRole,
-                    context.ContractVersion),
+            ["response.contract"] = responseContract,
             ["outcome.context"] = context.OutcomeContext,
             ["outcome.contract"] = context.OutcomeContract,
             // Retain legacy variables so a hot-reloaded older WORKFLOW.md remains valid.
-            ["repository.knowledge"] = string.IsNullOrWhiteSpace(repositoryFacts)
+            ["repository.knowledge"] = string.IsNullOrWhiteSpace(repositoryKnowledgeBlock)
                 ? workspace
-                : $"{workspace}{Environment.NewLine}{Environment.NewLine}{repositoryFacts}",
+                : $"{workspace}{Environment.NewLine}{Environment.NewLine}{repositoryKnowledgeBlock}",
             ["plan"] = Clip(context.PlanSummary, 1_000),
             ["handoffs"] = handoffs,
             ["learnings"] = learnings,
@@ -2216,61 +2219,38 @@ public sealed partial class CopilotReasoningHost(
         "- **Boundary:** Work only in this isolated workspace. Treat original source locations " +
         "as metadata and prefer workspace-relative paths.";
 
-    internal static string PrepareRepositoryFacts(
+    internal static string PrepareRepositoryKnowledgeContent(
         string knowledge,
         string sourceProjectPath)
     {
         var sanitized = RepositoryLocationPattern().Replace(
             RemoveSourceProjectPath(knowledge, sourceProjectPath),
             "- **Project files:** Materialized in the isolated workspace.");
-        var normalized = sanitized.ReplaceLineEndings("\n");
-        var readmeMatch = ReadmeSignalPattern().Match(normalized);
-        var readmeSummary = readmeMatch.Success
-            ? SummarizeReadme(readmeMatch.Groups["content"].Value)
-            : string.Empty;
-        var focused = GeneratedRepositorySectionPattern().Replace(
-            normalized,
-            string.Empty);
-        focused = ReadmeSignalPattern().Replace(focused, string.Empty);
-        focused = GeneratedRepositoryDetailPattern().Replace(focused, string.Empty);
-        focused = EmptyRepositoryNotesPattern().Replace(focused, string.Empty);
-        focused = RepositoryTitlePattern().Replace(focused, "- **Project:** $1");
-        focused = RepositoryProfileHeadingPattern().Replace(focused, string.Empty);
-        focused = RepositorySubheadingPattern().Replace(focused, "### ");
-        if (!string.IsNullOrWhiteSpace(readmeSummary))
-        {
-            focused +=
-                $"{Environment.NewLine}{Environment.NewLine}" +
-                $"### Project summary{Environment.NewLine}{readmeSummary}";
-        }
-        return ExcessBlankLinesPattern().Replace(focused, "\n\n").Trim();
+        return sanitized.ReplaceLineEndings("\n").Trim();
     }
 
-    internal static string SummarizeReadme(string readme)
+    internal static string BuildRepositoryKnowledgeBlock(
+        string knowledge,
+        string sourceProjectPath)
     {
-        var summaryLines = new List<string>();
-        foreach (var line in readme.ReplaceLineEndings("\n").Split('\n'))
-        {
-            var candidate = line.Trim();
-            if (summaryLines.Count == 0 &&
-                (
-                    candidate.Length == 0 ||
-                    candidate.StartsWith('#') ||
-                    candidate.StartsWith("![", StringComparison.Ordinal) ||
-                    candidate.StartsWith("[![", StringComparison.Ordinal)
-                ))
-            {
-                continue;
-            }
-            if (candidate.Length == 0 || candidate.StartsWith('#'))
-            {
-                break;
-            }
+        var prepared = PrepareRepositoryKnowledgeContent(
+            knowledge,
+            sourceProjectPath);
+        return BuildRepositoryKnowledgeBlock(prepared);
+    }
 
-            summaryLines.Add(candidate);
+    private static string BuildRepositoryKnowledgeBlock(string prepared)
+    {
+        if (string.IsNullOrWhiteSpace(prepared))
+        {
+            return string.Empty;
         }
 
-        return Clip(string.Join(' ', summaryLines), 500);
+        return
+            $"## Repository knowledge{Environment.NewLine}{Environment.NewLine}" +
+            $"{RepositoryKnowledgeBegin}{Environment.NewLine}" +
+            $"{prepared}{Environment.NewLine}" +
+            RepositoryKnowledgeEnd;
     }
 
     internal static string ResolveCopilotSessionHome(string? inheritedHome = null)
@@ -2352,10 +2332,38 @@ public sealed partial class CopilotReasoningHost(
         string workingDirectory)
     {
         var workspace = PrepareWorkspace(workingDirectory);
-        var facts = PrepareRepositoryFacts(knowledge, sourceProjectPath);
-        return string.IsNullOrWhiteSpace(facts)
+        var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
+            knowledge,
+            sourceProjectPath);
+        return string.IsNullOrWhiteSpace(repositoryKnowledgeBlock)
             ? workspace
-            : $"{workspace}{Environment.NewLine}{Environment.NewLine}{facts}";
+            : $"{workspace}{Environment.NewLine}{Environment.NewLine}{repositoryKnowledgeBlock}";
+    }
+
+    internal static string BuildDirectPrompt(
+        AgentExecutionContext context,
+        string agentInstructions,
+        string workingDirectory)
+    {
+        var sections = new List<string>
+        {
+            context.DirectPrompt.Trim(),
+            $"## Workspace{Environment.NewLine}{Environment.NewLine}" +
+            PrepareWorkspace(workingDirectory)
+        };
+        var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
+            context.RepositoryKnowledge,
+            context.SourceProjectPath);
+        if (!string.IsNullOrWhiteSpace(repositoryKnowledgeBlock))
+        {
+            sections.Add(repositoryKnowledgeBlock);
+        }
+        sections.Add(
+            $"## Quality Engineer role contract{Environment.NewLine}{Environment.NewLine}" +
+            agentInstructions.Trim());
+        return string.Join(
+            $"{Environment.NewLine}{Environment.NewLine}",
+            sections);
     }
 
     internal static string RemoveSourceProjectPath(
