@@ -69,6 +69,8 @@ public sealed partial class CopilotReasoningHost(
         "STUDIO_PLAN_CONTEXT_V1_BEGIN";
     internal const string StudioPlanContextEnd =
         "STUDIO_PLAN_CONTEXT_V1_END";
+    private const string PromptCompactionMarker =
+        "\n...[prompt context compacted]...\n";
     private const int MinimumDirectDependencyOutputCharacters = 64;
     private const int MaximumDirectDependencyOutputCharacters = 900;
     private const int MinimumAncestorOutputCharacters = 64;
@@ -1389,7 +1391,10 @@ public sealed partial class CopilotReasoningHost(
             }
             return renderedPrompt;
         }
-        var bounded = ClipPrompt(renderedPrompt, maximum);
+        var bounded = ClipPrompt(
+            renderedPrompt,
+            maximum,
+            repositoryKnowledgeBlock);
         if (!string.IsNullOrWhiteSpace(repositoryKnowledgeBlock) &&
             renderedPrompt.Contains(
                 repositoryKnowledgeBlock,
@@ -2599,53 +2604,144 @@ public sealed partial class CopilotReasoningHost(
     private static string Tail(string value, int maxCharacters) =>
         value.Length <= maxCharacters ? value : value[^maxCharacters..];
 
-    private static string ClipPrompt(string value, int maxCharacters)
+    private readonly record struct RequiredPromptRange(int Start, int End)
+    {
+        public int Length => End - Start;
+    }
+
+    private static string ClipPrompt(
+        string value,
+        int maxCharacters,
+        string repositoryKnowledgeBlock = "")
     {
         if (value.Length <= maxCharacters)
         {
             return value;
         }
 
-        var begin = value.IndexOf(
+        var requiredRanges = new List<RequiredPromptRange>(2);
+        if (!string.IsNullOrWhiteSpace(repositoryKnowledgeBlock))
+        {
+            var knowledgeStart = value.IndexOf(
+                repositoryKnowledgeBlock,
+                StringComparison.Ordinal);
+            if (knowledgeStart >= 0)
+            {
+                requiredRanges.Add(
+                    new RequiredPromptRange(
+                        knowledgeStart,
+                        knowledgeStart + repositoryKnowledgeBlock.Length));
+            }
+        }
+
+        var studioRange = FindDelimitedPromptRange(
+            value,
             StudioPlanContextBegin,
-            StringComparison.Ordinal);
-        if (begin < 0)
+            StudioPlanContextEnd,
+            "The rendered Studio dependency context markers are invalid.");
+        if (studioRange is not null)
+        {
+            requiredRanges.Add(studioRange.Value);
+        }
+
+        if (requiredRanges.Count == 0)
         {
             return Clip(value, maxCharacters);
         }
+
+        var mergedRanges = MergeRequiredPromptRanges(requiredRanges);
+        return mergedRanges.Count == 1
+            ? ClipPromptAroundRequiredRange(
+                value,
+                maxCharacters,
+                mergedRanges[0],
+                preferPrefix: studioRange is null)
+            : ClipPromptAroundRequiredRanges(
+                value,
+                maxCharacters,
+                mergedRanges);
+    }
+
+    private static RequiredPromptRange? FindDelimitedPromptRange(
+        string value,
+        string beginMarker,
+        string endMarker,
+        string invalidMarkerMessage)
+    {
+        var begin = value.IndexOf(beginMarker, StringComparison.Ordinal);
+        if (begin < 0)
+        {
+            return null;
+        }
+
         var secondBegin = value.IndexOf(
-            StudioPlanContextBegin,
-            begin + StudioPlanContextBegin.Length,
+            beginMarker,
+            begin + beginMarker.Length,
             StringComparison.Ordinal);
         var endStart = value.IndexOf(
-            StudioPlanContextEnd,
-            begin + StudioPlanContextBegin.Length,
+            endMarker,
+            begin + beginMarker.Length,
             StringComparison.Ordinal);
         if (secondBegin >= 0 ||
             endStart < 0 ||
             value.IndexOf(
-                StudioPlanContextEnd,
-                endStart + StudioPlanContextEnd.Length,
+                endMarker,
+                endStart + endMarker.Length,
                 StringComparison.Ordinal) >= 0)
         {
-            throw new InvalidOperationException(
-                "The rendered Studio dependency context markers are invalid.");
+            throw new InvalidOperationException(invalidMarkerMessage);
         }
 
-        var end = endStart + StudioPlanContextEnd.Length;
-        var required = value[begin..end];
-        const string compacted = "\n...[prompt context compacted]...\n";
-        var available = maxCharacters - required.Length -
-                        (compacted.Length * 2);
+        return new RequiredPromptRange(
+            begin,
+            endStart + endMarker.Length);
+    }
+
+    private static IReadOnlyList<RequiredPromptRange>
+        MergeRequiredPromptRanges(
+            IReadOnlyList<RequiredPromptRange> ranges)
+    {
+        var ordered = ranges
+            .OrderBy(range => range.Start)
+            .ThenBy(range => range.End)
+            .ToList();
+        var merged = new List<RequiredPromptRange>(ordered.Count);
+        foreach (var range in ordered)
+        {
+            if (merged.Count == 0 || range.Start > merged[^1].End)
+            {
+                merged.Add(range);
+                continue;
+            }
+
+            var previous = merged[^1];
+            merged[^1] = new RequiredPromptRange(
+                previous.Start,
+                Math.Max(previous.End, range.End));
+        }
+
+        return merged;
+    }
+
+    private static string ClipPromptAroundRequiredRange(
+        string value,
+        int maxCharacters,
+        RequiredPromptRange requiredRange,
+        bool preferPrefix)
+    {
+        var available = maxCharacters - requiredRange.Length -
+                        (PromptCompactionMarker.Length * 2);
         if (available < 0)
         {
             throw new InvalidOperationException(
-                "The required Studio dependency context cannot fit in the Copilot prompt envelope.");
+                "The required prompt context cannot fit in the Copilot prompt envelope.");
         }
 
-        var prefix = value[..begin];
-        var suffix = value[end..];
-        var prefixBudget = Math.Min(prefix.Length, available * 2 / 5);
+        var prefix = value[..requiredRange.Start];
+        var suffix = value[requiredRange.End..];
+        var prefixBudget = Math.Min(
+            prefix.Length,
+            preferPrefix ? available * 2 / 3 : available * 2 / 5);
         var suffixBudget = Math.Min(suffix.Length, available - prefixBudget);
         var unused = available - prefixBudget - suffixBudget;
         if (unused > 0)
@@ -2661,10 +2757,109 @@ public sealed partial class CopilotReasoningHost(
         }
 
         return prefix[..prefixBudget] +
-               compacted +
-               required +
-               compacted +
+               PromptCompactionMarker +
+               value[requiredRange.Start..requiredRange.End] +
+               PromptCompactionMarker +
                suffix[^suffixBudget..];
+    }
+
+    private static string ClipPromptAroundRequiredRanges(
+        string value,
+        int maxCharacters,
+        IReadOnlyList<RequiredPromptRange> requiredRanges)
+    {
+        var gaps = new List<RequiredPromptRange>(
+            requiredRanges.Count + 1);
+        var cursor = 0;
+        foreach (var range in requiredRanges)
+        {
+            gaps.Add(new RequiredPromptRange(cursor, range.Start));
+            cursor = range.End;
+        }
+        gaps.Add(new RequiredPromptRange(cursor, value.Length));
+
+        var requiredCharacters = requiredRanges.Sum(range => range.Length);
+        var available = maxCharacters - requiredCharacters;
+        var gapBudgets = gaps
+            .Select(gap => gap.Length == 0
+                ? 0
+                : Math.Min(gap.Length, PromptCompactionMarker.Length))
+            .ToArray();
+        var remaining = available - gapBudgets.Sum();
+        if (remaining < 0)
+        {
+            throw new InvalidOperationException(
+                "The required prompt contexts cannot fit in the Copilot prompt envelope.");
+        }
+
+        while (remaining > 0)
+        {
+            var expandable = Enumerable.Range(0, gaps.Count)
+                .Where(index => gapBudgets[index] < gaps[index].Length)
+                .ToList();
+            if (expandable.Count == 0)
+            {
+                break;
+            }
+
+            var share = Math.Max(1, remaining / expandable.Count);
+            foreach (var index in expandable)
+            {
+                var added = Math.Min(
+                    gaps[index].Length - gapBudgets[index],
+                    share);
+                gapBudgets[index] += added;
+                remaining -= added;
+                if (remaining == 0)
+                {
+                    break;
+                }
+            }
+        }
+
+        var builder = new StringBuilder(maxCharacters);
+        for (var index = 0; index < requiredRanges.Count; index++)
+        {
+            AppendBoundedPromptGap(
+                builder,
+                value,
+                gaps[index],
+                gapBudgets[index]);
+            var required = requiredRanges[index];
+            builder.Append(
+                value.AsSpan(required.Start, required.Length));
+        }
+        AppendBoundedPromptGap(
+            builder,
+            value,
+            gaps[^1],
+            gapBudgets[^1]);
+        return builder.ToString();
+    }
+
+    private static void AppendBoundedPromptGap(
+        StringBuilder builder,
+        string value,
+        RequiredPromptRange gap,
+        int budget)
+    {
+        if (gap.Length == 0 || budget == 0)
+        {
+            return;
+        }
+        if (gap.Length <= budget)
+        {
+            builder.Append(value.AsSpan(gap.Start, gap.Length));
+            return;
+        }
+
+        var available = budget - PromptCompactionMarker.Length;
+        var headLength = available * 2 / 3;
+        builder.Append(value.AsSpan(gap.Start, headLength));
+        builder.Append(PromptCompactionMarker);
+        var tailLength = available - headLength;
+        builder.Append(
+            value.AsSpan(gap.End - tailLength, tailLength));
     }
 
     private static string Clip(string value, int maxCharacters)

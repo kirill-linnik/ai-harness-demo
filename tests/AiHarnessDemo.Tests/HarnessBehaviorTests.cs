@@ -1350,6 +1350,135 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains(knowledge, bounded);
     }
 
+    [Fact]
+    public void PreMortemPrompt_PreservesRepositoryKnowledgeDuringCompaction()
+    {
+        const string requiredTail = "REPOSITORY-KNOWLEDGE-TAIL";
+        var knowledge = $"{new string('k', 6_300)}{requiredTail}";
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "pre-mortem-sceptic",
+            "Pre-mortem Sceptic",
+            "pre-mortem-sceptic",
+            "gpt-5.6-sol",
+            "max",
+            1,
+            new string('t', 8_525),
+            knowledge,
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Review the architecture.",
+            [],
+            [],
+            ContractVersion: "studio-v2",
+            InvocationKind: ExecutionInvocationKind.PreMortem);
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Investigate the evaluated result independently.",
+            context.WorkspacePath);
+        var rendered = new WorkflowPromptRenderer().Render(
+            "{{ task }}\n\n{{ agent.instructions }}\n\n{{ workspace }}\n\n" +
+            "{{ role.context }}\n\n" +
+            new string('p', 12_000) +
+            "\n\n{{ response.contract }}",
+            values);
+
+        var bounded = CopilotReasoningHost.BoundRenderedPrompt(
+            context,
+            rendered);
+        var repositoryKnowledgeBlock =
+            CopilotReasoningHost.BuildRepositoryKnowledgeBlock(
+                knowledge,
+                context.SourceProjectPath);
+
+        Assert.Equal(
+            CopilotReasoningHost.ResolveMaximumRenderedPromptCharacters(
+                context),
+            bounded.Length);
+        Assert.Contains(repositoryKnowledgeBlock, bounded);
+        Assert.Contains(requiredTail, bounded);
+        Assert.Contains(context.Task, bounded);
+        Assert.Contains(
+            "...[prompt context compacted]...",
+            bounded,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void StudioWorkerPrompt_PreservesKnowledgeAndDependenciesDuringCompaction()
+    {
+        var knowledge = $"{new string('k', 6_000)}knowledge-tail";
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "software-engineer",
+            "Software Engineer",
+            "software-engineer",
+            "gpt-5.6-sol",
+            "high",
+            1,
+            new string('t', 6_000),
+            knowledge,
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Implement the redesign.",
+            [],
+            [],
+            ContractVersion: "studio-v2",
+            InvocationKind: ExecutionInvocationKind.Worker,
+            StudioDependencyOutputs:
+            [
+                new StudioDependencyOutput(
+                    "approved-architecture",
+                    "architect",
+                    StudioDependencyKind.Direct,
+                    1,
+                    1,
+                    1,
+                    new string('d', 900))
+            ]);
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Implement the approved architecture.",
+            context.WorkspacePath);
+        var rendered = new WorkflowPromptRenderer().Render(
+            "{{ task }}\n\n{{ role.context }}\n\n" +
+            new string('p', 20_000) +
+            "\n\n{{ response.contract }}",
+            values);
+
+        var bounded = CopilotReasoningHost.BoundRenderedPrompt(
+            context,
+            rendered);
+        var repositoryKnowledgeBlock =
+            CopilotReasoningHost.BuildRepositoryKnowledgeBlock(
+                knowledge,
+                context.SourceProjectPath);
+
+        Assert.Equal(
+            CopilotReasoningHost.ResolveMaximumRenderedPromptCharacters(
+                context),
+            bounded.Length);
+        Assert.Contains(repositoryKnowledgeBlock, bounded);
+        Assert.Contains(
+            CopilotReasoningHost.StudioPlanContextBegin,
+            bounded,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            CopilotReasoningHost.StudioPlanContextEnd,
+            bounded,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "approved-architecture",
+            bounded,
+            StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData("product-manager", ExecutionInvocationKind.Worker, false)]
     [InlineData("pre-mortem-sceptic", ExecutionInvocationKind.PreMortem, false)]
