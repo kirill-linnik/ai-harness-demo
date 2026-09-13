@@ -1479,6 +1479,66 @@ public sealed class CopilotReasoningHostTests
             StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void StudioDeliveryVerificationPrompt_PreservesTheCompleteStructuredContract()
+    {
+        var task =
+            "Confirmed Delivery brief:" +
+            Environment.NewLine +
+            new string('t', 20_000) +
+            Environment.NewLine +
+            "Host recovery context: inspect the preserved workspace state before continuing.";
+        var outcomeContext = string.Join(
+            Environment.NewLine,
+            Enumerable.Range(1, 6).Select(index =>
+                $"- AC-{index:000}: complete requirement {index} | verification: complete check {index}"));
+        const string outcomeContract =
+            "OUTCOME_QA_V2_BEGIN\nReturn all AC-001 through AC-006.\nOUTCOME_QA_V2_END";
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(),
+            1,
+            "quality-engineer",
+            "Quality Engineer",
+            "quality-engineer",
+            "claude-sonnet-5",
+            "max",
+            4,
+            task,
+            new string('k', 6_000),
+            @"E:\source-project",
+            @"E:\worktrees\flow-123",
+            Guid.NewGuid(),
+            AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
+            "Verify the recovered candidate.",
+            [],
+            [],
+            OutcomeContext: outcomeContext,
+            OutcomeContract: outcomeContract,
+            ContractVersion: "studio-v2",
+            InvocationKind: ExecutionInvocationKind.Worker,
+            RequiresDeliveryReadinessQa: true);
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Verify without modifying the workspace.",
+            context.WorkspacePath);
+        var rendered = new WorkflowPromptRenderer().Render(
+            "{{ task }}\n\n{{ agent.instructions }}\n\n{{ role.context }}\n\n" +
+            new string('p', 20_000) +
+            "\n\n{{ outcome.context }}\n\n{{ outcome.contract }}\n\n" +
+            "{{ response.contract }}",
+            values);
+
+        var bounded = CopilotReasoningHost.BoundRenderedPrompt(
+            context,
+            rendered);
+
+        Assert.True(rendered.Length > 16_000);
+        Assert.Equal(task, values["task"]);
+        Assert.Equal(rendered, bounded);
+        Assert.Contains("AC-006: complete requirement 6", bounded);
+        Assert.Contains(outcomeContract, bounded);
+    }
+
     [Theory]
     [InlineData("product-manager", ExecutionInvocationKind.Worker, false)]
     [InlineData("pre-mortem-sceptic", ExecutionInvocationKind.PreMortem, false)]

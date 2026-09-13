@@ -9175,7 +9175,9 @@ public sealed class WorkflowEngine(
             if (!canResume)
             {
                 priorAssignment +=
-                    $"{Environment.NewLine}Inspect existing workspace changes before editing.";
+                    $"{Environment.NewLine}{Environment.NewLine}" +
+                    "Host recovery context: inspect the preserved workspace state before " +
+                    "continuing. This retry retains the step's persisted permission ceiling.";
             }
             var retryStep = FindReusableCausalRetry(
                 failedStep,

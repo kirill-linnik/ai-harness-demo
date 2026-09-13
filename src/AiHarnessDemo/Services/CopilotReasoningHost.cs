@@ -53,12 +53,18 @@ public sealed partial class CopilotReasoningHost(
         FlowOutcomeParser.MaximumDocumentCharacters +
         ReviewFeedbackParser.MaximumRequestedChangeCharacters +
         8_192;
+    internal const int MaximumDeliveryVerificationTaskCharacters =
+        MaximumPlanningBriefCharacters + 8_192;
     private const int MaximumPlanningPromptCharacters =
         MaximumPlanningTaskCharacters +
         TeamPlanParser.MaximumDocumentCharacters;
     private const int MaximumReviewClassificationPromptCharacters =
         MaximumReviewClassificationTaskCharacters +
         ReviewFeedbackParser.MaximumDocumentCharacters;
+    private const int MaximumDeliveryVerificationPromptCharacters =
+        MaximumDeliveryVerificationTaskCharacters +
+        DeliveryReadinessPolicy.MaximumSnapshotBytes +
+        32_768;
     private const int ProductManagerLedgerCharacters = 6_000;
     internal const int MaximumStudioDependencyContextCharacters = 3_200;
     internal const string RepositoryKnowledgeBegin =
@@ -1413,14 +1419,16 @@ public sealed partial class CopilotReasoningHost(
         AgentExecutionContext context)
     {
         var baseMaximum = context.ContractVersion == "studio-v2"
-            ? context.InvocationKind switch
-            {
-                ExecutionInvocationKind.Planning =>
-                    MaximumPlanningPromptCharacters,
-                ExecutionInvocationKind.ReviewClassification =>
-                    MaximumReviewClassificationPromptCharacters,
-                _ => MaximumPromptCharacters
-            }
+            ? context.RequiresDeliveryReadinessQa
+                ? MaximumDeliveryVerificationPromptCharacters
+                : context.InvocationKind switch
+                {
+                    ExecutionInvocationKind.Planning =>
+                        MaximumPlanningPromptCharacters,
+                    ExecutionInvocationKind.ReviewClassification =>
+                        MaximumReviewClassificationPromptCharacters,
+                    _ => MaximumPromptCharacters
+                }
             : context.InvocationKind ==
               ExecutionInvocationKind.ReviewClassification
                 ? 131_072
@@ -1434,9 +1442,10 @@ public sealed partial class CopilotReasoningHost(
     private static bool IsStructuredLargePrompt(
         AgentExecutionContext context) =>
         context.ContractVersion == "studio-v2" &&
-        context.InvocationKind is
-            ExecutionInvocationKind.Planning or
-            ExecutionInvocationKind.ReviewClassification;
+        (context.RequiresDeliveryReadinessQa ||
+         context.InvocationKind is
+             ExecutionInvocationKind.Planning or
+             ExecutionInvocationKind.ReviewClassification);
 
     internal static CopilotExecutionTimeouts ResolveExecutionTimeouts(
         CopilotConfig config,
@@ -1934,20 +1943,25 @@ public sealed partial class CopilotReasoningHost(
     {
         if (context.ContractVersion == "studio-v2")
         {
-            var maximum = context.InvocationKind switch
-            {
-                ExecutionInvocationKind.Planning =>
-                    MaximumPlanningTaskCharacters,
-                ExecutionInvocationKind.ReviewClassification =>
-                    MaximumReviewClassificationTaskCharacters,
-                _ => 0
-            };
+            var maximum = context.RequiresDeliveryReadinessQa
+                ? MaximumDeliveryVerificationTaskCharacters
+                : context.InvocationKind switch
+                {
+                    ExecutionInvocationKind.Planning =>
+                        MaximumPlanningTaskCharacters,
+                    ExecutionInvocationKind.ReviewClassification =>
+                        MaximumReviewClassificationTaskCharacters,
+                    _ => 0
+                };
             if (maximum > 0)
             {
                 if (context.Task.Length > maximum)
                 {
+                    var taskKind = context.RequiresDeliveryReadinessQa
+                        ? "Delivery verification"
+                        : context.InvocationKind.ToString();
                     throw new InvalidOperationException(
-                        $"The {context.InvocationKind} task contains {context.Task.Length} characters, exceeding its contract-derived hard limit of {maximum}. The host will not truncate confirmed structured context.");
+                        $"The {taskKind} task contains {context.Task.Length} characters, exceeding its contract-derived hard limit of {maximum}. The host will not truncate confirmed structured context.");
                 }
                 return context.Task;
             }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useFlowQuery, useRestartFlowMutation } from "../../api/queries";
+import type { FlowDetailDto } from "../../api/types";
 import { AppShell } from "../../components/AppShell";
 import { BootScreen } from "../../components/BootScreen";
 import { FatalScreen } from "../../components/FatalScreen";
@@ -20,6 +21,37 @@ import { BlockedFlowCard } from "./BlockedFlowCard";
 import { ReviewCard } from "./ReviewCard";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { RecoverFlowButton } from "./RecoverFlowButton";
+
+const failedTaskRecoveryEvents = new Set([
+  "flow.manual-restart",
+  "flow.finalization-retry-queued",
+  "flow.completed-output-recovered"
+]);
+
+function latestManualRetry(flow: FlowDetailDto) {
+  return [...flow.steps]
+    .reverse()
+    .find(step => step.label.startsWith("Manual restart of "));
+}
+
+function recoveryCommitted(
+  flow: FlowDetailDto,
+  previousStepIds: ReadonlySet<string>,
+  previousEventIds: ReadonlySet<string>
+) {
+  return (
+    flow.steps.some(
+      step =>
+        !previousStepIds.has(step.id) &&
+        step.label.startsWith("Manual restart of ")
+    ) ||
+    flow.events.some(
+      event =>
+        !previousEventIds.has(event.id) &&
+        failedTaskRecoveryEvents.has(event.type)
+    )
+  );
+}
 
 export function FlowPage() {
   const { id } = useParams<{ id: string }>();
@@ -84,15 +116,42 @@ export function FlowPage() {
     toast("Flow link copied.", "success");
   }
 
-  async function restartFailedFlow() {
+  async function restartFailedFlow(failed: FlowDetailDto) {
+    const previousStepIds = new Set(failed.steps.map(step => step.id));
+    const previousEventIds = new Set(failed.events.map(event => event.id));
     try {
-      const restarted = await restartFlow.mutateAsync(flow!.id);
-      const retryStep = [...restarted.steps]
-        .reverse()
-        .find(step => step.label.startsWith("Manual restart of "));
+      const restarted = await restartFlow.mutateAsync(failed.id);
+      const retryStep = latestManualRetry(restarted);
       setSelectedStepId(retryStep?.id ?? null);
       toast("Failed task recovery queued from its preserved session and workspace.", "success");
     } catch (error) {
+      try {
+        const refreshed = (await flowQuery.refetch()).data;
+        if (
+          refreshed &&
+          recoveryCommitted(refreshed, previousStepIds, previousEventIds)
+        ) {
+          setSelectedStepId(latestManualRetry(refreshed)?.id ?? null);
+          if (refreshed.status === "Failed") {
+            toast(
+              "Failed task recovery was committed, but the retried task has already failed again.",
+              "error"
+            );
+          } else {
+            toast(
+              "Failed task recovery was committed despite the interrupted response; the current flow state was refreshed.",
+              "success"
+            );
+          }
+          return;
+        }
+      } catch (refreshError) {
+        const recoveryMessage = error instanceof Error ? error.message : String(error);
+        const refreshMessage =
+          refreshError instanceof Error ? refreshError.message : String(refreshError);
+        toast(`${recoveryMessage} Current flow state could not be refreshed: ${refreshMessage}`, "error");
+        return;
+      }
       toast(error instanceof Error ? error.message : String(error), "error");
     }
   }
@@ -319,7 +378,7 @@ export function FlowPage() {
           <button
             className="button"
             disabled={restartFlow.isPending}
-            onClick={() => void restartFailedFlow()}
+            onClick={() => void restartFailedFlow(flow)}
           >
             <RefreshIcon /> {restartFlow.isPending ? "Recovering..." : "Recover failed task"}
           </button>

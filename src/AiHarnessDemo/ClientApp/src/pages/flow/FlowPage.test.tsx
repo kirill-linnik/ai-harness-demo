@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../api/endpoints";
 import { queryKeys } from "../../api/queries";
 import type { BootstrapDto, FlowDetailDto, FlowStepDto } from "../../api/types";
@@ -10,6 +10,12 @@ import { FlowPage } from "./FlowPage";
 
 const flowId = "b3bbe5ab-95ce-446d-9606-c22151285c33";
 const timestamp = "2026-09-02T20:13:47Z";
+
+beforeEach(() => {
+  const toastRegion = document.createElement("div");
+  toastRegion.id = "toast-region";
+  document.body.append(toastRegion);
+});
 
 const bootstrap: BootstrapDto = {
   settings: {
@@ -311,6 +317,7 @@ function studioAdvisoryFlow(): FlowDetailDto {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  document.getElementById("toast-region")?.remove();
 });
 
 describe("FlowPage manual restart", () => {
@@ -435,6 +442,73 @@ describe("FlowPage manual restart", () => {
       ).toBeGreaterThan(0)
     );
     expect(screen.queryByText("Flow stopped")).not.toBeInTheDocument();
+  });
+
+  it("reports committed recovery when the restart response is ambiguous", async () => {
+    const failed = failedFlow();
+    const retry = step({
+      id: "22222222-2222-2222-2222-222222222222",
+      sequence: 50,
+      label: "Manual restart of Software Engineer",
+      status: "Running",
+      phase: "StreamingTurn",
+      attempt: 2,
+      startedAt: timestamp,
+      completedAt: null
+    });
+    const restarted: FlowDetailDto = {
+      ...failed,
+      status: "Running",
+      failureReason: "",
+      completedAt: null,
+      steps: [...failed.steps, retry],
+      events: [
+        {
+          id: "44444444-4444-4444-8444-444444444444",
+          flowStepId: failed.steps[0].id,
+          type: "flow.manual-restart",
+          message: "Manual restart requested.",
+          dataJson: null,
+          createdAt: timestamp
+        }
+      ]
+    };
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(restarted);
+    const restartFlow = vi
+      .spyOn(api, "restartFlow")
+      .mockRejectedValue(new Error("Only a failed flow can be restarted."));
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false }
+      }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    queryClient.setQueryData(queryKeys.flow(flowId), failed);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
+            <Routes>
+              <Route path="/factory/:id" element={<FlowPage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Recover failed task" }));
+
+    await waitFor(() => expect(restartFlow).toHaveBeenCalledWith(flowId));
+    expect(
+      await screen.findByText(
+        "Failed task recovery was committed despite the interrupted response; the current flow state was refreshed."
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Only a failed flow can be restarted.")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Manual restart of Software Engineer").length).toBeGreaterThan(0);
   });
 
   it("requires a reason before resolving an exhausted outcome cycle", async () => {

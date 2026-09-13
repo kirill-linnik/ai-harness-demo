@@ -1380,6 +1380,8 @@ public sealed class WorkflowRestartRecoveryTests
             flow.FailureReason = "Workflow template failed.";
             failedStep.Status = StepStatus.Failed;
             failedStep.Phase = AgentRunPhase.Failed;
+            failedStep.PermissionProfile =
+                ExecutionPermissionProfile.ReadOnlySource;
             failedStep.CopilotSessionId = Guid.NewGuid();
             failedStep.CopilotSessionHome = fixture.CopilotHome;
             failedStep.CompletedAt = DateTimeOffset.UtcNow;
@@ -1394,6 +1396,9 @@ public sealed class WorkflowRestartRecoveryTests
             step.Label == "Manual restart of Software Engineer");
         Assert.Equal(StepStatus.Pending, retry.Status);
         Assert.Null(retry.CopilotSessionId);
+        Assert.Contains("Host recovery context:", retry.InputSummary);
+        Assert.Contains("persisted permission ceiling", retry.InputSummary);
+        Assert.DoesNotContain("before editing", retry.InputSummary);
         Assert.DoesNotContain(
             restarted.Events,
             item => item.Type == "agent.session-discovered");
