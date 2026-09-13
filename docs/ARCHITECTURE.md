@@ -147,7 +147,7 @@ flowchart TD
     D --> E[Team Lead team-plan-v1]
     E -->|MissingQualification| F[Blocked; slot released]
     E -->|Planned| G[Sequential pre-review workers]
-    G --> H[Final outcome owner: flow-outcome-v1]
+    G --> H[Final Verify + outcome owner: outcome-qa-v2 and flow-outcome-v1]
     H --> S[Host seals exact reviewed candidate identity]
     S --> I[Generic CustomerReview]
     I -->|Refinement| J[Account Manager normalizes]
@@ -180,12 +180,16 @@ Team Lead receives the confirmed brief and the exact enabled optional snapshot r
 - bounded assignment and justification text;
 - `PlanDuty` values (`Analyze`, `Design`, `Implement`, `Verify`, `PrepareOutcome`, `Publish`);
 - `PlanStage` (`BeforeReview` or `AfterApproval`);
-- one final pre-review outcome owner with `PrepareOutcome`;
+- one final pre-review outcome owner with both `Verify` and `PrepareOutcome`, as the sole
+  verification step after every candidate-changing dependency;
 - bounded task profiles and optional pre-mortem checkpoints; and
 - either `Planned` or an exact `MissingQualification` document.
 
-Delivery requires implementation, verification, outcome preparation, and exactly one
-`AfterApproval` Publish-only step. Advisory forbids Implement, Publish, and AfterApproval. Only
+Delivery requires implementation, one final combined verification/outcome-preparation step, and
+exactly one `AfterApproval` Publish-only step. Previously accepted plans that separated verification
+from a later outcome owner retain their immutable plan document; manual recovery reorders only the
+pending execution attempts so the deferred owner prepares the candidate before verification retries.
+Advisory forbids Implement, Publish, and AfterApproval. Only
 pre-review steps are initially materialized. Execution follows the deterministic order one step at
 a time; fan-out/fan-in and an integration join are explicitly deferred. Before each v2 worker
 attempt, the engine resolves the accepted plan's declared dependency graph and selects the latest

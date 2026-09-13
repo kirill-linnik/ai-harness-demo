@@ -103,11 +103,13 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
   stable `AC-000` identifier, a requirement, an independently observable verification, owner roles,
   evidence kinds, and its customer visibility. The host hashes this plan; it is the only criterion
   namespace any later turn may use.
-- The plan step that carries the `Verify` duty must return exactly one strict `outcome-qa-v2` block
-  between `OUTCOME_QA_V2_BEGIN` and `OUTCOME_QA_V2_END`. The host injects the exact
-  `AcceptancePlanHash`, the planned criteria, and the complete set of host-issued evidence
-  identifiers into that turn's assignment; the response must echo the hash verbatim, cover every
-  criterion, and cite only those identifiers. It must contain one result for every planned
+- Exactly one plan step carries the `Verify` duty: the final `BeforeReview` outcome owner, which also
+  carries `PrepareOutcome`. Every candidate-changing step, including creation of required
+  `.customer-preview` artifacts, must be its earlier dependency. That step must return exactly one
+  strict `outcome-qa-v2` block between `OUTCOME_QA_V2_BEGIN` and `OUTCOME_QA_V2_END`. The host
+  injects the exact `AcceptancePlanHash`, the planned criteria, and the complete set of host-issued
+  evidence identifiers into that turn's assignment; the response must echo the hash verbatim,
+  cover every criterion, and cite only those identifiers. It must contain one result for every planned
   criterion (`Verified`, `Failed`, or `Blocked`, exact casing) plus zero or more residual risks
   classified `NonBlockingDisclosure`, `WaiverRequired`, or `Blocking`. A non-verified criterion
   must state remediation. The host derives the verdict; a supplied verdict must equal the

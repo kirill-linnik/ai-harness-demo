@@ -13,7 +13,8 @@ public sealed record TeamPlanValidationContext(
     int MaximumSteps,
     int MaximumDependenciesPerStep,
     int MaximumAssignmentCharacters,
-    IReadOnlyCollection<PlanDuty> RequiredDuties)
+    IReadOnlyCollection<PlanDuty> RequiredDuties,
+    bool RequireOutcomeOwnerVerification = true)
 {
     public static TeamPlanValidationContext FromWorkflow(
         FlowKind flowKind,
@@ -33,13 +34,15 @@ public sealed record TeamPlanValidationContext(
             planning.MaxSteps,
             planning.MaxDependenciesPerStep,
             planning.MaxAssignmentCharacters,
-            required);
+            required,
+            RequireOutcomeOwnerVerification: true);
     }
 
     public static TeamPlanValidationContext ForPersistedPlan(
         FlowKind flowKind,
         IReadOnlyCollection<FlowAgentSnapshot> snapshots,
         bool preMortemEnabled) =>
+        // Accepted plan documents stay immutable; legacy ordering is repaired in execution state.
         new(
             flowKind,
             snapshots,
@@ -55,7 +58,8 @@ public sealed record TeamPlanValidationContext(
                     PlanDuty.Verify,
                     PlanDuty.PrepareOutcome,
                     PlanDuty.Publish
-                ]);
+                ],
+            RequireOutcomeOwnerVerification: false);
 }
 
 public sealed record ValidatedTeamPlan(
@@ -699,6 +703,19 @@ public sealed class TeamPlanValidator
         if (preReview.Any(step => step.Duties?.Contains(PlanDuty.Publish) == true))
         {
             errors.Add("a Delivery plan cannot Publish before review");
+        }
+        if (context.RequireOutcomeOwnerVerification)
+        {
+            var verificationSteps = preReview
+                .Where(step => step.Duties?.Contains(PlanDuty.Verify) == true)
+                .ToList();
+            if (verificationSteps.Count != 1 ||
+                owners.Count != 1 ||
+                !ReferenceEquals(verificationSteps.SingleOrDefault(), owners[0]))
+            {
+                errors.Add(
+                    "a Delivery plan requires its final outcome owner to be the sole BeforeReview Verify-duty step");
+            }
         }
         var afterApproval = steps
             .Where(step => step.Stage == PlanStage.AfterApproval)

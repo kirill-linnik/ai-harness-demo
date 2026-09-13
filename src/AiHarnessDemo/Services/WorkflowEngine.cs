@@ -1664,6 +1664,45 @@ public sealed class WorkflowEngine(
         return result;
     }
 
+    private static async Task<VerificationOrderRecoveryRecord?>
+        LoadVerificationOrderRecoveryAsync(
+            HarnessDbContext database,
+            Guid flowId,
+            int iteration,
+            CancellationToken cancellationToken)
+    {
+        var records = await database.FlowEvents
+            .AsNoTracking()
+            .Where(flowEvent =>
+                flowEvent.FlowRunId == flowId &&
+                flowEvent.Type == "flow.verification-order-recovered" &&
+                flowEvent.DataJson != null)
+            .OrderByDescending(flowEvent => flowEvent.CreatedAt)
+            .Select(flowEvent => flowEvent.DataJson!)
+            .ToListAsync(cancellationToken);
+        foreach (var json in records)
+        {
+            var record =
+                JsonSerializer.Deserialize<VerificationOrderRecoveryRecord>(
+                    json)
+                ?? throw new InvalidOperationException(
+                    "The persisted Delivery verification-order recovery record is invalid.");
+            if (!string.Equals(
+                    record.Version,
+                    VerificationOrderRecoveryRecord.CurrentVersion,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Unsupported Delivery verification-order recovery version '{record.Version}'.");
+            }
+            if (record.Iteration == iteration)
+            {
+                return record;
+            }
+        }
+        return null;
+    }
+
     private static void EnsureMaterializedStepMatches(
         FlowStep step,
         TeamPlanStep planned,
@@ -1891,7 +1930,7 @@ public sealed class WorkflowEngine(
             Required configured duties: {{requiredDuties}}.
             {{(flow.Kind == FlowKind.Advisory
                 ? "Advisory requires at least one worker and PrepareOutcome, and forbids Implement, Publish, and AfterApproval."
-                : "Delivery requires Implement, Verify, and PrepareOutcome before review plus exactly one AfterApproval Publish-only step. Never Publish before review.")}}
+                : "Delivery requires exactly one Verify-duty step: the final BeforeReview OutcomeOwner, which also has PrepareOutcome. All implementation, packaging, and preview creation it verifies must be completed by earlier dependencies. Delivery also requires exactly one AfterApproval Publish-only step. Never Publish before review.")}}
             The AfterApproval publication step remains planned only and will not run before durable
             customer acceptance. Its TaskProfile may be an empty object.
             Never tell a pre-review worker to stage, commit, branch, push, or publish changes.
@@ -4749,6 +4788,49 @@ public sealed class WorkflowEngine(
         }
 
         var directKeys = currentPlanStep.DependsOn?.ToList() ?? [];
+        if (flow.Kind == FlowKind.Delivery &&
+            (currentStep.IsOutcomeOwner ||
+             IsDeliveryVerificationStep(currentStep)))
+        {
+            var recoveredOrder =
+                await LoadVerificationOrderRecoveryAsync(
+                    database,
+                    flow.Id,
+                    currentStep.Iteration,
+                    cancellationToken);
+            var usesRecoveredOrder = recoveredOrder is not null &&
+                (currentStep.IsOutcomeOwner &&
+                 string.Equals(
+                     currentStep.PlanStepKey,
+                     recoveredOrder.OutcomeOwnerPlanStepKey,
+                     StringComparison.Ordinal) ||
+                 IsDeliveryVerificationStep(currentStep) &&
+                 GetStableSemanticRootId(currentStep) ==
+                 recoveredOrder.VerificationRootStepId);
+            if (usesRecoveredOrder)
+            {
+                var dependency = currentStep.DependsOnStepId is { } dependencyId
+                    ? await database.FlowSteps
+                        .AsNoTracking()
+                        .SingleOrDefaultAsync(
+                            step =>
+                                step.Id == dependencyId &&
+                                step.FlowRunId == flow.Id &&
+                                step.Iteration == currentStep.Iteration &&
+                                step.Sequence < currentStep.Sequence &&
+                                step.Status == StepStatus.Completed,
+                            cancellationToken)
+                    : null;
+                if (dependency is null ||
+                    string.IsNullOrWhiteSpace(dependency.PlanStepKey) ||
+                    !byKey.ContainsKey(dependency.PlanStepKey))
+                {
+                    throw new InvalidOperationException(
+                        $"Recovered Studio worker '{currentStep.PlanStepKey}' has no valid completed direct dependency.");
+                }
+                directKeys = [dependency.PlanStepKey];
+            }
+        }
         if (directKeys.Count == 0)
         {
             return [];
@@ -6858,10 +6940,26 @@ public sealed class WorkflowEngine(
             ?? throw new InvalidOperationException(
                 "studio-v2 pushback cannot be validated without the accepted plan document.");
         var document = TeamPlanParser.ParseJson(planJson).Document;
-        if (!TeamPlanValidator.IsDependencyAncestor(
-                document,
+        var ownerIsPlannedAncestor = TeamPlanValidator.IsDependencyAncestor(
+            document,
+            handoff.OwnerPlanStepKey,
+            blockedStep.PlanStepKey);
+        var recoveredOrder = ownerIsPlannedAncestor
+            ? null
+            : await LoadVerificationOrderRecoveryAsync(
+                database,
+                flow.Id,
+                flow.Iteration,
+                cancellationToken);
+        var ownerIsRecoveredDependency = recoveredOrder is not null &&
+            GetStableSemanticRootId(blockedStep) ==
+            recoveredOrder.VerificationRootStepId &&
+            string.Equals(
                 handoff.OwnerPlanStepKey,
-                blockedStep.PlanStepKey))
+                recoveredOrder.OutcomeOwnerPlanStepKey,
+                StringComparison.Ordinal);
+        if (!ownerIsPlannedAncestor &&
+            !ownerIsRecoveredDependency)
         {
             throw new InvalidOperationException(
                 $"Pushback owner '{handoff.OwnerPlanStepKey}' must be an earlier dependency " +
@@ -9023,6 +9121,14 @@ public sealed class WorkflowEngine(
                 throw new InvalidOperationException(
                     $"The legacy flow cannot be restarted because no durable definition exists for historical agent '{failedStep.AgentId}'.");
             }
+            if (await TryQueueDeferredOutcomeOwnerRecoveryAsync(
+                    database,
+                    flow,
+                    failedStep,
+                    cancellationToken))
+            {
+                return flow;
+            }
             var copilotHome = string.IsNullOrWhiteSpace(failedStep.CopilotSessionHome)
                 ? sessionJournal.ExpectedHome()
                 : failedStep.CopilotSessionHome;
@@ -9458,6 +9564,224 @@ public sealed class WorkflowEngine(
         step.StartedAt = null;
         step.CompletedAt = null;
         step.DurationMilliseconds = 0;
+    }
+
+    private async Task<bool> TryQueueDeferredOutcomeOwnerRecoveryAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep failedStep,
+        CancellationToken cancellationToken)
+    {
+        if (flow.ContractVersion != "studio-v2" ||
+            flow.Kind != FlowKind.Delivery ||
+            failedStep.Status != StepStatus.Pushback ||
+            failedStep.IsOutcomeOwner ||
+            !IsDeliveryVerificationStep(failedStep) ||
+            string.IsNullOrWhiteSpace(flow.OutcomeOwnerPlanStepKey))
+        {
+            return false;
+        }
+
+        var verificationRootId = GetStableSemanticRootId(failedStep);
+        var verificationRoot = flow.Steps.SingleOrDefault(step =>
+            step.Id == verificationRootId);
+        if (verificationRoot is null)
+        {
+            return false;
+        }
+
+        var outcomeOwner = flow.Steps
+            .Where(step =>
+                step.Iteration == flow.Iteration &&
+                step.IsOutcomeOwner &&
+                !IsDeliveryVerificationStep(step) &&
+                step.Status == StepStatus.Skipped &&
+                string.Equals(
+                    step.PlanStepKey,
+                    flow.OutcomeOwnerPlanStepKey,
+                    StringComparison.Ordinal) &&
+                step.Sequence > verificationRoot.Sequence)
+            .OrderBy(step => step.Sequence)
+            .ThenBy(step => step.Attempt)
+            .FirstOrDefault();
+        if (outcomeOwner?.DependsOnStepId is not { } ownerDependencyId ||
+            !flow.Steps.Any(step =>
+                step.Id == ownerDependencyId &&
+                GetStableSemanticRootId(step) == verificationRootId))
+        {
+            return false;
+        }
+
+        ResetSkippedStep(outcomeOwner);
+        outcomeOwner.DependsOnStepId = verificationRoot.DependsOnStepId;
+        const string ownerRecoveryMarker =
+            "Host recovery context: verification ran before this outcome-owner step.";
+        if (!outcomeOwner.InputSummary.Contains(
+                ownerRecoveryMarker,
+                StringComparison.Ordinal))
+        {
+            outcomeOwner.InputSummary =
+                $"{outcomeOwner.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+                $"{ownerRecoveryMarker} Prepare the complete candidate before verification is " +
+                $"retried, addressing this finding: {ClipText(failedStep.PushbackReason, 2_000)}";
+        }
+
+        var retryStep = FindReusableCausalRetry(failedStep, flow.Steps);
+        if (retryStep is null)
+        {
+            foreach (var laterStep in flow.Steps.Where(step =>
+                         step.Iteration == flow.Iteration &&
+                         step.Sequence > outcomeOwner.Sequence))
+            {
+                laterStep.Sequence += 10;
+            }
+
+            retryStep = new FlowStep
+            {
+                FlowRunId = flow.Id,
+                Iteration = flow.Iteration,
+                Sequence = outcomeOwner.Sequence + 10,
+                AgentId = failedStep.AgentId,
+                AgentName = failedStep.AgentName,
+                AgentRole = failedStep.AgentRole,
+                Label = $"{ManualRestartLabelPrefix}{failedStep.AgentName}",
+                PlanStepKey = failedStep.PlanStepKey,
+                PlanDutiesJson = failedStep.PlanDutiesJson,
+                PlanStage = failedStep.PlanStage,
+                InvocationKind = failedStep.InvocationKind,
+                IsOutcomeOwner = false,
+                PermissionProfile = failedStep.PermissionProfile,
+                EffectivePermissionJson = failedStep.EffectivePermissionJson,
+                WorkflowRevision = failedStep.WorkflowRevision,
+                Kind = failedStep.Kind,
+                Status = StepStatus.Pending,
+                Phase = AgentRunPhase.PreparingWorkspace,
+                Attempt = flow.Steps
+                    .Where(step =>
+                        step.Iteration == flow.Iteration &&
+                        step.AgentId == failedStep.AgentId)
+                    .Select(step => step.Attempt)
+                    .DefaultIfEmpty()
+                    .Max() + 1,
+                RemotePublicationAllowed = failedStep.RemotePublicationAllowed,
+                RetryOfStepId = GetRetryRootId(failedStep),
+                PushbackRootStepId = null,
+                OutcomeQaRound = failedStep.OutcomeQaRound,
+                OutcomePlanHash = failedStep.OutcomePlanHash,
+                StableSemanticRootId = verificationRootId,
+                PreMortemOriginStepId = failedStep.PreMortemOriginStepId,
+                PreMortemTargetStepId = failedStep.PreMortemTargetStepId,
+                PreMortemReviewStepId = failedStep.PreMortemReviewStepId
+            };
+            flow.Steps.Add(retryStep);
+            database.Entry(retryStep).State = EntityState.Added;
+        }
+        else
+        {
+            ResetSkippedStep(retryStep);
+            retryStep.CopilotSessionId = null;
+            retryStep.CopilotSessionHome = string.Empty;
+            retryStep.PushbackRootStepId = null;
+        }
+
+        retryStep.DependsOnStepId = outcomeOwner.Id;
+        retryStep.InputSummary =
+            $"{verificationRoot.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+            "Host recovery context: this accepted legacy Delivery plan placed verification before " +
+            "its distinct outcome owner. The deferred outcome owner will now prepare the complete " +
+            "candidate first; independently re-run every planned criterion against that result.";
+
+        if (!await database.TaskProfiles.AnyAsync(
+                profile => profile.FlowStepId == retryStep.Id,
+                cancellationToken))
+        {
+            var sourceProfile = await database.TaskProfiles
+                                    .AsNoTracking()
+                                    .Where(profile =>
+                                        profile.FlowRunId == flow.Id &&
+                                        profile.Iteration == flow.Iteration &&
+                                        profile.PlanStepKey ==
+                                        failedStep.PlanStepKey &&
+                                        profile.AgentId == failedStep.AgentId)
+                                    .OrderByDescending(profile =>
+                                        profile.FlowStepId == failedStep.Id)
+                                    .ThenByDescending(profile =>
+                                        profile.CreatedAt)
+                                    .FirstOrDefaultAsync(cancellationToken)
+                                ?? throw new InvalidOperationException(
+                                    $"No durable task profile exists for failed plan step '{failedStep.PlanStepKey}'.");
+            database.TaskProfiles.Add(
+                TaskProfileRules.CopyForStep(sourceProfile, retryStep.Id));
+        }
+
+        foreach (var dependent in flow.Steps.Where(step =>
+                     step.Status == StepStatus.Pending &&
+                     step.DependsOnStepId == failedStep.Id &&
+                     step.Id != outcomeOwner.Id &&
+                     step.Id != retryStep.Id))
+        {
+            dependent.DependsOnStepId = retryStep.Id;
+        }
+        RebindActiveQaRetry(flow, failedStep, retryStep);
+        var permissionTightened =
+            PreserveOrTightenRetryPermission(flow, failedStep, retryStep);
+
+        var failureReason = flow.FailureReason;
+        _lifecycle.Transition(flow, FlowStatus.Queued);
+        flow.FailureReason = string.Empty;
+        flow.CompletedAt = null;
+        flow.OutcomeUrl = string.Empty;
+        flow.OutcomeLabel = string.Empty;
+        flow.UpdatedAt = DateTimeOffset.UtcNow;
+        database.FlowEvents.AddRange(
+            new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = failedStep.Id,
+                Type = "flow.manual-restart",
+                Message =
+                    $"Manual restart requested after {failedStep.AgentName} failed: {failureReason}"
+            },
+            new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = outcomeOwner.Id,
+                Type = "flow.verification-order-recovered",
+                Message =
+                    $"Recovered the accepted legacy Delivery plan by running outcome owner " +
+                    $"'{outcomeOwner.PlanStepKey}' before retrying verification; the immutable plan document was preserved.",
+                DataJson = JsonSerializer.Serialize(
+                    new VerificationOrderRecoveryRecord(
+                        VerificationOrderRecoveryRecord.CurrentVersion,
+                        flow.Iteration,
+                        verificationRoot.Id,
+                        verificationRoot.PlanStepKey,
+                        outcomeOwner.Id,
+                        outcomeOwner.PlanStepKey,
+                        retryStep.Id))
+            },
+            new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = retryStep.Id,
+                Type = "step.manual-retry-scheduled",
+                Message =
+                    $"{failedStep.AgentName} will retry only after the deferred outcome owner prepares the complete candidate."
+            });
+        if (permissionTightened)
+        {
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = retryStep.Id,
+                Type = "step.permission-policy-tightened",
+                Message =
+                    "The retry retained its original permission ceiling and incorporated only stricter current WORKFLOW.md restrictions."
+            });
+        }
+
+        await database.SaveChangesAsync(cancellationToken);
+        return true;
     }
 
     private async Task RecoverInterruptedStepAsync(
@@ -10099,6 +10423,24 @@ public sealed class WorkflowEngine(
             revisionAttempt,
             workflowProvider.GetEffective().Revision,
             upstreamOwnerStep);
+        var recoveredOrder = flow.ContractVersion == "studio-v2"
+            ? await LoadVerificationOrderRecoveryAsync(
+                database,
+                flow.Id,
+                flow.Iteration,
+                cancellationToken)
+            : null;
+        if (recoveredOrder is not null &&
+            GetStableSemanticRootId(blockedStep) ==
+            recoveredOrder.VerificationRootStepId &&
+            upstreamOwnerStep is not null &&
+            string.Equals(
+                upstreamOwnerStep.PlanStepKey,
+                recoveredOrder.OutcomeOwnerPlanStepKey,
+                StringComparison.Ordinal))
+        {
+            revisionStep.DependsOnStepId = upstreamOwnerStep.Id;
+        }
         var revisionPolicyTightened = false;
         var retryPolicyTightened = false;
         if (flow.ContractVersion == "studio-v2")
@@ -12329,6 +12671,19 @@ public sealed class WorkflowEngine(
         StepStatus StepStatus,
         AgentRunPhase Phase,
         FlowStatus FlowStatus);
+
+    private sealed record VerificationOrderRecoveryRecord(
+        string Version,
+        int Iteration,
+        Guid VerificationRootStepId,
+        string VerificationPlanStepKey,
+        Guid OutcomeOwnerStepId,
+        string OutcomeOwnerPlanStepKey,
+        Guid VerificationRetryStepId)
+    {
+        public const string CurrentVersion =
+            "delivery-verification-order-recovery-v1";
+    }
 
     private sealed class CompletedJournalContractException(
         string message,
