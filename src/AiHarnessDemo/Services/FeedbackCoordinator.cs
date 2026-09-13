@@ -21,8 +21,12 @@ public sealed partial class FeedbackCoordinator(
     CandidateFingerprintService? candidateFingerprintService = null,
     WorkflowDefinitionProvider? workflowProvider = null,
     FlowAgentSnapshotService? flowAgentSnapshotService = null,
-    IDemoRuntimeRevoker? demoRuntimeRevoker = null)
+    IDemoRuntimeRevoker? demoRuntimeRevoker = null,
+    ILogger<FeedbackCoordinator>? logger = null)
 {
+    private readonly ILogger<FeedbackCoordinator> _logger =
+        logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<FeedbackCoordinator>.Instance;
+
     [GeneratedRegex(
         @"(?im)^\s*REWORK_TARGET_ROLES\s*:\s*(?<roles>NONE|[a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)\s*$")]
     private static partial Regex ReworkTargetRolesPattern();
@@ -872,23 +876,28 @@ public sealed partial class FeedbackCoordinator(
         var storedStep = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
-        storedStep.Phase = progress.Phase;
-        if (progress.ExecutionPrompt is not null)
+        var update = AgentProgressPersistence.Apply(storedStep, progress);
+        if (update.PhaseChanged)
         {
-            storedStep.ExecutionPrompt = progress.ExecutionPrompt;
+            _logger.LogInformation(
+                "Feedback step {StepId} for flow {FlowId} entered {Phase}; session {CopilotSessionId}. {Activity}",
+                stepId,
+                flowId,
+                progress.Phase,
+                progress.CopilotSessionId,
+                progress.Activity);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flowId,
+                FlowStepId = stepId,
+                Type = $"agent.{progress.Phase}",
+                Message = progress.Activity
+            });
         }
-        if (progress.CopilotSessionId is not null)
+        if (!update.StateChanged)
         {
-            storedStep.CopilotSessionId = progress.CopilotSessionId;
-            storedStep.CopilotSessionHome = progress.CopilotSessionHome ?? string.Empty;
+            return;
         }
-        database.FlowEvents.Add(new FlowEvent
-        {
-            FlowRunId = flowId,
-            FlowStepId = stepId,
-            Type = $"agent.{progress.Phase}",
-            Message = progress.Activity
-        });
         await database.SaveChangesAsync(cancellationToken);
     }
 

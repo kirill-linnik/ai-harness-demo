@@ -416,8 +416,16 @@ SQLite runs in write-ahead logging mode. Core durable tables are:
 - `ReviewedPublicationRecords`: one row per reviewed studio-v2 publication repository, holding the
   publication root, reviewed fingerprint, remote repository, branch, head/tree, pull request URL,
   and the stage reached (`Intent`, `BranchPublished`, `PullRequestOpened`, `Completed`).
-- `FlowEvents`: append-only status, materialization, recovery, and failure evidence.
+- `FlowEvents`: append-only status, materialization, recovery, failure, and agent phase-transition
+  evidence. Repeated callbacks within one phase are not duplicated; individual tool calls remain
+  attached to their `FlowStep`.
 - `FlowMessages`, `TaskProfiles`, routing tables, tool calls, outcomes, and learnings.
+
+The dashboard presents this ledger in causal order from oldest to newest, labels each step event
+with its agent attempt, and collapses low-level runtime phase detail. Console application logs use
+local timestamps, one line per event, and structured flow, step, session, model, duration, and
+outcome fields. Entity Framework SQL command logging is disabled; persistence failures still flow
+through normal warning and error categories.
 
 At startup, `CopilotSessionJournal` and `WorkflowEngine` reconcile:
 

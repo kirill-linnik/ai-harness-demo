@@ -999,6 +999,94 @@ public sealed class CopilotJsonlParserTests
     }
 
     [Fact]
+    public void ProgressReporter_FinishesOnlyOnTheTerminalResult()
+    {
+        var progress = new List<AgentRunProgress>();
+        var reporter = CopilotJsonlParser.CreateProgressReporter(progress.Add);
+
+        reporter(
+            """{"type":"assistant.message","data":{"content":"I will inspect another file."}}""");
+        reporter(
+            """{"type":"tool.execution_start","data":{"toolCallId":"one","toolName":"view"}}""");
+        reporter(
+            """{"type":"tool.execution_complete","data":{"toolCallId":"one","success":true}}""");
+        reporter("""{"type":"result","exitCode":0}""");
+
+        Assert.Collection(
+            progress,
+            item =>
+            {
+                Assert.Equal(AgentRunPhase.StreamingTurn, item.Phase);
+                Assert.Equal("Agent response received.", item.Activity);
+            },
+            item =>
+            {
+                Assert.Equal(AgentRunPhase.Finishing, item.Phase);
+                Assert.Equal("Agent run completed.", item.Activity);
+            });
+    }
+
+    [Fact]
+    public void ProgressReporter_CollapsesToolChatterIntoOneStreamingTransition()
+    {
+        var progress = new List<AgentRunProgress>();
+        var reporter = CopilotJsonlParser.CreateProgressReporter(progress.Add);
+
+        reporter(
+            """{"type":"tool.execution_start","data":{"toolCallId":"one","toolName":"grep"}}""");
+        reporter(
+            """{"type":"tool.execution_complete","data":{"toolCallId":"one","success":true}}""");
+        reporter(
+            """{"type":"tool.execution_start","data":{"toolCallId":"two","toolName":"powershell"}}""");
+        reporter(
+            """{"type":"tool.execution_complete","data":{"toolCallId":"two","success":true}}""");
+        reporter("""{"type":"result","exitCode":0}""");
+
+        Assert.Collection(
+            progress,
+            item =>
+            {
+                Assert.Equal(AgentRunPhase.StreamingTurn, item.Phase);
+                Assert.Equal("Agent is using tools.", item.Activity);
+            },
+            item =>
+            {
+                Assert.Equal(AgentRunPhase.Finishing, item.Phase);
+                Assert.Equal("Agent run completed.", item.Activity);
+            });
+    }
+
+    [Fact]
+    public void ProgressPersistence_RecordsOnlyPhaseTransitions()
+    {
+        var step = new FlowStep
+        {
+            FlowRunId = Guid.NewGuid(),
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            Phase = AgentRunPhase.StreamingTurn
+        };
+
+        var repeatedPhase = AgentProgressPersistence.Apply(
+            step,
+            new AgentRunProgress(
+                AgentRunPhase.StreamingTurn,
+                "Using powershell."));
+        Assert.False(repeatedPhase.PhaseChanged);
+        Assert.False(repeatedPhase.StateChanged);
+
+        var finishing = AgentProgressPersistence.Apply(
+            step,
+            new AgentRunProgress(
+                AgentRunPhase.Finishing,
+                "Agent run completed."));
+        Assert.True(finishing.PhaseChanged);
+        Assert.True(finishing.StateChanged);
+        Assert.Equal(AgentRunPhase.Finishing, step.Phase);
+    }
+
+    [Fact]
     public void Parse_TreatsAnEarlyExitWithStandardErrorAsAmbiguous()
     {
         var result = CopilotJsonlParser.Parse(

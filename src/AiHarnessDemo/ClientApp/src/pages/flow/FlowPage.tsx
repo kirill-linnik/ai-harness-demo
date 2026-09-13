@@ -248,11 +248,11 @@ export function FlowPage() {
           <div className="card-header">
             <div>
               <h3>Execution ledger</h3>
-              <p>Append-only events across the full flow.</p>
+              <p>Chronological flow decisions with runtime detail grouped by agent attempt.</p>
             </div>
           </div>
           <div className="card-body">
-            <Timeline events={flow.events} />
+            <Timeline events={flow.events} steps={flow.steps} />
           </div>
         </div>
       </section>

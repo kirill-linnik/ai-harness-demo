@@ -203,12 +203,19 @@ public sealed class WorkflowEngine(
         try
         {
             await AcquireConcurrencySlotAsync(cancellationToken);
+            logger.LogInformation(
+                "Flow {FlowId} entered execution with {ActiveFlowCount} active flow(s).",
+                flowId,
+                ActiveFlowCount);
             try
             {
                 using var executionSource = CancellationTokenSource.CreateLinkedTokenSource(
                     cancellationToken,
                     handoffGate.KillSwitchToken);
                 await RunCoreAsync(flowId, executionSource.Token);
+                logger.LogInformation(
+                    "Flow {FlowId} completed its current execution cycle.",
+                    flowId);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -221,10 +228,16 @@ public sealed class WorkflowEngine(
             }
             finally
             {
+                int activeFlowCount;
                 lock (_concurrencyLock)
                 {
                     _activeFlows--;
+                    activeFlowCount = _activeFlows;
                 }
+                logger.LogInformation(
+                    "Flow {FlowId} released its execution slot; {ActiveFlowCount} active flow(s) remain.",
+                    flowId,
+                    activeFlowCount);
             }
         }
         finally
@@ -4309,6 +4322,17 @@ public sealed class WorkflowEngine(
         AgentExecutionResult? attemptedResult = null;
         try
         {
+            logger.LogInformation(
+                "Starting agent step {StepId} for flow {FlowId}: {AgentId} attempt {Attempt}, " +
+                "{InvocationKind}, session {CopilotSessionId}, model {Model}/{Effort}.",
+                stepId,
+                flowId,
+                executionContext.AgentId,
+                executionContext.Attempt,
+                executionContext.InvocationKind,
+                executionContext.CopilotSessionId,
+                executionContext.Model,
+                executionContext.ModelEffort);
             attemptedResult = await agentRunner.ExecuteAsync(
                 executionContext,
                 cancellationToken);
@@ -4342,7 +4366,7 @@ public sealed class WorkflowEngine(
                     cancellationToken);
             }
             stopwatch.Stop();
-            return await CompleteStepAsync(
+            var completedStep = await CompleteStepAsync(
                 flowId,
                 stepId,
                 attemptedResult,
@@ -4350,6 +4374,16 @@ public sealed class WorkflowEngine(
                 stopwatch.ElapsedMilliseconds,
                 recoveredSessionId: null,
                 cancellationToken);
+            logger.LogInformation(
+                "Agent step {StepId} for flow {FlowId} finished with {StepStatus}/{StepPhase} " +
+                "after {ElapsedMilliseconds} ms and {ToolCallCount} tool call(s).",
+                stepId,
+                flowId,
+                completedStep.Status,
+                completedStep.Phase,
+                stopwatch.ElapsedMilliseconds,
+                attemptedResult.ToolCalls.Count);
+            return completedStep;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -8421,6 +8455,9 @@ public sealed class WorkflowEngine(
         Guid flowId,
         CancellationToken cancellationToken)
     {
+        logger.LogWarning(
+            "Operator requested recovery for active flow {FlowId}.",
+            flowId);
         await _manualRestartGate.WaitAsync(cancellationToken);
         try
         {
@@ -8508,6 +8545,10 @@ public sealed class WorkflowEngine(
                     : "Operator recovery reconciled the interrupted Copilot session and returned the flow to the queue."
             });
             await flowDatabase.SaveChangesAsync(cancellationToken);
+            logger.LogInformation(
+                "Recovered active flow {FlowId}; reconciled {InterruptedStepCount} interrupted step(s) and queued durable continuation.",
+                flowId,
+                interruptedSteps.Count);
         }
         finally
         {
@@ -11242,23 +11283,21 @@ public sealed class WorkflowEngine(
         var step = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
-        step.Phase = progress.Phase;
-        if (progress.ExecutionPrompt is not null)
+        var update = AgentProgressPersistence.Apply(step, progress);
+        if (update.PhaseChanged)
         {
-            step.ExecutionPrompt = progress.ExecutionPrompt;
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flowId,
+                FlowStepId = stepId,
+                Type = $"agent.{progress.Phase}",
+                Message = progress.Activity
+            });
         }
-        if (progress.CopilotSessionId is not null)
+        if (!update.StateChanged)
         {
-            step.CopilotSessionId = progress.CopilotSessionId;
-            step.CopilotSessionHome = progress.CopilotSessionHome ?? string.Empty;
+            return;
         }
-        database.FlowEvents.Add(new FlowEvent
-        {
-            FlowRunId = flowId,
-            FlowStepId = stepId,
-            Type = $"agent.{progress.Phase}",
-            Message = progress.Activity
-        });
         await database.SaveChangesAsync(cancellationToken);
     }
 
@@ -12616,6 +12655,9 @@ public sealed class FlowWorker :
                 stoppingToken);
         }
 
+        _logger.LogInformation(
+            "Dispatched flow {FlowId} from the durable queue.",
+            flowId);
         _ = ObserveAsync(flowId, state, task, source, stoppingToken);
     }
 

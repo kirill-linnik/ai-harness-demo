@@ -1925,8 +1925,20 @@ summary:focus-visible {
 .timeline {
   display: grid;
   max-height: 330px;
+  margin: 0;
   overflow-y: auto;
+  padding: 0;
   gap: 0;
+  list-style: none;
+  scroll-behavior: smooth;
+}
+
+.timeline-order {
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .timeline-item {
@@ -1968,6 +1980,17 @@ summary:focus-visible {
   background: var(--red);
 }
 
+.timeline-item.warning .timeline-dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 1px rgba(247, 185, 85, 0.3);
+}
+
+.timeline-item.learning .timeline-dot,
+.timeline-item.runtime .timeline-dot {
+  background: var(--violet);
+  box-shadow: 0 0 0 1px rgba(155, 135, 245, 0.3);
+}
+
 .timeline-item.completed .timeline-dot,
 .timeline-item.approved .timeline-dot {
   background: var(--green);
@@ -1980,11 +2003,73 @@ summary:focus-visible {
   font-weight: 550;
 }
 
-.timeline-copy span {
-  display: block;
+.timeline-message,
+.timeline-event-detail p {
+  margin: 4px 0 0;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
+.timeline-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 9px;
   margin-top: 3px;
   color: var(--muted);
   font-size: 10px;
+}
+
+.timeline-event-detail {
+  margin-top: 4px;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
+.timeline-event-detail summary,
+.timeline-runtime summary {
+  cursor: pointer;
+}
+
+.timeline-event-detail summary:hover,
+.timeline-runtime summary:hover {
+  color: var(--ink);
+}
+
+.timeline-runtime {
+  min-width: 0;
+}
+
+.timeline-runtime summary strong {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.timeline-runtime summary::marker {
+  color: var(--muted);
+}
+
+.timeline-runtime-events {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 25, 0.42);
+}
+
+.timeline-runtime-events div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.timeline-runtime-events time {
+  color: var(--muted-strong);
+  font-variant-numeric: tabular-nums;
 }
 
 .feedback-card {

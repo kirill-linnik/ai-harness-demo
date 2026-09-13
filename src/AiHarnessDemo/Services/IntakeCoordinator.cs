@@ -31,7 +31,8 @@ public sealed partial class IntakeCoordinator(
     FlowLifecycleCoordinator? lifecycleCoordinator = null,
     CopilotSessionJournal? sessionJournal = null,
     AgentManifestStager? manifestStager = null,
-    PermissionProfileResolver? permissionProfileResolver = null)
+    PermissionProfileResolver? permissionProfileResolver = null,
+    ILogger<IntakeCoordinator>? logger = null)
 {
     internal const string InitialLinkedIntakePlanStepKey =
         "account-manager:initial-linked-intake";
@@ -43,6 +44,8 @@ public sealed partial class IntakeCoordinator(
         manifestStager ?? new AgentManifestStager();
     private readonly PermissionProfileResolver _permissionResolver =
         permissionProfileResolver ?? new PermissionProfileResolver();
+    private readonly ILogger<IntakeCoordinator> _logger =
+        logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeCoordinator>.Instance;
     internal Func<string, Guid, CancellationToken, Task<CopilotSessionSnapshot>>?
         SessionInspectorOverride { get; set; }
     internal Func<CopilotSessionSnapshot, bool>?
@@ -2588,23 +2591,28 @@ public sealed partial class IntakeCoordinator(
         var step = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
-        step.Phase = progress.Phase;
-        if (progress.ExecutionPrompt is not null)
+        var update = AgentProgressPersistence.Apply(step, progress);
+        if (update.PhaseChanged)
         {
-            step.ExecutionPrompt = progress.ExecutionPrompt;
+            _logger.LogInformation(
+                "Intake step {StepId} for flow {FlowId} entered {Phase}; session {CopilotSessionId}. {Activity}",
+                stepId,
+                flowId,
+                progress.Phase,
+                progress.CopilotSessionId,
+                progress.Activity);
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flowId,
+                FlowStepId = stepId,
+                Type = $"agent.{progress.Phase}",
+                Message = progress.Activity
+            });
         }
-        if (progress.CopilotSessionId is not null)
+        if (!update.StateChanged)
         {
-            step.CopilotSessionId = progress.CopilotSessionId;
-            step.CopilotSessionHome = progress.CopilotSessionHome ?? string.Empty;
+            return;
         }
-        database.FlowEvents.Add(new FlowEvent
-        {
-            FlowRunId = flowId,
-            FlowStepId = stepId,
-            Type = $"agent.{progress.Phase}",
-            Message = progress.Activity
-        });
         await database.SaveChangesAsync(cancellationToken);
     }
 

@@ -304,7 +304,19 @@ public static partial class CopilotJsonlParser
         Action<AgentRunProgress>? report,
         string copilotSessionHome = "")
     {
-        var pendingToolNames = new Dictionary<string, string>(StringComparer.Ordinal);
+        var streamingReported = false;
+        void ReportStreaming(string activity)
+        {
+            if (streamingReported)
+            {
+                return;
+            }
+            streamingReported = true;
+            report?.Invoke(new AgentRunProgress(
+                AgentRunPhase.StreamingTurn,
+                activity));
+        }
+
         return line =>
         {
             if (report is null ||
@@ -331,48 +343,31 @@ public static partial class CopilotJsonlParser
 
                 if (eventType == "tool.execution_start")
                 {
-                    var tool = ReadString(payload, "toolName") ?? "unknown";
-                    var id = ReadToolCallId(payload);
-                    if (id is not null)
-                    {
-                        pendingToolNames[id] = tool;
-                    }
-                    report(new AgentRunProgress(
-                        AgentRunPhase.StreamingTurn,
-                        $"Using {tool}."));
+                    ReportStreaming("Agent is using tools.");
                     return;
                 }
 
                 if (eventType == "tool.execution_complete")
                 {
-                    var id = ReadToolCallId(payload);
-                    var tool = ReadString(payload, "toolName");
-                    if (tool is null && id is not null)
-                    {
-                        pendingToolNames.TryGetValue(id, out tool);
-                    }
-                    if (id is not null)
-                    {
-                        pendingToolNames.Remove(id);
-                    }
-                    report(new AgentRunProgress(
-                        AgentRunPhase.StreamingTurn,
-                        $"{tool ?? "Tool"} completed."));
                     return;
                 }
 
-                if (eventType is "assistant.message" or "result")
+                if (eventType == "assistant.message")
                 {
-                    if (eventType == "assistant.message" &&
-                        IsSubAgentEvent(document.RootElement))
+                    if (!IsSubAgentEvent(document.RootElement))
                     {
-                        return;
+                        // A message can request another tool call. It proves the turn is active,
+                        // but only the terminal result event means the CLI is finishing.
+                        ReportStreaming("Agent response received.");
                     }
+                    return;
+                }
+
+                if (eventType == "result")
+                {
                     report(new AgentRunProgress(
                         AgentRunPhase.Finishing,
-                        eventType == "result"
-                            ? "Agent run completed."
-                            : "Response drafted. Validating the handoff."));
+                        "Agent run completed."));
                     return;
                 }
 
