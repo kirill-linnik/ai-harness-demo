@@ -18,42 +18,8 @@ namespace AiHarnessDemo.Tests;
 public sealed class ReviewWorkflowTests
 {
     [Fact]
-    public void ReviewFeedbackV1_IsExactStrictAndBounded()
+    public void DirectReviewRequest_RejectsUnknownProperties()
     {
-        var output = $$"""
-            surrounding classification
-            {{ReviewFeedbackParser.BeginSentinel}}
-            {
-              "Version": "review-feedback-v1",
-              "Intent": "RequestRefinement",
-              "CustomerReply": "I will ask the team to narrow the result.",
-              "Refinement": {
-                "Goal": "Limit the recommendation to checkout resilience.",
-                "RequestedChanges": ["Exclude unrelated services."]
-              },
-              "ExplicitImplementationAdoption": false
-            }
-            {{ReviewFeedbackParser.EndSentinel}}
-            """;
-
-        var parsed = ReviewFeedbackParser.Parse(output);
-
-        Assert.Equal(ReviewIntent.RequestRefinement, parsed.Document.Intent);
-        Assert.Equal(
-            "Limit the recommendation to checkout resilience.",
-            parsed.Document.Refinement!.Goal);
-        Assert.Throws<ReviewFeedbackContractException>(() =>
-            ReviewFeedbackParser.ParseJson(
-                parsed.RawJson.Replace(
-                    "\"ExplicitImplementationAdoption\": false",
-                    "\"ExplicitImplementationAdoption\": false, \"Unknown\": true",
-                    StringComparison.Ordinal)));
-        Assert.Throws<ReviewFeedbackContractException>(() =>
-            ReviewFeedbackParser.Parse(
-                output.Replace(
-                    "\"RequestRefinement\"",
-                    "\"requestrefinement\"",
-                    StringComparison.Ordinal)));
         Assert.Throws<JsonException>(() =>
             JsonSerializer.Deserialize<DirectReviewRequest>(
                 """
@@ -61,6 +27,14 @@ public sealed class ReviewWorkflowTests
                   "GateId": "00000000-0000-0000-0000-000000000001",
                   "Intent": "Accept",
                   "Unknown": true
+                }
+                """));
+        Assert.Throws<JsonException>(() =>
+            JsonSerializer.Deserialize<DirectReviewRequest>(
+                """
+                {
+                  "GateId": "00000000-0000-0000-0000-000000000001",
+                  "Intent": "accept"
                 }
                 """));
 
@@ -101,9 +75,6 @@ public sealed class ReviewWorkflowTests
         var review = Assert.Single(
             before.GateRecords,
             gate => gate.ActionType == HandoffActionType.CustomerReview);
-        Assert.DoesNotContain(
-            before.GateRecords,
-            gate => gate.ActionType == HandoffActionType.Release);
         Assert.False(review.Resolved);
         Assert.DoesNotContain(
             before.AgentSnapshots,
@@ -170,9 +141,6 @@ public sealed class ReviewWorkflowTests
             before.GateRecords,
             gate => gate.ActionType == HandoffActionType.CustomerReview);
         Assert.DoesNotContain(
-            before.GateRecords,
-            gate => gate.ActionType == HandoffActionType.Release);
-        Assert.DoesNotContain(
             before.Steps,
             step => step.PlanStage == PlanStage.AfterApproval);
         Assert.DoesNotContain(
@@ -236,7 +204,7 @@ public sealed class ReviewWorkflowTests
         Assert.Equal(1, harness.PublicationVerifier.Calls);
         Assert.Single(
             published.Steps,
-            step => ReviewCoordinator.IsStudioPublicationStep(published, step));
+            step => ReviewCoordinator.IsPublicationStep(published, step));
         Assert.Contains(
             harness.Runner.Contexts,
             context =>
@@ -512,7 +480,7 @@ public sealed class ReviewWorkflowTests
                 Assert.Single(
                     completed.Steps,
                     step =>
-                        ReviewCoordinator.IsStudioPublicationStep(
+                        ReviewCoordinator.IsPublicationStep(
                             completed,
                             step) &&
                         step.Status == StepStatus.Completed);
@@ -911,7 +879,7 @@ public sealed class ReviewWorkflowTests
             refinement.Flow.ConsolidatedRequest,
             StringComparison.Ordinal);
         Assert.Contains(
-            "Current reviewed flow-outcome-v1 JSON:",
+            "Current reviewed flow outcome JSON:",
             refinement.Flow.ConsolidatedRequest,
             StringComparison.Ordinal);
         Assert.Contains(
@@ -920,15 +888,11 @@ public sealed class ReviewWorkflowTests
             StringComparison.Ordinal);
         Assert.True(
             refinement.Flow.ConsolidatedRequest.IndexOf(
-                "Current reviewed flow-outcome-v1 JSON:",
+                "Current reviewed flow outcome JSON:",
                 StringComparison.Ordinal) <
             refinement.Flow.ConsolidatedRequest.IndexOf(
                 "Previous confirmed brief:",
                 StringComparison.Ordinal));
-        Assert.Contains(
-            FlowOutcomeParser.Version,
-            refinement.Flow.ConsolidatedRequest,
-            StringComparison.Ordinal);
         Assert.Equal(
             ReviewDecision.RefinementRequested,
             refinement.Flow.GateRecords.Single(gate =>
@@ -961,192 +925,6 @@ public sealed class ReviewWorkflowTests
                 item.DataJson?.Contains(
                     "Exclude account services.",
                     StringComparison.Ordinal) == true);
-    }
-
-    [Fact]
-    public async Task LegacyUnverifiedReleaseGate_RemainsReadableButApprovalIsBlocked()
-    {
-        await using var harness =
-            await ReviewHarness.CreateAsync(FlowKind.Advisory);
-        var legacyFlow = new FlowRun
-        {
-            Title = "Legacy delivery",
-            OriginalRequest = "Ship the legacy result.",
-            ConsolidatedRequest = "Ship the legacy result.",
-            Kind = FlowKind.Delivery,
-            ContractVersion = "legacy-v1",
-            Status = FlowStatus.WaitingForFeedback,
-            RepositoryPath = harness.Root,
-            RepositoryKnowledge = "Legacy fixture.",
-            WorkspacePath = harness.WorkspacePath,
-            BranchName = "legacy-review",
-            Outcome = OutcomeType.PullRequest
-        };
-        var releaseStep = new FlowStep
-        {
-            FlowRunId = legacyFlow.Id,
-            Iteration = 1,
-            Sequence = 10,
-            AgentId = "legacy-release",
-            AgentName = "Legacy Release",
-            AgentRole = "release-engineer",
-            Status = StepStatus.Completed,
-            OutputSummary = "Prepared release candidate."
-        };
-        legacyFlow.Steps.Add(releaseStep);
-        var releaseGate = harness.Gate.SubmitProposal(new HandoffProposal
-        {
-            FlowRunId = legacyFlow.Id,
-            FlowStepId = releaseStep.Id,
-            ActionType = HandoffActionType.Release,
-            Summary = "Legacy customer release review.",
-            BlastRadius = HandoffBlastRadius.High
-        });
-        legacyFlow.GateRecords.Add(releaseGate);
-        await using (var database =
-                     await harness.Factory.CreateDbContextAsync())
-        {
-            database.Flows.Add(legacyFlow);
-            await database.SaveChangesAsync();
-        }
-
-        var readable = legacyFlow.ToDetailDto();
-        var dtoGate = Assert.Single(readable.GateRecords);
-        Assert.Equal(HandoffActionType.Release, dtoGate.ActionType);
-        Assert.Null(dtoGate.ReviewDecision);
-
-        var coordinator = new FeedbackCoordinator(
-            harness.Factory,
-            new FixedModelRouter(),
-            new BootstrapTaskProfileFactory(),
-            TestRoutingSupport.Recorder(harness.Factory),
-            harness.Runner,
-            harness.Gate,
-            new FlowQueue(),
-            new FlowLifecycleCoordinator(),
-            workflowProvider: harness.WorkflowProvider);
-        var decision = await coordinator.DecideAsync(
-            legacyFlow.Id,
-            approve: true,
-            releaseGate.Id,
-            candidateFingerprint: string.Empty,
-            feedback: string.Empty);
-
-        Assert.Equal(ReleaseDecisionOutcome.Conflict, decision.Outcome);
-        Assert.Contains(
-            "cannot be approved",
-            decision.Message,
-            StringComparison.OrdinalIgnoreCase);
-        await using (var database =
-                     await harness.Factory.CreateDbContextAsync())
-        {
-            Assert.DoesNotContain(
-                await database.FlowSteps
-                .AsNoTracking()
-                .Where(step =>
-                    step.FlowRunId == legacyFlow.Id &&
-                    step.AgentRole == "release-engineer" &&
-                    step.Status == StepStatus.Pending)
-                .ToListAsync(),
-                _ => true);
-        }
-
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task MigratedLegacyFeedback_UsesCapturedProductManager(
-        bool keepChangedGlobalDefinition)
-    {
-        await using var harness =
-            await ReviewHarness.CreateAsync(FlowKind.Advisory);
-        var legacyFlow = new FlowRun
-        {
-            Title = "Legacy feedback",
-            OriginalRequest = "Review the legacy result.",
-            ConsolidatedRequest = "Review the legacy result.",
-            Kind = FlowKind.Delivery,
-            ContractVersion = "legacy-v1",
-            Status = FlowStatus.WaitingForFeedback,
-            RepositoryPath = harness.Root,
-            RepositoryKnowledge = "Legacy fixture.",
-            WorkspacePath = harness.WorkspacePath,
-            Outcome = OutcomeType.PullRequest
-        };
-        legacyFlow.AgentSnapshots.Add(new FlowAgentSnapshot
-        {
-            FlowRunId = legacyFlow.Id,
-            AgentId = "product-manager",
-            Name = "Captured Product Manager",
-            Description = "Captured feedback specialist.",
-            Role = "product-manager",
-            Instructions = "Use the captured legacy feedback contract.",
-            DefinitionHash = "sha256:captured-product-manager",
-            EnabledAtSnapshot = true,
-            SourceFileName = "product-manager.agent.md"
-        });
-        await using (var database =
-                     await harness.Factory.CreateDbContextAsync())
-        {
-            database.Flows.Add(legacyFlow);
-            if (keepChangedGlobalDefinition)
-            {
-                database.Agents.Add(new AgentRecord
-                {
-                    Id = "product-manager",
-                    Name = "Changed Global Product Manager",
-                    Description = "This mutable definition must be ignored.",
-                    Role = "product-manager",
-                    SourcePath = "changed.agent.md",
-                    Enabled = false,
-                    SortOrder = 50
-                });
-            }
-            await database.SaveChangesAsync();
-        }
-
-        var catalog = new AgentCatalog(
-            new HarnessPaths(
-                harness.Root,
-                Path.Combine(harness.Root, ".github", "agents"),
-                Path.Combine(harness.Root, "harness.db")),
-            harness.Factory);
-        var snapshotService =
-            new FlowAgentSnapshotService(harness.Factory, catalog);
-        var coordinator = new FeedbackCoordinator(
-            harness.Factory,
-            new FixedModelRouter(),
-            new BootstrapTaskProfileFactory(),
-            TestRoutingSupport.Recorder(harness.Factory),
-            harness.Runner,
-            harness.Gate,
-            new FlowQueue(),
-            new FlowLifecycleCoordinator(),
-            workflowProvider: harness.WorkflowProvider,
-            flowAgentSnapshotService: snapshotService);
-
-        var response = await coordinator.RespondAsync(
-            legacyFlow.Id,
-            "Explain the result before I decide.");
-
-        Assert.True(response.ShouldSpeak);
-        var context = Assert.Single(
-            harness.Runner.Contexts,
-            item => item.FlowId == legacyFlow.Id);
-        Assert.Equal("product-manager", context.AgentId);
-        Assert.Equal("Captured Product Manager", context.AgentName);
-        await using var verify =
-            await harness.Factory.CreateDbContextAsync();
-        var step = await verify.FlowSteps.SingleAsync(item =>
-            item.FlowRunId == legacyFlow.Id &&
-            item.AgentRole == "product-manager");
-        Assert.Equal("Captured Product Manager", step.AgentName);
-        Assert.Contains(
-            await verify.FlowMessages
-                .Where(item => item.FlowRunId == legacyFlow.Id)
-                .ToListAsync(),
-            item => item.Role == ConversationRole.ProductManager);
     }
 
     [Fact]
@@ -1214,9 +992,9 @@ public sealed class ReviewWorkflowTests
         var flow = await harness.LoadFlowAsync();
         Assert.Equal(FlowStatus.Blocked, flow.Status);
         Assert.Equal("delivery.readiness-blocked", flow.CurrentBlockerCode);
-        Assert.Empty(flow.GateRecords.Where(gate =>
+        Assert.DoesNotContain(flow.GateRecords, gate =>
             gate.ActionType is HandoffActionType.CustomerReview
-                or HandoffActionType.CustomerWaiver));
+                or HandoffActionType.CustomerWaiver);
         Assert.Equal(0, harness.CandidatePublisher.Calls);
     }
 
@@ -1469,13 +1247,24 @@ public sealed class ReviewWorkflowTests
         var prompt =
             $"AcceptancePlanHash: {planHash}{Environment.NewLine}" +
             "- AC-001 (Observation): verify the result" + Environment.NewLine +
-            "- EV-S010-000 [Observation] host-observed verification";
+            "- EV-S010-001 [Observation; supportsVerification=true] host-observed verification";
+        DeliveryEvidenceItem[] evidence =
+        [
+            new(
+                "EV-S010-001",
+                OutcomeEvidenceKind.Observation,
+                "reviewed-preview",
+                "host-observed verification",
+                SupportsVerification: true,
+                ExitCode: null,
+                ResultDigest: string.Empty)
+        ];
 
         var parsed = DeliveryReadinessPolicy.ParseQaOutput(
             DeliveryReadinessFixtures.QaBlockFromPrompt(prompt),
             plan,
             planHash,
-            ["EV-S010-000"]);
+            evidence);
 
         Assert.Equal(OutcomeQaVerdict.PASS, parsed.Document.Verdict);
         Assert.Empty(Assert.Single(parsed.Document.Criteria!).ResponsibleRoles!);
@@ -1490,7 +1279,7 @@ public sealed class ReviewWorkflowTests
                 invalid,
                 plan,
                 planHash,
-                ["EV-S010-000"]));
+                evidence));
         Assert.Contains(
             "Verified outcome cannot name responsible roles",
             exception.Message,
@@ -1506,7 +1295,6 @@ public sealed class ReviewWorkflowTests
             Title = "Guarded delivery",
             OriginalRequest = "Guard the approval path.",
             Kind = FlowKind.Delivery,
-            ContractVersion = "studio-v2",
             Status = FlowStatus.Running
         };
 
@@ -1797,6 +1585,29 @@ public sealed class ReviewWorkflowTests
         Assert.Contains(
             flow.Events,
             item => item.Type == "delivery.readiness-resolved");
+        var continuation = Assert.Single(
+            flow.Steps,
+            step =>
+                step.Status == StepStatus.Pending &&
+                step.IsOutcomeOwner &&
+                step.PlanStepKey == "prepare");
+
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var completed = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, completed.Status);
+        Assert.Equal(StepStatus.Completed, completed.Steps.Single(
+            step => step.Id == continuation.Id).Status);
+        Assert.Equal(
+            continuation.Id,
+            ReviewedCandidateLedger.Read(completed).OutcomeOwnerStepId);
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var active = await database.DeliveryReadinessSnapshots.SingleAsync(
+            item => item.FlowRunId == harness.FlowId && item.Active);
+        Assert.Equal(2, active.Revision);
+        Assert.Equal(DeliveryReadinessState.ReadyToApprove, active.State);
     }
 
     [Fact]
@@ -2099,7 +1910,6 @@ public sealed class ReviewWorkflowTests
                   max_concurrent_agents: 1
                   max_attempts: 1
                 studio:
-                  version: 1
                   planning:
                     max_steps: 24
                     max_dependencies_per_step: 8
@@ -2144,7 +1954,6 @@ public sealed class ReviewWorkflowTests
                 OriginalRequest = "Produce a customer-reviewable result.",
                 ConsolidatedRequest = "Produce a customer-reviewable result.",
                 Kind = kind,
-                ContractVersion = "studio-v2",
                 Status = FlowStatus.Queued,
                 RepositoryPath = root,
                 RepositoryKnowledge = "A configured test repository.",
@@ -2212,7 +2021,6 @@ public sealed class ReviewWorkflowTests
             gate.SetTrustLevel(
                 HandoffActionType.RequestRevision,
                 HandoffTrustLevel.Auto);
-            gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
             gate.SetTrustLevel(
                 HandoffActionType.CustomerReview,
                 HandoffTrustLevel.Gated);
@@ -2226,7 +2034,6 @@ public sealed class ReviewWorkflowTests
             var engine = new WorkflowEngine(
                 factory,
                 catalog,
-                new FlowPlanner(),
                 new FixedModelRouter(),
                 new BootstrapTaskProfileFactory(),
                 TestRoutingSupport.Recorder(factory),
@@ -2398,7 +2205,6 @@ public sealed class ReviewWorkflowTests
         private static TeamPlanDocument AdvisoryPlan() =>
             new()
             {
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned,
                 Steps =
                 [
@@ -2417,25 +2223,31 @@ public sealed class ReviewWorkflowTests
         private static TeamPlanDocument DeliveryPlan() =>
             new()
             {
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned,
                 Steps =
                 [
                     Step(
-                        "prepare",
+                        "implement",
                         "outcome-crafter",
                         10,
                         PlanStage.BeforeReview,
+                        [PlanDuty.Implement],
+                        outcomeOwner: false),
+                    Step(
+                        "prepare",
+                        "outcome-crafter",
+                        20,
+                        PlanStage.BeforeReview,
                         [
-                            PlanDuty.Implement,
                             PlanDuty.Verify,
                             PlanDuty.PrepareOutcome
                         ],
-                        outcomeOwner: true),
+                        outcomeOwner: true,
+                        dependsOn: ["implement"]),
                     Step(
                         "publish",
                         "sky-publisher",
-                        20,
+                        30,
                         PlanStage.AfterApproval,
                         [PlanDuty.Publish],
                         outcomeOwner: false,
@@ -2533,7 +2345,7 @@ public sealed class ReviewWorkflowTests
 
         public string? PublicationOutputOverride { get; set; }
 
-        /// <summary>Optional strict <c>outcome-qa-v2</c> block for a scripted readiness case.</summary>
+        /// <summary>Optional strict outcome-QA block for a scripted readiness case.</summary>
         public Func<AgentExecutionContext, string>? QaBlockOverride { get; set; }
 
         public Task<AgentExecutionResult> ExecuteAsync(
@@ -2556,12 +2368,12 @@ public sealed class ReviewWorkflowTests
                     $"HANDOFF_STATUS: COMPLETE{Environment.NewLine}{plan}",
                 "account-manager" => $$$"""
                   HANDOFF_STATUS: COMPLETE
-                  {{{IntakeV2Parser.BeginSentinel}}}
-                  {"Version":"intake-v2","Status":"Confirmed","FlowKind":"{{{(context.Outcome == OutcomeType.None ? "Advisory" : "Delivery")}}}","TaskTitle":"Refine customer result","CustomerReply":"I normalized the requested refinement for the team.","Brief":{"Goal":"Focus on checkout resilience.","Details":["Exclude account services.","Add operational trade-offs."],"SuccessCriteria":["The revised result addresses the requested focus."],"Constraints":[],"Assumptions":[]}}
-                  {{{IntakeV2Parser.EndSentinel}}}
+                  {{{IntakeParser.BeginSentinel}}}
+                  {"Status":"Confirmed","FlowKind":"{{{(context.Outcome == OutcomeType.None ? "Advisory" : "Delivery")}}}","TaskTitle":"Refine customer result","CustomerReply":"I normalized the requested refinement for the team.","Brief":{"Goal":"Focus on checkout resilience.","Details":["Exclude account services.","Add operational trade-offs."],"SuccessCriteria":["The revised result addresses the requested focus."],"Constraints":[],"Assumptions":[]}}
+                  {{{IntakeParser.EndSentinel}}}
                   """,
                 "product-manager" => """
-                  The captured Product Manager reviewed the full legacy execution ledger.
+                  The captured Product Manager reviewed the complete execution ledger.
 
                   REWORK_TARGET_ROLES: NONE
                   """,
@@ -2590,7 +2402,7 @@ public sealed class ReviewWorkflowTests
                     FlowOutcomeParser.BeginSentinel +
                     Environment.NewLine +
                     """
-                    {"Version":"flow-outcome-v1","Goal":"Produce a customer-reviewable result.","Summary":"The requested result is ready for customer review.","ImplementationDetails":["The assigned evidence was consolidated into this result."],"Artifacts":[]}
+                    {"Goal":"Produce a customer-reviewable result.","Summary":"The requested result is ready for customer review.","ImplementationDetails":["The assigned evidence was consolidated into this result."],"Artifacts":[]}
                     """ +
                     Environment.NewLine +
                     FlowOutcomeParser.EndSentinel;
@@ -2611,15 +2423,31 @@ public sealed class ReviewWorkflowTests
                     Environment.NewLine +
                     RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
                     Environment.NewLine +
-                    $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
+                    """{"Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
                     Environment.NewLine +
                     RepositoryKnowledgeSynthesizer.RecapEndSentinel;
             }
+            IReadOnlyList<ToolCallRecord> toolCalls =
+                context.PlanStepKey == "implement"
+                    ?
+                    [
+                        new ToolCallRecord(
+                            "observe",
+                            "Host-observed fixture verification.",
+                            Succeeded: true,
+                            ToolType: "Observation",
+                            ResultDigest:
+                                OutcomeVerificationRules.ComputeSha256(
+                                    "review-workflow-observation"),
+                            ResultSummary:
+                                "The customer-visible behavior was observed.")
+                    ]
+                    : [];
             return Task.FromResult(new AgentExecutionResult(
                 output,
                 "Fixture evidence.",
                 1,
-                []));
+                toolCalls));
         }
     }
 
@@ -2704,7 +2532,6 @@ public sealed class ReviewWorkflowTests
             ReviewedCandidateLedger.ValidateForFlow(flow, identity);
             return Task.FromResult(new OutcomeCandidateSnapshot(
                 new CandidateManifest(
-                    OutcomeVerificationRules.CandidateManifestVersion,
                     flow.Iteration,
                     identity.AcceptancePlanHash,
                     identity.Repositories.Select(repository =>
@@ -2726,7 +2553,6 @@ public sealed class ReviewWorkflowTests
             string outcomeOwnerPlanStepKey,
             string outcomeContractJson) =>
             new(
-                ReviewedCandidateIdentity.CurrentVersion,
                 flow.Id,
                 flow.Iteration,
                 outcomeOwnerStepId,

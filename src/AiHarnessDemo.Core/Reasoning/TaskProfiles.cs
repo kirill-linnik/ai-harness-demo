@@ -25,14 +25,12 @@ public sealed record TaskProfileInput(
     IReadOnlyList<string> Rationales);
 
 public sealed record TeamTaskProfilesDocument(
-    string Version,
     IReadOnlyList<TaskProfileInput> Profiles);
 
 public static class TaskProfileRules
 {
-    public const string Version = "task-profile-v1";
-    public const string BeginSentinel = "TEAM_TASK_PROFILES_V1_BEGIN";
-    public const string EndSentinel = "TEAM_TASK_PROFILES_V1_END";
+    public const string BeginSentinel = "TEAM_TASK_PROFILES_BEGIN";
+    public const string EndSentinel = "TEAM_TASK_PROFILES_END";
     private const int MaximumReasonLength = 240;
     private const int MaximumRationales = 5;
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -189,10 +187,6 @@ public static class TaskProfileRules
         {
             throw new TaskProfileValidationException(["task-profile document is null"]);
         }
-        if (!string.Equals(document.Version, Version, StringComparison.Ordinal))
-        {
-            errors.Add($"version must be exactly '{Version}'");
-        }
         if (document.Profiles is null)
         {
             errors.Add("profiles is required");
@@ -250,7 +244,6 @@ public static class TaskProfileRules
             FlowStepId = flowStepId,
             PlanStepKey = source.PlanStepKey,
             AgentId = source.AgentId,
-            Version = source.Version,
             Role = source.Role,
             Complexity = source.Complexity,
             ReasoningDepth = source.ReasoningDepth,

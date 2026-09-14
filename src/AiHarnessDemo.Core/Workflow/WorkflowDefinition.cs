@@ -29,15 +29,11 @@ public sealed class WorkflowConfig
 
     public CopilotConfig Copilot { get; set; } = new();
 
-    public OutcomeVerificationConfig OutcomeVerification { get; set; } = new();
-
     public StudioConfig Studio { get; set; } = new();
 }
 
 public sealed class StudioConfig
 {
-    public int Version { get; set; } = 1;
-
     public StudioPlanningConfig Planning { get; set; } = new();
 
     public StudioFlowKindsConfig FlowKinds { get; set; } = new();
@@ -167,13 +163,6 @@ public sealed class CopilotConfig
     public int MaximumQualityStallTimeoutMs { get; set; } = 900_000;
 }
 
-public sealed class OutcomeVerificationConfig
-{
-    public bool Enabled { get; set; } = true;
-
-    public int MaxRounds { get; set; } = 3;
-}
-
 public sealed class WorkflowConfigurationException(string message, Exception? innerException = null)
     : Exception(message, innerException);
 
@@ -272,7 +261,7 @@ public sealed class WorkflowLoader
             return;
         }
         var studio = RequireMapping(studioNode, "studio");
-        RejectUnknown(studio, "studio", "version", "planning", "flow_kinds", "advisory", "permissions");
+        RejectUnknown(studio, "studio", "planning", "flow_kinds", "advisory", "permissions");
 
         ValidateMapping(studio, "planning", "studio.planning",
             "max_steps", "max_dependencies_per_step", "max_assignment_characters");
@@ -438,11 +427,6 @@ public sealed class WorkflowLoader
             throw new WorkflowConfigurationException(
                 "copilot must be a YAML mapping and cannot be null.");
         }
-        if (config.OutcomeVerification is null)
-        {
-            throw new WorkflowConfigurationException(
-                "outcome_verification must be a YAML mapping and cannot be null.");
-        }
         if (config.Studio is null ||
             config.Studio.Planning is null ||
             config.Studio.FlowKinds is null ||
@@ -519,11 +503,6 @@ public sealed class WorkflowLoader
             throw new WorkflowConfigurationException(
                 "copilot.maximum_quality_stall_timeout_ms cannot be smaller than stall_timeout_ms or exceed turn_timeout_ms.");
         }
-        if (config.OutcomeVerification.MaxRounds is < 1 or > 10)
-        {
-            throw new WorkflowConfigurationException(
-                "outcome_verification.max_rounds must be an integer from 1 through 10.");
-        }
         ValidateStudio(config.Studio);
         if (string.IsNullOrWhiteSpace(prompt))
         {
@@ -534,10 +513,6 @@ public sealed class WorkflowLoader
 
     private static void ValidateStudio(StudioConfig studio)
     {
-        if (studio.Version != 1)
-        {
-            throw new WorkflowConfigurationException("studio.version must be 1.");
-        }
         if (studio.Planning.MaxSteps is < 1 or > 24)
         {
             throw new WorkflowConfigurationException(

@@ -3,7 +3,6 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../api/endpoints";
-import { ApiError } from "../../api/client";
 import type { PreviewDto } from "../../api/types";
 import { ToastProvider } from "../../lib/toast";
 import { PreviewPage } from "./PreviewPage";
@@ -15,12 +14,10 @@ const preview: PreviewDto = {
   request: "Modernize both sites.",
   repositoryName: "devclub",
   kind: "Delivery",
-  contractVersion: "legacy-v1",
   iteration: 1,
   status: "WaitingForFeedback",
   outcomeLabel: "Pull request candidate",
   outcomeResult: null,
-  historicalDeliveryEvidence: null,
   artifacts: [
     {
       id: "eu",
@@ -67,44 +64,6 @@ const preview: PreviewDto = {
     publicationStatus: "NotApplicable"
   },
   publicationStatus: "NotApplicable",
-  outcomeVerification: {
-    status: "Passed",
-    legacyUnverified: false,
-    currentRound: 1,
-    maxRounds: 3,
-    planHashPrefix: "sha256:aaaaaaaaaaaa",
-    candidateFingerprintPrefix: "sha256:bbbbbbbbbbbb",
-    candidateFingerprint:
-      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    releaseGateId: "33333333-3333-4333-8333-333333333333",
-    criteria: [
-      {
-        id: "AC-001",
-        requirement: "The refreshed site is customer-checkable.",
-        verification: "Open the preview and inspect the rendered result.",
-        ownerRoles: ["software-engineer"],
-        evidenceKinds: ["Observation"],
-        customerVisible: true
-      }
-    ],
-    evidence: [],
-    latestResults: [
-      {
-        criterionId: "AC-001",
-        status: "PASS",
-        rationale: "The preview rendered correctly.",
-        responsibleRoles: [],
-        remediation: null
-      }
-    ],
-    failedCriterionIds: [],
-    pendingOwnerRoles: [],
-    stale: false,
-    previewRequired: true,
-    releaseReady: true,
-    verifiedAt: "2026-09-03T11:55:00Z",
-    humanResolutionGate: null
-  },
   deliveryReadiness: null,
   generatedAt: "2026-09-03T12:00:00Z"
 };
@@ -136,12 +95,7 @@ function renderPage(value: PreviewDto = preview) {
 }
 
 describe("PreviewPage", () => {
-  it("embeds the delivered artifact and lets the customer approve it", async () => {
-    const decide = vi.spyOn(api, "decideFlow").mockResolvedValue({
-      outcome: "Approved",
-      flow: { id: flowId } as never,
-      message: "Customer approval was recorded and publication was queued."
-    });
+  it("embeds the delivered artifact and routes customer review to the flow", async () => {
     renderPage();
 
     expect(
@@ -151,31 +105,13 @@ describe("PreviewPage", () => {
       "sandbox",
       "allow-scripts"
     );
-    fireEvent.click(screen.getByRole("button", { name: "Approve and publish" }));
-
-    await waitFor(() =>
-      expect(decide).toHaveBeenCalledWith(flowId, {
-        approve: true,
-        gateId: preview.outcomeVerification.releaseGateId,
-        candidateFingerprint: preview.outcomeVerification.candidateFingerprint,
-        feedback: ""
-      })
+    expect(screen.getByRole("link", { name: "Review result" })).toHaveAttribute(
+      "href",
+      `#/factory/${flowId}`
     );
-    expect(
-      await screen.findByText(
-        "Execution details",
-        { selector: "div" },
-        { timeout: 5_000 }
-      )
-    ).toBeInTheDocument();
   });
 
   it("keeps untrusted preview messages away from decision controls and opens an isolated view", async () => {
-    const decide = vi.spyOn(api, "decideFlow").mockResolvedValue({
-      outcome: "Approved",
-      flow: {} as never,
-      message: "Approved."
-    });
     const openedWindow = { opener: window } as unknown as Window;
     const open = vi.spyOn(window, "open").mockReturnValue(openedWindow);
     renderPage();
@@ -188,7 +124,7 @@ describe("PreviewPage", () => {
         data: {
           action: "approve",
           flowId,
-          gateId: preview.outcomeVerification.releaseGateId
+          gateId: "33333333-3333-4333-8333-333333333333"
         },
         origin: "null"
       })
@@ -211,197 +147,31 @@ describe("PreviewPage", () => {
       "noopener,noreferrer"
     );
     expect(openedWindow.opener).toBeNull();
-    expect(decide).not.toHaveBeenCalled();
   });
 
-  it("marks decision responsibilities for narrow-layout containment", async () => {
-    renderPage();
-
-    const responsibilities = await screen.findByRole("region", {
-      name: "Decision responsibilities"
-    });
-    expect(responsibilities).toHaveClass("preview-responsibilities");
-  });
-
-  it("requires feedback and submits it before requesting changes", async () => {
-    const decide = vi.spyOn(api, "decideFlow").mockResolvedValue({
-      outcome: "Rejected",
-      flow: {} as never,
-      message: "Customer feedback was retained and a revised iteration was queued."
-    });
-    renderPage();
-
-    await screen.findByTitle("devclub.eu interactive customer preview");
-    fireEvent.change(screen.getByLabelText("What should change?"), {
-      target: { value: "Increase body text contrast." }
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
-
-    await waitFor(() =>
-      expect(decide).toHaveBeenCalledWith(flowId, {
-        approve: false,
-        gateId: preview.outcomeVerification.releaseGateId,
-        candidateFingerprint: preview.outcomeVerification.candidateFingerprint,
-        feedback: "Increase body text contrast."
-      })
-    );
-  });
-
-  it("sends rejection feedback only through the identity-bound decision", async () => {
-    const feedback = vi.spyOn(api, "sendFeedback").mockResolvedValue({} as never);
-    const decide = vi.spyOn(api, "decideFlow").mockRejectedValue(
-      new ApiError("The reviewed release gate is stale.", 409, {
-        outcome: "Conflict"
-      })
-    );
-    renderPage();
-    await screen.findByTitle("devclub.eu interactive customer preview");
-    fireEvent.change(screen.getByLabelText("What should change?"), {
-      target: { value: "Increase body text contrast." }
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
-
-    expect(
-      await screen.findByText(/reviewed gate or candidate is stale/i)
-    ).toBeInTheDocument();
-    expect(feedback).not.toHaveBeenCalled();
-    expect(decide).toHaveBeenCalledWith(flowId, {
-      approve: false,
-      gateId: preview.outcomeVerification.releaseGateId,
-      candidateFingerprint: preview.outcomeVerification.candidateFingerprint,
-      feedback: "Increase body text contrast."
-    });
-  });
-
-  it("refreshes and warns when a stale reviewed gate conflicts", async () => {
-    const decide = vi.spyOn(api, "decideFlow").mockRejectedValue(
-      new ApiError(
-        "The reviewed candidate fingerprint is stale.",
-        409,
-        { outcome: "Conflict" }
-      )
-    );
-    const { previewRequest } = renderPage();
-    await screen.findByTitle("devclub.eu interactive customer preview");
-    previewRequest.mockResolvedValue({
-      ...preview,
-      outcomeVerification: {
-        ...preview.outcomeVerification,
-        candidateFingerprint:
-          "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        candidateFingerprintPrefix: "sha256:cccccccccccc",
-        releaseGateId: "55555555-5555-4555-8555-555555555555"
-      }
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Approve and publish" }));
-
-    await waitFor(() => expect(previewRequest).toHaveBeenCalledTimes(2));
-    expect(
-      await screen.findByText(/reviewed gate or candidate is stale/i)
-    ).toBeInTheDocument();
-    expect(decide).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("Approval recorded")).not.toBeInTheDocument();
-  });
-
-  it("does not claim approval when the server queues a drift refresh", async () => {
-    vi.spyOn(api, "decideFlow").mockResolvedValue({
-      outcome: "RefreshQueued",
-      flow: {} as never,
-      message: "Refresh queued."
-    });
-    renderPage();
-    await screen.findByTitle("devclub.eu interactive customer preview");
-
-    fireEvent.click(screen.getByRole("button", { name: "Approve and publish" }));
-
-    expect(
-      await screen.findByText(/candidate changed during approval/i)
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/Approval recorded/i)).not.toBeInTheDocument();
-    expect(
-      await screen.findByText(
-        "Execution details",
-        { selector: "div" },
-        { timeout: 5_000 }
-      )
-    ).toBeInTheDocument();
-  });
-
-  it("confirms abandonment before removing customer artifacts", async () => {
-    const abandon = vi.spyOn(api, "abandonFlow").mockResolvedValue({
-      flowId,
-      status: "Abandoned",
-      processesStopped: 1,
-      listeningPortsReleased: [4173],
-      copilotSessionsDeleted: 2,
-      worktreesRemoved: 1,
-      localBranchesDeleted: 1,
-      remoteBranchesDeleted: 0
-    });
-    renderPage();
-
-    await screen.findByTitle("devclub.eu interactive customer preview");
-    fireEvent.click(screen.getByRole("button", { name: "Abandon" }));
-    expect(screen.getByRole("dialog", { name: "Abandon this flow?" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Abandon and remove artifacts" }));
-
-    await waitFor(() => expect(abandon).toHaveBeenCalledWith(flowId));
-  });
-
-  it("shows internal verification separately and hides release approval during resolution", async () => {
-    renderPage({
-      ...preview,
-      outcomeVerification: {
-        ...preview.outcomeVerification,
-        status: "AwaitingHumanResolution",
-        releaseReady: false,
-        latestResults: [
-          {
-            criterionId: "AC-001",
-            status: "FAIL",
-            rationale: "The preview did not meet the criterion.",
-            responsibleRoles: ["software-engineer"],
-            remediation: "Correct the rendering."
-          }
-        ],
-        failedCriterionIds: ["AC-001"],
-        humanResolutionGate: {
-          gateId: "44444444-4444-4444-8444-444444444444",
-          decision: "AwaitingHumanApproval",
-          summary: "QA budget exhausted.",
-          createdAt: "2026-09-03T12:00:00Z"
-        }
-      }
-    });
-
-    expect(await screen.findByText("Release approval is unavailable")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Approve and publish" })).not.toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Decision responsibilities" })).toHaveTextContent(
-      "Independent QA verification"
-    );
-  });
-
-  it("fails closed when a verified customer-visible outcome has no preview artifact", async () => {
+  it("shows the current Delivery fallback when no browser artifact is available", async () => {
     renderPage({
       ...preview,
       artifacts: []
     });
 
     expect(
-      await screen.findByText(/requires a browser artifact, but none is available/)
+      await screen.findByText(
+        "This Delivery result contains no browser artifact. Review the normalized result above."
+      )
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Approve and publish" })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Review result" })).toHaveAttribute(
+      "href",
+      `#/factory/${flowId}`
+    );
   });
 
-  it("lists Advisory text artifacts safely without pull-request or legacy release controls", async () => {
+  it("lists Advisory text artifacts safely without pull-request or Delivery controls", async () => {
     const advisoryArtifactUrl =
       `/api/flows/${flowId}/artifacts/abc123/recommendation.md`;
     renderPage({
       ...preview,
       kind: "Advisory",
-      contractVersion: "studio-v2",
       outcomeLabel: "Advisory result ready",
       outcomeResult: {
         goal: "Assess checkout resilience.",
@@ -466,60 +236,9 @@ describe("PreviewPage", () => {
     );
   });
 
-  it("renders dffc-shaped historical evidence and removes legacy-unverified approval", async () => {
-    renderPage({
-      ...preview,
-      flowId: "dffc6813-6600-433b-acb0-2da5a5165113",
-      historicalDeliveryEvidence: {
-        nonAuthoritative: true,
-        items: [
-          {
-            kind: "Implementation",
-            agentName: "Software Engineer",
-            label: "Correct implementation",
-            markdown: "## Changed\n\nThe **offline preview** was corrected.",
-            completedAt: "2026-09-01T10:00:00Z"
-          },
-          {
-            kind: "Quality verification",
-            agentName: "Quality Engineer",
-            label: "Verify",
-            markdown: "- Focused checks passed",
-            completedAt: "2026-09-01T11:00:00Z"
-          },
-          {
-            kind: "Release package",
-            agentName: "Release Engineer",
-            label: "Package",
-            markdown: "Packaged immutable artifacts.",
-            completedAt: "2026-09-01T12:00:00Z"
-          }
-        ]
-      },
-      outcomeVerification: {
-        ...preview.outcomeVerification,
-        status: "LegacyUnverified",
-        legacyUnverified: true,
-        releaseReady: false,
-        candidateFingerprint: "",
-        candidateFingerprintPrefix: ""
-      }
-    });
-
-    expect(
-      await screen.findByRole("heading", { name: "Historical delivery evidence" })
-    ).toBeInTheDocument();
-    expect(screen.getByText("offline preview")).toBeInTheDocument();
-    expect(screen.getByText(/does not prove readiness or authorize publication/i)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Approval is unavailable" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Approve and publish" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Request changes" })).toBeInTheDocument();
-  });
-
   it("shows normalized studio details and typed readiness evidence and risks", async () => {
     renderPage({
       ...preview,
-      contractVersion: "studio-v2",
       outcomeResult: {
         goal: "Deliver a self-contained reviewed build.",
         summary: "The candidate is sealed and testable.",
@@ -528,7 +247,6 @@ describe("PreviewPage", () => {
       },
       deliveryReadiness: {
         state: "ReadyToApprove",
-        reconciliation: "Current",
         revision: 1,
         contractHash: "sha256:ready",
         reviewedCandidateId: "11111111-1111-4111-8111-111111111111",
@@ -583,7 +301,6 @@ describe("PreviewPage", () => {
   it("labels artifacts offline-only and routes rebuild through the current review", async () => {
     renderPage({
       ...preview,
-      contractVersion: "studio-v2",
       review: {
         gateId: "99999999-9999-4999-8999-999999999999",
         available: true,

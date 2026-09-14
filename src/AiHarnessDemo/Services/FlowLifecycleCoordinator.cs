@@ -37,13 +37,13 @@ public sealed class FlowLifecycleCoordinator
     {
         ArgumentNullException.ThrowIfNull(flow);
         if (target == FlowStatus.Approved &&
-            flow is { ContractVersion: "studio-v2", Kind: FlowKind.Delivery })
+            flow.Kind == FlowKind.Delivery)
         {
             throw new FlowLifecycleException(
                 flow.Id,
                 flow.Status,
                 target,
-                "a studio-v2 Delivery flow reaches Approved only through " +
+                "a Studio Delivery flow reaches Approved only through " +
                 nameof(CompletePublishedDelivery));
         }
         return TransitionCore(flow, target);
@@ -112,7 +112,7 @@ public sealed class FlowLifecycleCoordinator
     }
 
     /// <summary>
-    /// The only path to <see cref="FlowStatus.Approved"/> for a studio-v2 Delivery flow. The caller
+    /// The only path to <see cref="FlowStatus.Approved"/> for a Studio Delivery flow. The caller
     /// must have re-read the authoritative readiness, waiver, review, and publication rows.
     /// </summary>
     public bool CompletePublishedDelivery(
@@ -195,13 +195,13 @@ public sealed class FlowLifecycleCoordinator
         FlowStatus target)
     {
         ArgumentNullException.ThrowIfNull(flow);
-        if (flow is not { ContractVersion: "studio-v2", Kind: FlowKind.Delivery })
+        if (flow.Kind != FlowKind.Delivery)
         {
             throw new FlowLifecycleException(
                 flow.Id,
                 flow.Status,
                 target,
-                "guarded readiness lifecycle operations apply only to studio-v2 Delivery flows");
+                "guarded readiness lifecycle operations apply only to Studio Delivery flows");
         }
         if (state != required)
         {

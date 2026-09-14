@@ -47,9 +47,11 @@ public sealed partial class IntakeCoordinator(
     private readonly ILogger<IntakeCoordinator> _logger =
         logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeCoordinator>.Instance;
     internal Func<string, Guid, CancellationToken, Task<CopilotSessionSnapshot>>?
-        SessionInspectorOverride { get; set; }
+        SessionInspectorOverride
+    { get; set; }
     internal Func<CopilotSessionSnapshot, bool>?
-        ActiveSessionStopperOverride { get; set; }
+        ActiveSessionStopperOverride
+    { get; set; }
     private readonly ConcurrentDictionary<Guid, byte> _intakeClaims = new();
     private const int MaximumIntakeFailureReasonCharacters = 4_000;
     internal const string SafeIntakeRetryMessage =
@@ -124,172 +126,171 @@ public sealed partial class IntakeCoordinator(
         {
             await using var lifecycleLease =
                 await _lifecycle.EnterAsync(flowId, cancellationToken);
-        Guid? existingStepId = null;
-        AgentExecutionResult? recoveredResult = null;
-        CopilotSessionSnapshot? completedJournal = null;
-        var resumeSession = false;
-        var recoverInterruptedSession = false;
-        await using (var database =
-                     await databaseFactory.CreateDbContextAsync(cancellationToken))
-        {
-            var candidate = await database.Flows
-                .AsNoTracking()
-                .AsSplitQuery()
-                .Include(flow => flow.Steps)
-                .Include(flow => flow.AgentSnapshots)
-                .SingleOrDefaultAsync(flow => flow.Id == flowId, cancellationToken)
-                ?? throw new KeyNotFoundException(
-                    $"Factory flow '{flowId}' was not found.");
-            if (candidate.Status != FlowStatus.Intake)
+            Guid? existingStepId = null;
+            AgentExecutionResult? recoveredResult = null;
+            CopilotSessionSnapshot? completedJournal = null;
+            var resumeSession = false;
+            var recoverInterruptedSession = false;
+            await using (var database =
+                         await databaseFactory.CreateDbContextAsync(cancellationToken))
             {
-                return null;
-            }
-
-            var intakeAttempts = candidate.Steps
-                .Where(step =>
-                    step.Iteration == candidate.Iteration &&
-                    step.InvocationKind ==
-                        ExecutionInvocationKind.Intake)
-                .ToList();
-            if (intakeAttempts.Count == 0)
-            {
-                // The initial linked turn was not yet durably materialized.
-            }
-            else
-            {
-                var canonical = intakeAttempts
-                    .Where(step => string.Equals(
-                        step.PlanStepKey,
-                        InitialLinkedIntakePlanStepKey,
-                        StringComparison.Ordinal))
-                    .ToList();
-                if (intakeAttempts.Count != 1 ||
-                    canonical.Count != 1)
-                {
-                    throw new InvalidOperationException(
-                        "Linked intake recovery found duplicate or noncanonical Account Manager attempts.");
-                }
-
-                var step = canonical[0];
-                if (step.Status is StepStatus.Completed or StepStatus.Failed)
+                var candidate = await database.Flows
+                    .AsNoTracking()
+                    .AsSplitQuery()
+                    .Include(flow => flow.Steps)
+                    .Include(flow => flow.AgentSnapshots)
+                    .SingleOrDefaultAsync(flow => flow.Id == flowId, cancellationToken)
+                    ?? throw new KeyNotFoundException(
+                        $"Factory flow '{flowId}' was not found.");
+                if (candidate.Status != FlowStatus.Intake)
                 {
                     return null;
                 }
-                if (step.Status is not (StepStatus.Pending or StepStatus.Running))
-                {
-                    throw new InvalidOperationException(
-                        $"Linked intake recovery cannot continue a {step.Status} Account Manager attempt.");
-                }
-                var accountManager = candidate.AgentSnapshots
-                    .SingleOrDefault(item =>
-                        item.AgentId == "account-manager" &&
-                        item.EnabledAtSnapshot)
-                    ?? throw new InvalidOperationException(
-                        "Linked intake recovery found no enabled Account Manager snapshot.");
-                ValidateCanonicalLinkedStep(
-                    candidate,
-                    step,
-                    accountManager,
-                    durableSeed);
-                existingStepId = step.Id;
 
-                var canonicalSessionId = AgentSessionIdentity.Create(
-                    candidate.Id,
-                    candidate.Iteration,
-                    accountManager.AgentId,
-                    InitialLinkedIntakePlanStepKey);
-                if (step.CopilotSessionId is { } persistedSessionId &&
-                    persistedSessionId != canonicalSessionId)
+                var intakeAttempts = candidate.Steps
+                    .Where(step =>
+                        step.Iteration == candidate.Iteration &&
+                        step.InvocationKind ==
+                            ExecutionInvocationKind.Intake)
+                    .ToList();
+                if (intakeAttempts.Count == 0)
                 {
-                    throw new InvalidOperationException(
-                        "Linked intake recovery found a noncanonical Copilot session identity.");
+                    // The initial linked turn was not yet durably materialized.
                 }
-
-                if (step.Status == StepStatus.Running)
+                else
                 {
-                    if (step.CopilotSessionId is null)
+                    var canonical = intakeAttempts
+                        .Where(step => string.Equals(
+                            step.PlanStepKey,
+                            InitialLinkedIntakePlanStepKey,
+                            StringComparison.Ordinal))
+                        .ToList();
+                    if (intakeAttempts.Count != 1 ||
+                        canonical.Count != 1)
                     {
                         throw new InvalidOperationException(
-                            "The running linked intake attempt has no durable Copilot session identity.");
+                            "Linked intake recovery found duplicate or noncanonical Account Manager attempts.");
                     }
-                    var copilotHome =
-                        string.IsNullOrWhiteSpace(step.CopilotSessionHome)
-                            ? _sessionJournal.ExpectedHome()
-                            : step.CopilotSessionHome;
-                    var journal = await InspectSessionAsync(
-                        copilotHome,
-                        canonicalSessionId,
-                        cancellationToken);
-                    if (journal.State == CopilotSessionJournalState.Active)
+
+                    var step = canonical[0];
+                    if (step.Status is StepStatus.Completed or StepStatus.Failed)
                     {
-                        if (!TryStopActiveSession(journal))
+                        return null;
+                    }
+                    if (step.Status is not (StepStatus.Pending or StepStatus.Running))
+                    {
+                        throw new InvalidOperationException(
+                            $"Linked intake recovery cannot continue a {step.Status} Account Manager attempt.");
+                    }
+                    var accountManager = candidate.AgentSnapshots
+                        .SingleOrDefault(item =>
+                            item.AgentId == "account-manager" &&
+                            item.EnabledAtSnapshot)
+                        ?? throw new InvalidOperationException(
+                            "Linked intake recovery found no enabled Account Manager snapshot.");
+                    ValidateCanonicalLinkedStep(
+                        candidate,
+                        step,
+                        accountManager,
+                        durableSeed);
+                    existingStepId = step.Id;
+
+                    var canonicalSessionId = AgentSessionIdentity.Create(
+                        candidate.Id,
+                        candidate.Iteration,
+                        accountManager.AgentId,
+                        InitialLinkedIntakePlanStepKey);
+                    if (step.CopilotSessionId is { } persistedSessionId &&
+                        persistedSessionId != canonicalSessionId)
+                    {
+                        throw new InvalidOperationException(
+                            "Linked intake recovery found a noncanonical Copilot session identity.");
+                    }
+
+                    if (step.Status == StepStatus.Running)
+                    {
+                        if (step.CopilotSessionId is null)
                         {
-                            return null;
+                            throw new InvalidOperationException(
+                                "The running linked intake attempt has no durable Copilot session identity.");
                         }
-                        journal = await InspectSessionAsync(
+                        var copilotHome =
+                            string.IsNullOrWhiteSpace(step.CopilotSessionHome)
+                                ? _sessionJournal.ExpectedHome()
+                                : step.CopilotSessionHome;
+                        var journal = await InspectSessionAsync(
                             copilotHome,
                             canonicalSessionId,
                             cancellationToken);
-                        if (journal.State ==
-                            CopilotSessionJournalState.Active)
+                        if (journal.State == CopilotSessionJournalState.Active)
                         {
-                            return null;
+                            if (!TryStopActiveSession(journal))
+                            {
+                                return null;
+                            }
+                            journal = await InspectSessionAsync(
+                                copilotHome,
+                                canonicalSessionId,
+                                cancellationToken);
+                            if (journal.State ==
+                                CopilotSessionJournalState.Active)
+                            {
+                                return null;
+                            }
                         }
-                    }
-                    ValidateLinkedJournalBinding(
-                        candidate,
-                        accountManager,
-                        canonicalSessionId,
-                        journal);
-                    switch (journal.State)
-                    {
-                        case CopilotSessionJournalState.Completed
-                            when journal.Result is { Success: true } result &&
-                                 CopilotReasoningHost.IsRecoverableCompletedOutput(
-                                     accountManager.Role,
-                                     result.OutputSummary,
-                                     contractVersion: candidate.ContractVersion,
-                                     invocationKind:
-                                         ExecutionInvocationKind.Intake,
-                                     planStepKey:
-                                         step.PlanStepKey,
-                                     expectedFlowKind:
-                                         candidate.Kind) &&
-                                 CopilotReasoningHost.IsRecoveryCurrent(
-                                     step.StartedAt,
-                                     journal.CompletedAt):
-                            recoveredResult = new AgentExecutionResult(
-                                result.OutputSummary,
-                                $"Recovered from completed Copilot session {canonicalSessionId:D}.",
-                                1,
-                                result.ToolCalls);
-                            completedJournal = journal;
-                            break;
+                        ValidateLinkedJournalBinding(
+                            candidate,
+                            accountManager,
+                            canonicalSessionId,
+                            journal);
+                        switch (journal.State)
+                        {
+                            case CopilotSessionJournalState.Completed
+                                when journal.Result is { Success: true } result &&
+                                     CopilotReasoningHost.IsRecoverableCompletedOutput(
+                                         accountManager.Role,
+                                         result.OutputSummary,
+                                         invocationKind:
+                                             ExecutionInvocationKind.Intake,
+                                         planStepKey:
+                                             step.PlanStepKey,
+                                         expectedFlowKind:
+                                             candidate.Kind) &&
+                                     CopilotReasoningHost.IsRecoveryCurrent(
+                                         step.StartedAt,
+                                         journal.CompletedAt):
+                                recoveredResult = new AgentExecutionResult(
+                                    result.OutputSummary,
+                                    $"Recovered from completed Copilot session {canonicalSessionId:D}.",
+                                    1,
+                                    result.ToolCalls);
+                                completedJournal = journal;
+                                break;
 
-                        case CopilotSessionJournalState.Interrupted:
-                            resumeSession = true;
-                            recoverInterruptedSession = true;
-                            break;
+                            case CopilotSessionJournalState.Interrupted:
+                                resumeSession = true;
+                                recoverInterruptedSession = true;
+                                break;
 
-                        case CopilotSessionJournalState.Completed:
-                            throw new InvalidOperationException(
-                                "The completed linked intake journal is stale or does not contain a valid intake-v2 result.");
+                            case CopilotSessionJournalState.Completed:
+                                throw new InvalidOperationException(
+                                    "The completed linked intake journal is stale or does not contain a valid intake result.");
 
-                        case CopilotSessionJournalState.Missing:
-                            throw new InvalidOperationException(
-                                "The running linked intake has no deterministic Copilot session journal; manual retry is required.");
+                            case CopilotSessionJournalState.Missing:
+                                throw new InvalidOperationException(
+                                    "The running linked intake has no deterministic Copilot session journal; manual retry is required.");
 
-                        case CopilotSessionJournalState.Active:
-                            throw new InvalidOperationException(
-                                "The linked intake Copilot session remained active after reconciliation.");
+                            case CopilotSessionJournalState.Active:
+                                throw new InvalidOperationException(
+                                    "The linked intake Copilot session remained active after reconciliation.");
 
-                        default:
-                            throw new InvalidOperationException(
-                                "The linked intake journal state is unsupported.");
+                            default:
+                                throw new InvalidOperationException(
+                                    "The linked intake journal state is unsupported.");
+                        }
                     }
                 }
             }
-        }
 
             IntakeResponse response;
             try
@@ -343,7 +344,6 @@ public sealed partial class IntakeCoordinator(
             candidates = await database.Flows
                 .AsNoTracking()
                 .Where(flow =>
-                    flow.ContractVersion == "studio-v2" &&
                     flow.Status == FlowStatus.Intake &&
                     database.FlowSteps.Any(step =>
                         step.FlowRunId == flow.Id &&
@@ -624,7 +624,7 @@ public sealed partial class IntakeCoordinator(
     }
 
     /// <summary>
-    /// Recovers parentless studio-v2 flows that crashed after their durable customer
+    /// Recovers parentless Studio flows that crashed after their durable customer
     /// message was saved but before their canonical Account Manager step, workspace,
     /// and <see cref="TaskProfile" /> were ever materialized. Startup reconciliation
     /// must find these; ordinary recovery cannot, because it only reconciles flows
@@ -641,7 +641,6 @@ public sealed partial class IntakeCoordinator(
             candidates = await database.Flows
                 .AsNoTracking()
                 .Where(flow =>
-                    flow.ContractVersion == "studio-v2" &&
                     flow.Status == FlowStatus.Intake &&
                     flow.ParentFlowRunId == null &&
                     database.FlowMessages.Any(message =>
@@ -867,8 +866,6 @@ public sealed partial class IntakeCoordinator(
                         "The intake result is durable, but its exact session-owned staged context still requires cleanup.",
                     DataJson = JsonSerializer.Serialize(new
                     {
-                        Version =
-                            "staged-context-cleanup-failure-v1",
                         Error = ClipFailureText(
                             exception.GetBaseException().Message,
                             1_000)
@@ -1075,571 +1072,533 @@ public sealed partial class IntakeCoordinator(
 
         try
         {
-        var workspace = await workspaceManager.PrepareAsync(
-            flow,
-            cancellationToken);
-        var workspaceStateChanged = false;
-        if (string.IsNullOrWhiteSpace(flow.WorkspacePath))
-        {
-            flow.WorkspacePath = workspace.Path;
-            flow.BranchName = workspace.BranchName;
-            workspaceStateChanged = true;
-        }
-        if (workspace.Mode is
-                WorkspaceMode.ProvisionalReadOnly or WorkspaceMode.AdvisoryReadOnly &&
-            !flow.Events.Any(item =>
-                item.Type == "workspace.guarded-snapshot-created"))
-        {
-            var workspaceEvent = new FlowEvent
+            var workspace = await workspaceManager.PrepareAsync(
+                flow,
+                cancellationToken);
+            var workspaceStateChanged = false;
+            if (string.IsNullOrWhiteSpace(flow.WorkspacePath))
             {
-                FlowRunId = flow.Id,
-                Type = "workspace.guarded-snapshot-created",
-                Message =
-                    "Created a guarded per-flow source snapshot without adding worktrees, branches, refs, or remotes to the source repositories.",
-                DataJson = JsonSerializer.Serialize(new
+                flow.WorkspacePath = workspace.Path;
+                flow.BranchName = workspace.BranchName;
+                workspaceStateChanged = true;
+            }
+            if (workspace.Mode is
+                    WorkspaceMode.ProvisionalReadOnly or WorkspaceMode.AdvisoryReadOnly &&
+                !flow.Events.Any(item =>
+                    item.Type == "workspace.guarded-snapshot-created"))
+            {
+                var workspaceEvent = new FlowEvent
                 {
-                    Version = "advisory-workspace-evidence-v1",
-                    Mode = workspace.Mode.ToString(),
-                    workspace.BaselineDigest,
-                    FileCount = workspace.BaselineFileCount,
-                    TotalBytes = workspace.BaselineTotalBytes
-                })
-            };
-            flow.Events.Add(workspaceEvent);
-            database.Entry(workspaceEvent).State = EntityState.Added;
-            workspaceStateChanged = true;
-        }
-        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson) &&
-            workspace.TrustedRepositories is { Count: > 0 })
-        {
-            var outcomeState = OutcomeVerificationRules.DeserializeAggregate(
-                flow.OutcomeVerificationJson);
-            outcomeState.TrustedRepositories = workspace.TrustedRepositories
-                .Select(item => new OutcomeTrustedRepository(
-                    item.RelativePath,
-                    item.RemoteRepository))
-                .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
-                .ToList();
-            outcomeState.UpdatedAt = DateTimeOffset.UtcNow;
-            flow.OutcomeVerificationJson =
-                OutcomeVerificationRules.SerializeAggregate(outcomeState);
-            workspaceStateChanged = true;
-        }
-        if (workspaceStateChanged)
-        {
-            await database.SaveChangesAsync(cancellationToken);
-        }
-
-        FlowStep intakeStep;
-        if (existingIntakeStepId is { } persistedStepId)
-        {
-            intakeStep = flow.Steps.Single(step => step.Id == persistedStepId);
-            if (linkedInitialTurn)
+                    FlowRunId = flow.Id,
+                    Type = "workspace.guarded-snapshot-created",
+                    Message =
+                        "Created a guarded per-flow source snapshot without adding worktrees, branches, refs, or remotes to the source repositories.",
+                    DataJson = JsonSerializer.Serialize(new
+                    {
+                        Mode = workspace.Mode.ToString(),
+                        workspace.BaselineDigest,
+                        FileCount = workspace.BaselineFileCount,
+                        TotalBytes = workspace.BaselineTotalBytes
+                    })
+                };
+                flow.Events.Add(workspaceEvent);
+                database.Entry(workspaceEvent).State = EntityState.Added;
+                workspaceStateChanged = true;
+            }
+            if (workspaceStateChanged)
             {
-                ValidateCanonicalLinkedStep(
-                    flow,
-                    intakeStep,
-                    accountManager,
-                    message);
+                await database.SaveChangesAsync(cancellationToken);
+            }
+
+            FlowStep intakeStep;
+            if (existingIntakeStepId is { } persistedStepId)
+            {
+                intakeStep = flow.Steps.Single(step => step.Id == persistedStepId);
+                if (linkedInitialTurn)
+                {
+                    ValidateCanonicalLinkedStep(
+                        flow,
+                        intakeStep,
+                        accountManager,
+                        message);
+                }
+                else
+                {
+                    ValidateCanonicalOrdinaryStep(
+                        flow,
+                        intakeStep,
+                        accountManager,
+                        message);
+                }
+                if (intakeStep.Status is not (
+                        StepStatus.Pending or StepStatus.Running))
+                {
+                    throw new InvalidOperationException(
+                        "The durable intake attempt is no longer recoverable.");
+                }
             }
             else
             {
-                ValidateCanonicalOrdinaryStep(
-                    flow,
-                    intakeStep,
-                    accountManager,
-                    message);
-            }
-            if (intakeStep.Status is not (
-                    StepStatus.Pending or StepStatus.Running))
-            {
-                throw new InvalidOperationException(
-                    "The durable intake attempt is no longer recoverable.");
-            }
-        }
-        else
-        {
-            var retryAttempt = failedAttemptToRetry is null
-                ? customerMessages.Count
-                : flow.Steps
-                    .Where(step =>
-                        step.InvocationKind ==
-                            ExecutionInvocationKind.Intake &&
-                        string.Equals(
-                            step.InputSummary,
-                            message,
-                            StringComparison.Ordinal))
-                    .Select(step => step.Attempt)
-                    .DefaultIfEmpty()
-                    .Max() + 1;
-            intakeStep = new FlowStep
-            {
-                FlowRunId = flow.Id,
-                Iteration = flow.Iteration,
-                Sequence = failedAttemptToRetry is null
-                    ? -100 + customerMessages.Count
+                var retryAttempt = failedAttemptToRetry is null
+                    ? customerMessages.Count
                     : flow.Steps
                         .Where(step =>
                             step.InvocationKind ==
-                            ExecutionInvocationKind.Intake)
-                        .Select(step => step.Sequence)
-                        .DefaultIfEmpty(-100)
-                        .Max() + 1,
-                AgentId = accountManager.AgentId,
-                AgentName = accountManager.Name,
-                AgentRole = accountManager.Role,
-                Label = "Review customer intake",
-                PlanStepKey = linkedInitialTurn
-                    ? InitialLinkedIntakePlanStepKey
-                    : failedAttemptToRetry is null
-                        ? string.Empty
-                        : $"account-manager:intake-retry:" +
-                          $"{(failedAttemptToRetry.StableSemanticRootId ??
-                             failedAttemptToRetry.Id):N}:{retryAttempt}",
-                PlanDutiesJson = """["Analyze"]""",
-                PlanStage = PlanStage.BeforeReview,
-                InvocationKind = ExecutionInvocationKind.Intake,
-                PermissionProfile =
-                    ExecutionPermissionProfile.ReadOnlySource,
-                Status = StepStatus.Pending,
-                Phase = AgentRunPhase.BuildingPrompt,
-                WorkflowRevision =
-                    workflowProvider.GetEffective().Revision,
-                Attempt = retryAttempt,
-                InputSummary = message,
-                RetryOfStepId =
-                    failedAttemptToRetry?.StableSemanticRootId ??
-                    failedAttemptToRetry?.Id
-            };
-            intakeStep.StableSemanticRootId =
-                failedAttemptToRetry?.StableSemanticRootId ??
-                failedAttemptToRetry?.Id ??
-                intakeStep.Id;
-            flow.Steps.Add(intakeStep);
-            database.Entry(intakeStep).State = EntityState.Added;
-            if (failedAttemptToRetry is not null)
-            {
-                var retryEvent = new FlowEvent
+                                ExecutionInvocationKind.Intake &&
+                            string.Equals(
+                                step.InputSummary,
+                                message,
+                                StringComparison.Ordinal))
+                        .Select(step => step.Attempt)
+                        .DefaultIfEmpty()
+                        .Max() + 1;
+                intakeStep = new FlowStep
                 {
                     FlowRunId = flow.Id,
-                    FlowStepId = intakeStep.Id,
-                    Type = "intake.retry-started",
-                    Message =
-                        "Retrying the failed Account Manager intake turn in the same flow, snapshot, and workspace without duplicating the customer message."
+                    Iteration = flow.Iteration,
+                    Sequence = failedAttemptToRetry is null
+                        ? -100 + customerMessages.Count
+                        : flow.Steps
+                            .Where(step =>
+                                step.InvocationKind ==
+                                ExecutionInvocationKind.Intake)
+                            .Select(step => step.Sequence)
+                            .DefaultIfEmpty(-100)
+                            .Max() + 1,
+                    AgentId = accountManager.AgentId,
+                    AgentName = accountManager.Name,
+                    AgentRole = accountManager.Role,
+                    Label = "Review customer intake",
+                    PlanStepKey = linkedInitialTurn
+                        ? InitialLinkedIntakePlanStepKey
+                        : failedAttemptToRetry is null
+                            ? string.Empty
+                            : $"account-manager:intake-retry:" +
+                              $"{(failedAttemptToRetry.StableSemanticRootId ??
+                                 failedAttemptToRetry.Id):N}:{retryAttempt}",
+                    PlanDutiesJson = """["Analyze"]""",
+                    PlanStage = PlanStage.BeforeReview,
+                    InvocationKind = ExecutionInvocationKind.Intake,
+                    PermissionProfile =
+                        ExecutionPermissionProfile.ReadOnlySource,
+                    Status = StepStatus.Pending,
+                    Phase = AgentRunPhase.BuildingPrompt,
+                    WorkflowRevision =
+                        workflowProvider.GetEffective().Revision,
+                    Attempt = retryAttempt,
+                    InputSummary = message,
+                    RetryOfStepId =
+                        failedAttemptToRetry?.StableSemanticRootId ??
+                        failedAttemptToRetry?.Id
                 };
-                flow.Events.Add(retryEvent);
-                database.Entry(retryEvent).State = EntityState.Added;
+                intakeStep.StableSemanticRootId =
+                    failedAttemptToRetry?.StableSemanticRootId ??
+                    failedAttemptToRetry?.Id ??
+                    intakeStep.Id;
+                flow.Steps.Add(intakeStep);
+                database.Entry(intakeStep).State = EntityState.Added;
+                if (failedAttemptToRetry is not null)
+                {
+                    var retryEvent = new FlowEvent
+                    {
+                        FlowRunId = flow.Id,
+                        FlowStepId = intakeStep.Id,
+                        Type = "intake.retry-started",
+                        Message =
+                            "Retrying the failed Account Manager intake turn in the same flow, snapshot, and workspace without duplicating the customer message."
+                    };
+                    flow.Events.Add(retryEvent);
+                    database.Entry(retryEvent).State = EntityState.Added;
+                }
             }
-        }
-        if (!flow.TaskProfiles.Any(profile =>
-                profile.FlowStepId == intakeStep.Id))
-        {
-            var profile = profileFactory.Create(
-                accountManager.Role,
-                FormatCustomerInputs(customerMessages),
-                flow.Id,
-                flow.Iteration,
-                intakeStep.Id,
-                intakeStep.PlanStepKey,
-                accountManager.AgentId);
-            flow.TaskProfiles.Add(profile);
-            database.TaskProfiles.Add(profile);
-        }
-        await database.SaveChangesAsync(cancellationToken);
-        RoutingDecision? routing = null;
-        if (recoveredExecutionResult is null)
-        {
-            routing = await modelRouter.SelectAsync(
-                new RoutingRequest(
+            if (!flow.TaskProfiles.Any(profile =>
+                    profile.FlowStepId == intakeStep.Id))
+            {
+                var profile = profileFactory.Create(
+                    accountManager.Role,
+                    FormatCustomerInputs(customerMessages),
+                    flow.Id,
+                    flow.Iteration,
                     intakeStep.Id,
-                    settings.ModelSelectionStrategy),
-                cancellationToken);
-            intakeStep.Model = routing.SelectedModel;
-            intakeStep.ModelEffort = routing.SelectedEffort;
-            intakeStep.ModelReason = routing.Reason;
-        }
-        else if (string.IsNullOrWhiteSpace(intakeStep.Model) ||
-                 string.IsNullOrWhiteSpace(intakeStep.ModelEffort))
-        {
-            throw new InvalidOperationException(
-                "The completed linked intake journal has no persisted routing identity.");
-        }
-        BindIntakePermissionAtFirstLaunch(
-            flow,
-            intakeStep);
-        intakeStep.Status = StepStatus.Running;
-        intakeStep.Phase = AgentRunPhase.BuildingPrompt;
-        intakeStep.StartedAt ??= DateTimeOffset.UtcNow;
-        var intakeSessionId =
-            AgentSessionIdentity.Create(
-                flow.Id,
-                flow.Iteration,
-                accountManager.AgentId,
-                intakeStep.PlanStepKey);
-        if (intakeStep.CopilotSessionId is { } existingSessionId &&
-            existingSessionId != intakeSessionId)
-        {
-            throw new InvalidOperationException(
-                "The durable intake attempt has a noncanonical Copilot session identity.");
-        }
-        intakeStep.CopilotSessionId = intakeSessionId;
-        if (string.IsNullOrWhiteSpace(intakeStep.CopilotSessionHome))
-        {
-            intakeStep.CopilotSessionHome =
-                _sessionJournal.ExpectedHome();
-        }
-        if (existingIntakeStepId is not null)
-        {
-            AddLinkedRecoveryEventOnce(
+                    intakeStep.PlanStepKey,
+                    accountManager.AgentId);
+                flow.TaskProfiles.Add(profile);
+                database.TaskProfiles.Add(profile);
+            }
+            await database.SaveChangesAsync(cancellationToken);
+            RoutingDecision? routing = null;
+            if (recoveredExecutionResult is null)
+            {
+                routing = await modelRouter.SelectAsync(
+                    new RoutingRequest(
+                        intakeStep.Id,
+                        settings.ModelSelectionStrategy),
+                    cancellationToken);
+                intakeStep.Model = routing.SelectedModel;
+                intakeStep.ModelEffort = routing.SelectedEffort;
+                intakeStep.ModelReason = routing.Reason;
+            }
+            else if (string.IsNullOrWhiteSpace(intakeStep.Model) ||
+                     string.IsNullOrWhiteSpace(intakeStep.ModelEffort))
+            {
+                throw new InvalidOperationException(
+                    "The completed linked intake journal has no persisted routing identity.");
+            }
+            BindIntakePermissionAtFirstLaunch(
                 flow,
-                intakeStep,
-                linkedInitialTurn
-                    ? recoveredExecutionResult is not null
-                        ? "linked.intake-journal-completed"
-                        : resumeSession
-                            ? "linked.intake-session-resumed"
-                            : "linked.intake-pending-recovered"
-                    : recoveredExecutionResult is not null
-                        ? "intake.recovery-journal-completed"
-                        : resumeSession
-                            ? "intake.recovery-session-resumed"
-                            : "intake.recovery-pending",
-                recoveredExecutionResult is not null
-                    ? "Recovered the completed initial Account Manager result from its deterministic Copilot session journal."
-                    : resumeSession
-                        ? "Resuming the interrupted initial Account Manager Copilot session."
-                        : "Continued the existing pending initial Account Manager attempt without creating a duplicate.");
-        }
-        await database.SaveChangesAsync(cancellationToken);
-
-        var stopwatch = Stopwatch.StartNew();
-        AgentExecutionResult result;
-        try
-        {
-            var learnings = await database.Learnings
-                .AsNoTracking()
-                .OrderBy(item => item.CreatedAt)
-                .Take(12)
-                .ToListAsync(cancellationToken);
-            var priorReplies = flow.Messages
-                .Where(item => item.Role == ConversationRole.AccountManager)
-                .OrderBy(item => item.CreatedAt)
-                .Select(item => item.Content)
-                .ToList();
-            result = recoveredExecutionResult ??
-                await agentRunner.ExecuteAsync(
-                new AgentExecutionContext(
+                intakeStep);
+            intakeStep.Status = StepStatus.Running;
+            intakeStep.Phase = AgentRunPhase.BuildingPrompt;
+            intakeStep.StartedAt ??= DateTimeOffset.UtcNow;
+            var intakeSessionId =
+                AgentSessionIdentity.Create(
                     flow.Id,
                     flow.Iteration,
                     accountManager.AgentId,
-                    accountManager.Name,
-                    accountManager.Role,
-                    intakeStep.Model,
-                    intakeStep.ModelEffort,
-                    intakeStep.Attempt,
-                    BuildDialogueTask(
-                        flow.Messages,
-                        configuredDeliveryOutcome,
-                        pendingConfirmation?.NormalizedBriefJson,
-                        pendingConfirmation?.Document?.FlowKind,
-                        flow.ContractVersion,
-                        promotionSeed),
-                    flow.RepositoryKnowledge,
-                    flow.RepositoryPath,
-                    workspace.Path,
-                    intakeSessionId,
-                    configuredDeliveryOutcome,
-                    $"Create a task-ready brief with sensible defaults. If classified as Delivery, packaging is already configured as {configuredDeliveryOutcome}; Advisory never publishes.",
-                    priorReplies,
-                    learnings,
-                    ModelSelectionStrategy: settings.ModelSelectionStrategy,
-                    ExpectedAcceptedTimeSeconds:
-                        routing?.PredictedAcceptedTimeSeconds ?? 0,
-                    ResumeSession: resumeSession,
-                    RecoverInterruptedSession:
-                        recoverInterruptedSession,
-                    IsGovernedOutcomeVerification:
-                        !string.IsNullOrWhiteSpace(
-                            flow.OutcomeVerificationJson),
-                    GovernedRepositoryRelativePaths:
-                        string.IsNullOrWhiteSpace(
-                            flow.OutcomeVerificationJson)
-                            ? null
-                            : OutcomeVerificationRules.DeserializeAggregate(
-                                    flow.OutcomeVerificationJson)
-                                .TrustedRepositories
-                                .Select(repository => repository.RelativePath)
-                                .ToArray(),
-                    Progress: progress =>
-                    {
-                        if (progress.ExecutionPrompt is not null)
-                        {
-                            intakeStep.ExecutionPrompt = progress.ExecutionPrompt;
-                        }
-                        if (progress.CopilotSessionId is not null)
-                        {
-                            intakeStep.CopilotSessionId = progress.CopilotSessionId;
-                            intakeStep.CopilotSessionHome =
-                                progress.CopilotSessionHome ?? string.Empty;
-                        }
-                        RecordProgressAsync(
-                                flow.Id,
-                                intakeStep.Id,
-                                progress,
-                                CancellationToken.None)
-                            .GetAwaiter()
-                            .GetResult();
-                    },
-                    InvocationStartedAt: intakeStep.StartedAt,
-                    FlowStepId: intakeStep.Id,
-                    ContractVersion: flow.ContractVersion,
-                    InvocationKind: intakeStep.InvocationKind,
-                    PromotionContext: promotionSeed is null
-                        ? null
-                        : new AdvisoryPromotionContext(
-                            linkedSeed!,
-                            AdvisoryPromotionSeedParser.ComputeHash(
-                                linkedSeed!)),
-                    PlanStepKey: intakeStep.PlanStepKey,
-                    FlowKind: flow.Kind),
-                cancellationToken);
-        }
-        catch (Exception exception)
-        {
-            stopwatch.Stop();
-            await FailIntakeAttemptAsync(
-                database,
-                flow,
-                intakeStep,
-                exception,
-                result: null,
-                stopwatch.ElapsedMilliseconds,
-                cancellationToken);
-            if (request.FlowId is null)
-            {
-                throw new IntakeAttemptException(
-                    flow.Id,
-                    flow.Status,
-                    SafeIntakeRetryMessage,
-                    exception);
-            }
-            throw;
-        }
-
-        stopwatch.Stop();
-        AccountManagerResponse response;
-        try
-        {
-            response = ParseResponse(result.Output, flow.ContractVersion);
-            if (flow.LinkKind == FlowLinkKind.AdvisoryPromotion &&
-                response.FlowKind is not (null or FlowKind.Delivery))
+                    intakeStep.PlanStepKey);
+            if (intakeStep.CopilotSessionId is { } existingSessionId &&
+                existingSessionId != intakeSessionId)
             {
                 throw new InvalidOperationException(
-                    "An Advisory-promotion intake must remain a Delivery flow.");
+                    "The durable intake attempt has a noncanonical Copilot session identity.");
             }
-            response = flow.ContractVersion == "studio-v2"
-                ? promotionSeed is not null && response.Ready
+            intakeStep.CopilotSessionId = intakeSessionId;
+            if (string.IsNullOrWhiteSpace(intakeStep.CopilotSessionHome))
+            {
+                intakeStep.CopilotSessionHome =
+                    _sessionJournal.ExpectedHome();
+            }
+            if (existingIntakeStepId is not null)
+            {
+                AddLinkedRecoveryEventOnce(
+                    flow,
+                    intakeStep,
+                    linkedInitialTurn
+                        ? recoveredExecutionResult is not null
+                            ? "linked.intake-journal-completed"
+                            : resumeSession
+                                ? "linked.intake-session-resumed"
+                                : "linked.intake-pending-recovered"
+                        : recoveredExecutionResult is not null
+                            ? "intake.recovery-journal-completed"
+                            : resumeSession
+                                ? "intake.recovery-session-resumed"
+                                : "intake.recovery-pending",
+                    recoveredExecutionResult is not null
+                        ? "Recovered the completed initial Account Manager result from its deterministic Copilot session journal."
+                        : resumeSession
+                            ? "Resuming the interrupted initial Account Manager Copilot session."
+                            : "Continued the existing pending initial Account Manager attempt without creating a duplicate.");
+            }
+            await database.SaveChangesAsync(cancellationToken);
+
+            var stopwatch = Stopwatch.StartNew();
+            AgentExecutionResult result;
+            try
+            {
+                var learnings = await database.Learnings
+                    .AsNoTracking()
+                    .OrderBy(item => item.CreatedAt)
+                    .Take(12)
+                    .ToListAsync(cancellationToken);
+                var priorReplies = flow.Messages
+                    .Where(item => item.Role == ConversationRole.AccountManager)
+                    .OrderBy(item => item.CreatedAt)
+                    .Select(item => item.Content)
+                    .ToList();
+                result = recoveredExecutionResult ??
+                    await agentRunner.ExecuteAsync(
+                    new AgentExecutionContext(
+                        flow.Id,
+                        flow.Iteration,
+                        accountManager.AgentId,
+                        accountManager.Name,
+                        accountManager.Role,
+                        intakeStep.Model,
+                        intakeStep.ModelEffort,
+                        intakeStep.Attempt,
+                        BuildDialogueTask(
+                            flow.Messages,
+                            configuredDeliveryOutcome,
+                            pendingConfirmation?.NormalizedBriefJson,
+                            pendingConfirmation?.Document?.FlowKind,
+                            promotionSeed),
+                        flow.RepositoryKnowledge,
+                        flow.RepositoryPath,
+                        workspace.Path,
+                        intakeSessionId,
+                        configuredDeliveryOutcome,
+                        $"Create a task-ready brief with sensible defaults. If classified as Delivery, packaging is already configured as {configuredDeliveryOutcome}; Advisory never publishes.",
+                        priorReplies,
+                        learnings,
+                        ModelSelectionStrategy: settings.ModelSelectionStrategy,
+                        ExpectedAcceptedTimeSeconds:
+                            routing?.PredictedAcceptedTimeSeconds ?? 0,
+                        ResumeSession: resumeSession,
+                        RecoverInterruptedSession:
+                            recoverInterruptedSession,
+                        GovernedRepositoryRelativePaths: null,
+                        Progress: progress =>
+                        {
+                            if (progress.ExecutionPrompt is not null)
+                            {
+                                intakeStep.ExecutionPrompt = progress.ExecutionPrompt;
+                            }
+                            if (progress.CopilotSessionId is not null)
+                            {
+                                intakeStep.CopilotSessionId = progress.CopilotSessionId;
+                                intakeStep.CopilotSessionHome =
+                                    progress.CopilotSessionHome ?? string.Empty;
+                            }
+                            RecordProgressAsync(
+                                    flow.Id,
+                                    intakeStep.Id,
+                                    progress,
+                                    CancellationToken.None)
+                                .GetAwaiter()
+                                .GetResult();
+                        },
+                        InvocationStartedAt: intakeStep.StartedAt,
+                        FlowStepId: intakeStep.Id,
+                        InvocationKind: intakeStep.InvocationKind,
+                        PromotionContext: promotionSeed is null
+                            ? null
+                            : new AdvisoryPromotionContext(
+                                linkedSeed!,
+                                AdvisoryPromotionSeedParser.ComputeHash(
+                                    linkedSeed!)),
+                        PlanStepKey: intakeStep.PlanStepKey,
+                        FlowKind: flow.Kind),
+                    cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                stopwatch.Stop();
+                await FailIntakeAttemptAsync(
+                    database,
+                    flow,
+                    intakeStep,
+                    exception,
+                    result: null,
+                    stopwatch.ElapsedMilliseconds,
+                    cancellationToken);
+                if (request.FlowId is null)
+                {
+                    throw new IntakeAttemptException(
+                        flow.Id,
+                        flow.Status,
+                        SafeIntakeRetryMessage,
+                        exception);
+                }
+                throw;
+            }
+
+            stopwatch.Stop();
+            AccountManagerResponse response;
+            try
+            {
+                response = ParseResponse(result.Output);
+                if (flow.LinkKind == FlowLinkKind.AdvisoryPromotion &&
+                    response.FlowKind is not (null or FlowKind.Delivery))
+                {
+                    throw new InvalidOperationException(
+                        "An Advisory-promotion intake must remain a Delivery flow.");
+                }
+                response = promotionSeed is not null && response.Ready
                     ? ApplyPromotionConfirmationGate(
                         response,
                         promotionSeed,
                         flow.Title)
                     : ApplyConfirmationGate(
                         response,
-                        pendingConfirmation?.Document)
-                : ApplyConfirmationGate(
+                        pendingConfirmation?.Document);
+                ValidateIntakeCompletion(
+                    flow,
                     response,
-                    pendingConfirmation?.NormalizedBriefJson);
-            ValidateIntakeCompletion(
-                flow,
-                response,
-                configuredDeliveryOutcome);
-        }
-        catch (OperationCanceledException) when (
-            cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception exception)
-        {
-            await FailIntakeAttemptAsync(
-                database,
-                flow,
-                intakeStep,
-                exception,
-                result,
-                stopwatch.ElapsedMilliseconds,
-                cancellationToken);
-            if (request.FlowId is null)
-            {
-                throw new IntakeAttemptException(
-                    flow.Id,
-                    flow.Status,
-                    SafeIntakeRetryMessage,
-                    exception);
+                    configuredDeliveryOutcome);
             }
-            throw;
-        }
-        flow.ConsolidatedRequest =
-            response.Status == AccountManagerIntakeStatus.NeedsClarification
-                ? FormatCustomerInputs(customerMessages)
-                : response.TaskBrief;
-        var accountManagerMessage = new FlowMessage
-        {
-            FlowRunId = flow.Id,
-            Role = ConversationRole.AccountManager,
-            Content = response.Reply,
-            IsQuestion = response.Status != AccountManagerIntakeStatus.Confirmed
-        };
-        flow.Messages.Add(accountManagerMessage);
-        database.Entry(accountManagerMessage).State = EntityState.Added;
-
-        intakeStep.Label = response.Status switch
-        {
-            AccountManagerIntakeStatus.NeedsClarification => "Clarification requested",
-            AccountManagerIntakeStatus.AwaitingConfirmation => "Customer confirmation requested",
-            AccountManagerIntakeStatus.Confirmed => "Customer confirmed brief",
-            _ => throw new InvalidOperationException("Unsupported Account Manager intake status.")
-        };
-        intakeStep.Status = StepStatus.Completed;
-        intakeStep.Phase = AgentRunPhase.Succeeded;
-        intakeStep.ExecutionAttempts = result.ExecutionAttempts;
-        intakeStep.OutputSummary = result.Output;
-        intakeStep.CompletedAt = DateTimeOffset.UtcNow;
-        intakeStep.DurationMilliseconds = stopwatch.ElapsedMilliseconds;
-        await observationRecorder.RecordCompletionAsync(
-            intakeStep.Id,
-            accepted: response.Status != AccountManagerIntakeStatus.NeedsClarification,
-            intakeStep.DurationMilliseconds,
-            result.ExecutionAttempts,
-            response.Ready ? "confirmed-intake" : "intake-turn",
-            cancellationToken);
-        foreach (var toolCall in result.ToolCalls)
-        {
-            var storedCall = new AgentToolCall
+            catch (OperationCanceledException) when (
+                cancellationToken.IsCancellationRequested)
             {
-                FlowStepId = intakeStep.Id,
-                ToolName = toolCall.ToolName,
-                ArgumentsSummary = toolCall.ArgumentsSummary,
-                Succeeded = toolCall.Succeeded,
-                ToolType = toolCall.ToolType,
-                NormalizedCommand = toolCall.NormalizedCommand,
-                NormalizedArguments = toolCall.NormalizedArguments,
-                WorkingDirectory = toolCall.WorkingDirectory,
-                ExitCode = toolCall.ExitCode,
-                ResultDigest = toolCall.ResultDigest,
-                ResultSummary = toolCall.ResultSummary
+                throw;
+            }
+            catch (Exception exception)
+            {
+                await FailIntakeAttemptAsync(
+                    database,
+                    flow,
+                    intakeStep,
+                    exception,
+                    result,
+                    stopwatch.ElapsedMilliseconds,
+                    cancellationToken);
+                if (request.FlowId is null)
+                {
+                    throw new IntakeAttemptException(
+                        flow.Id,
+                        flow.Status,
+                        SafeIntakeRetryMessage,
+                        exception);
+                }
+                throw;
+            }
+            flow.ConsolidatedRequest =
+                response.Status == AccountManagerIntakeStatus.NeedsClarification
+                    ? FormatCustomerInputs(customerMessages)
+                    : response.TaskBrief;
+            var accountManagerMessage = new FlowMessage
+            {
+                FlowRunId = flow.Id,
+                Role = ConversationRole.AccountManager,
+                Content = response.Reply,
+                IsQuestion = response.Status != AccountManagerIntakeStatus.Confirmed
             };
-            intakeStep.ToolCalls.Add(storedCall);
-            database.Entry(storedCall).State = EntityState.Added;
-        }
+            flow.Messages.Add(accountManagerMessage);
+            database.Entry(accountManagerMessage).State = EntityState.Added;
 
-        var intakeGate = handoffGate.SubmitProposal(new HandoffProposal
-        {
-            FlowRunId = flow.Id,
-            FlowStepId = intakeStep.Id,
-            ActionType = response.Ready
-                ? HandoffActionType.Advance
-                : HandoffActionType.RequestRevision,
-            Summary = string.IsNullOrWhiteSpace(response.TaskBrief)
-                ? result.Output
-                : response.TaskBrief,
-            Evidence = $"Copilot Account Manager reviewed {customerMessages.Count} customer turn(s).",
-            BlastRadius = HandoffBlastRadius.Low
-        });
-        flow.GateRecords.Add(intakeGate);
-        database.Entry(intakeGate).State = EntityState.Added;
-        var (intakeEventType, intakeEventMessage) = response.Status switch
-        {
-            AccountManagerIntakeStatus.NeedsClarification => (
-                "intake.clarification",
-                "Copilot Account Manager requested one material clarification."),
-            AccountManagerIntakeStatus.AwaitingConfirmation => (
-                "intake.confirmation_requested",
-                "Copilot Account Manager presented its understanding for customer confirmation."),
-            AccountManagerIntakeStatus.Confirmed => (
-                "intake.confirmed",
-                "Customer explicitly confirmed the Account Manager brief."),
-            _ => throw new InvalidOperationException("Unsupported Account Manager intake status.")
-        };
-        var intakeEvent = new FlowEvent
-        {
-            FlowRunId = flow.Id,
-            FlowStepId = intakeStep.Id,
-            Type = intakeEventType,
-            Message = intakeEventMessage,
-            DataJson = flow.ContractVersion == "studio-v2"
-                ? response.RawContractJson
-                : null
-        };
-        flow.Events.Add(intakeEvent);
-        database.Entry(intakeEvent).State = EntityState.Added;
-        if (response.Ready)
-        {
-            flow.ModelSelectionStrategy = settings.ModelSelectionStrategy;
-        }
-        var queuedEvent = ApplyIntakeOutcome(
-            flow,
-            response,
-            configuredDeliveryOutcome,
-            _lifecycle);
-        if (queuedEvent is not null)
-        {
-            database.Entry(queuedEvent).State = EntityState.Added;
-        }
-        if (flow.ContractVersion == "studio-v2" &&
-            response.FlowKind == FlowKind.Advisory &&
-            !flow.Events.Any(item => item.Type == "workspace.advisory-policy"))
-        {
-            var policyEvent = new FlowEvent
+            intakeStep.Label = response.Status switch
+            {
+                AccountManagerIntakeStatus.NeedsClarification => "Clarification requested",
+                AccountManagerIntakeStatus.AwaitingConfirmation => "Customer confirmation requested",
+                AccountManagerIntakeStatus.Confirmed => "Customer confirmed brief",
+                _ => throw new InvalidOperationException("Unsupported Account Manager intake status.")
+            };
+            intakeStep.Status = StepStatus.Completed;
+            intakeStep.Phase = AgentRunPhase.Succeeded;
+            intakeStep.ExecutionAttempts = result.ExecutionAttempts;
+            intakeStep.OutputSummary = result.Output;
+            intakeStep.CompletedAt = DateTimeOffset.UtcNow;
+            intakeStep.DurationMilliseconds = stopwatch.ElapsedMilliseconds;
+            await observationRecorder.RecordCompletionAsync(
+                intakeStep.Id,
+                accepted: response.Status != AccountManagerIntakeStatus.NeedsClarification,
+                intakeStep.DurationMilliseconds,
+                result.ExecutionAttempts,
+                response.Ready ? "confirmed-intake" : "intake-turn",
+                cancellationToken);
+            foreach (var toolCall in result.ToolCalls)
+            {
+                var storedCall = new AgentToolCall
+                {
+                    FlowStepId = intakeStep.Id,
+                    ToolName = toolCall.ToolName,
+                    ArgumentsSummary = toolCall.ArgumentsSummary,
+                    Succeeded = toolCall.Succeeded,
+                    ToolType = toolCall.ToolType,
+                    NormalizedCommand = toolCall.NormalizedCommand,
+                    NormalizedArguments = toolCall.NormalizedArguments,
+                    WorkingDirectory = toolCall.WorkingDirectory,
+                    ExitCode = toolCall.ExitCode,
+                    ResultDigest = toolCall.ResultDigest,
+                    ResultSummary = toolCall.ResultSummary
+                };
+                intakeStep.ToolCalls.Add(storedCall);
+                database.Entry(storedCall).State = EntityState.Added;
+            }
+
+            var intakeGate = handoffGate.SubmitProposal(new HandoffProposal
             {
                 FlowRunId = flow.Id,
                 FlowStepId = intakeStep.Id,
-                Type = "workspace.advisory-policy",
-                Message =
-                    "Advisory execution uses the guarded source snapshot with repository hooks, source writes, shell access, and publication disabled.",
-                DataJson = JsonSerializer.Serialize(new
-                {
-                    Version = "advisory-policy-v1",
-                    WorkspaceMode = WorkspaceMode.AdvisoryReadOnly.ToString(),
-                    PermissionProfile =
-                        ExecutionPermissionProfile.ReadOnlySource.ToString(),
-                    HooksEnabled = false,
-                    PublicationAllowed = false
-                })
+                ActionType = response.Ready
+                    ? HandoffActionType.Advance
+                    : HandoffActionType.RequestRevision,
+                Summary = string.IsNullOrWhiteSpace(response.TaskBrief)
+                    ? result.Output
+                    : response.TaskBrief,
+                Evidence = $"Copilot Account Manager reviewed {customerMessages.Count} customer turn(s).",
+                BlastRadius = HandoffBlastRadius.Low
+            });
+            flow.GateRecords.Add(intakeGate);
+            database.Entry(intakeGate).State = EntityState.Added;
+            var (intakeEventType, intakeEventMessage) = response.Status switch
+            {
+                AccountManagerIntakeStatus.NeedsClarification => (
+                    "intake.clarification",
+                    "Copilot Account Manager requested one material clarification."),
+                AccountManagerIntakeStatus.AwaitingConfirmation => (
+                    "intake.confirmation_requested",
+                    "Copilot Account Manager presented its understanding for customer confirmation."),
+                AccountManagerIntakeStatus.Confirmed => (
+                    "intake.confirmed",
+                    "Customer explicitly confirmed the Account Manager brief."),
+                _ => throw new InvalidOperationException("Unsupported Account Manager intake status.")
             };
-            flow.Events.Add(policyEvent);
-            database.Entry(policyEvent).State = EntityState.Added;
-        }
-        flow.UpdatedAt = DateTimeOffset.UtcNow;
-        flow.FailureReason = string.Empty;
-        await database.SaveChangesAsync(cancellationToken);
-        if (queuedEvent is not null &&
-            queueReadyFlow &&
-            !flowQueue.Queue(flow.Id))
-        {
-            throw new InvalidOperationException("Unable to queue the customer-confirmed flow.");
-        }
+            var intakeEvent = new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = intakeStep.Id,
+                Type = intakeEventType,
+                Message = intakeEventMessage,
+                DataJson = response.RawContractJson
+            };
+            flow.Events.Add(intakeEvent);
+            database.Entry(intakeEvent).State = EntityState.Added;
+            if (response.Ready)
+            {
+                flow.ModelSelectionStrategy = settings.ModelSelectionStrategy;
+            }
+            var queuedEvent = ApplyIntakeOutcome(
+                flow,
+                response,
+                configuredDeliveryOutcome,
+                _lifecycle);
+            if (queuedEvent is not null)
+            {
+                database.Entry(queuedEvent).State = EntityState.Added;
+            }
+            if (response.FlowKind == FlowKind.Advisory &&
+                !flow.Events.Any(item => item.Type == "workspace.advisory-policy"))
+            {
+                var policyEvent = new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = intakeStep.Id,
+                    Type = "workspace.advisory-policy",
+                    Message =
+                        "Advisory execution uses the guarded source snapshot with repository hooks, source writes, shell access, and publication disabled.",
+                    DataJson = JsonSerializer.Serialize(new
+                    {
+                        WorkspaceMode = WorkspaceMode.AdvisoryReadOnly.ToString(),
+                        PermissionProfile =
+                            ExecutionPermissionProfile.ReadOnlySource.ToString(),
+                        HooksEnabled = false,
+                        PublicationAllowed = false
+                    })
+                };
+                flow.Events.Add(policyEvent);
+                database.Entry(policyEvent).State = EntityState.Added;
+            }
+            flow.UpdatedAt = DateTimeOffset.UtcNow;
+            flow.FailureReason = string.Empty;
+            await database.SaveChangesAsync(cancellationToken);
+            if (queuedEvent is not null &&
+                queueReadyFlow &&
+                !flowQueue.Queue(flow.Id))
+            {
+                throw new InvalidOperationException("Unable to queue the customer-confirmed flow.");
+            }
 
-        var detailFlow = await database.Flows
-            .AsNoTracking()
-            .AsSplitQuery()
-            .Include(item => item.Steps)
-            .ThenInclude(step => step.ToolCalls)
-            .Include(item => item.Steps)
-            .ThenInclude(step => step.RoutingDecisions)
-            .ThenInclude(decision => decision.TaskProfile)
-            .Include(item => item.Steps)
-            .ThenInclude(step => step.RoutingDecisions)
-            .ThenInclude(decision => decision.Alternatives)
-            .Include(item => item.Messages)
-            .Include(item => item.Events)
-            .Include(item => item.GateRecords)
-            .SingleAsync(item => item.Id == flow.Id, cancellationToken);
-        return new IntakeResponse(
-            detailFlow.ToDetailDto(),
-            response.Reply,
-            response.Ready,
-            ShouldSpeak: true);
+            var detailFlow = await database.Flows
+                .AsNoTracking()
+                .AsSplitQuery()
+                .Include(item => item.Steps)
+                .ThenInclude(step => step.ToolCalls)
+                .Include(item => item.Steps)
+                .ThenInclude(step => step.RoutingDecisions)
+                .ThenInclude(decision => decision.TaskProfile)
+                .Include(item => item.Steps)
+                .ThenInclude(step => step.RoutingDecisions)
+                .ThenInclude(decision => decision.Alternatives)
+                .Include(item => item.Messages)
+                .Include(item => item.Events)
+                .Include(item => item.GateRecords)
+                .SingleAsync(item => item.Id == flow.Id, cancellationToken);
+            return new IntakeResponse(
+                detailFlow.ToDetailDto(),
+                response.Reply,
+                response.Ready,
+                ShouldSpeak: true);
         }
         catch (IntakeAttemptException) when (request.FlowId is null)
         {
@@ -1771,8 +1730,6 @@ public sealed partial class IntakeCoordinator(
                     "The Account Manager intake setup failed after the new flow was saved and remains available for retry.",
                 DataJson = JsonSerializer.Serialize(new
                 {
-                    Version =
-                        "intake-attempt-failure-v1",
                     FailureKind = "SetupFailure",
                     Reason = reason
                 })
@@ -1862,7 +1819,6 @@ public sealed partial class IntakeCoordinator(
                     : "The Account Manager output failed intake contract or lifecycle validation and remains available for retry.",
                 DataJson = JsonSerializer.Serialize(new
                 {
-                    Version = "intake-attempt-failure-v1",
                     FailureKind = failureKind.ToString(),
                     Reason = reason,
                     OutputCharacters = result?.Output.Length ?? 0,
@@ -1888,8 +1844,7 @@ public sealed partial class IntakeCoordinator(
         FlowRun flow,
         FlowStep step)
     {
-        if (flow.ContractVersion != "studio-v2" ||
-            !string.IsNullOrWhiteSpace(step.EffectivePermissionJson))
+        if (!string.IsNullOrWhiteSpace(step.EffectivePermissionJson))
         {
             return;
         }
@@ -1917,10 +1872,7 @@ public sealed partial class IntakeCoordinator(
             ImmutableArray.Create(PlanDuty.Analyze),
             DurableReviewDecision: null,
             DurableApproval: false,
-            IsOnlyPlannedPublishStep: false,
-            ContractVersion: flow.ContractVersion,
-            LegacyPublicationAuthorized: false,
-            IsGovernedOutcomeVerification: false);
+            IsOnlyPlannedPublishStep: false);
         var permission = _permissionResolver.Resolve(
             request,
             PermissionProfileResolver.FromWorkflow(workflow));
@@ -1944,14 +1896,13 @@ public sealed partial class IntakeCoordinator(
             throw new InvalidOperationException(
                 "An intake result can be completed only while the flow remains in Intake.");
         }
-        if (flow.ContractVersion == "studio-v2" &&
-            (response.Status is
+        if ((response.Status is
                 AccountManagerIntakeStatus.AwaitingConfirmation or
                 AccountManagerIntakeStatus.Confirmed) &&
             response.FlowKind is null)
         {
             throw new InvalidOperationException(
-                "An actionable intake-v2 result must include its flow kind.");
+                "An actionable intake result must include its flow kind.");
         }
         if (flow.LinkKind == FlowLinkKind.AdvisoryPromotion &&
             response.FlowKind is not (null or FlowKind.Delivery))
@@ -1992,91 +1943,30 @@ public sealed partial class IntakeCoordinator(
         return value[..(maximum - suffix.Length)] + suffix;
     }
 
-    public static AccountManagerResponse ParseResponse(
-        string output,
-        string contractVersion = "legacy-v1")
+    public static AccountManagerResponse ParseResponse(string output)
     {
-        if (string.Equals(
-                contractVersion,
-                "studio-v2",
-                StringComparison.Ordinal))
+        var parsed = IntakeParser.Parse(output);
+        var intakeStatus = parsed.Document.Status!.Value switch
         {
-            var parsed = IntakeV2Parser.Parse(output);
-            var intakeStatusV2 = parsed.Document.Status!.Value switch
-            {
-                IntakeV2Status.NeedsClarification =>
-                    AccountManagerIntakeStatus.NeedsClarification,
-                IntakeV2Status.AwaitingConfirmation =>
-                    AccountManagerIntakeStatus.AwaitingConfirmation,
-                IntakeV2Status.Confirmed =>
-                    AccountManagerIntakeStatus.Confirmed,
-                _ => throw new InvalidOperationException(
-                    "Copilot Account Manager returned an unsupported intake-v2 status.")
-            };
-            return new AccountManagerResponse(
-                intakeStatusV2,
-                parsed.Document.CustomerReply,
-                parsed.Document.TaskTitle,
-                intakeStatusV2 == AccountManagerIntakeStatus.NeedsClarification
-                    ? string.Empty
-                    : parsed.NormalizedBriefJson,
-                parsed.Document.FlowKind,
-                parsed.Document.Brief,
-                IntakeV2Parser.Serialize(parsed.Document));
-        }
-
-        if (!string.Equals(
-                contractVersion,
-                "legacy-v1",
-                StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                $"Unsupported intake contract version '{contractVersion}'.");
-        }
-
-        var status = IntakeStatusPattern().Match(output);
-        var title = TaskTitlePattern().Match(output);
-        var reply = CustomerReplyPattern().Match(output);
-        var brief = TaskBriefPattern().Match(output);
-        if (!status.Success || !title.Success || !reply.Success || !brief.Success)
-        {
-            throw new InvalidOperationException(
-                "Copilot Account Manager returned an invalid intake contract. " +
-                "Expected INTAKE_STATUS, TASK_TITLE, CUSTOMER_REPLY, and TASK_BRIEF markers.");
-        }
-
-        var intakeStatus = status.Groups[1].Value.ToUpperInvariant() switch
-        {
-            "NEEDS_CLARIFICATION" => AccountManagerIntakeStatus.NeedsClarification,
-            "AWAITING_CONFIRMATION" => AccountManagerIntakeStatus.AwaitingConfirmation,
-            "CONFIRMED" => AccountManagerIntakeStatus.Confirmed,
+            IntakeStatus.NeedsClarification =>
+                AccountManagerIntakeStatus.NeedsClarification,
+            IntakeStatus.AwaitingConfirmation =>
+                AccountManagerIntakeStatus.AwaitingConfirmation,
+            IntakeStatus.Confirmed =>
+                AccountManagerIntakeStatus.Confirmed,
             _ => throw new InvalidOperationException(
                 "Copilot Account Manager returned an unsupported intake status.")
         };
-        var taskTitle = BuildTitle(title.Groups[1].Value);
-        if (string.IsNullOrWhiteSpace(taskTitle) ||
-            string.Equals(taskTitle, "NONE", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException(
-                "Copilot Account Manager returned no usable TASK_TITLE.");
-        }
-        var taskBrief = brief.Groups[1].Value.Trim();
-        var requiresBrief = intakeStatus is
-            AccountManagerIntakeStatus.AwaitingConfirmation or
-            AccountManagerIntakeStatus.Confirmed;
-        if (requiresBrief &&
-            (string.IsNullOrWhiteSpace(taskBrief) ||
-             string.Equals(taskBrief, "NONE", StringComparison.OrdinalIgnoreCase)))
-        {
-            throw new InvalidOperationException(
-                "Copilot Account Manager requested or recorded confirmation without a TASK_BRIEF.");
-        }
-
         return new AccountManagerResponse(
             intakeStatus,
-            reply.Groups[1].Value.Trim(),
-            taskTitle,
-            requiresBrief ? taskBrief : string.Empty);
+            parsed.Document.CustomerReply,
+            parsed.Document.TaskTitle,
+            intakeStatus == AccountManagerIntakeStatus.NeedsClarification
+                ? string.Empty
+                : parsed.NormalizedBriefJson,
+            parsed.Document.FlowKind,
+            parsed.Document.Brief,
+            IntakeParser.Serialize(parsed.Document));
     }
 
     internal static AccountManagerResponse ApplyConfirmationGate(
@@ -2103,11 +1993,7 @@ public sealed partial class IntakeCoordinator(
         string? linkedSeed,
         Guid? recoveringStepId = null)
     {
-        if (!string.Equals(
-                flow.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) ||
-            flow.LinkKind != FlowLinkKind.AdvisoryPromotion ||
+        if (flow.LinkKind != FlowLinkKind.AdvisoryPromotion ||
             flow.Kind != FlowKind.Delivery ||
             flow.Status != FlowStatus.Intake ||
             flow.ParentFlowRunId is null ||
@@ -2147,7 +2033,7 @@ public sealed partial class IntakeCoordinator(
         }
         var brief = response.NormalizedBrief
                     ?? throw new InvalidOperationException(
-                        "A directly confirmed Advisory promotion requires a complete intake-v2 brief.");
+                        "A directly confirmed Advisory promotion requires a complete intake brief.");
         var details = brief.Details ??
                       throw new InvalidOperationException(
                           "A directly confirmed Advisory promotion requires implementation details.");
@@ -2169,14 +2055,13 @@ public sealed partial class IntakeCoordinator(
                 "The directly confirmed promotion brief drifted from the durable accepted goal or implementation details.");
         }
 
-        var confirmed = new IntakeV2Document
+        var confirmed = new IntakeDocument
         {
-            Version = IntakeV2Parser.Version,
-            Status = IntakeV2Status.Confirmed,
+            Status = IntakeStatus.Confirmed,
             FlowKind = FlowKind.Delivery,
             TaskTitle = durableTaskTitle,
             CustomerReply = response.Reply,
-            Brief = new IntakeV2Brief
+            Brief = new IntakeBrief
             {
                 Goal = seed.Goal,
                 Details = seed.ImplementationDetails,
@@ -2185,15 +2070,15 @@ public sealed partial class IntakeCoordinator(
                 Assumptions = []
             }
         };
-        var normalized = IntakeV2Parser.ParseJson(
-            IntakeV2Parser.Serialize(confirmed));
+        var normalized = IntakeParser.ParseJson(
+            IntakeParser.Serialize(confirmed));
         return response with
         {
             TaskTitle = normalized.Document.TaskTitle,
             TaskBrief = normalized.NormalizedBriefJson,
             FlowKind = normalized.Document.FlowKind,
             NormalizedBrief = normalized.Document.Brief,
-            RawContractJson = IntakeV2Parser.Serialize(normalized.Document)
+            RawContractJson = IntakeParser.Serialize(normalized.Document)
         };
     }
 
@@ -2329,38 +2214,37 @@ public sealed partial class IntakeCoordinator(
 
     internal static AccountManagerResponse ApplyConfirmationGate(
         AccountManagerResponse response,
-        IntakeV2Document? pendingConfirmation)
+        IntakeDocument? pendingConfirmation)
     {
         if (!response.Ready)
         {
             return response;
         }
-        if (pendingConfirmation?.Status != IntakeV2Status.AwaitingConfirmation ||
+        if (pendingConfirmation?.Status != IntakeStatus.AwaitingConfirmation ||
             pendingConfirmation.FlowKind is null ||
             pendingConfirmation.Brief is null)
         {
             throw new InvalidOperationException(
-                "Copilot Account Manager cannot confirm an intake-v2 brief that the customer has not reviewed.");
+                "Copilot Account Manager cannot confirm an intake brief that the customer has not reviewed.");
         }
 
-        var confirmed = new IntakeV2Document
+        var confirmed = new IntakeDocument
         {
-            Version = IntakeV2Parser.Version,
-            Status = IntakeV2Status.Confirmed,
+            Status = IntakeStatus.Confirmed,
             FlowKind = pendingConfirmation.FlowKind,
             TaskTitle = pendingConfirmation.TaskTitle,
             CustomerReply = response.Reply,
             Brief = pendingConfirmation.Brief
         };
-        var normalized = IntakeV2Parser.ParseJson(
-            IntakeV2Parser.Serialize(confirmed));
+        var normalized = IntakeParser.ParseJson(
+            IntakeParser.Serialize(confirmed));
         return response with
         {
             TaskTitle = normalized.Document.TaskTitle,
             TaskBrief = normalized.NormalizedBriefJson,
             FlowKind = normalized.Document.FlowKind,
             NormalizedBrief = normalized.Document.Brief,
-            RawContractJson = IntakeV2Parser.Serialize(normalized.Document)
+            RawContractJson = IntakeParser.Serialize(normalized.Document)
         };
     }
 
@@ -2411,10 +2295,7 @@ public sealed partial class IntakeCoordinator(
             Outcome = OutcomeTypeRules.RequireDelivery(
                 settings.Outcome,
                 nameof(settings.Outcome)),
-            ModelSelectionStrategy = settings.ModelSelectionStrategy,
-            RuntimeMarker = "LiveCopilot",
-            ContractVersion = "studio-v2",
-            OutcomeVerificationJson = string.Empty
+            ModelSelectionStrategy = settings.ModelSelectionStrategy
         };
     }
 
@@ -2466,27 +2347,16 @@ public sealed partial class IntakeCoordinator(
         {
             return null;
         }
-        if (flow.ContractVersion == "legacy-v1")
-        {
-            return new PendingIntakeConfirmation(
-                null,
-                flow.ConsolidatedRequest.Trim());
-        }
-        if (flow.ContractVersion != "studio-v2")
-        {
-            throw new InvalidOperationException(
-                $"Unsupported intake contract version '{flow.ContractVersion}'.");
-        }
         if (string.IsNullOrWhiteSpace(latestIntakeEvent.DataJson))
         {
             throw new InvalidOperationException(
-                "The pending intake-v2 confirmation has no durable normalized proposal.");
+                "The pending intake confirmation has no durable normalized proposal.");
         }
-        var parsed = IntakeV2Parser.ParseJson(latestIntakeEvent.DataJson);
-        if (parsed.Document.Status != IntakeV2Status.AwaitingConfirmation)
+        var parsed = IntakeParser.ParseJson(latestIntakeEvent.DataJson);
+        if (parsed.Document.Status != IntakeStatus.AwaitingConfirmation)
         {
             throw new InvalidOperationException(
-                "The pending intake-v2 proposal is not awaiting confirmation.");
+                "The pending intake proposal is not awaiting confirmation.");
         }
         return new PendingIntakeConfirmation(
             parsed.Document,
@@ -2498,7 +2368,6 @@ public sealed partial class IntakeCoordinator(
         OutcomeType outcome,
         string? pendingConfirmationBrief = null,
         FlowKind? pendingFlowKind = null,
-        string contractVersion = "legacy-v1",
         AdvisoryPromotionSeed? promotionSeed = null)
     {
         var orderedMessages = messages
@@ -2529,48 +2398,28 @@ public sealed partial class IntakeCoordinator(
             ? string.Empty
             : Environment.NewLine +
               Environment.NewLine +
-              (contractVersion == "studio-v2"
-                  ? $"UNCONFIRMED_FLOW_KIND: {pendingFlowKind}{Environment.NewLine}" +
-                    "UNCONFIRMED_NORMALIZED_BRIEF:"
-                  : "UNCONFIRMED_TASK_BRIEF:") +
+              $"UNCONFIRMED_FLOW_KIND: {pendingFlowKind}{Environment.NewLine}" +
+              "UNCONFIRMED_NORMALIZED_BRIEF:" +
               Environment.NewLine +
               pendingConfirmationBrief.Trim();
-        if (contractVersion == "studio-v2")
-        {
-            return
-                "Classify the repository-grounded customer intent as Advisory or Delivery. " +
-                "Advisory means inspect, recommend, or explain without source changes or publication. " +
-                "Delivery means the customer is asking the team to implement or change the product. " +
-                "Describe customer outcomes, not tools or implementation mechanics. " +
-                "Default to AwaitingConfirmation once meaningful work can begin; downstream details " +
-                "do not need to be settled during intake. Treat all prior answers as settled and do " +
-                "not ask for the same detail twice. Ask at most one focused clarification question. " +
-                (promotionSeed is null
-                    ? "No proposed brief is customer-approved merely because it is clear. "
-                    : "Only the host-marked durable Advisory promotion is already customer-authorized. ") +
-                confirmationPolicy
-                    .Replace("CONFIRMED", "Confirmed", StringComparison.Ordinal)
-                    .Replace("AWAITING_CONFIRMATION", "AwaitingConfirmation", StringComparison.Ordinal) +
-                "A correction is not confirmation. A confirmation must preserve the exact pending " +
-                "FlowKind and normalized Brief; never silently change either during confirmation. " +
-                $"The configured Delivery packaging preference is {outcome}; do not discuss it with " +
-                "the customer, and do not apply it to Advisory work. " +
-                pendingBriefContext +
-                Environment.NewLine +
-                Environment.NewLine +
-                dialogue;
-        }
-
         return
-            "Turn this complete customer dialogue into a brief the delivery team can act on. " +
-            "Default to AWAITING_CONFIRMATION once meaningful work can begin; downstream details do " +
-            "not need to be settled during intake. Treat all prior answers as settled and do not ask " +
-            "for the same detail twice. Ask at most one focused clarification question in this turn. " +
-            "A request for a design the customer can click is actionable and requires an interactive " +
-            "result, not another prototype, implementation, or deployment choice. " +
-            $"The configured delivery outcome is {outcome}; do not ask the customer how the work " +
-            "should be packaged, released, or deployed. " +
-            confirmationPolicy +
+            "Classify the repository-grounded customer intent as Advisory or Delivery. " +
+            "Advisory means inspect, recommend, or explain without source changes or publication. " +
+            "Delivery means the customer is asking the team to implement or change the product. " +
+            "Describe customer outcomes, not tools or implementation mechanics. " +
+            "Default to AwaitingConfirmation once meaningful work can begin; downstream details " +
+            "do not need to be settled during intake. Treat all prior answers as settled and do " +
+            "not ask for the same detail twice. Ask at most one focused clarification question. " +
+            (promotionSeed is null
+                ? "No proposed brief is customer-approved merely because it is clear. "
+                : "Only the host-marked durable Advisory promotion is already customer-authorized. ") +
+            confirmationPolicy
+                .Replace("CONFIRMED", "Confirmed", StringComparison.Ordinal)
+                .Replace("AWAITING_CONFIRMATION", "AwaitingConfirmation", StringComparison.Ordinal) +
+            "A correction is not confirmation. A confirmation must preserve the exact pending " +
+            "FlowKind and normalized Brief; never silently change either during confirmation. " +
+            $"The configured Delivery packaging preference is {outcome}; do not discuss it with " +
+            "the customer, and do not apply it to Advisory work. " +
             pendingBriefContext +
             Environment.NewLine +
             Environment.NewLine +
@@ -2578,7 +2427,7 @@ public sealed partial class IntakeCoordinator(
     }
 
     private sealed record PendingIntakeConfirmation(
-        IntakeV2Document? Document,
+        IntakeDocument? Document,
         string NormalizedBriefJson);
 
     private async Task RecordProgressAsync(
@@ -2639,7 +2488,7 @@ public sealed record AccountManagerResponse(
     string TaskTitle,
     string TaskBrief,
     FlowKind? FlowKind = null,
-    IntakeV2Brief? NormalizedBrief = null,
+    IntakeBrief? NormalizedBrief = null,
     string RawContractJson = "")
 {
     public bool Ready => Status == AccountManagerIntakeStatus.Confirmed;

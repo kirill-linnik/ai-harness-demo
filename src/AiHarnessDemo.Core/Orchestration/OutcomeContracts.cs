@@ -6,8 +6,6 @@ namespace AiHarnessDemo.Core.Orchestration;
 
 public sealed class FlowOutcomeDocument
 {
-    public string Version { get; init; } = string.Empty;
-
     public string Goal { get; init; } = string.Empty;
 
     public string Summary { get; init; } = string.Empty;
@@ -40,9 +38,8 @@ public sealed class FlowOutcomeContractException(IReadOnlyList<string> errors)
 
 public static class FlowOutcomeParser
 {
-    public const string Version = "flow-outcome-v1";
-    public const string BeginSentinel = "FLOW_OUTCOME_V1_BEGIN";
-    public const string EndSentinel = "FLOW_OUTCOME_V1_END";
+    public const string BeginSentinel = "FLOW_OUTCOME_BEGIN";
+    public const string EndSentinel = "FLOW_OUTCOME_END";
     public const int HardMaximumArtifactCount = 8;
     public const int HardMaximumTotalArtifactBytes = 65_536;
     public const int MaximumDocumentCharacters = 131_072;
@@ -150,11 +147,6 @@ public static class FlowOutcomeParser
         }
 
         var errors = new List<string>();
-        ValidateText(document.Version, 1, 32, "version", errors);
-        if (!string.Equals(document.Version, Version, StringComparison.Ordinal))
-        {
-            errors.Add($"version must be exactly '{Version}'");
-        }
         ValidateText(
             document.Goal,
             1,
@@ -330,7 +322,7 @@ public static class FlowOutcomeParser
         RequireProperties(
             root,
             "flow outcome",
-            ["Version", "Goal", "Summary", "ImplementationDetails", "Artifacts"],
+            ["Goal", "Summary", "ImplementationDetails", "Artifacts"],
             errors);
         if (root.TryGetProperty("Artifacts", out var artifacts) &&
             artifacts.ValueKind == JsonValueKind.Array)

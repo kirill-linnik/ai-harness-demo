@@ -1,479 +1,308 @@
 # Architecture
 
-## Product boundary
+## Audience and first successful path
 
-AI Harness Studio is an independent .NET adaptation of selected orchestration behaviors described
-by OpenAI Symphony. It is not a full Symphony implementation and does not claim conformance with
-Symphony's tracker, runtime, or deployment model.
+This document is for developers and operators who run, extend, or troubleshoot AI Harness Studio.
+The shortest successful path is:
 
-| Symphony-derived behavior | Studio implementation |
-| --- | --- |
-| Repository-owned workflow | Strict YAML and prompt template in `WORKFLOW.md`. |
-| Atomic last-known-good reload | `WorkflowDefinitionProvider` separates current-file validity from the effective LKG definition. |
-| One work item per workspace | A `FlowRun` owns one contained `WorkspaceManager` workspace. |
-| Authoritative orchestrator | `FlowQueue`, `FlowWorker`, `WorkflowEngine`, and guarded `FlowLifecycleCoordinator` transitions. |
-| Attempt/session recovery | `FlowStep`, deterministic session identity, `CopilotSessionJournal`, and restart reconciliation. |
-| Bounded concurrency | `agent.max_concurrent_agents` limits concurrently executing flows, not plan steps. |
-| Hooks | `after_create`, `before_run`, `after_run`, and `before_remove` retain explicit failure behavior. |
-| Durable human handoff | A persisted review gate replaces any agent process waiting for a person. |
-| Non-authoritative status view | ASP.NET API and React render SQLite state; they do not advance it independently. |
+1. Start the ASP.NET Core host.
+2. In **Settings**, choose a **Source project** and select **Initialize and study repository**.
+3. From **Factory**, submit the customer outcome you want.
+4. Answer the Account Manager's questions and explicitly confirm the brief and flow kind.
+5. Follow the persisted Team Lead plan and agent attempts on the flow page.
+6. Review the resulting Advisory, or inspect a Delivery's **Delivery readiness** and
+   **Open reviewed preview** before selecting **Accept**.
 
-| Studio-only extension | Architectural consequence |
-| --- | --- |
-| Advisory and Delivery kinds | The flow kind determines workspace mode, duty validation, review actions, and publication eligibility. |
-| Account Manager intake | `intake-v2` and explicit confirmation precede dispatch. |
-| Dynamic Team Lead plan | `team-plan-v1` selects arbitrary enabled snapshot agents; v2 never calls `FlowPlanner`. |
-| Immutable definition snapshots | `FlowAgentSnapshot` is the sole execution source after flow creation. |
-| Duties, stages, and outcome owner | Permission and lifecycle decisions use plan metadata rather than fixed role names. |
-| Missing qualification | A structured blocker and one customer-safe explanation end in `Blocked` without a timer. |
-| Generic customer review | `CustomerReview` supports acceptance, refinement, and Advisory promotion. |
-| Linked flows | Promotion, roster repair, and scope revision create constrained successors with new workspaces and snapshots. |
-| Permission profiles | The host—not manifest prose—derives and persists the effective tool and publication policy. |
-| SQLite orchestration ledger | Plans, snapshots, attempts, events, reviews, links, and publication authorization survive restart. |
+An accepted Advisory stops without publication and can later be promoted to a fresh Delivery. An
+accepted Delivery continues to its planned post-approval Publish step and reaches `Approved` only
+after the host verifies the published result.
 
-## Agent catalog
+## System boundary
 
-`AgentCatalogLoader` parses `.github\agents\*.agent.md` into an in-memory candidate. `AgentCatalog`
-publishes it atomically only after required-definition validation succeeds and exposes both catalog
-readiness and the last error through the API.
-
-| Agent | Definition rule | Runtime rule |
-| --- | --- | --- |
-| Account Manager | Required | Non-switchable; handles intake, refinement normalization, and customer-safe blocker explanations. |
-| Team Lead | Required | Non-switchable; creates every v2 downstream plan. |
-| Pre-mortem Sceptic | Required definition | Execution is optional/switchable; when selected, strict output, model-family separation, and round bounds apply. |
-| Analyst and every other agent | Optional | Arbitrary IDs are selectable only when valid and enabled in the captured flow snapshot. |
-
-Malformed optional definitions remain visible with diagnostics but are not selectable. Missing,
-empty, or malformed required definitions make the current catalog unready. Operators can call the
-explicit `/api/agent-catalog/reload` route after repairing files. A failed reload leaves the prior
-effective catalog available only to already-snapshotted work; new-flow admission remains closed.
-
-Creating a `studio-v2` flow captures name, description, role, instructions, definition hash, enabled
-state, required/switchable policy, source filename, timestamp, and catalog revision. Later file
-edits, deletion, reloads, and toggles never refresh that flow. An active `legacy-v1` row receives a
-one-time startup snapshot with an event documenting that historical limitation; terminal legacy
-rows remain readable without one.
-If a failed terminal legacy flow is explicitly restarted, Studio captures the then-effective
-catalog once, records that migration limitation, and still executes the legacy planner; it never
-converts or replans the row as `studio-v2`.
-
-## Workflow contract
-
-Root `WORKFLOW.md` is a strict Studio extension of the Symphony-style contract:
-
-- YAML is typed; unknown `studio` fields and invalid policy combinations are rejected.
-- Prompt variables are strict and missing values fail closed.
-- File reload is atomic. `CurrentFileValid` describes the file now on disk;
-  `HasEffectiveDefinition` and `EffectiveRevision` describe the last valid definition retained in
-  memory.
-- Current invalidity blocks new-flow admission. Existing snapshotted attempts may continue against
-  the effective LKG.
-- Every `FlowStep` stores `WorkflowRevision`, `PermissionProfile`, and the serialized
-  `EffectivePermissionJson` before Copilot CLI launch.
-- A resumed attempt reuses that exact permission document and revision. A newly-created retry starts
-  from the prior attempt's policy and may intersect it with a current valid policy only when the
-  result is stricter. It never gains a tool, URL, credential, write, or publish capability silently.
-- `agent.max_concurrent_agents` is retained for compatibility but means concurrent `FlowRun`
-  workers. Steps within one flow remain sequential.
-
-## Lifecycle ownership
-
-`FlowLifecycleCoordinator` serializes mutation commands per flow and validates state edges. Invalid
-edges throw `FlowLifecycleException`; `ApiExceptionHandler` maps it to HTTP 409.
-
-Principal transitions are:
+AI Harness Studio is a standalone .NET 10 application inspired by selected OpenAI Symphony
+orchestration ideas. It is not a Symphony implementation or drop-in replacement.
 
 ```text
-Intake -> Queued
-Queued | Reworking -> Running
-Running | Reworking -> WaitingForFeedback | Blocked | Failed
-WaitingForFeedback -> Queued | Reworking | Approved
-Failed -> Queued                  (explicit manual restart only)
-active or Blocked -> Abandoning -> Abandoned
-Running -> Approved               (verified post-approval publication)
+React + Vite dashboard
+        |
+ASP.NET Core API and background worker
+        |
+WorkflowEngine + guarded lifecycle coordinators
+        |
+Copilot CLI agent turns in per-flow workspaces
+        |
+SQLite orchestration ledger
 ```
 
-Recovery has one additional guarded operation, `Running | Reworking -> Queued`, used only after
-interrupted attempts have been reconciled. The flow detail page exposes this as an explicit escape
-hatch for execution that stopped progressing after system sleep, terminal loss, or another runtime
-interruption. It cancels only that flow's worker, inspects the persisted Copilot journal, and
-requeues the same attempt with its workspace, session identity, workflow revision, and effective
-permission ceiling intact. API handlers and coordinators do not assign `FlowRun.Status` directly.
-Step state plus append-only `FlowEvent` entries make execution, materialization, recovery, review,
-failure, and cleanup visible.
+The host is authoritative. Agent output proposes plans, handoffs, QA facts, and customer-facing
+outcomes; host code validates those documents, derives permissions and readiness, changes lifecycle
+state, materializes artifacts, and performs publication.
 
-### Advisory lifecycle
+Independent flows can use separate worker slots. Steps within one flow execute sequentially.
 
-```mermaid
-flowchart TD
-    A[Request] --> B[Account Manager intake-v2]
-    B --> C{Explicit confirmation}
-    C -->|Correction| B
-    C -->|Advisory confirmed| D[Queued]
-    D --> E[Team Lead team-plan-v1]
-    E -->|MissingQualification| F[Account Manager explains once]
-    F --> G[Blocked]
-    G -->|Scope revision or roster repair| H[Linked flow with fresh snapshot]
-    E -->|Planned| I[Sequential optional workers]
-    I --> J[Final outcome owner: flow-outcome-v1]
-    J --> K[Generic CustomerReview]
-    K -->|Refinement| L[Same workspace and snapshot, next iteration]
-    L --> E
-    K -->|Accept| M[Approved and idle]
-    M -->|Promote later| N[One linked Delivery with clean seed]
-```
+## Configuration sources
 
-Advisory uses a guarded copied source snapshot. Snapshot ownership is journaled before the atomic
-final move, so restart can adopt only a matching flow/source-baseline orphan and never arbitrary
-content. Abandonment repeats the metadata/nonce/marker/baseline ownership check before recursive
-deletion; an unowned or changed deterministic-path collision is preserved and recorded as a
-cleanup diagnostic. Hooks, source mutation, shell tools, publication credentials, and remote publication are
-disabled. Declared text/Markdown/CSV/JSON artifacts are host-materialized only after a byte-for-byte
-baseline check. Each materialization uses an iteration/outcome-hash-specific directory and persists
-its directory, limits, outcome hash, and per-file identity; discovery never reinterprets an accepted
-outcome with the current `WORKFLOW.md`. Historical `advisory-artifacts-v1` events are adapted only
-as typed read-only policies, preserving their legacy artifact-root layout without allowing new v2
-materializations to use that layout.
-
-### Delivery lifecycle
-
-```mermaid
-flowchart TD
-    A[Request] --> B[Account Manager intake-v2]
-    B --> C{Explicit confirmation}
-    C -->|Correction| B
-    C -->|Delivery confirmed| D[Queued]
-    D --> E[Team Lead team-plan-v1]
-    E -->|MissingQualification| F[Blocked; slot released]
-    E -->|Planned| G[Sequential pre-review workers]
-    G --> H[Final Verify + outcome owner: outcome-qa-v2 and flow-outcome-v1]
-    H --> S[Host seals exact reviewed candidate identity]
-    S --> I[Generic CustomerReview]
-    I -->|Refinement| J[Account Manager normalizes]
-    J --> K[New iteration, same workspace and snapshot]
-    K --> E
-    I -->|Accept| L[Persist publication authorization]
-    L --> M[Materialize read/shell-only Publish semantic root; skip hooks]
-    M --> P[Host publishes sealed commit/tree identities]
-    P -->|Remote and local identity verified| N[Approved]
-    P -->|Failed or bytes changed| O[Failed; authorization retained]
-    O -->|Manual restart| M
-```
-
-There is no v2 lifecycle dependency on `software-engineer`, `quality-engineer`,
-`release-engineer`, or `product-manager`. Those names remain legitimate optional catalog entries
-and remain part of the `legacy-v1` pipeline, prompts, and historical records.
-
-## Dynamic contracts
-
-### `team-plan-v1`
-
-Team Lead receives the confirmed brief and the exact enabled optional snapshot roster as `Id`,
-`Name`, and `Description`. The strict document contains:
-
-- one or more ordered `BeforeReview` steps for a valid plan;
-- exact snapshot `AgentId` values, with repeated agent IDs allowed under distinct step IDs;
-- canonical lowercase kebab-case plan-step IDs with case-insensitive uniqueness; `team-plan`,
-  `account-manager:...`, and `pre-mortem:...` are host-reserved and rejected;
-- acyclic dependencies on lower-order steps;
-- bounded assignment and justification text;
-- `PlanDuty` values (`Analyze`, `Design`, `Implement`, `Verify`, `PrepareOutcome`, `Publish`);
-- `PlanStage` (`BeforeReview` or `AfterApproval`);
-- one final pre-review outcome owner with both `Verify` and `PrepareOutcome`, as the sole
-  verification step after every candidate-changing dependency;
-- bounded task profiles and optional pre-mortem checkpoints; and
-- either `Planned` or an exact `MissingQualification` document.
-
-Delivery requires implementation, one final combined verification/outcome-preparation step, and
-exactly one `AfterApproval` Publish-only step. Previously accepted plans that separated verification
-from a later outcome owner retain their immutable plan document; manual recovery reorders only the
-pending execution attempts so the deferred owner prepares the candidate before verification retries.
-Advisory forbids Implement, Publish, and AfterApproval. Only
-pre-review steps are initially materialized. Execution follows the deterministic order one step at
-a time; fan-out/fan-in and an integration join are explicitly deferred. Before each v2 worker
-attempt, the engine resolves the accepted plan's declared dependency graph and selects the latest
-effective completed attempt for every direct dependency, including retries and revisions. The
-prompt host gives every direct result a fair bounded allocation with an explicit clipping marker,
-adds ancestors only when space remains, and never substitutes unrelated recent output.
-
-### `flow-outcome-v1`
-
-The declared outcome owner returns one normalized customer-facing goal, summary, and bounded
-implementation-detail list. Advisory may declare bounded safe artifacts. The result is the durable
-source for `CustomerReview` and for the clean promotion seed.
-
-`MissingQualification` persists an operator-facing summary, exact gaps, rationale, and suggested
-agent. Account Manager runs once to create a distinct customer-safe message. The parent then remains
-immutable and `Blocked`; repair actions create a linked flow rather than mutating or retrying it.
-
-## Review, refinement, and links
-
-`HandoffGateRecord` stores the generic review and typed `ReviewDecision`.
-
-- Direct buttons are already typed and never invoke Copilot. Free-text feedback is request-hashed
-  against the current gate/iteration and classified once by the snapshotted Account Manager in the
-  existing isolated workspace. The visible step has the host-owned `ReviewClassification`
-  invocation and `ReadOnlySource`; malformed `review-feedback-v1` receives one bounded correction
-  before failing closed. An ambiguous result persists only the safe clarification and leaves the
-  gate, status, and iteration unchanged.
-- Advisory acceptance ends the flow without publication.
-- Advisory refinement increments the same flow iteration and reuses its workspace and snapshot.
-- Advisory promotion atomically accepts the reviewed result and creates at most one linked Delivery
-  for `(parent, iteration, AdvisoryPromotion)`.
-- Delivery refinement also reuses the flow workspace and snapshot.
-- Delivery acceptance is durable authorization; only then is the one planned Publish semantic root
-  materialized.
-
-### Host-derived Delivery readiness
-
-`studio-v2` Delivery flows carry a separate host-owned readiness aggregate. It is the only
-authorization input for review, waiver, acceptance, publication, and final approval; agent prose and
-`HANDOFF_STATUS: COMPLETE` are display and diagnostics only.
-
-- The Team Lead's Delivery `team-plan-v1` must declare `AcceptanceCriteria` (`DeliveryAcceptancePlan`,
-  stable `AC-000` ids). The host hashes the plan and persists it as
-  `delivery.acceptance-plan-recorded`.
-- The plan step with the `Verify` duty must return a strict `outcome-qa-v2` document. The host
-  injects the exact acceptance plan hash, the planned criteria, and the host-issued evidence
-  registry into that turn's assignment, then validates exhaustive criterion coverage, exact enum
-  casing, duplicate properties, bounds, evidence-identifier membership, and risk classification,
-  derives the verdict itself, and persists the exact bytes as `delivery.readiness-qa-recorded`. An
-  invalid contract fails the turn closed.
-- Evidence identifiers are host-owned. Each completed `BeforeReview` worker step, and the
-  verification step itself before dispatch, records `delivery.readiness-evidence-recorded` with
-  deterministic `EV-Snnn-nnn` identifiers derived from the host execution record and its observed
-  tool calls. Membership in that registry is mandatory, so a fabricated identifier can never
-  authorize a verified criterion and an empty registry fails closed.
-- After the candidate is sealed, `DeliveryReadinessPolicy` derives one of `ReadyToApprove`,
-  `NeedsCustomerWaiver`, `NeedsRefinement`, or `Blocked` in that precedence and writes an immutable
-  `DeliveryReadinessSnapshotRecord` bound one-to-one to a `ReviewedCandidateRecord`. Unique partial
-  indexes allow exactly one active snapshot and one active reviewed candidate per flow.
-- `WorkflowEngine` opens an ordinary `CustomerReview` only for `ReadyToApprove`. A
-  `NeedsCustomerWaiver` result opens the separate `CustomerWaiver` gate; `NeedsRefinement` and
-  `Blocked` open no customer gate at all and record a typed blocker.
-- `POST /api/flows/{flowId}/readiness-waiver` records immutable `ReadinessWaiverRecord` receipts for
-  the exact enumerated `WaiverRequired` risk ids, then re-derives the same QA facts and opens the
-  ordinary review. Acceptance criteria and `Blocking` risks are schema-invalid waiver targets.
-- Review, waiver, and publication requests carry `reviewedCandidateId`, `readinessRevision`, and
-  `readinessContractHash`. For a Delivery readiness flow all three are mandatory; an omitted value
-  is a stale tab and returns `readiness.review-stale`. A stale or non-ready binding returns an
-  RFC 9457 `409` with a stable `code` (`readiness.not-ready`, `readiness.waiver-required`,
-  `readiness.waiver-not-applicable`, `readiness.candidate-stale`, `readiness.review-stale`,
-  `readiness.reconciliation-required`, `readiness.publication-not-authorized`) and never resolves a
-  gate.
-- `POST /api/flows/{flowId}/readiness-resolution` is the typed way out of a non-releasable state.
-  `NeedsRefinement` accepts only `RequestRefinement` (queues a new iteration); `Blocked` accepts
-  `Continue` (re-queues the same iteration), `Replan` (new iteration), or `Abandon` (delegated to
-  the durable abandonment service). Every resolution supersedes the active readiness snapshot and
-  candidate binding, and none of them can accept a result, grant a waiver, or resolve a gate.
-- `LoadCurrentAsync` rejects a readiness row whose persisted state or hash disagrees with its
-  canonical contract JSON, so durable state edited outside the derivation path fails closed.
-- Restart reconciliation never transitions a studio-v2 Delivery flow to `Approved` directly. A
-  publication that completed inside the crash window is reauthorized against the current readiness,
-  accepted review, and journal binding and then completed through `CompletePublishedDelivery`;
-  otherwise a denial event is recorded and the flow stays unapproved.
-- `VerifiedCandidatePublisher` re-reads the readiness rows before any token lookup, Git command, or
-  journal mutation, stamps `ReviewedCandidateId`, `ReadinessSnapshotId`, `ReadinessContractHash`,
-  `CustomerReviewGateId`, and `WaiverSetHash` onto every `ReviewedPublicationRecord`, and
-  `PublishedOutcomeVerifier` rechecks the same binding after remote verification.
-- `FlowLifecycleCoordinator.Transition` refuses `Approved` for a `studio-v2` Delivery flow.
-  `OpenWaiverReview`, `OpenCustomerReview`, `QueueApprovedPublication`, and
-  `CompletePublishedDelivery` are the only guarded paths, and each requires the derived state plus an
-  exact candidate binding.
-- Startup reconciliation is fail-closed and idempotent: a pre-readiness `studio-v2` Delivery flow
-  with review history gains a `LegacyUnverified` snapshot, any unresolved review is superseded, and
-  the projection renders **Published - readiness unverified** under `Blocked` instead of green.
-- The exact candidate is sealed before the review gate: all repository HEAD/tree identities plus
-  bounded scaffold/preview identity are persisted as `reviewed-candidate-v1`, tied to flow,
-  iteration, outcome owner, plan-step key, and outcome-contract hash.
-- Delivery preview metadata is projected from the verified preview manifest, and file responses
-  recheck the requested length and digest before serving an in-memory copy. Missing, stale, or
-  mutated reviewed-candidate identity returns a conflict without file bytes.
-- While a studio Delivery is awaiting its unresolved review, the detail projection exposes a
-  distinct `ReviewedPreviewUrl` only after current seal verification finds a renderable preview.
-  The UI labels it **Open reviewed preview**. After approval it disappears; the separately verified
-  published `OutcomeUrl` remains labelled as the published outcome.
-- The studio-v2 Publish Copilot turn has no create/edit tools, receives only read plus the local
-  shell needed for packaging inspection, denies supported source-mutating commands, receives no
-  publication credentials, and runs no workspace hooks. Free-text review classification likewise
-  suppresses every workspace hook and verifies the reviewed candidate before and after its
-  read-only turn. The trusted host—not the agent—pushes the sealed commits and creates PR metadata,
-  then rechecks the same candidate bytes.
-- Failed publication retains authorization and is retried only through explicit manual restart.
-
-### Reviewed previews and non-authoritative live demos
-
-The reviewed preview and live demo have deliberately different trust boundaries:
-
-- `.customer-preview\<variant>` remains part of the sealed candidate manifest. Studio rechecks every
-  reviewed file length and SHA-256 digest and serves it with `connect-src 'none'`; this immutable,
-  network-disabled representation is the customer-review artifact.
-- A live demo is opt-in convenience only. It does not contribute evidence, readiness, waiver,
-  acceptance, publication authorization, or final approval. Legacy candidates without a sealed
-  manifest remain offline-preview-only.
-- The only launch source is a sealed
-  `.customer-preview\<variant>\customer-demo.json`. `customer-demo-v1` rejects unknown, duplicate,
-  missing, or case-mismatched properties and accepts only `Version`, `ArtifactId`, `LaunchProfile`,
-  `WorkingDirectory`, `Arguments`, `HealthPath`, and `StartupTimeoutSeconds`. Arguments contain
-  exactly one `{port}` token. npm application arguments structurally require exactly one explicit
-  `--host`, `--listen`, or `--bind` option whose value is exactly `127.0.0.1`; wildcard, hostname,
-  duplicate, conflicting, substring-only, and unknown host-affecting forms fail. Paths remain under
-  the flow workspace.
-- `CustomerDemoLaunchPolicy` centrally maps the approved `npm`, `dotnet`, and `python` profiles to
-  resolved host executables. `npx` and package acquisition are unsupported. Each profile has a
-  strict argument grammar; manifests cannot name an executable, shell string, host-affecting
-  switch, or path outside the workspace.
-  Candidate code still executes with the local user's authority, which is why launch is explicit,
-  loopback-only, bounded, and never automatic. This generic policy does not attempt dependency
-  installation; missing tools or dependencies fail visibly.
-- `DemoInstanceRecord` persists the exact candidate/manifest binding, workspace and launch identity,
-  PID plus process-start identity, assigned port, state, health timestamps, and bounded diagnostics.
-  A unique binding index provides one row per candidate artifact; a partial unique index prevents
-  two active Studio records from claiming one port.
-- `DemoRuntimeManager` serializes operations per flow/artifact. It probes a bounded configurable
-  loopback range, claims the port durably, starts a structured `ProcessStartInfo.ArgumentList`,
-  injects the selected port, and requires a bounded HTTP health check. Before `Running`, reuse,
-  reconciliation, or proxy access, the host also verifies that the exact `127.0.0.1` listener is
-  owned by the recorded process or its descendant; wildcard, foreign, mixed, and unverifiable
-  listeners fail closed. Failure stops only the identity-matched owned process and persists
-  `Failed`.
-- Startup reconciliation handles each active row independently. It validates the exact candidate,
-  manifest, workspace, launch, PID/start, and health binding once and caches a proxy lease; stale
-  owned processes are stopped, ownership mismatches are never killed, and Studio never auto-starts
-  demos.
-- `/api/demos/{instanceId}/{**path}` uses only that reconciled lease, exact persisted equality,
-  process and live listener ownership, and cached health to proxy to the persisted loopback port.
-  It does not walk workspace links or revalidate the reviewed candidate per asset. Health checks
-  are rate-limited, require consecutive failures, and emit only actual state transitions.
-- Every proxy response, including redirects and failures, applies CSP `sandbox` without
-  `allow-same-origin` and uses `Cross-Origin-Resource-Policy: cross-origin` so subresources remain
-  loadable from the sandbox's opaque origin. Opaque-origin CORS is terminated at the proxy and
-  translated to the owned upstream origin, preserving proxied `POST`, `PUT`, `PATCH`, and `DELETE`
-  without giving candidate JavaScript harness-origin authority. Redirects stay under the stable
-  instance prefix and trailing slashes are preserved. WebSockets are intentionally unsupported.
-- Customer decisions queue durable work before the best-effort immediate revocation call.
-  `FlowWorker` independently repeats and confirms revocation before any queued execution; a
-  transient revocation failure leaves the flow queued and retries without invoking an agent.
-- Every state change appends a `FlowEvent`. Harness lifecycle mutations use the
-  `X-AI-Harness-Request` local-request guard; only the exact instance proxy route is exempt for
-  opaque-origin application traffic. Stale candidate or manifest identities return typed
-  conflicts.
-
-Promotion transfers only a bounded `advisory-promotion-seed-v1` containing the accepted goal and
-implementation details. It does not copy messages, tools, sessions, steps, plan documents, events,
-or the parent workspace. The child runs normal Account Manager and Team Lead stages with a fresh
-snapshot and workspace. On the first promoted-child turn only, Account Manager may confirm directly
-when the host validates Delivery kind, exact goal, and the complete normalized implementation-detail
-ordered list against the durable seed; any one-character or ordering drift fails closed. The
-canonical seed accepts the complete bounded `flow-outcome-v1` goal plus all 24 implementation
-details. To stay within the Copilot CLI command-line envelope, the host stages that canonical JSON
-once in the session's read-only context root and places only its path and SHA-256 identity in the
-prompt; model output is still parsed and host-validated, so the file is never a success fallback.
-Startup reconciliation finds a linked Intake child with no attempt or with its canonical initial
-Account Manager step still `Pending`/`Running`. It creates no replacement step: pending work follows
-normal intake, a valid completed journal is applied, an interrupted deterministic session is
-resumed, and missing/invalid journal state becomes a visible manual-retry failure. Qualification
-roster repair and scope revision use the same clean-successor rule. SQLite uniqueness constraints
-and guarded coordinators make repeated requests idempotent. A scope revision child additionally
-stores the normalized request hash; an identical replay returns that child, while a materially
-different request conflicts because the parent iteration can have only one successor of that link
-kind.
-
-The old `/feedback` and `/decision` routes and legacy DTO fields remain. For `studio-v2` they are
-compatibility wrappers over generic review behavior; for `legacy-v1` they retain Product Manager and
-`Release`-gate semantics.
-
-## Permission boundary
-
-| Profile | Allowed purpose | Important denials |
-| --- | --- | --- |
-| `ReadOnlySource` | Intake, planning, review classification, blocker explanation, Advisory workers, read-only analysis | No writes, shell, publication tools, custom MCPs, or publication credentials. |
-| `WorkspaceWrite` | Delivery implementation, verification, local outcome preparation | Isolated-workspace write/shell only; supported remote-publish commands, destinations, and credentials denied. |
-| `Publish` | One accepted Delivery's planned Publish step | Requires a durable accepted `CustomerReview`, exact plan-step key, AfterApproval stage, Publish-only duty, and matching `reviewed-candidate-v1`; create/edit, supported mutation commands, credentials, remote tools, and workspace hooks are withheld from Copilot while the host performs exact-object publication. |
-| `PreMortemReadOnly` | Optional pre-mortem | Read/search/research only, no write/shell/publish, and a different model family from the reviewed step. |
-
-Manifest frontmatter and instructions cannot grant capabilities. The host persists an explicit
-`ExecutionInvocationKind` (`Intake`, `Planning`, `Worker`, `PreMortem`,
-`ReviewClassification`, `BlockerExplanation`, or `Publication`) and derives policy from that
-host-owned lifecycle value plus flow kind, stage, duties, and durable review state. Agent IDs and
-display names remain audit/session identity only and are never authorization inputs. The host then
-applies workflow ceilings and additional deny rules.
-Publication credentials are separated from all non-publish turns. Deny-by-default CLI arguments,
-workspace containment, guarded Git metadata, immutable candidate identity, and exact-target host
-publication provide strong enforcement on supported paths.
-
-This remains a trusted-host design, **not** kernel or adversarial OS sandbox isolation. Without a
-separate OS identity or sandbox, a hostile same-user process that already knows an authoritative
-absolute path may bypass application-level path discovery controls.
-
-## Durable state and restart reconciliation
-
-SQLite runs in write-ahead logging mode. Core durable tables are:
-
-- `Flows`: lifecycle, kind, contract version, lineage, blockers, workspace, outcome, and timestamps.
-- `FlowAgentSnapshots`: immutable per-flow execution definitions.
-- `FlowPlanDocuments`: one accepted plan per flow iteration.
-- `FlowSteps`: sequential attempts, stable semantic roots, sessions, workflow revisions, effective
-  permissions, status, evidence, and retry links.
-- `GateRecords`: generic customer review, legacy release, and outcome-resolution decisions.
-- `ReviewedPublicationRecords`: one row per reviewed studio-v2 publication repository, holding the
-  publication root, reviewed fingerprint, remote repository, branch, head/tree, pull request URL,
-  and the stage reached (`Intent`, `BranchPublished`, `PullRequestOpened`, `Completed`).
-- `FlowEvents`: append-only status, materialization, recovery, failure, and agent phase-transition
-  evidence. Repeated callbacks within one phase are not duplicated; individual tool calls remain
-  attached to their `FlowStep`.
-- `FlowMessages`, `TaskProfiles`, routing tables, tool calls, outcomes, and learnings.
-
-The dashboard presents this ledger in causal order from oldest to newest, labels each step event
-with its agent attempt, and collapses low-level runtime phase detail. Console application logs use
-local timestamps, one line per event, and structured flow, step, session, model, duration, and
-outcome fields. Entity Framework SQL command logging is disabled; persistence failures still flow
-through normal warning and error categories.
-
-At startup, `CopilotSessionJournal` and `WorkflowEngine` reconcile:
-
-| Durable case | Recovery action |
+| Source | Purpose |
 | --- | --- |
-| Completed valid journal attempt | Complete the existing `FlowStep` once and continue downstream. |
-| Interrupted resumable attempt | Stop only a verified orphan process, retain the session ID, reset the same attempt to pending, and queue it once. |
-| Live flow manually recovered after suspend or terminal loss | Cancel only its current worker, run the same journal reconciliation, preserve the attempt contract and workspace, and requeue it. |
-| Linked Intake with a pending initial Account Manager step | Execute that exact durable step once through the normal intake coordinator. |
-| Linked Intake with a running initial Account Manager step | Apply a current valid journal result, resume the verified interrupted session, or record a visible manual-retry failure. |
-| Failed attempt | Stay `Failed` until explicit manual restart. |
-| Open MissingQualification | Stay `Blocked`; do not run Account Manager again and do not schedule a timer. |
-| Open customer review | Stay `WaitingForFeedback`; do not recreate or enqueue the review. |
-| Accepted Delivery without publication materialization | Recreate the one planned publication root from the durable review and queue it. |
-| Failed accepted publication | Stay `Failed`; preserve authorization and semantic root for manual restart. |
-| Interrupted reviewed publication | Re-read `ReviewedPublicationRecords` and the publication events first, reconcile the remote branch head with `git ls-remote` and the pull request identity across open, closed, and merged states, then finish only the repositories that are not yet `Completed`. |
-| Accepted Advisory | Stay idle and keep idempotent promotion available. |
-| Active `legacy-v1` | Requeue on its static planner/release path using its migration-time snapshot. |
-| Terminal `legacy-v1` | Remain readable without requiring a snapshot. |
+| `WORKFLOW.md` | Typed runtime limits, required duties, permission ceilings, artifact limits, and prompt templates. |
+| `.github\agents\*.agent.md` | Agent identity, description, role, and instructions. |
+| Studio settings | Source project, repository knowledge, Delivery artifact type, routing strategy, and correction limits. |
+| `data\ai-harness.db` | Durable flow, plan, execution, review, readiness, and publication state. |
+| `data\worktrees` | Isolated per-flow workspaces. |
 
-Reconciliation never refreshes a v2 snapshot, invents historical instructions, creates another
-accepted plan, review, publication root, or linked successor, retries missing qualification, or
-runs two attempts for one flow. `FlowWorker` and `WorkflowEngine` both deduplicate execution claims.
-A blocked flow returns from `RunAsync`, releasing its concurrent-flow slot.
+`WorkflowDefinitionProvider` reloads `WORKFLOW.md` atomically. A valid definition becomes the
+effective definition; an invalid current file blocks new work without partially applying its
+contents. A started attempt keeps its persisted workflow revision and effective permission
+document. A retry can preserve or tighten that permission, but cannot silently gain authority.
+
+`AgentCatalogLoader` reads the agent files and `AgentCatalog` publishes a valid catalog atomically.
+Use **Reload catalog** after changing an agent definition. Invalid optional definitions remain
+visible for diagnosis but cannot be selected. An invalid required definition blocks new work.
+
+## One dynamic, duty-based flow
+
+All work uses the same dynamic planner and executor. Agent names identify who performs a step;
+duties and host-owned lifecycle state determine what the step may do.
+
+### Intake and immutable roster
+
+Creating a flow captures the effective agent definitions and their enabled state in
+`FlowAgentSnapshot` rows. Instructions, definition hashes, enabled flags, and policy flags are then
+fixed for that flow. Catalog reloads and toggles affect only flows created afterward.
+
+The Account Manager uses its captured definition to clarify the request and produce a strict
+`intake` brief. The customer must explicitly confirm that brief and choose Advisory or Delivery
+before execution can be queued.
+
+The catalog has three special definitions:
+
+| Agent | Rule |
+| --- | --- |
+| Account Manager | Required and always enabled. Owns intake, refinement normalization, and customer-safe blocker explanations. |
+| Team Lead | Required and always enabled. Creates the downstream plan. |
+| Pre-mortem Sceptic | Required definition but switchable. Runs only at selected pre-review checkpoints. |
+
+Every other definition is optional and switchable. In particular, **Quality Engineer is optional**.
+The Team Lead may assign `Verify` to any enabled suitable agent in the immutable roster. Selecting
+an independent Quality Engineer is the stronger assurance choice because it separates
+implementation from verification, but the runtime does not require that identity.
+
+### Team Lead plan
+
+After confirmation, the Team Lead receives the brief and the exact enabled optional roster from the
+flow snapshot. It returns either a strict `team plan` or `MissingQualification`.
+
+A valid plan contains ordered steps with:
+
+- an exact snapshotted `AgentId`;
+- `BeforeReview` or `AfterApproval` stage;
+- one or more duties: `Analyze`, `Design`, `Implement`, `Verify`, `PrepareOutcome`, or `Publish`;
+- dependencies that name earlier plan steps;
+- an assignment, selection rationale, and task profile;
+- exactly one final `BeforeReview` outcome owner; and
+- Delivery acceptance criteria when the flow kind is Delivery.
+
+The plan validator rejects disabled or unknown agent IDs, core agents selected as workers, duplicate
+or cyclic dependencies, dependencies on later steps, invalid stages or duties, and missing required
+duties. The accepted plan is immutable for its flow iteration.
+
+Required duties are independent of agent names:
+
+| Flow kind | Required plan shape |
+| --- | --- |
+| Advisory | At least one `BeforeReview` worker and an outcome owner with `PrepareOutcome`; no `Implement`, `Publish`, or `AfterApproval` step. |
+| Delivery | `Implement`, `Verify`, `PrepareOutcome`, and `Publish`; exactly one `AfterApproval` step whose sole duty is `Publish`. |
+
+For Delivery, the final `BeforeReview` outcome owner must be the only step with `Verify` and must
+also carry `PrepareOutcome`. Every candidate-changing step, including preview preparation, must be
+an earlier dependency. The combined owner verifies the complete candidate and returns both the
+strict QA document and the customer-facing `flow outcome`.
+
+### Sequential dependency execution
+
+`WorkflowEngine` materializes only pre-review workers before customer review, orders them
+deterministically, and executes one pending attempt at a time. A dependency must point backward in
+the accepted plan. Before a worker runs, the host resolves the latest successful attempt for each
+declared dependency and provides bounded dependency results in the prompt. There is no parallel
+fan-out or integration join inside a flow.
+
+Optional pre-mortem checkpoints are inserted after their target steps. They run read-only and their
+findings are advisory input; they do not approve or reject a result.
+
+If the enabled roster cannot cover the required work, the Team Lead returns
+`MissingQualification`. The Account Manager translates it once into a customer-safe blocker and
+the flow remains `Blocked`. Roster repair or scope revision creates a linked flow with a new
+snapshot and workspace rather than altering the blocked plan.
+
+## Advisory flow
+
+Advisory work uses a guarded source snapshot and the `ReadOnlySource` permission profile. Agent
+turns cannot modify the source, run a shell, or publish.
+
+The outcome owner returns the customer-facing goal, summary, implementation details, and any
+declared artifacts. Artifacts are data in that response, not files written by the agent. Before
+opening customer review, the host:
+
+1. verifies the guarded source snapshot against its recorded baseline;
+2. validates artifact paths, count, total UTF-8 bytes, and media types;
+3. writes supported text, Markdown, CSV, and JSON artifacts under the configured
+   `.studio\advisory` area using an atomic materialization; and
+4. records artifact lengths and digests in the flow ledger.
+
+A customer can **Accept**, **Request refinement**, or **Promote to Delivery**. Refinement starts a
+new iteration in the same snapshot and workspace. Promotion creates one linked Delivery with a
+fresh snapshot, fresh workspace, and normal Account Manager intake.
+
+## Delivery flow
+
+Delivery work uses an isolated Git worktree. Pre-review duties that need to change or validate the
+candidate run under at most `WorkspaceWrite`; remote publication remains unavailable.
+
+### Readiness and reviewed candidate
+
+Delivery readiness is derived by the host from the current iteration:
+
+1. The Team Lead declares ordered acceptance criteria. The host records and hashes that plan.
+2. The host records evidence identifiers from completed steps and observed tool calls. A verified
+   criterion must cite a successful observation whose kind is allowed by that criterion; a generic
+   step-completion record is context only.
+3. The final outcome owner returns one result for every criterion and classifies residual risks.
+   It may cite only host-issued evidence identifiers and must report any confirmed requirement that
+   the acceptance plan omitted as a plan gap.
+4. The host validates the QA document and derives the verdict; prose and
+   `HANDOFF_STATUS: COMPLETE` do not authorize release. Any plan gap prevents a passing verdict.
+5. The host seals the exact candidate, including repository commit and tree identities and any
+   reviewed preview files.
+6. The host derives readiness and binds it to that sealed candidate.
+
+The customer-visible states are:
+
+| State | Result |
+| --- | --- |
+| `ReadyToApprove` | Opens ordinary customer review. The customer may accept or request refinement. |
+| `NeedsCustomerWaiver` | Opens a separate informed-consent step for specifically disclosed risks. Recording all required waivers re-derives readiness before ordinary review opens. |
+| `NeedsRefinement` | Acceptance is unavailable; the customer can request another iteration. |
+| `Blocked` | Acceptance is unavailable; the customer can continue, replan, or abandon as permitted by the host. |
+
+A failed, blocked, missing, or malformed criterion cannot be waived. Review, waiver, publication,
+and final approval re-read the current readiness and candidate binding. A stale browser request or
+changed candidate fails closed.
+
+For browser-visible work, `.customer-preview\<variant>` is part of the sealed candidate and is
+served only after length and digest checks. Its reviewed representation is network-disabled. A
+separately requested loopback live demo is convenience only and contributes no readiness evidence
+or publication authority.
+
+### Customer review and publication
+
+Only a Delivery in `ReadyToApprove` can open ordinary customer review. **Request refinement**
+supersedes the current readiness and candidate binding and starts a new iteration in the same
+workspace and snapshot.
+
+**Accept** records durable authorization for the exact reviewed candidate. The host then
+materializes the planned `AfterApproval` Publish-only step. The agent can inspect packaging under a
+governed read-and-shell policy, but cannot edit the candidate, receive publication credentials, or
+perform the remote write. The host publishes the sealed commit and tree identities, records commit
+or pull-request results, verifies the remote result against the same binding, and only then marks
+the flow `Approved`.
+
+A publication failure is visible and does not create approval. The durable authorization and
+publication identity remain available for an explicit restart.
+
+Publication recaps do not overwrite the editable Repository Knowledge baseline. The published
+commit or pull request remains isolated from the configured source checkout until the user
+integrates it; after integration, **Initialize and study repository** re-derives knowledge from the
+actual source bytes so later flows never receive claims from an unmerged branch.
+
+## Pushback and recovery
+
+Worker output must contain exactly one `HANDOFF_STATUS: COMPLETE` or
+`HANDOFF_STATUS: PUSHBACK`. Pushback also names an earlier dependency or ancestor plan-step ID and
+a bounded reason. The host rejects an unrelated or unfinished owner, records the attribution, and,
+within the configured correction limit, schedules:
+
+1. a revision attempt for the named upstream owner; then
+2. a retry of the blocked step with that revision result.
+
+Retries preserve or tighten the original permission document. Exhausting the correction limit
+fails the flow instead of bypassing the handoff.
+
+The SQLite ledger and `CopilotSessionJournal` support restart reconciliation. Completed journal
+results are applied once; interrupted resumable attempts retain their flow, workspace, semantic
+step, Copilot session identity, workflow revision, and permission ceiling. Open customer reviews
+remain waiting, accepted Delivery publication can be rematerialized from durable authorization,
+and missing-qualification blockers are not retried automatically.
+
+The flow page's **Recover stalled execution** action is limited to queued, running, or reworking
+work. It stops only the tracked worker, reconciles persisted state, and queues the flow once.
+Failed work requires the explicit **Recover failed task** action. Queue and execution claims prevent
+two workers from running the same flow concurrently.
+
+## Permission ceilings
+
+`PermissionProfileResolver` derives the requested profile from the host-owned invocation kind, flow
+kind, plan stage, duties, and durable review state, then intersects it with the limits in
+`WORKFLOW.md`.
+
+| Profile | Use | Ceiling |
+| --- | --- | --- |
+| `ReadOnlySource` | Intake, planning, Advisory workers, blocker explanation | Read/search only; no write, shell, remote publication, or publication credentials. |
+| `WorkspaceWrite` | Delivery implementation, verification, and outcome preparation | Writes and shell are restricted to the isolated workspace; remote publication remains denied. |
+| `PreMortemReadOnly` | Optional pre-mortem checkpoint | Read/search only, with no write, shell, or publication. |
+| `Publish` | Accepted Delivery's sole planned post-approval step | Host-controlled inspection only for the agent; source mutation and credentials stay denied while the host publishes the sealed objects. |
+
+Agent frontmatter, instructions, display names, and plan-selected identities cannot raise these
+ceilings. The effective permission document is persisted before execution and checked again when an
+attempt resumes.
+
+These are trusted-host controls, not an operating-system sandbox against a hostile process running
+as the same user.
+
+## Durable state and startup
+
+SQLite runs in write-ahead logging mode. The durable model includes:
+
+- `Flows`, `FlowSteps`, `FlowMessages`, and append-only `FlowEvents`;
+- `FlowAgentSnapshots` and `FlowPlanDocuments`;
+- customer gates, Delivery readiness, reviewed candidates, waivers, and publication records;
+- observed tool calls, task profiles, model-routing decisions, and learnings; and
+- live-demo process records.
+
+`FlowLifecycleCoordinator` serializes mutations per flow and guards status transitions. API and UI
+projections render persisted state; they do not independently authorize lifecycle changes.
+
+Startup calls `Database.EnsureCreatedAsync()`. It creates the current schema only when the database
+does not exist and does not update an existing schema. During development, stop Studio and recreate
+the database after entity-shape changes:
+
+```powershell
+Remove-Item .\data\ai-harness.db, .\data\ai-harness.db-wal, .\data\ai-harness.db-shm `
+  -Force -ErrorAction SilentlyContinue
+.\Start-Demo.ps1
+```
+
+This deletes local settings, flow history, reviews, and readiness records. Treat the database as
+development state rather than as an upgradeable production store.
 
 ## Runtime components
 
 | Component | Responsibility |
 | --- | --- |
-| `NewWorkAdmissionService` | Requires current workflow/catalog readiness and a configured studied project before creating work. |
-| `AgentCatalog` / `FlowAgentSnapshotService` | Atomic definitions, diagnostics, explicit reload, and immutable per-flow execution source. |
-| `IntakeCoordinator` | Executes Account Manager intake and applies the confirmation gate. |
-| `TeamPlanValidator` | Strict plan parsing, roster/dependency/duty/stage/outcome-owner validation, and MissingQualification validation. |
-| `FlowLifecycleCoordinator` | Per-flow mutation lock plus typed transition guard. |
-| `WorkflowEngine` | Sequential orchestration, materialization, execution, handoffs, review readiness, recovery, and legacy routing. |
-| `FlowQueue` / `FlowWorker` | Dispatch independent flows and deduplicate queued/running work. |
-| `ReviewCoordinator` | Generic acceptance, same-flow refinement, publication materialization, and Advisory promotion. |
-| `MissingQualificationCoordinator` | One explanation attempt and durable blocking. |
-| `LinkedFlowCoordinator` | Clean, uniquely linked successors and normal child intake. |
-| `CopilotReasoningHost` | Snapshot instructions, strict workflow prompt, persisted permissions, CLI execution, and session recovery. |
-| `WorkspaceManager` | Deterministic guarded snapshots or Delivery worktrees, containment, recovery, hooks, and cleanup. |
-| `FlowAbandonmentService` | Guarded `Abandoning` transition, process/session/workspace cleanup, then durable `Abandoned`. |
+| `IntakeCoordinator` | Account Manager turns, strict intake parsing, and explicit confirmation. |
+| `FlowAgentSnapshotService` | Immutable per-flow agent definitions and enabled state. |
+| `TeamPlanValidator` | Roster, dependency, duty, stage, outcome-owner, and acceptance-criteria validation. |
+| `WorkflowEngine` | Plan materialization, sequential execution, pushback, finalization, and reconciliation. |
+| `FlowQueue` / `FlowWorker` | Concurrent-flow scheduling, execution claims, and manual recovery. |
+| `WorkspaceManager` | Guarded Advisory snapshots and isolated Delivery worktrees. |
+| `AdvisoryArtifactCatalog` | Source-baseline verification and host-written Advisory artifacts. |
+| `DeliveryReadinessService` | Host evidence, QA validation, readiness derivation, waivers, and candidate binding. |
+| `ReviewedCandidateService` | Candidate sealing and identity revalidation. |
+| `ReviewCoordinator` | Customer decisions, refinements, promotion, and post-acceptance publication materialization. |
+| `VerifiedCandidatePublisher` / `PublishedOutcomeVerifier` | Exact-object publication and post-publication verification. |
+| `PermissionProfileResolver` | Host-derived permission profiles and workflow ceilings. |
+| `FlowLifecycleCoordinator` | Per-flow mutation lock and guarded status transitions. |
 
-## Local commands
+## Local validation
 
 Run from the repository root on Windows:
 

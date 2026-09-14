@@ -21,7 +21,8 @@ internal sealed class ScriptedProcessRunner : ProcessRunner
 
     public sealed record ProcessInvocation(
         string Executable,
-        IReadOnlyList<string> Arguments);
+        IReadOnlyList<string> Arguments,
+        string WorkingDirectory);
 
     public sealed record FakePullRequest(
         string Url,
@@ -84,7 +85,10 @@ internal sealed class ScriptedProcessRunner : ProcessRunner
         IReadOnlyDictionary<string, string?>? environmentVariables = null)
     {
         var argumentList = arguments.ToArray();
-        var invocation = new ProcessInvocation(executable, argumentList);
+        var invocation = new ProcessInvocation(
+            executable,
+            argumentList,
+            Path.GetFullPath(workingDirectory));
         lock (sync)
         {
             invocations.Add(invocation);

@@ -52,8 +52,8 @@ public sealed class HandoffGateEngineTests
     public void ResolveProposal_RecordsCustomerDecisionOnce()
     {
         using var gate = new HandoffGateEngine();
-        gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
-        var record = gate.SubmitProposal(Proposal(HandoffActionType.Release));
+        gate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Gated);
+        var record = gate.SubmitProposal(Proposal(HandoffActionType.Advance));
 
         var resolved = gate.ResolveProposal(
             record.Id,
@@ -71,9 +71,9 @@ public sealed class HandoffGateEngineTests
     public void SupersedeProposal_ResolvesAKillSwitchBlockedGate()
     {
         using var gate = new HandoffGateEngine();
-        gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
+        gate.SetTrustLevel(HandoffActionType.CustomerReview, HandoffTrustLevel.Gated);
         gate.EngageKillSwitch();
-        var record = gate.SubmitProposal(Proposal(HandoffActionType.Release));
+        var record = gate.SubmitProposal(Proposal(HandoffActionType.CustomerReview));
 
         var superseded = gate.SupersedeProposal(
             record.Id,
@@ -85,34 +85,16 @@ public sealed class HandoffGateEngineTests
         Assert.False(superseded.Approved);
     }
 
-    [Fact]
-    public void SetTrustLevel_RejectsAutomaticRelease()
+    [Theory]
+    [InlineData(HandoffActionType.CustomerReview)]
+    [InlineData(HandoffActionType.CustomerWaiver)]
+    public void SetTrustLevel_RejectsAutomaticHumanGate(
+        HandoffActionType actionType)
     {
         using var gate = new HandoffGateEngine();
 
         Assert.Throws<InvalidOperationException>(() =>
-            gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Auto));
-    }
-
-    [Fact]
-    public void OutcomeResolution_IsAlwaysHumanGated()
-    {
-        using var gate = new HandoffGateEngine();
-        gate.SetTrustLevel(
-            HandoffActionType.OutcomeResolution,
-            HandoffTrustLevel.Gated);
-
-        var record = gate.SubmitProposal(
-            Proposal(HandoffActionType.OutcomeResolution));
-
-        Assert.Equal(
-            HandoffGateDecision.AwaitingHumanApproval,
-            record.Decision);
-        Assert.Contains("Operator resolution", record.Reason);
-        Assert.Throws<InvalidOperationException>(() =>
-            gate.SetTrustLevel(
-                HandoffActionType.OutcomeResolution,
-                HandoffTrustLevel.Auto));
+            gate.SetTrustLevel(actionType, HandoffTrustLevel.Auto));
     }
 
     [Fact]
@@ -234,8 +216,6 @@ public sealed class WorkflowDefinitionTests
             ---
             future_symphony_extension:
               value: accepted
-            studio:
-              version: 1
             ---
             Prompt
             """);
@@ -245,13 +225,12 @@ public sealed class WorkflowDefinitionTests
             ---
             studio:
               version: 1
-              surprise: true
             ---
             Prompt
             """);
         var exception = Assert.Throws<WorkflowConfigurationException>(() =>
             new WorkflowLoader().Load(rejected.Path));
-        Assert.Contains("studio.surprise", exception.Message);
+        Assert.Contains("studio.version", exception.Message);
     }
 
     [Fact]
@@ -260,7 +239,6 @@ public sealed class WorkflowDefinitionTests
         using var unsafePermission = WorkflowArtifact.Create("""
             ---
             studio:
-              version: 1
               flow_kinds:
                 advisory:
                   required_duties: [PrepareOutcome]
@@ -276,7 +254,6 @@ public sealed class WorkflowDefinitionTests
         using var missingDuty = WorkflowArtifact.Create("""
             ---
             studio:
-              version: 1
               flow_kinds:
                 delivery:
                   required_duties: [Implement, Verify, PrepareOutcome]
@@ -296,8 +273,6 @@ public sealed class WorkflowDefinitionTests
             ---
             agent:
               max_concurrent_agents: 3
-            studio:
-              version: 1
             ---
             Work on {{ task }}.
             """);
@@ -315,7 +290,6 @@ public sealed class WorkflowDefinitionTests
         File.WriteAllText(artifact.Path, """
             ---
             studio:
-              version: 1
               invalid_field: true
             ---
             Invalid current file
@@ -511,7 +485,7 @@ public sealed class WorkflowDefinitionTests
             }
 
             [Fact]
-            public async Task SnapshotsRemainImmutableAndLegacyMigrationSkipsTerminalFlows()
+            public async Task SnapshotsRemainImmutableForNewFlows()
             {
                 await using var artifact = await CatalogArtifact.CreateWithDatabaseAsync();
                 await artifact.Catalog.LoadAsync();
@@ -519,18 +493,15 @@ public sealed class WorkflowDefinitionTests
                     artifact.Factory,
                     artifact.Catalog);
                 Guid activeId;
-                Guid terminalId;
                 await using (var database = await artifact.Factory.CreateDbContextAsync())
                 {
                     var active = Flow("active", FlowStatus.Intake);
-                    var terminal = Flow("terminal", FlowStatus.Approved);
                     activeId = active.Id;
-                    terminalId = terminal.Id;
-                    database.Flows.AddRange(active, terminal);
+                    database.Flows.Add(active);
+                    snapshots.CaptureForNewFlow(database, active);
                     await database.SaveChangesAsync();
                 }
 
-                Assert.Equal(1, await snapshots.MigrateLegacyNonterminalAsync());
                 var original = await snapshots.GetManifestAsync(activeId, "account-manager");
                 var originalAnalyst = await snapshots.GetManifestAsync(activeId, "analyst");
                 var originalPreMortem = await snapshots.GetAgentsAsync(activeId);
@@ -557,11 +528,6 @@ public sealed class WorkflowDefinitionTests
                 Assert.True((await snapshots.GetAgentsAsync(activeId)).Single(item =>
                     item.Id == "pre-mortem-sceptic").Enabled);
                 await using var verify = await artifact.Factory.CreateDbContextAsync();
-                Assert.False(await verify.FlowAgentSnapshots.AnyAsync(item =>
-                    item.FlowRunId == terminalId));
-                Assert.True(await verify.FlowEvents.AnyAsync(item =>
-                    item.FlowRunId == activeId &&
-                    item.Type == "flow.agent-snapshot-migrated"));
 
                 var newFlow = Flow("new", FlowStatus.Intake);
                 verify.Flows.Add(newFlow);
@@ -583,7 +549,6 @@ public sealed class WorkflowDefinitionTests
                 Title = title,
                 OriginalRequest = title,
                 Status = status,
-                ContractVersion = "legacy-v1"
             };
 
             private sealed class CatalogArtifact : IAsyncDisposable, IDisposable

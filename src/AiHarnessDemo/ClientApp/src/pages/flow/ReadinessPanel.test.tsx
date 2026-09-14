@@ -19,7 +19,6 @@ function readiness(
 ): DeliveryReadinessDto {
   return {
     state: "ReadyToApprove",
-    reconciliation: "Current",
     revision: 1,
     contractHash: `sha256:${"a".repeat(64)}`,
     reviewedCandidateId: candidateId,
@@ -57,7 +56,6 @@ function flow(overrides: Partial<FlowDetailDto> = {}): FlowDetailDto {
     originalRequest: "Harden checkout retries.",
     consolidatedRequest: "{}",
     kind: "Delivery",
-    contractVersion: "studio-v2",
     parentFlowRunId: null,
     parentIteration: null,
     linkKind: null,
@@ -103,26 +101,6 @@ function flow(overrides: Partial<FlowDetailDto> = {}): FlowDetailDto {
       publicationStatus: "AwaitingApproval"
     },
     publicationStatus: "AwaitingApproval",
-    outcomeVerification: {
-      status: "LegacyUnverified",
-      legacyUnverified: true,
-      currentRound: 0,
-      maxRounds: 0,
-      planHashPrefix: "",
-      candidateFingerprintPrefix: "",
-      candidateFingerprint: "",
-      releaseGateId: null,
-      criteria: [],
-      evidence: [],
-      latestResults: [],
-      failedCriterionIds: [],
-      pendingOwnerRoles: [],
-      stale: false,
-      previewRequired: false,
-      releaseReady: false,
-      verifiedAt: null,
-      humanResolutionGate: null
-    },
     deliveryReadiness: readiness(),
     ...overrides
   };
@@ -219,7 +197,7 @@ describe("ReadinessPanel", () => {
             riskId: "RR-001",
             classification: "WaiverRequired",
             severity: "High",
-            statement: "Retries are unverified for the legacy gateway.",
+            statement: "Retries are unverified for the retired gateway.",
             impact: "A duplicate charge is possible on that gateway only.",
             evidenceIds: ["EV-RISK"],
             criterionIds: [],
@@ -334,29 +312,6 @@ describe("ReadinessPanel", () => {
     });
   });
 
-  it("renders an unreconciled published result as blocked and never green", () => {
-    const legacy = flow({
-      status: "Approved",
-      deliveryReadiness: readiness({
-        state: "Blocked",
-        reconciliation: "LegacyUnverified",
-        label: "Published - readiness unverified",
-        allowedActions: ["Continue", "Replan", "Abandon"],
-        reviewGateId: null,
-        publicationAssurance: "Published - readiness unverified"
-      })
-    });
-
-    const { container } = renderPanel(<ReadinessPanel flow={legacy} />);
-
-    expect(
-      screen.getAllByText("Published - readiness unverified").length
-    ).toBeGreaterThan(0);
-    expect(
-      container.querySelector('[data-readiness-state="Blocked"]')
-    ).not.toBeNull();
-    expect(container.querySelector(".readiness-ready")).toBeNull();
-  });
 });
 
 describe("ReviewCard readiness gating", () => {

@@ -446,15 +446,10 @@ public sealed class CandidateFingerprintTests
                     Digest('a'),
                     Guid.NewGuid(),
                     requiresPreview: false));
-            var contextError = Assert.Throws<InvalidOperationException>(() =>
-                OutcomeVerificationContextBuilder.ResolveContextDirectory(
-                    link,
-                    Digest('b')));
             var publicationError = Assert.Throws<InvalidOperationException>(() =>
                 VerifiedCandidatePublisher.ResolveWorkspaceRepository(link, "."));
 
             Assert.Contains("reparse point", candidateError.Message);
-            Assert.Contains("reparse point", contextError.Message);
             Assert.Contains("reparse point", publicationError.Message);
         }
         finally
@@ -745,11 +740,7 @@ public sealed class CandidateFingerprintTests
                 Iteration = 1,
                 Outcome = OutcomeType.Commit
             };
-            var state = OutcomeVerificationRules.CreateInitialState(1, 3);
-            state.TrustedRepositories =
-                [new OutcomeTrustedRepository("repo", string.Empty)];
-            flow.OutcomeVerificationJson =
-                OutcomeVerificationRules.SerializeAggregate(state);
+            RecordTrustedRepositories(flow, ["repo"]);
             var service = new CandidateFingerprintService(
                 new ProcessRunner(),
                 TimeProvider.System);
@@ -1034,11 +1025,7 @@ public sealed class CandidateFingerprintTests
                 Iteration = 1,
                 Outcome = OutcomeType.Commit
             };
-            var state = OutcomeVerificationRules.CreateInitialState(1, 3);
-            state.TrustedRepositories =
-                [new OutcomeTrustedRepository("repo", string.Empty)];
-            flow.OutcomeVerificationJson =
-                OutcomeVerificationRules.SerializeAggregate(state);
+            RecordTrustedRepositories(flow, ["repo"]);
             var service = new CandidateFingerprintService(
                 new ProcessRunner(),
                 TimeProvider.System);
@@ -1057,16 +1044,6 @@ public sealed class CandidateFingerprintTests
         {
             ClearAndDelete(root);
         }
-    }
-
-    [Fact]
-    public void PreviewRequirement_UsesStructuredCustomerVisibleCriteria()
-    {
-        var internalPlan = Plan(customerVisible: false);
-        var visiblePlan = Plan(customerVisible: true);
-
-        Assert.False(CandidateFingerprintService.RequiresPreview(internalPlan));
-        Assert.True(CandidateFingerprintService.RequiresPreview(visiblePlan));
     }
 
     [Fact]
@@ -1384,7 +1361,7 @@ public sealed class CandidateFingerprintTests
     }
 
     [Fact]
-    public async Task HostSeal_ExcludesPreviewAndQaContextFromCommitButStillFingerprintsPreview()
+    public async Task HostSeal_ExcludesPreviewFromCommitButStillFingerprintsIt()
     {
         using var workspace = CandidateWorkspace.Create();
         var service = new CandidateFingerprintService(
@@ -1402,15 +1379,6 @@ public sealed class CandidateFingerprintTests
         await File.WriteAllTextAsync(
             Path.Combine(preview, "index.html"),
             "<h1>Preview</h1>");
-        var qaContext = Path.Combine(
-            workspace.Root,
-            ".ai-harness",
-            "outcome-verification",
-            "round-1",
-            "qa-context.json");
-        Directory.CreateDirectory(Path.GetDirectoryName(qaContext)!);
-        await File.WriteAllTextAsync(qaContext, "{}");
-
         _ = await service.SealAsync(workspace.Flow);
         var treeEntries = workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD")
             .ReplaceLineEndings("\n")
@@ -1427,20 +1395,11 @@ public sealed class CandidateFingerprintTests
         Assert.DoesNotContain(
             ".customer-preview/demo/browser/index.html",
             treeEntries);
-        Assert.DoesNotContain(
-            ".ai-harness/outcome-verification/round-1/qa-context.json",
-            treeEntries);
         Assert.Contains(
             candidate.Manifest.PreviewArtifacts,
             item => string.Equals(
                 item.RelativePath,
                 ".customer-preview/demo/browser/index.html",
-                StringComparison.Ordinal));
-        Assert.DoesNotContain(
-            candidate.Manifest.PreviewArtifacts,
-            item => string.Equals(
-                item.RelativePath,
-                ".ai-harness/outcome-verification/round-1/qa-context.json",
                 StringComparison.Ordinal));
     }
 
@@ -1693,23 +1652,28 @@ public sealed class CandidateFingerprintTests
             Iteration = 1,
             Outcome = OutcomeType.Commit
         };
-        var state = OutcomeVerificationRules.CreateInitialState(1, 3);
-        state.TrustedRepositories = repositoryPaths
-            .Order(StringComparer.Ordinal)
-            .Select(path => new OutcomeTrustedRepository(path, string.Empty))
-            .ToList();
-        flow.OutcomeVerificationJson =
-            OutcomeVerificationRules.SerializeAggregate(state);
+        RecordTrustedRepositories(flow, repositoryPaths);
         return flow;
     }
 
     private static void ConfigureReviewedFlow(FlowRun flow)
     {
-        flow.ContractVersion = "studio-v2";
         flow.Kind = FlowKind.Delivery;
         flow.OutcomeOwnerPlanStepKey = "outcome";
         flow.OutcomeContractJson =
-            """{"Version":"flow-outcome-v1","Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["Changed tracked product bytes."],"Artifacts":[]}""";
+            """{"Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["Changed tracked product bytes."],"Artifacts":[]}""";
+        RecordTrustedRepositories(flow, ["."]);
+    }
+
+    private static string Digest(char value) => $"sha256:{new string(value, 64)}";
+
+    private static void RecordTrustedRepositories(
+        FlowRun flow,
+        IReadOnlyList<string> relativePaths,
+        string remoteRepository = "")
+    {
+        flow.Events.RemoveAll(
+            item => item.Type == StudioWorkspaceRepositoryMapLedger.EventType);
         flow.Events.Add(new FlowEvent
         {
             FlowRunId = flow.Id,
@@ -1719,28 +1683,13 @@ public sealed class CandidateFingerprintTests
                 StudioWorkspaceRepositoryMapLedger.Create(
                     flow,
                     flow.WorkspacePath,
-                    [new WorkspaceRepositoryIdentity(".", string.Empty)]))
+                    relativePaths
+                        .Order(StringComparer.Ordinal)
+                        .Select(path => new WorkspaceRepositoryIdentity(
+                            path,
+                            remoteRepository))
+                        .ToArray()))
         });
-    }
-
-    private static string Digest(char value) => $"sha256:{new string(value, 64)}";
-
-    private static OutcomeAcceptancePlanSnapshot Plan(bool customerVisible)
-    {
-        var plan = new OutcomeAcceptancePlan(
-            OutcomeVerificationRules.AcceptanceVersion,
-            [
-                new OutcomeAcceptanceCriterion(
-                    "AC-001",
-                    "The browser test remains reliable.",
-                    "Run the browser preview, open the page, and verify that the page content displays '<h1>Preview</h1>' without errors.",
-                    ["software-engineer"],
-                    [OutcomeEvidenceKind.Test],
-                    customerVisible)
-            ]);
-        return OutcomeVerificationRules.CreateAcceptanceSnapshot(
-            plan,
-            Guid.NewGuid());
     }
 
     private static async Task WriteHookScriptAsync(
@@ -1944,17 +1893,10 @@ public sealed class CandidateFingerprintTests
         private void SetTrustedRepositories(
             IReadOnlyList<string> relativePaths,
             string remoteRepository = "")
-        {
-            var state = OutcomeVerificationRules.CreateInitialState(1, 3);
-            state.TrustedRepositories = relativePaths
-                .Order(StringComparer.Ordinal)
-                .Select(path => new OutcomeTrustedRepository(
-                    path,
-                    remoteRepository))
-                .ToList();
-            Flow.OutcomeVerificationJson =
-                OutcomeVerificationRules.SerializeAggregate(state);
-        }
+            => RecordTrustedRepositories(
+                Flow,
+                relativePaths,
+                remoteRepository);
 
         private void InitializeRepository(string path) =>
             InitializeRepositoryAt(path);

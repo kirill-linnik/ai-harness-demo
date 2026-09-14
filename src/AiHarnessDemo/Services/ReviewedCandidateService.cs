@@ -14,7 +14,6 @@ public sealed record ReviewedCandidateRepositoryIdentity(
     string RemoteRepository);
 
 public sealed record ReviewedCandidateIdentity(
-    string Version,
     Guid FlowId,
     int Iteration,
     Guid OutcomeOwnerStepId,
@@ -27,19 +26,12 @@ public sealed record ReviewedCandidateIdentity(
     int PreviewFileCount,
     long PreviewTotalBytes,
     IReadOnlyList<ReviewedCandidateRepositoryIdentity> Repositories,
-    DateTimeOffset SealedAt)
-{
-    public const string CurrentVersion = "reviewed-candidate-v1";
-}
+    DateTimeOffset SealedAt);
 
 public sealed record StudioWorkspaceRepositoryMap(
-    string Version,
     Guid FlowId,
     string WorkspacePath,
-    IReadOnlyList<WorkspaceRepositoryIdentity> Repositories)
-{
-    public const string CurrentVersion = "studio-workspace-repositories-v1";
-}
+    IReadOnlyList<WorkspaceRepositoryIdentity> Repositories);
 
 public interface IReviewedCandidateService
 {
@@ -90,7 +82,6 @@ public sealed class ReviewedCandidateService(
         var acceptancePlanHash = OutcomeVerificationRules.ComputeSha256(
             string.Join(
                 "\n",
-                ReviewedCandidateIdentity.CurrentVersion,
                 flow.Id.ToString("D"),
                 flow.Iteration.ToString(
                     System.Globalization.CultureInfo.InvariantCulture),
@@ -104,7 +95,6 @@ public sealed class ReviewedCandidateService(
             requiresPreview: false,
             cancellationToken);
         var identity = new ReviewedCandidateIdentity(
-            ReviewedCandidateIdentity.CurrentVersion,
             flow.Id,
             flow.Iteration,
             outcomeOwnerStepId,
@@ -249,7 +239,9 @@ public static class ReviewedCandidateLedger
     private const int MaximumRepositories = 128;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        PropertyNameCaseInsensitive = false
+        PropertyNameCaseInsensitive = false,
+        UnmappedMemberHandling =
+            System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
     };
 
     public static string Serialize(ReviewedCandidateIdentity identity)
@@ -294,7 +286,20 @@ public static class ReviewedCandidateLedger
         Guid? expectedOutcomeOwnerStepId = null)
     {
         ArgumentNullException.ThrowIfNull(flow);
-        var events = flow.Events
+        expectedOutcomeOwnerStepId ??= flow.Steps
+            .Where(step =>
+                step.Iteration == flow.Iteration &&
+                step.IsOutcomeOwner &&
+                step.Status == StepStatus.Completed &&
+                string.Equals(
+                    step.PlanStepKey,
+                    flow.OutcomeOwnerPlanStepKey,
+                    StringComparison.Ordinal))
+            .OrderByDescending(step => step.Sequence)
+            .ThenByDescending(step => step.Attempt)
+            .Select(step => (Guid?)step.Id)
+            .FirstOrDefault();
+        var candidates = flow.Events
             .Where(item =>
                 item.Type == EventType &&
                 item.FlowStepId is not null)
@@ -307,10 +312,13 @@ public static class ReviewedCandidateLedger
                         "The reviewed candidate event has no structured identity."))
             })
             .Where(item =>
-                item.Identity.Iteration == flow.Iteration &&
-                (!expectedOutcomeOwnerStepId.HasValue ||
-                 item.Event.FlowStepId == expectedOutcomeOwnerStepId))
+                item.Identity.Iteration == flow.Iteration)
             .ToArray();
+        var events = expectedOutcomeOwnerStepId is { } ownerStepId
+            ? candidates
+                .Where(item => item.Event.FlowStepId == ownerStepId)
+                .ToArray()
+            : candidates;
         if (events.Length != 1)
         {
             throw new CandidateValidationException(
@@ -360,8 +368,7 @@ public static class ReviewedCandidateLedger
         ReviewedCandidateIdentity identity)
     {
         Validate(identity);
-        if (flow.ContractVersion != "studio-v2" ||
-            flow.Kind != FlowKind.Delivery ||
+        if (flow.Kind != FlowKind.Delivery ||
             identity.FlowId != flow.Id ||
             identity.Iteration != flow.Iteration ||
             string.IsNullOrWhiteSpace(flow.OutcomeOwnerPlanStepKey) ||
@@ -387,8 +394,7 @@ public static class ReviewedCandidateLedger
         string outcomeContractJson)
     {
         ArgumentNullException.ThrowIfNull(flow);
-        if (flow.ContractVersion != "studio-v2" ||
-            flow.Kind != FlowKind.Delivery ||
+        if (flow.Kind != FlowKind.Delivery ||
             flow.Id == Guid.Empty ||
             flow.Iteration < 1 ||
             outcomeOwnerStepId == Guid.Empty ||
@@ -400,18 +406,14 @@ public static class ReviewedCandidateLedger
             string.IsNullOrWhiteSpace(outcomeContractJson))
         {
             throw new CandidateValidationException(
-                "A reviewed candidate can be sealed only for the current completed studio-v2 Delivery outcome owner.");
+                "A reviewed candidate can be sealed only for the current completed Delivery outcome owner.");
         }
     }
 
     public static void Validate(ReviewedCandidateIdentity identity)
     {
         ArgumentNullException.ThrowIfNull(identity);
-        if (!string.Equals(
-                identity.Version,
-                ReviewedCandidateIdentity.CurrentVersion,
-                StringComparison.Ordinal) ||
-            identity.FlowId == Guid.Empty ||
+        if (identity.FlowId == Guid.Empty ||
             identity.Iteration < 1 ||
             identity.OutcomeOwnerStepId == Guid.Empty ||
             string.IsNullOrWhiteSpace(identity.OutcomeOwnerPlanStepKey) ||
@@ -455,7 +457,9 @@ public static class StudioWorkspaceRepositoryMapLedger
     private const int MaximumDataBytes = 48 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        PropertyNameCaseInsensitive = false
+        PropertyNameCaseInsensitive = false,
+        UnmappedMemberHandling =
+            System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
     };
 
     public static StudioWorkspaceRepositoryMap Create(
@@ -464,7 +468,6 @@ public static class StudioWorkspaceRepositoryMapLedger
         IReadOnlyList<WorkspaceRepositoryIdentity> repositories)
     {
         var map = new StudioWorkspaceRepositoryMap(
-            StudioWorkspaceRepositoryMap.CurrentVersion,
             flow.Id,
             Path.GetFullPath(workspacePath),
             repositories
@@ -527,11 +530,7 @@ public static class StudioWorkspaceRepositoryMapLedger
         FlowRun? flow)
     {
         ArgumentNullException.ThrowIfNull(map);
-        if (!string.Equals(
-                map.Version,
-                StudioWorkspaceRepositoryMap.CurrentVersion,
-                StringComparison.Ordinal) ||
-            map.FlowId == Guid.Empty ||
+        if (map.FlowId == Guid.Empty ||
             string.IsNullOrWhiteSpace(map.WorkspacePath) ||
             !Path.IsPathFullyQualified(map.WorkspacePath) ||
             map.Repositories is null ||

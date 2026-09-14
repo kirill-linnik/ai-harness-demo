@@ -11,7 +11,6 @@ function summary(overrides: Partial<FlowSummaryDto> = {}): FlowSummaryDto {
     id: "11111111-1111-4111-8111-111111111111",
     title: "Assess checkout resilience",
     kind: "Advisory",
-    contractVersion: "studio-v2",
     parentFlowRunId: "22222222-2222-4222-8222-222222222222",
     parentIteration: 2,
     linkKind: "QualificationScopeRevision",

@@ -217,11 +217,10 @@ public sealed class WorkflowRestartRecoveryTests
             WorkspacePath = @"C:\workspace",
             BranchName = "ai-harness/review-ready",
             Kind = FlowKind.Delivery,
-            ContractVersion = "studio-v2",
             Status = FlowStatus.Failed,
             OutcomeOwnerPlanStepKey = "verify-outcome",
             OutcomeContractJson =
-                """{"Version":"flow-outcome-v1","Goal":"Deliver","Summary":"Ready","ImplementationDetails":["Verified"],"Artifacts":[]}"""
+                """{"Goal":"Deliver","Summary":"Ready","ImplementationDetails":["Verified"],"Artifacts":[]}"""
         };
         var outcomeOwner = new FlowStep
         {
@@ -236,7 +235,7 @@ public sealed class WorkflowRestartRecoveryTests
             IsOutcomeOwner = true,
             Status = StepStatus.Failed,
             OutputSummary =
-                "HANDOFF_STATUS: COMPLETE\nFLOW_OUTCOME_V1_BEGIN\n{}\nFLOW_OUTCOME_V1_END"
+                "HANDOFF_STATUS: COMPLETE\nFLOW_OUTCOME_BEGIN\n{}\nFLOW_OUTCOME_END"
         };
         flow.Steps.Add(outcomeOwner);
         flow.Events.Add(new FlowEvent
@@ -279,12 +278,11 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     [Fact]
-    public async Task StudioV2Recovery_CompletesJournalAttemptOnceWithoutRefreshingSnapshot()
+    public async Task CurrentFlowRecovery_CompletesJournalAttemptOnceWithoutRefreshingSnapshot()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: true,
-            persistSessionId: false,
-            contractVersion: "studio-v2");
+            persistSessionId: false);
         var stagedRoot = AgentManifestStager.GetSessionRoot(
             fixture.CopilotHome,
             fixture.SessionId);
@@ -324,13 +322,13 @@ public sealed class WorkflowRestartRecoveryTests
             {
                 ExecutionInvocationKind.Intake,
                 IntakeContract(
-                    IntakeV2Status.AwaitingConfirmation,
+                    IntakeStatus.AwaitingConfirmation,
                     FlowKind.Delivery)
             },
             {
                 ExecutionInvocationKind.BlockerExplanation,
                 IntakeContract(
-                    IntakeV2Status.NeedsClarification,
+                    IntakeStatus.NeedsClarification,
                     flowKind: null,
                     emptyBrief: true)
             },
@@ -338,18 +336,14 @@ public sealed class WorkflowRestartRecoveryTests
                 ExecutionInvocationKind.PreMortem,
                 """
                 PRE_MORTEM_STATUS: CLEAR
-                PRE_MORTEM_FINDINGS_V1_BEGIN
-                {"Version":"pre-mortem-findings-v1","Findings":[]}
-                PRE_MORTEM_FINDINGS_V1_END
+                PRE_MORTEM_FINDINGS_BEGIN
+                {"Findings":[]}
+                PRE_MORTEM_FINDINGS_END
                 """
             },
             {
                 ExecutionInvocationKind.Planning,
                 PlanningContract()
-            },
-            {
-                ExecutionInvocationKind.ReviewClassification,
-                ReviewContract()
             }
         };
 
@@ -362,7 +356,6 @@ public sealed class WorkflowRestartRecoveryTests
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: true,
             persistSessionId: false,
-            contractVersion: "studio-v2",
             invocationKind: invocationKind,
             completedOutput: output);
 
@@ -393,10 +386,9 @@ public sealed class WorkflowRestartRecoveryTests
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: true,
             persistSessionId: true,
-            contractVersion: "studio-v2",
             invocationKind: ExecutionInvocationKind.Intake,
             completedOutput:
-                "HANDOFF_STATUS: COMPLETE without intake-v2");
+                "HANDOFF_STATUS: COMPLETE without intake");
 
         await fixture.Engine.RecoverInterruptedFlowsAsync(
             CancellationToken.None);
@@ -435,14 +427,13 @@ public sealed class WorkflowRestartRecoveryTests
     {
         const string output = """
             HANDOFF_STATUS: COMPLETE
-            FLOW_OUTCOME_V1_BEGIN
-            {"Version":"flow-outcome-v1","Goal":"Recover the outcome.","Summary":"The durable outcome is complete.","ImplementationDetails":["Apply the recovered result exactly once."],"Artifacts":[]}
-            FLOW_OUTCOME_V1_END
+            FLOW_OUTCOME_BEGIN
+            {"Goal":"Recover the outcome.","Summary":"The durable outcome is complete.","ImplementationDetails":["Apply the recovered result exactly once."],"Artifacts":[]}
+            FLOW_OUTCOME_END
             """;
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: true,
             persistSessionId: false,
-            contractVersion: "studio-v2",
             invocationKind: ExecutionInvocationKind.Worker,
             completedOutput: output,
             isOutcomeOwner: true);
@@ -472,12 +463,11 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     [Fact]
-    public async Task StudioV2Recovery_QueuesInterruptedAttemptForSameSessionResume()
+    public async Task CurrentFlowRecovery_QueuesInterruptedAttemptForSameSessionResume()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: false,
-            persistSessionId: true,
-            contractVersion: "studio-v2");
+            persistSessionId: true);
         var stagedRoot = AgentManifestStager.GetSessionRoot(
             fixture.CopilotHome,
             fixture.SessionId);
@@ -513,8 +503,7 @@ public sealed class WorkflowRestartRecoveryTests
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: false,
-            persistSessionId: true,
-            contractVersion: "studio-v2");
+            persistSessionId: true);
         Guid stepId;
         const string effectivePermission =
             """{"Profile":"ReadOnlySource","AllowedTools":["read"]}""";
@@ -633,12 +622,11 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     [Fact]
-    public async Task StudioV2Recovery_MissingPersistedPromptFailsClosedBeforeRerun()
+    public async Task CurrentFlowRecovery_MissingPersistedPromptFailsClosedBeforeRerun()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: false,
-            persistSessionId: true,
-            contractVersion: "studio-v2");
+            persistSessionId: true);
         await using (var database =
                      await fixture.DatabaseFactory.CreateDbContextAsync())
         {
@@ -749,7 +737,10 @@ public sealed class WorkflowRestartRecoveryTests
             includeShutdown: false);
         await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
         {
-            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var flow = await database.Flows
+                .Include(item => item.Steps)
+                .Include(item => item.AgentSnapshots)
+                .SingleAsync();
             var failedStep = Assert.Single(flow.Steps);
             flow.Status = FlowStatus.Failed;
             flow.FailureReason = "Agent process produced no output for 300 seconds.";
@@ -978,52 +969,6 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     [Fact]
-    public void OutcomeQaPushbackRetry_PreservesTypedMetadataAndStableRoot()
-    {
-        var flow = new FlowRun
-        {
-            Title = "Governed pushback",
-            OriginalRequest = "Governed pushback"
-        };
-        var blocked = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 30,
-            AgentId = "quality-engineer",
-            AgentName = "Quality Engineer",
-            AgentRole = "quality-engineer",
-            Label = "Unexpected QA label",
-            Kind = FlowStepKind.OutcomeQa,
-            Status = StepStatus.Pushback,
-            Attempt = 2,
-            OutcomeQaRound = 2,
-            OutcomePlanHash = "sha256:" + new string('a', 64),
-            StableSemanticRootId = Guid.NewGuid()
-        };
-        var upstreamOwner = new AgentRecord
-        {
-            Id = "software-engineer",
-            Name = "Software Engineer",
-            Description = "Implements the fix.",
-            Role = "software-engineer",
-            SourcePath = "software-engineer.agent.md"
-        };
-
-        var (_, retry) = WorkflowEngine.CreateRecoverySteps(
-            flow,
-            blocked,
-            upstreamOwner,
-            revisionAttempt: 3);
-
-        Assert.Equal(FlowStepKind.OutcomeQa, retry.Kind);
-        Assert.Equal(2, retry.OutcomeQaRound);
-        Assert.Equal(blocked.OutcomePlanHash, retry.OutcomePlanHash);
-        Assert.Equal(blocked.StableSemanticRootId, retry.StableSemanticRootId);
-        Assert.Equal(blocked.StableSemanticRootId, retry.RetryOfStepId);
-    }
-
-    [Fact]
     public void IntentionallyDisabledPreMortemRetry_ResolvesItsFailure()
     {
         var flowId = Guid.NewGuid();
@@ -1107,7 +1052,7 @@ public sealed class WorkflowRestartRecoveryTests
             AgentRole = "team-lead",
             Status = StepStatus.Completed,
             Attempt = 2,
-            OutputSummary = "TEAM_TASK_PROFILES_V1_BEGIN"
+            OutputSummary = "TEAM_TASK_PROFILES_BEGIN"
         };
         var superseded = new FlowStep
         {
@@ -1152,6 +1097,22 @@ public sealed class WorkflowRestartRecoveryTests
             failedStep.Attempt = 2;
             failedStep.PreMortemOriginStepId = originStepId;
             failedStep.CompletedAt = DateTimeOffset.UtcNow;
+            flow.AgentSnapshots.Add(new FlowAgentSnapshot
+            {
+                FlowRunId = flow.Id,
+                AgentId = WorkflowEngine.PreMortemRole,
+                Name = "Pre-mortem Sceptic",
+                Description = "Reviews failure modes.",
+                Role = WorkflowEngine.PreMortemRole,
+                Instructions = "Review the current checkpoint.",
+                DefinitionHash = "sha256:pre-mortem-recovery",
+                EnabledAtSnapshot = true,
+                SourceFileName = "pre-mortem-sceptic.agent.md"
+            });
+            var profile = await database.TaskProfiles.SingleAsync(
+                item => item.FlowStepId == failedStep.Id);
+            profile.AgentId = WorkflowEngine.PreMortemRole;
+            profile.Role = WorkflowEngine.PreMortemRole;
             await database.SaveChangesAsync();
         }
 
@@ -1455,19 +1416,18 @@ public sealed class WorkflowRestartRecoveryTests
     }
 
     private static string IntakeContract(
-        IntakeV2Status status,
+        IntakeStatus status,
         FlowKind? flowKind,
         bool emptyBrief = false) =>
-        IntakeV2Parser.BeginSentinel +
+        IntakeParser.BeginSentinel +
         Environment.NewLine +
-        IntakeV2Parser.Serialize(new IntakeV2Document
+        IntakeParser.Serialize(new IntakeDocument
         {
-            Version = IntakeV2Parser.Version,
             Status = status,
             FlowKind = flowKind,
             TaskTitle = "Recover intake",
             CustomerReply = "The recovered intake result is valid.",
-            Brief = new IntakeV2Brief
+            Brief = new IntakeBrief
             {
                 Goal = emptyBrief ? string.Empty : "Recover the intake.",
                 Details = emptyBrief ? [] : ["Keep the durable request."],
@@ -1477,13 +1437,12 @@ public sealed class WorkflowRestartRecoveryTests
             }
         }) +
         Environment.NewLine +
-        IntakeV2Parser.EndSentinel;
+        IntakeParser.EndSentinel;
 
     private static string PlanningContract()
     {
         var document = new TeamPlanDocument
         {
-            Version = TeamPlanParser.Version,
             Disposition = TeamPlanDisposition.MissingQualification,
             Steps = [],
             PreMortemCheckpoints = [],
@@ -1509,19 +1468,6 @@ public sealed class WorkflowRestartRecoveryTests
                TeamPlanParser.EndSentinel;
     }
 
-    private static string ReviewContract() =>
-        ReviewFeedbackParser.BeginSentinel +
-        Environment.NewLine +
-        ReviewFeedbackParser.Serialize(new ReviewFeedbackDocument
-        {
-            Version = ReviewFeedbackParser.Version,
-            Intent = ReviewIntent.Ambiguous,
-            CustomerReply = "Please clarify the requested review decision.",
-            Refinement = null,
-            ExplicitImplementationAdoption = false
-        }) +
-        Environment.NewLine +
-        ReviewFeedbackParser.EndSentinel;
 }
 
 internal sealed class RecoveryFixture : IAsyncDisposable
@@ -1573,7 +1519,6 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         bool persistSessionId,
         bool includeShutdown = true,
         bool includeToolCall = false,
-        string contractVersion = "legacy-v1",
         ExecutionInvocationKind invocationKind =
             ExecutionInvocationKind.Worker,
         string? completedOutput = null,
@@ -1598,7 +1543,6 @@ internal sealed class RecoveryFixture : IAsyncDisposable
               max_concurrent_agents: 1
               max_attempts: 1
             studio:
-              version: 1
               planning:
                 max_steps: 24
                 max_dependencies_per_step: 8
@@ -1622,13 +1566,11 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         var flowId = Guid.NewGuid();
         var (agentId, agentName, agentRole, planStepKey) =
             InvocationIdentity(invocationKind);
-        var sessionId = contractVersion == "studio-v2"
-            ? AgentSessionIdentity.Create(
-                flowId,
-                1,
-                agentId,
-                planStepKey)
-            : Guid.NewGuid();
+        var sessionId = AgentSessionIdentity.Create(
+            flowId,
+            1,
+            agentId,
+            planStepKey);
         var sessionDirectory = Path.Combine(
             copilotHome,
             "session-state",
@@ -1656,7 +1598,6 @@ internal sealed class RecoveryFixture : IAsyncDisposable
             OriginalRequest = "Recover implementation",
             ConsolidatedRequest = "Complete the implementation.",
             Status = FlowStatus.Running,
-            ContractVersion = contractVersion,
             RepositoryPath = root,
             RepositoryKnowledge = "Test repository.",
             WorkspacePath = workspacePath
@@ -1669,14 +1610,10 @@ internal sealed class RecoveryFixture : IAsyncDisposable
             AgentId = agentId,
             AgentName = agentName,
             AgentRole = agentRole,
-            PlanStepKey = contractVersion == "studio-v2"
-                ? planStepKey
-                : string.Empty,
-            PlanDutiesJson = contractVersion == "studio-v2"
-                ? invocationKind == ExecutionInvocationKind.Planning
-                    ? """["Analyze","Design"]"""
-                    : """["Analyze"]"""
-                : "[]",
+            PlanStepKey = planStepKey,
+            PlanDutiesJson = invocationKind == ExecutionInvocationKind.Planning
+                ? """["Analyze","Design"]"""
+                : """["Analyze"]""",
             InvocationKind = invocationKind,
             IsOutcomeOwner = isOutcomeOwner,
             Label = "Execute Software Engineer contract",
@@ -1685,53 +1622,43 @@ internal sealed class RecoveryFixture : IAsyncDisposable
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
             CopilotSessionId = persistSessionId ? sessionId : null,
             CopilotSessionHome = copilotHome,
-            ExecutionPrompt = contractVersion == "studio-v2"
-                ? "Original durable execution prompt."
-                : string.Empty,
-            WorkflowRevision = contractVersion == "studio-v2"
-                ? new string('A', 64)
-                : string.Empty
+            ExecutionPrompt = "Original durable execution prompt.",
+            WorkflowRevision = new string('A', 64)
         });
-        if (contractVersion == "studio-v2")
+        flow.AgentSnapshots.Add(new FlowAgentSnapshot
         {
-            flow.AgentSnapshots.Add(new FlowAgentSnapshot
-            {
-                FlowRunId = flow.Id,
-                AgentId = agentId,
-                Name = agentName,
-                Description = "Performs the recovered work.",
-                Role = agentRole,
-                Instructions = "Complete the assignment.",
-                DefinitionHash = "sha256:recovery",
-                EnabledAtSnapshot = true,
-                SourceFileName = $"{agentId}.agent.md"
-            });
-        }
+            FlowRunId = flow.Id,
+            AgentId = agentId,
+            Name = agentName,
+            Description = "Performs the recovered work.",
+            Role = agentRole,
+            Instructions = "Complete the assignment.",
+            DefinitionHash = "sha256:recovery",
+            EnabledAtSnapshot = true,
+            SourceFileName = $"{agentId}.agent.md"
+        });
         await using (var database = await databaseFactory.CreateDbContextAsync())
         {
             await database.Database.EnsureCreatedAsync();
             database.Flows.Add(flow);
-            if (contractVersion == "studio-v2")
+            database.TaskProfiles.Add(new TaskProfile
             {
-                database.TaskProfiles.Add(new TaskProfile
-                {
-                    FlowRunId = flow.Id,
-                    FlowStepId = flow.Steps.Single().Id,
-                    Iteration = flow.Iteration,
-                    PlanStepKey = planStepKey,
-                    AgentId = agentId,
-                    Role = agentRole,
-                    Complexity = 4,
-                    ReasoningDepth = 4,
-                    ContextDemand = 4,
-                    ToolIntensity = 2,
-                    TaskTypeTagsJson = """["CrossCutting"]""",
-                    Risk = TaskRisk.Low,
-                    RiskReason = "Recovery fixture.",
-                    Confidence = 1,
-                    RationalesJson = """["Recovery fixture."]"""
-                });
-            }
+                FlowRunId = flow.Id,
+                FlowStepId = flow.Steps.Single().Id,
+                Iteration = flow.Iteration,
+                PlanStepKey = planStepKey,
+                AgentId = agentId,
+                Role = agentRole,
+                Complexity = 4,
+                ReasoningDepth = 4,
+                ContextDemand = 4,
+                ToolIntensity = 2,
+                TaskTypeTagsJson = """["CrossCutting"]""",
+                Risk = TaskRisk.Low,
+                RiskReason = "Recovery fixture.",
+                Confidence = 1,
+                RationalesJson = """["Recovery fixture."]"""
+            });
             await database.SaveChangesAsync();
         }
 
@@ -1746,7 +1673,6 @@ internal sealed class RecoveryFixture : IAsyncDisposable
         var engine = new WorkflowEngine(
             databaseFactory,
             new AgentCatalog(paths, databaseFactory),
-            new FlowPlanner(),
             new FixedModelRouter(),
             new BootstrapTaskProfileFactory(),
             TestRoutingSupport.Recorder(databaseFactory),
@@ -1901,9 +1827,6 @@ internal sealed class RecoveryFixture : IAsyncDisposable
             ExecutionInvocationKind.Planning =>
                 ("team-lead", "Team Lead", "team-lead",
                     WorkflowEngine.TeamLeadPlanStepKey),
-            ExecutionInvocationKind.ReviewClassification =>
-                ("account-manager", "Account Manager", "account-manager",
-                    "account-manager:review-classification:recovery"),
             ExecutionInvocationKind.Publication =>
                 ("publisher", "Publisher", "publisher", "publish"),
             _ =>

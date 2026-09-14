@@ -5,10 +5,9 @@ using AiHarnessDemo.Core.Verification;
 namespace AiHarnessDemo.Tests;
 
 /// <summary>
-/// The production Delivery flow <c>36aecd50-3007-4eeb-87a2-e3cd02576dcb</c> exactly as captured
-/// from the running app at <c>/api/flows/36aecd50-3007-4eeb-87a2-e3cd02576dcb</c>. The regression
-/// reads the checked-in artifact rather than restating any of its text, so the replayed request and
-/// the replayed contradictory outcome are byte-identical to the recorded incident.
+/// A compact regression fixture derived from Delivery flow
+/// <c>36aecd50-3007-4eeb-87a2-e3cd02576dcb</c>. It preserves the contradictory customer-visible
+/// facts while expressing them only through current, unversioned contracts.
 /// </summary>
 internal sealed class ReferenceFlowArtifact
 {
@@ -21,7 +20,6 @@ internal sealed class ReferenceFlowArtifact
         Guid id,
         string status,
         string kind,
-        string contract,
         int iteration,
         string originalRequest,
         string consolidatedRequest,
@@ -30,13 +28,11 @@ internal sealed class ReferenceFlowArtifact
         RecordedReview review,
         RecordedOutcome outcome,
         string outcomeJson,
-        RecordedOutcomeVerification outcomeVerification,
         IReadOnlyList<string> stepRoles)
     {
         Id = id;
         Status = status;
         Kind = kind;
-        Contract = contract;
         Iteration = iteration;
         OriginalRequest = originalRequest;
         ConsolidatedRequest = consolidatedRequest;
@@ -45,7 +41,6 @@ internal sealed class ReferenceFlowArtifact
         Review = review;
         Outcome = outcome;
         OutcomeJson = outcomeJson;
-        OutcomeVerification = outcomeVerification;
         StepRoles = stepRoles;
     }
 
@@ -58,14 +53,12 @@ internal sealed class ReferenceFlowArtifact
 
     public string Kind { get; }
 
-    public string Contract { get; }
-
     public int Iteration { get; }
 
     /// <summary>The exact customer request the incident flow was created from.</summary>
     public string OriginalRequest { get; }
 
-    /// <summary>The exact confirmed <c>intake-v2</c> brief JSON persisted for the flow.</summary>
+    /// <summary>The exact confirmed <c>intake</c> brief JSON persisted for the flow.</summary>
     public string ConsolidatedRequest { get; }
 
     public string OutcomeLabel { get; }
@@ -77,11 +70,11 @@ internal sealed class ReferenceFlowArtifact
 
     public RecordedOutcome Outcome { get; }
 
-    /// <summary>The exact <c>flow-outcome-v1</c> projection the API returned for the flow.</summary>
+    /// <summary>The exact <c>flow outcome</c> projection the API returned for the flow.</summary>
     public string OutcomeJson { get; }
 
     /// <summary>
-    /// The captured outcome rebuilt into the strict <c>flow-outcome-v1</c> envelope the host parser
+    /// The captured outcome rebuilt into the strict <c>flow outcome</c> envelope the host parser
     /// requires. Only the contract property names are supplied by this helper; the Goal, Summary,
     /// and ImplementationDetails text is byte-identical to the captured incident, so the replayed
     /// contradiction is the original one.
@@ -90,15 +83,12 @@ internal sealed class ReferenceFlowArtifact
         JsonSerializer.Serialize(
             new
             {
-                Version = "flow-outcome-v1",
                 Outcome.Goal,
                 Outcome.Summary,
                 Outcome.ImplementationDetails,
                 Artifacts = Array.Empty<object>()
             },
             new JsonSerializerOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
-
-    public RecordedOutcomeVerification OutcomeVerification { get; }
 
     public IReadOnlyList<string> StepRoles { get; }
 
@@ -131,7 +121,6 @@ internal sealed class ReferenceFlowArtifact
             Guid.Parse(Text("Id")),
             Text("Status"),
             Text("Kind"),
-            Text("Contract"),
             root.GetProperty("Iteration").GetInt32(),
             Text("OriginalRequest"),
             Text("ConsolidatedRequest"),
@@ -140,9 +129,6 @@ internal sealed class ReferenceFlowArtifact
             JsonSerializer.Deserialize<RecordedReview>(Text("Review"), options)!,
             JsonSerializer.Deserialize<RecordedOutcome>(outcomeJson, options)!,
             outcomeJson,
-            JsonSerializer.Deserialize<RecordedOutcomeVerification>(
-                Text("OutcomeVerification"),
-                options)!,
             [.. JsonSerializer.Deserialize<List<RecordedStep>>(Text("Steps"), options)!
                 .Select(step => step.AgentRole)]);
     }
@@ -161,13 +147,6 @@ internal sealed class ReferenceFlowArtifact
         IReadOnlyList<string> ImplementationDetails,
         IReadOnlyList<JsonElement> Artifacts);
 
-    internal sealed record RecordedOutcomeVerification(
-        string Status,
-        bool LegacyUnverified,
-        bool ReleaseReady,
-        bool Stale,
-        IReadOnlyList<string> FailedCriterionIds);
-
     internal sealed record RecordedStep(string AgentRole, string Status);
 
     private sealed record RecordedBrief(
@@ -179,7 +158,7 @@ internal sealed class ReferenceFlowArtifact
 }
 
 /// <summary>
-/// Builds the mandatory acceptance plan and the strict <c>outcome-qa-v2</c> contracts for the
+/// Builds the mandatory acceptance plan and strict outcome-QA contracts for the
 /// captured incident. The criteria come from the customer's own confirmed success criteria, and the
 /// failing results mirror the four gaps the recorded outcome document itself confirmed.
 /// </summary>
@@ -187,7 +166,6 @@ internal static class ReferenceFlowContracts
 {
     public static DeliveryAcceptancePlan AcceptancePlan() =>
         new(
-            DeliveryAcceptancePlan.CurrentVersion,
             [.. ReferenceFlowArtifact.Current.SuccessCriteria.Select((requirement, index) =>
                 new DeliveryAcceptanceCriterion
                 {
@@ -317,7 +295,7 @@ internal static class ReferenceFlowContracts
                 : "FAIL";
         return
             $$"""
-            {"Version":"outcome-qa-v2","AcceptancePlanHash":"{{planHash}}","Verdict":"{{verdict}}","Criteria":[{{criteria}}],"ResidualRisks":[{{riskItems}}]}
+            {"AcceptancePlanHash":"{{planHash}}","Verdict":"{{verdict}}","Criteria":[{{criteria}}],"ResidualRisks":[{{riskItems}}],"PlanGaps":[]}
             """;
     }
 }

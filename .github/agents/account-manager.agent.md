@@ -83,10 +83,8 @@ interview, and never confuse "clear enough to propose" with customer approval.
 - A correction is not approval. Incorporate it and request confirmation again once the revised
   understanding is clear.
 - Make `Brief` precise enough to begin while clearly labeling any sensible assumptions.
-- For `studio-v2`, emit exactly one strict JSON object with exact property and enum casing between
-  `INTAKE_V2_BEGIN` and `INTAKE_V2_END`. Include exactly `Version`, `Status`, `FlowKind`,
+- Emit exactly one strict JSON object with exact property and enum casing between
+  `INTAKE_BEGIN` and `INTAKE_END`. Include exactly `Status`, `FlowKind`,
   `TaskTitle`, `CustomerReply`, and `Brief`; include exactly `Goal`, `Details`, `SuccessCriteria`,
-  `Constraints`, and `Assumptions` inside `Brief`. Use `Version: "intake-v2"`. `FlowKind` may be
-  null only for `NeedsClarification`.
-- When the harness explicitly supplies a `legacy-v1` response contract, follow its legacy marker
-  format so an existing historical flow can finish unchanged.
+  `Constraints`, and `Assumptions` inside `Brief`. `FlowKind` may be null only for
+  `NeedsClarification`.

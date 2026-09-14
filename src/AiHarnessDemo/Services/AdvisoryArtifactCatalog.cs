@@ -34,7 +34,6 @@ public sealed record AdvisoryArtifactIdentity(
     string ContentDigest);
 
 public sealed record AdvisoryArtifactMaterializationPolicy(
-    string Version,
     Guid FlowId,
     int Iteration,
     string OutcomeHash,
@@ -43,18 +42,7 @@ public sealed record AdvisoryArtifactMaterializationPolicy(
     int MaximumArtifactCount,
     int MaximumTotalArtifactBytes,
     IReadOnlyList<AdvisoryArtifactIdentity> Artifacts,
-    DateTimeOffset MaterializedAt)
-{
-    public const string CurrentVersion = "advisory-artifacts-v2";
-
-    /// <summary>
-    /// In-memory provenance assigned only while adapting a durable advisory-artifacts-v1 event.
-    /// It is deliberately not serialized, so a newly persisted v2 policy cannot opt into the
-    /// legacy root-equality exception.
-    /// </summary>
-    [JsonIgnore]
-    public bool LegacyMigratedReadOnly { get; init; }
-}
+    DateTimeOffset MaterializedAt);
 
 public sealed record AdvisoryOutcomeMaterialization(
     AdvisorySourceVerification Verification,
@@ -80,12 +68,11 @@ public sealed class AdvisoryArtifactCatalog(
     private const string MetadataDirectoryName = ".studio-host";
     private const string GuardedSnapshotMarkerFileName =
         ".studio-workspace-owner.json";
-    private const string MetadataVersion = "advisory-workspace-v2";
-    private const string LegacyMetadataVersion = "advisory-workspace-v1";
     private const int MaximumMaterializationDataBytes = 60 * 1024;
     private static readonly JsonSerializerOptions MetadataJsonOptions = new()
     {
         PropertyNameCaseInsensitive = false,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
         WriteIndented = true,
         Converters =
         {
@@ -94,7 +81,8 @@ public sealed class AdvisoryArtifactCatalog(
     };
     private static readonly JsonSerializerOptions DurableJsonOptions = new()
     {
-        PropertyNameCaseInsensitive = false
+        PropertyNameCaseInsensitive = false,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
     };
 
     public async Task<AdvisoryWorkspaceEvidence> EnsureBaselineAsync(
@@ -133,13 +121,8 @@ public sealed class AdvisoryArtifactCatalog(
                 throw new InvalidOperationException(
                     "The guarded Advisory workspace no longer matches its flow-owned baseline.");
             }
-            if (existing.Mode != mode ||
-                !string.Equals(
-                    existing.Version,
-                    MetadataVersion,
-                    StringComparison.Ordinal))
+            if (existing.Mode != mode)
             {
-                existing.Version = MetadataVersion;
                 existing.Mode = mode;
                 await WriteMetadataAsync(existing, cancellationToken);
             }
@@ -155,7 +138,6 @@ public sealed class AdvisoryArtifactCatalog(
             cancellationToken);
         var metadata = new AdvisoryWorkspaceMetadata
         {
-            Version = MetadataVersion,
             FlowId = flow.Id,
             WorkspacePath = workspace,
             SourcePath = Path.GetFullPath(flow.RepositoryPath),
@@ -203,7 +185,6 @@ public sealed class AdvisoryArtifactCatalog(
             staging,
             new GuardedSnapshotMarker
             {
-                Version = GuardedSnapshotMarker.CurrentVersion,
                 FlowId = flow.Id,
                 SourcePath = Path.GetFullPath(flow.RepositoryPath),
                 WorkspacePath = final,
@@ -213,7 +194,6 @@ public sealed class AdvisoryArtifactCatalog(
             cancellationToken);
         var metadata = new AdvisoryWorkspaceMetadata
         {
-            Version = MetadataVersion,
             FlowId = flow.Id,
             WorkspacePath = final,
             SourcePath = Path.GetFullPath(flow.RepositoryPath),
@@ -285,7 +265,6 @@ public sealed class AdvisoryArtifactCatalog(
         if (metadata.Mode != expectedMode)
         {
             metadata.Mode = expectedMode;
-            metadata.Version = MetadataVersion;
             await WriteMetadataAsync(metadata, cancellationToken);
         }
         return new GuardedSnapshotOwnership(
@@ -302,7 +281,6 @@ public sealed class AdvisoryArtifactCatalog(
         await WriteMetadataAsync(
             new AdvisoryWorkspaceMetadata
             {
-                Version = MetadataVersion,
                 FlowId = flow.Id,
                 WorkspacePath = workspace,
                 SourcePath = Path.GetFullPath(flow.RepositoryPath),
@@ -344,11 +322,10 @@ public sealed class AdvisoryArtifactCatalog(
         string? additionalExcludedRoot,
         CancellationToken cancellationToken)
     {
-        if (flow.Kind != FlowKind.Advisory ||
-            !string.Equals(flow.ContractVersion, "studio-v2", StringComparison.Ordinal))
+        if (flow.Kind != FlowKind.Advisory)
         {
             throw new InvalidOperationException(
-                "Only studio-v2 Advisory flows have a guarded source baseline.");
+                "Only Studio Advisory flows have a guarded source baseline.");
         }
         var workspace = ValidateWorkspace(
             flow,
@@ -430,7 +407,6 @@ public sealed class AdvisoryArtifactCatalog(
             .OrderBy(artifact => artifact.Path, StringComparer.Ordinal)
             .ToArray();
         var policy = new AdvisoryArtifactMaterializationPolicy(
-            AdvisoryArtifactMaterializationPolicy.CurrentVersion,
             flow.Id,
             flow.Iteration,
             outcomeHash,
@@ -442,12 +418,11 @@ public sealed class AdvisoryArtifactCatalog(
             DateTimeOffset.UtcNow);
         ValidateMaterializationPolicy(policy, flow: null);
         if (flow.Kind != FlowKind.Advisory ||
-            flow.ContractVersion != "studio-v2" ||
             policy.FlowId != flow.Id ||
             policy.Iteration != flow.Iteration)
         {
             throw new InvalidOperationException(
-                "Advisory artifacts can be materialized only for the current studio-v2 Advisory iteration.");
+                "Advisory artifacts can be materialized only for the current Studio Advisory iteration.");
         }
         var materializationRoot = ResolveMaterializationRoot(flow, policy);
         var alreadyRegistered = await IsRegisteredMaterializationAsync(
@@ -486,11 +461,6 @@ public sealed class AdvisoryArtifactCatalog(
     public string SerializeMaterialization(
         AdvisoryArtifactMaterializationPolicy policy)
     {
-        if (policy.LegacyMigratedReadOnly)
-        {
-            throw new InvalidOperationException(
-                "A legacy-migrated Advisory policy is read-only and cannot be persisted as a new v2 materialization.");
-        }
         ValidateMaterializationPolicy(policy, flow: null);
         var json = JsonSerializer.Serialize(policy, DurableJsonOptions);
         if (Encoding.UTF8.GetByteCount(json) > MaximumMaterializationDataBytes)
@@ -503,8 +473,7 @@ public sealed class AdvisoryArtifactCatalog(
 
     public AdvisoryArtifactMaterializationPolicy? TryReadCurrentMaterialization(
         FlowRun flow) =>
-        ReadPersistedMaterialization(flow) ??
-        TryReadLegacyMaterialization(flow);
+        ReadPersistedMaterialization(flow);
 
     public static AdvisoryArtifactMaterializationPolicy?
         ReadPersistedMaterialization(FlowRun flow)
@@ -513,8 +482,7 @@ public sealed class AdvisoryArtifactCatalog(
         var candidates = flow.Events
             .Where(item =>
                 item.Type == MaterializationEventType &&
-                !string.IsNullOrWhiteSpace(item.DataJson) &&
-                IsCurrentMaterializationJson(item.DataJson!))
+                !string.IsNullOrWhiteSpace(item.DataJson))
             .Select(item => DeserializeMaterialization(item.DataJson!))
             .Where(item => item.Iteration == flow.Iteration)
             .ToArray();
@@ -529,69 +497,6 @@ public sealed class AdvisoryArtifactCatalog(
         }
         ValidateMaterializationPolicy(candidates[0], flow);
         return candidates[0];
-    }
-
-    private AdvisoryArtifactMaterializationPolicy?
-        TryReadLegacyMaterialization(FlowRun flow)
-    {
-        var currentStepIds = flow.Steps
-            .Where(step => step.Iteration == flow.Iteration)
-            .Select(step => step.Id)
-            .ToHashSet();
-        var legacyEvents = flow.Events
-            .Where(item =>
-                item.Type == MaterializationEventType &&
-                item.FlowStepId is { } stepId &&
-                currentStepIds.Contains(stepId) &&
-                IsLegacyMaterializationJson(item.DataJson))
-            .ToArray();
-        if (legacyEvents.Length > 1)
-        {
-            throw new InvalidOperationException(
-                "The current Advisory iteration has duplicate legacy materializations.");
-        }
-        if (legacyEvents.Length == 0)
-        {
-            return null;
-        }
-        var workspace = ValidateWorkspace(
-            flow,
-            flow.WorkspacePath,
-            "Legacy Advisory artifacts");
-        var metadata = ReadMetadata(flow.Id)
-                       ?? throw new InvalidOperationException(
-                           "The legacy Advisory materialization has no flow-owned workspace metadata.");
-        ValidateMetadata(metadata, flow, workspace);
-        var outcome = FlowOutcomeParser.ParseJson(flow.OutcomeContractJson);
-        var identities = (outcome.Document.Artifacts ?? [])
-            .Select(artifact =>
-            {
-                var bytes = Encoding.UTF8.GetBytes(artifact.Content);
-                return new AdvisoryArtifactIdentity(
-                    NormalizeArtifactPath(artifact.Path),
-                    artifact.MediaType,
-                    bytes.Length,
-                    "sha256:" + Convert.ToHexString(SHA256.HashData(bytes))
-                        .ToLowerInvariant());
-            })
-            .OrderBy(item => item.Path, StringComparer.Ordinal)
-            .ToArray();
-        var policy = new AdvisoryArtifactMaterializationPolicy(
-            AdvisoryArtifactMaterializationPolicy.CurrentVersion,
-            flow.Id,
-            flow.Iteration,
-            OutcomeVerificationRules.ComputeSha256(outcome.RawJson),
-            metadata.ArtifactDirectory,
-            metadata.ArtifactDirectory,
-            identities.Length,
-            identities.Sum(item => item.ByteLength),
-            identities,
-            legacyEvents[0].CreatedAt)
-        {
-            LegacyMigratedReadOnly = true
-        };
-        ValidateMaterializationPolicy(policy, flow);
-        return policy;
     }
 
     public IReadOnlyList<AdvisoryArtifact> Discover(FlowRun flow)
@@ -847,7 +752,6 @@ public sealed class AdvisoryArtifactCatalog(
                 RelativeDirectory = policy.MaterializationDirectory,
                 Artifacts = policy.Artifacts.ToArray()
             });
-            metadata.Version = MetadataVersion;
             await WriteMetadataAsync(metadata, cancellationToken);
         }
     }
@@ -1208,78 +1112,74 @@ public sealed class AdvisoryArtifactCatalog(
             string stagingWorkspace,
             GuardedSnapshotMarker marker,
             CancellationToken cancellationToken)
-        {
-            var markerPath = Path.Combine(
-                stagingWorkspace,
-                GuardedSnapshotMarkerFileName);
-            await using var stream = new FileStream(
-                markerPath,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 4_096,
-                FileOptions.WriteThrough);
-            await JsonSerializer.SerializeAsync(
-                stream,
-                marker,
-                DurableJsonOptions,
-                cancellationToken);
-            await stream.FlushAsync(cancellationToken);
-            stream.Flush(flushToDisk: true);
-        }
+    {
+        var markerPath = Path.Combine(
+            stagingWorkspace,
+            GuardedSnapshotMarkerFileName);
+        await using var stream = new FileStream(
+            markerPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 4_096,
+            FileOptions.WriteThrough);
+        await JsonSerializer.SerializeAsync(
+            stream,
+            marker,
+            DurableJsonOptions,
+            cancellationToken);
+        await stream.FlushAsync(cancellationToken);
+        stream.Flush(flushToDisk: true);
+    }
 
     private static async Task<bool> HasMatchingOwnershipMarkerAsync(
             FlowRun flow,
             string workspace,
             AdvisoryWorkspaceMetadata metadata,
             CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(metadata.OwnershipNonce))
         {
-            if (string.IsNullOrWhiteSpace(metadata.OwnershipNonce))
-            {
-                return false;
-            }
-            var markerPath = Path.Combine(
-                workspace,
-                GuardedSnapshotMarkerFileName);
-            if (!File.Exists(markerPath))
-            {
-                return false;
-            }
-            RejectReparse(markerPath, "Guarded snapshot ownership marker");
-            try
-            {
-                await using var stream = new FileStream(
-                    markerPath,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.Read,
-                    bufferSize: 4_096,
-                    useAsync: true);
-                var marker = await JsonSerializer.DeserializeAsync<GuardedSnapshotMarker>(
-                    stream,
-                    DurableJsonOptions,
-                    cancellationToken);
-                return marker is not null &&
-                       string.Equals(
-                           marker.Version,
-                           GuardedSnapshotMarker.CurrentVersion,
-                           StringComparison.Ordinal) &&
-                       marker.FlowId == flow.Id &&
-                       PathsEqual(marker.SourcePath, flow.RepositoryPath) &&
-                       PathsEqual(marker.WorkspacePath, workspace) &&
-                       string.Equals(
-                           marker.OwnershipNonce,
-                           metadata.OwnershipNonce,
-                           StringComparison.Ordinal) &&
-                       string.Equals(
-                           marker.BaselineDigest,
-                           metadata.Baseline?.Digest,
-                           StringComparison.Ordinal);
-            }
-            catch (JsonException)
-            {
-                return false;
-            }
+            return false;
+        }
+        var markerPath = Path.Combine(
+            workspace,
+            GuardedSnapshotMarkerFileName);
+        if (!File.Exists(markerPath))
+        {
+            return false;
+        }
+        RejectReparse(markerPath, "Guarded snapshot ownership marker");
+        try
+        {
+            await using var stream = new FileStream(
+                markerPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 4_096,
+                useAsync: true);
+            var marker = await JsonSerializer.DeserializeAsync<GuardedSnapshotMarker>(
+                stream,
+                DurableJsonOptions,
+                cancellationToken);
+            return marker is not null &&
+                   marker.FlowId == flow.Id &&
+                   PathsEqual(marker.SourcePath, flow.RepositoryPath) &&
+                   PathsEqual(marker.WorkspacePath, workspace) &&
+                   string.Equals(
+                       marker.OwnershipNonce,
+                       metadata.OwnershipNonce,
+                       StringComparison.Ordinal) &&
+                   string.Equals(
+                       marker.BaselineDigest,
+                       metadata.Baseline?.Digest,
+                       StringComparison.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static void ValidateMetadata(
@@ -1287,9 +1187,7 @@ public sealed class AdvisoryArtifactCatalog(
         FlowRun flow,
         string workspace)
     {
-        if (metadata.Version is not (
-                MetadataVersion or LegacyMetadataVersion) ||
-            metadata.FlowId != flow.Id ||
+        if (metadata.FlowId != flow.Id ||
             !PathsEqual(metadata.WorkspacePath, workspace) ||
             !string.IsNullOrWhiteSpace(metadata.SourcePath) &&
             !PathsEqual(metadata.SourcePath, flow.RepositoryPath) ||
@@ -1445,60 +1343,12 @@ public sealed class AdvisoryArtifactCatalog(
         }
     }
 
-    private static bool IsCurrentMaterializationJson(string json)
-    {
-        try
-        {
-            using var document = JsonDocument.Parse(json);
-            return document.RootElement.ValueKind == JsonValueKind.Object &&
-                   document.RootElement.TryGetProperty(
-                       "Version",
-                       out var version) &&
-                   string.Equals(
-                       version.GetString(),
-                       AdvisoryArtifactMaterializationPolicy.CurrentVersion,
-                       StringComparison.Ordinal);
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-    }
-
-    private static bool IsLegacyMaterializationJson(string? json)
-    {
-        if (string.IsNullOrWhiteSpace(json))
-        {
-            return false;
-        }
-        try
-        {
-            using var document = JsonDocument.Parse(json);
-            return document.RootElement.ValueKind == JsonValueKind.Object &&
-                   document.RootElement.TryGetProperty(
-                       "Version",
-                       out var version) &&
-                   string.Equals(
-                       version.GetString(),
-                       "advisory-artifacts-v1",
-                       StringComparison.Ordinal);
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-    }
-
     private static void ValidateMaterializationPolicy(
         AdvisoryArtifactMaterializationPolicy policy,
         FlowRun? flow)
     {
         ArgumentNullException.ThrowIfNull(policy);
-        if (!string.Equals(
-                policy.Version,
-                AdvisoryArtifactMaterializationPolicy.CurrentVersion,
-                StringComparison.Ordinal) ||
-            policy.FlowId == Guid.Empty ||
+        if (policy.FlowId == Guid.Empty ||
             policy.Iteration < 1 ||
             !OutcomeVerificationRules.IsSha256(policy.OutcomeHash) ||
             string.IsNullOrWhiteSpace(policy.ArtifactDirectory) ||
@@ -1535,14 +1385,7 @@ public sealed class AdvisoryArtifactCatalog(
         var comparison = OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
-        var isLegacyRoot =
-            policy.LegacyMigratedReadOnly &&
-            string.Equals(
-                normalizedArtifactDirectory,
-                normalizedMaterializationDirectory,
-                comparison);
-        if (!isLegacyRoot &&
-            !normalizedMaterializationDirectory.StartsWith(
+        if (!normalizedMaterializationDirectory.StartsWith(
                 normalizedArtifactDirectory + "\\",
                 comparison))
         {
@@ -1629,8 +1472,6 @@ public sealed class AdvisoryArtifactCatalog(
 
     private sealed class AdvisoryWorkspaceMetadata
     {
-        public string Version { get; set; } = string.Empty;
-
         public Guid FlowId { get; set; }
 
         public string WorkspacePath { get; set; } = string.Empty;
@@ -1663,10 +1504,6 @@ public sealed class AdvisoryArtifactCatalog(
 
     private sealed class GuardedSnapshotMarker
     {
-        public const string CurrentVersion = "guarded-snapshot-owner-v1";
-
-        public string Version { get; set; } = string.Empty;
-
         public Guid FlowId { get; set; }
 
         public string SourcePath { get; set; } = string.Empty;

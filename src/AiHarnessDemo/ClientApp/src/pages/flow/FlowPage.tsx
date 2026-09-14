@@ -13,10 +13,7 @@ import { useToast } from "../../lib/toast";
 import { IterationLane } from "./IterationLane";
 import { StepDetail } from "./StepDetail";
 import { Timeline } from "./Timeline";
-import { FeedbackCard } from "./FeedbackCard";
 import { AbandonFlowButton } from "./AbandonFlowButton";
-import { OutcomeResolutionCard } from "./OutcomeResolutionCard";
-import { OutcomeVerificationPanel } from "./OutcomeVerificationPanel";
 import { BlockedFlowCard } from "./BlockedFlowCard";
 import { ReviewCard } from "./ReviewCard";
 import { ReadinessPanel } from "./ReadinessPanel";
@@ -99,7 +96,6 @@ export function FlowPage() {
       : 0;
   const grouped = groupBy(allSteps, step => step.iteration);
   const repositoryName = lastPathPart(flow.repositoryPath);
-  const studioFlow = flow.contractVersion === "studio-v2";
   const publishedDelivery =
     flow.kind === "Delivery" &&
     flow.status === "Approved" &&
@@ -190,11 +186,6 @@ export function FlowPage() {
               </span>
             )}
             <span>{allSteps.filter(step => step.status === "Pushback").length} pushbacks observed</span>
-            {!studioFlow && !flow.outcomeVerification.legacyUnverified && (
-              <span>
-                QA {flow.outcomeVerification.currentRound}/{flow.outcomeVerification.maxRounds}
-              </span>
-            )}
           </div>
         </div>
         <div className="flow-heading-actions">
@@ -207,7 +198,7 @@ export function FlowPage() {
           <button className="button small" onClick={() => void copyFlowLink()}>
             <CopyIcon /> Copy link
           </button>
-          {(!studioFlow || publishedDelivery) && flow.outcomeUrl && (
+          {publishedDelivery && flow.outcomeUrl && (
             <a className="button primary small" href={flow.outcomeUrl}>
               <ExternalIcon /> {publishedDelivery || flow.status === "Approved"
                 ? "Published outcome"
@@ -251,7 +242,7 @@ export function FlowPage() {
           </div>
         </nav>
       )}
-      {studioFlow && flow.status === "Blocked" && <BlockedFlowCard flow={flow} />}
+      {flow.status === "Blocked" && <BlockedFlowCard flow={flow} />}
       <div className="card lane-card">
         <div className="card-header">
           <div>
@@ -285,7 +276,6 @@ export function FlowPage() {
           </div>
         )}
       </div>
-      {!studioFlow && <OutcomeVerificationPanel outcome={flow.outcomeVerification} />}
       {flow.deliveryReadiness && <ReadinessPanel flow={flow} />}
       <section className="factory-detail-grid">
         <div className="card detail-panel">
@@ -315,13 +305,7 @@ export function FlowPage() {
           </div>
         </div>
       </section>
-      {studioFlow && flow.review.available && <ReviewCard flow={flow} />}
-      {!studioFlow && flow.status === "WaitingForFeedback" &&
-        flow.outcomeVerification.status !== "AwaitingHumanResolution" && <FeedbackCard flow={flow} />}
-      {!studioFlow && flow.status === "WaitingForFeedback" &&
-        flow.outcomeVerification.status === "AwaitingHumanResolution" && (
-          <OutcomeResolutionCard flow={flow} />
-        )}
+      {flow.review.available && <ReviewCard flow={flow} />}
       {flow.status === "Approved" && (
         <section className="approval-banner">
           <div>
@@ -337,11 +321,6 @@ export function FlowPage() {
             </span>
           </div>
           <div className="flow-heading-actions">
-            {!studioFlow && (
-              <a className="button" href={`#/preview/${flow.id}`}>
-                <ExternalIcon /> Accepted preview
-              </a>
-            )}
             {publishedDelivery && (
               <a className="button success" href={flow.outcomeUrl}>
                 <ExternalIcon /> Published outcome

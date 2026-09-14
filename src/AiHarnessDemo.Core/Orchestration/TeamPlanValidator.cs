@@ -13,8 +13,7 @@ public sealed record TeamPlanValidationContext(
     int MaximumSteps,
     int MaximumDependenciesPerStep,
     int MaximumAssignmentCharacters,
-    IReadOnlyCollection<PlanDuty> RequiredDuties,
-    bool RequireOutcomeOwnerVerification = true)
+    IReadOnlyCollection<PlanDuty> RequiredDuties)
 {
     public static TeamPlanValidationContext FromWorkflow(
         FlowKind flowKind,
@@ -34,15 +33,13 @@ public sealed record TeamPlanValidationContext(
             planning.MaxSteps,
             planning.MaxDependenciesPerStep,
             planning.MaxAssignmentCharacters,
-            required,
-            RequireOutcomeOwnerVerification: true);
+            required);
     }
 
     public static TeamPlanValidationContext ForPersistedPlan(
         FlowKind flowKind,
         IReadOnlyCollection<FlowAgentSnapshot> snapshots,
         bool preMortemEnabled) =>
-        // Accepted plan documents stay immutable; legacy ordering is repaired in execution state.
         new(
             flowKind,
             snapshots,
@@ -58,8 +55,7 @@ public sealed record TeamPlanValidationContext(
                     PlanDuty.Verify,
                     PlanDuty.PrepareOutcome,
                     PlanDuty.Publish
-                ],
-            RequireOutcomeOwnerVerification: false);
+                ]);
 }
 
 public sealed record ValidatedTeamPlan(
@@ -101,10 +97,6 @@ public sealed class TeamPlanValidator
         ArgumentNullException.ThrowIfNull(context);
 
         var errors = new List<string>();
-        if (!string.Equals(document.Version, TeamPlanParser.Version, StringComparison.Ordinal))
-        {
-            errors.Add($"version must be exactly '{TeamPlanParser.Version}'");
-        }
         ValidateContext(context, errors);
 
         if (document.Steps?.Any(step => step is null) == true)
@@ -230,7 +222,7 @@ public sealed class TeamPlanValidator
     }
 
     /// <summary>
-    /// A studio-v2 Delivery plan must publish typed acceptance criteria. They are the only criterion
+    /// A Delivery plan must publish typed acceptance criteria. They are the only criterion
     /// namespace that later verification may use, so a missing or malformed plan is rejected here
     /// rather than being reconstructed from prose later.
     /// </summary>
@@ -256,9 +248,7 @@ public sealed class TeamPlanValidator
             return;
         }
         foreach (var error in DeliveryReadinessPolicy.ValidateAcceptancePlan(
-                     new DeliveryAcceptancePlan(
-                         DeliveryAcceptancePlan.CurrentVersion,
-                         document.AcceptanceCriteria)))
+                     new DeliveryAcceptancePlan(document.AcceptanceCriteria)))
         {
             errors.Add(error);
         }
@@ -704,18 +694,15 @@ public sealed class TeamPlanValidator
         {
             errors.Add("a Delivery plan cannot Publish before review");
         }
-        if (context.RequireOutcomeOwnerVerification)
+        var verificationSteps = preReview
+            .Where(step => step.Duties?.Contains(PlanDuty.Verify) == true)
+            .ToList();
+        if (verificationSteps.Count != 1 ||
+            owners.Count != 1 ||
+            !ReferenceEquals(verificationSteps.SingleOrDefault(), owners[0]))
         {
-            var verificationSteps = preReview
-                .Where(step => step.Duties?.Contains(PlanDuty.Verify) == true)
-                .ToList();
-            if (verificationSteps.Count != 1 ||
-                owners.Count != 1 ||
-                !ReferenceEquals(verificationSteps.SingleOrDefault(), owners[0]))
-            {
-                errors.Add(
-                    "a Delivery plan requires its final outcome owner to be the sole BeforeReview Verify-duty step");
-            }
+            errors.Add(
+                "a Delivery plan requires its final outcome owner to be the sole BeforeReview Verify-duty step");
         }
         var afterApproval = steps
             .Where(step => step.Stage == PlanStage.AfterApproval)

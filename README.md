@@ -1,25 +1,26 @@
 # AI Harness Studio
 
-AI Harness Studio is a standalone .NET 10 application that turns a customer request into an
-observable, durable multi-agent flow executed through GitHub Copilot CLI. It is an independent
-adaptation of selected OpenAI Symphony ideas, not a port, drop-in replacement, or claim of full
-Symphony conformance.
+AI Harness Studio is a standalone .NET 10 application that turns a customer request into one
+observable, durable, dynamic multi-agent flow executed through GitHub Copilot CLI. It is an
+independent adaptation of selected OpenAI Symphony ideas, not a port, drop-in replacement, or claim
+of full Symphony conformance.
 
 The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vite.
 
 ## Key capabilities
 
 - **Repository-grounded work** — Studio performs a read-only, evidence-based repository study,
-  persists the resulting project knowledge, and refreshes it after an accepted Delivery when the
-  implementation changes that knowledge.
-- **Dynamic agent teams** — an Account Manager confirms the brief, then a Team Lead selects enabled
-  repository-defined agents, duties, dependencies, acceptance criteria, and an outcome owner.
+  persists the resulting project knowledge, and keeps publication recaps flow-scoped until the
+  published branch is integrated and the source is re-analyzed.
+- **Dynamic, duty-based teams** — an Account Manager confirms the brief, then a Team Lead selects
+  enabled snapshotted agents and assigns duties, dependencies, acceptance criteria, and an outcome
+  owner. Duties, not agent names, define the required work.
 - **Advisory and Delivery flows** — Advisory produces reviewable recommendations without source
-  writes; Delivery works in an isolated Git worktree and can publish a commit or pull request only
-  after customer acceptance.
+  writes and lets the host materialize declared artifacts; Delivery works in an isolated Git
+  worktree and can publish a commit or pull request only after customer acceptance.
 - **Evidence-based readiness** — Delivery acceptance criteria, host-observed execution evidence, QA
-  results, residual risks, waivers, and the exact reviewed candidate are bound together before
-  approval or publication.
+  results, residual risks, waivers, and the exact sealed candidate are bound together before review,
+  approval, or publication.
 - **Reviewable outcomes** — customers can inspect Advisory artifacts or an immutable,
   network-disabled Delivery preview. An optional loopback-only live demo is available for
   convenience but never counts as readiness evidence.
@@ -28,21 +29,27 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
 
 ## How a flow runs
 
-1. Select and study a source repository, then submit a request.
-2. Account Manager returns a strict `intake-v2` brief for customer confirmation as Advisory or
-   Delivery.
-3. Team Lead creates a validated `team-plan-v1` from the flow's immutable agent snapshot.
-4. Agents execute sequentially in the flow's isolated workspace. Dependencies carry results
-   forward, optional pre-mortem checks can challenge work, and every transition is persisted.
-5. The outcome owner returns `flow-outcome-v1`. Customers can refine either flow kind, accept an
-   Advisory, promote it to a fresh Delivery, or approve a ready Delivery for host-controlled
-   publication.
+1. In **Settings**, choose a **Source project** and select **Initialize and study repository**.
+2. Submit a request. Creating the flow captures immutable agent definitions and enabled state.
+3. The Account Manager returns a strict `intake` brief for explicit customer confirmation as
+   Advisory or Delivery.
+4. The Team Lead creates a validated `team plan` from that snapshot. Worker identities are optional,
+   but required duties and dependency rules are enforced.
+5. Agents execute sequentially in the flow workspace. Dependencies carry results forward, optional
+   pre-mortem checks can challenge work, and bounded pushback can return work to an earlier
+   dependency.
+6. For Delivery, the final `BeforeReview` outcome owner is the sole `Verify` step and also owns
+   `PrepareOutcome`. The host validates its criterion results, seals the candidate, and derives
+   Delivery readiness.
+7. Customers can refine either flow kind, accept an Advisory, promote it to a fresh Delivery, or
+   accept a ready Delivery. Only accepted Delivery work materializes the planned `AfterApproval`
+   Publish step.
 
 Different flows may run concurrently; steps inside one flow remain sequential.
 
 ## Runtime guarantees
 
-- Root `WORKFLOW.md` is a strict, atomically reloaded policy and prompt contract. An invalid current
+- Root `WORKFLOW.md` is a strict, atomically reloaded policy and prompt definition. An invalid current
   file blocks new work without changing the last-known-good definition used by existing flows.
 - Agent definitions live in `.github\agents\*.agent.md`. Each flow captures immutable definitions
   and enabled state, so catalog changes affect only future flows.
@@ -63,6 +70,7 @@ same-user process.
 | Account Manager | Required and always enabled for intake, refinement, and customer-safe blocker explanations. |
 | Team Lead | Required and always enabled for dynamic planning. |
 | Pre-mortem Sceptic | Required definition; execution can be disabled. |
+| Quality Engineer | Optional and switchable. Any enabled suitable agent may carry `Verify`; selecting an independent Quality Engineer provides stronger separation from implementation. |
 | All other definitions | Optional, switchable, and selected by exact snapshot ID. |
 
 Use **Reload catalog** after editing definitions. Invalid optional definitions remain visible for
@@ -92,6 +100,18 @@ dotnet run --project .\src\AiHarnessDemo
 Open `http://localhost:5283`. Runtime state is stored in `data\ai-harness.db`; isolated flow
 workspaces are created under `data\worktrees`.
 
+Startup uses `Database.EnsureCreatedAsync()` to create a fresh schema when the database file is
+absent. It does not update an existing schema. After entity-shape changes, stop Studio and recreate
+the development database:
+
+```powershell
+Remove-Item .\data\ai-harness.db, .\data\ai-harness.db-wal, .\data\ai-harness.db-shm `
+  -Force -ErrorAction SilentlyContinue
+.\Start-Demo.ps1
+```
+
+This deletes local settings, flow history, reviews, and readiness records.
+
 ## Validate
 
 ```powershell
@@ -107,6 +127,6 @@ npm run build
 Pop-Location
 ```
 
-See [`docs\ARCHITECTURE.md`](docs/ARCHITECTURE.md) for contracts, lifecycle details, persistence,
+See [`docs\ARCHITECTURE.md`](docs/ARCHITECTURE.md) for plan rules, lifecycle details, persistence,
 recovery, and trust boundaries. See
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for Symphony attribution.

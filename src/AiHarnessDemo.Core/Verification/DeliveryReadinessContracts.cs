@@ -7,7 +7,7 @@ namespace AiHarnessDemo.Core.Verification;
 
 /// <summary>
 /// Host-derived outcome of one acceptance criterion. The value is derived from the strict
-/// <c>outcome-qa-v2</c> contract and never from prose, a handoff marker, or a claim.
+/// strict verification contract and never from prose, a handoff marker, or a claim.
 /// </summary>
 public enum DeliveryCriterionOutcome
 {
@@ -59,17 +59,6 @@ public enum DeliveryReadinessAction
     Abandon
 }
 
-/// <summary>
-/// Reconciliation provenance for a persisted readiness assessment. Legacy rows are projected as
-/// <see cref="DeliveryReadinessState.Blocked"/> and never as a green approval.
-/// </summary>
-public enum DeliveryReadinessReconciliation
-{
-    Current,
-    LegacyUnverified,
-    SupersededByReconciliation
-}
-
 /// <summary>Stable machine-readable conflict codes returned to clients as RFC 9457 problems.</summary>
 public static class DeliveryReadinessConflicts
 {
@@ -78,7 +67,7 @@ public static class DeliveryReadinessConflicts
     public const string WaiverNotApplicable = "readiness.waiver-not-applicable";
     public const string CandidateStale = "readiness.candidate-stale";
     public const string ReviewStale = "readiness.review-stale";
-    public const string ReconciliationRequired = "readiness.reconciliation-required";
+    public const string BindingInvalid = "readiness.binding-invalid";
     public const string PublicationNotAuthorized = "readiness.publication-not-authorized";
     public const string ContractInvalid = "readiness.contract-invalid";
 }
@@ -128,15 +117,11 @@ public sealed class DeliveryAcceptanceCriterion
 }
 
 /// <summary>
-/// The mandatory studio-v2 Delivery acceptance plan. It is authored during planning, hashed by the
+/// The mandatory Delivery acceptance plan. It is authored during planning, hashed by the
 /// host, and is the only permitted criterion namespace for later verification.
 /// </summary>
 public sealed record DeliveryAcceptancePlan(
-    string Version,
-    IReadOnlyList<DeliveryAcceptanceCriterion> Criteria)
-{
-    public const string CurrentVersion = "delivery-acceptance-plan-v1";
-}
+    IReadOnlyList<DeliveryAcceptanceCriterion> Criteria);
 
 public sealed class DeliveryQaCriterionDocument
 {
@@ -172,15 +157,24 @@ public sealed class DeliveryResidualRiskDocument
     public string? PreMortemFindingId { get; init; }
 }
 
+public sealed class DeliveryPlanGapDocument
+{
+    public string Requirement { get; init; } = string.Empty;
+
+    public string Verification { get; init; } = string.Empty;
+
+    public IReadOnlyList<string>? OwnerRoles { get; init; }
+
+    public string Rationale { get; init; } = string.Empty;
+}
+
 /// <summary>
-/// The strict <c>outcome-qa-v2</c> document. It must contain exactly one result for every planned
+/// The strict verification document. It must contain exactly one result for every planned
 /// acceptance criterion. The agent-supplied verdict is compared against the host derivation and is
 /// never itself an authorization.
 /// </summary>
 public sealed class DeliveryQaDocument
 {
-    public string Version { get; init; } = string.Empty;
-
     public string AcceptancePlanHash { get; init; } = string.Empty;
 
     public OutcomeQaVerdict? Verdict { get; init; }
@@ -188,12 +182,24 @@ public sealed class DeliveryQaDocument
     public IReadOnlyList<DeliveryQaCriterionDocument>? Criteria { get; init; }
 
     public IReadOnlyList<DeliveryResidualRiskDocument>? ResidualRisks { get; init; }
+
+    public IReadOnlyList<DeliveryPlanGapDocument>? PlanGaps { get; init; }
 }
 
 public sealed record ParsedDeliveryQaDocument(
     DeliveryQaDocument Document,
     string RawJson,
     string ContractHash);
+
+/// <summary>One host-observed fact that a verification result may cite.</summary>
+public sealed record DeliveryEvidenceItem(
+    string EvidenceId,
+    OutcomeEvidenceKind Kind,
+    string Locator,
+    string Summary,
+    bool SupportsVerification,
+    int? ExitCode,
+    string ResultDigest);
 
 /// <summary>One persisted, host-derived criterion row inside a readiness snapshot.</summary>
 public sealed record DeliveryReadinessCriterion(
@@ -224,13 +230,11 @@ public sealed record DeliveryReadinessRisk(
 /// an acceptance, or a publication is bound to the identifiers and hashes carried here.
 /// </summary>
 public sealed record DeliveryReadinessSnapshot(
-    string Version,
     Guid Id,
     Guid FlowRunId,
     int Iteration,
     int Revision,
     DeliveryReadinessState State,
-    DeliveryReadinessReconciliation Reconciliation,
     string CandidateFingerprint,
     string AcceptancePlanHash,
     string OutcomeContractHash,
@@ -242,10 +246,7 @@ public sealed record DeliveryReadinessSnapshot(
     IReadOnlyList<DeliveryReadinessRisk> Risks,
     IReadOnlyList<string> RequiredWaiverRiskIds,
     IReadOnlyList<string> Diagnostics,
-    DateTimeOffset CreatedAt)
-{
-    public const string CurrentVersion = "delivery-readiness-v1";
-}
+    DateTimeOffset CreatedAt);
 
 /// <summary>Everything the pure policy needs to derive one readiness assessment.</summary>
 public sealed record DeliveryReadinessDerivationInput(
@@ -262,7 +263,7 @@ public sealed record DeliveryReadinessDerivationInput(
     string OutcomeContractHash,
     string CandidateFingerprint,
     IReadOnlyCollection<string> GrantedWaiverRiskIds,
-    IReadOnlyCollection<string>? KnownEvidenceIds,
+    IReadOnlyCollection<DeliveryEvidenceItem>? KnownEvidence,
     IReadOnlyList<Guid> PreMortemStepIds,
     IReadOnlyList<string> HostDiagnostics,
     DateTimeOffset CreatedAt,
@@ -275,9 +276,8 @@ public sealed record DeliveryReadinessDerivationInput(
 /// </summary>
 public static class DeliveryReadinessPolicy
 {
-    public const string QaVersion = "outcome-qa-v2";
-    public const string QaBeginMarker = "OUTCOME_QA_V2_BEGIN";
-    public const string QaEndMarker = "OUTCOME_QA_V2_END";
+    public const string QaBeginMarker = "OUTCOME_QA_BEGIN";
+    public const string QaEndMarker = "OUTCOME_QA_END";
 
     public const int MaximumQaBytes = 64 * 1024;
     public const int MaximumCriteria = 24;
@@ -327,15 +327,7 @@ public static class DeliveryReadinessPolicy
         var errors = new List<string>();
         if (plan is null)
         {
-            return ["acceptance plan is required for a studio-v2 Delivery flow"];
-        }
-        if (!string.Equals(
-                plan.Version,
-                DeliveryAcceptancePlan.CurrentVersion,
-                StringComparison.Ordinal))
-        {
-            errors.Add(
-                $"acceptance plan version must be exactly '{DeliveryAcceptancePlan.CurrentVersion}'");
+            return ["acceptance plan is required for a Delivery flow"];
         }
         if (plan.Criteria is null || plan.Criteria.Count is < 1 or > MaximumCriteria)
         {
@@ -377,12 +369,12 @@ public static class DeliveryReadinessPolicy
         return errors;
     }
 
-    /// <summary>Extracts and strictly validates an <c>outcome-qa-v2</c> document from agent output.</summary>
+    /// <summary>Extracts and strictly validates a verification document from agent output.</summary>
     public static ParsedDeliveryQaDocument ParseQaOutput(
         string output,
         DeliveryAcceptancePlan plan,
         string acceptancePlanHash,
-        IReadOnlyCollection<string>? knownEvidenceIds = null)
+        IReadOnlyCollection<DeliveryEvidenceItem>? knownEvidence = null)
     {
         ArgumentNullException.ThrowIfNull(output);
         var begins = FindStandalone(output, QaBeginMarker);
@@ -396,7 +388,7 @@ public static class DeliveryReadinessPolicy
             output[(begins[0] + QaBeginMarker.Length)..ends[0]].Trim(),
             plan,
             acceptancePlanHash,
-            knownEvidenceIds);
+            knownEvidence);
     }
 
     public static bool ContainsQaContract(string? output) =>
@@ -407,7 +399,7 @@ public static class DeliveryReadinessPolicy
         string json,
         DeliveryAcceptancePlan plan,
         string acceptancePlanHash,
-        IReadOnlyCollection<string>? knownEvidenceIds = null)
+        IReadOnlyCollection<DeliveryEvidenceItem>? knownEvidence = null)
     {
         ArgumentNullException.ThrowIfNull(json);
         ArgumentNullException.ThrowIfNull(plan);
@@ -439,14 +431,14 @@ public static class DeliveryReadinessPolicy
         catch (JsonException exception)
         {
             throw new DeliveryReadinessContractException(
-                [$"QA result is not strict {QaVersion} JSON: {exception.Message}"]);
+                [$"QA result is not strict JSON: {exception.Message}"]);
         }
 
         var errors = ValidateQaDocument(
             document,
             plan,
             acceptancePlanHash,
-            knownEvidenceIds);
+            knownEvidence);
         if (errors.Count > 0)
         {
             throw new DeliveryReadinessContractException(errors);
@@ -461,16 +453,12 @@ public static class DeliveryReadinessPolicy
         DeliveryQaDocument? document,
         DeliveryAcceptancePlan plan,
         string acceptancePlanHash,
-        IReadOnlyCollection<string>? knownEvidenceIds = null)
+        IReadOnlyCollection<DeliveryEvidenceItem>? knownEvidence = null)
     {
         var errors = new List<string>();
         if (document is null)
         {
             return ["QA result document is null"];
-        }
-        if (!string.Equals(document.Version, QaVersion, StringComparison.Ordinal))
-        {
-            errors.Add($"version must be exactly '{QaVersion}'");
         }
         if (!OutcomeVerificationRules.IsSha256(document.AcceptancePlanHash) ||
             !string.Equals(
@@ -494,10 +482,15 @@ public static class DeliveryReadinessPolicy
             errors.Add("residualRisks is required");
             return errors;
         }
+        if (document.PlanGaps is null)
+        {
+            errors.Add("planGaps is required");
+            return errors;
+        }
 
-        var plannedIds = (plan.Criteria ?? [])
-            .Select(item => item.Id)
-            .ToHashSet(StringComparer.Ordinal);
+        var plannedById = (plan.Criteria ?? [])
+            .ToDictionary(item => item.Id, StringComparer.Ordinal);
+        var plannedIds = plannedById.Keys.ToHashSet(StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var criterionIndex = 0;
         foreach (var result in document.Criteria)
@@ -532,7 +525,11 @@ public static class DeliveryReadinessPolicy
                 result.EvidenceIds,
                 $"criterion '{result.CriterionId}'",
                 required: result.Outcome == DeliveryCriterionOutcome.Verified,
-                knownEvidenceIds,
+                knownEvidence,
+                result.Outcome == DeliveryCriterionOutcome.Verified &&
+                plannedById.TryGetValue(criterionId, out var planned)
+                    ? planned.EvidenceKinds
+                    : null,
                 errors);
             if ((result.Outcome is
                      DeliveryCriterionOutcome.Failed or
@@ -619,7 +616,8 @@ public static class DeliveryReadinessPolicy
                 risk.EvidenceIds,
                 $"residual risk '{risk.RiskId}'",
                 required: false,
-                knownEvidenceIds,
+                knownEvidence,
+                allowedKinds: null,
                 errors);
             if (risk.CriterionIds is not null)
             {
@@ -647,6 +645,41 @@ public static class DeliveryReadinessPolicy
             }
         }
 
+        if (document.PlanGaps.Count > MaximumCriteria)
+        {
+            errors.Add($"planGaps must contain at most {MaximumCriteria} entries");
+        }
+        foreach (var (gap, index) in document.PlanGaps.Select(
+                     (gap, index) => (gap, index)))
+        {
+            if (gap is null)
+            {
+                errors.Add($"plan gap {index + 1} is null");
+                continue;
+            }
+            RequireText(
+                gap.Requirement,
+                $"plan gap {index + 1} requirement",
+                errors);
+            RequireText(
+                gap.Verification,
+                $"plan gap {index + 1} verification",
+                errors);
+            RequireText(
+                gap.Rationale,
+                $"plan gap {index + 1} rationale",
+                errors);
+            if (gap.OwnerRoles is null ||
+                gap.OwnerRoles.Count is < 1 or > 4 ||
+                gap.OwnerRoles.Any(string.IsNullOrWhiteSpace) ||
+                gap.OwnerRoles.Distinct(StringComparer.Ordinal).Count() !=
+                    gap.OwnerRoles.Count)
+            {
+                errors.Add(
+                    $"plan gap {index + 1} ownerRoles must contain 1-4 unique roles");
+            }
+        }
+
         if (errors.Count == 0)
         {
             var derived = DeriveVerdict(document);
@@ -668,12 +701,14 @@ public static class DeliveryReadinessPolicy
         ArgumentNullException.ThrowIfNull(document);
         var criteria = document.Criteria ?? [];
         var risks = document.ResidualRisks ?? [];
+        var planGaps = document.PlanGaps ?? [];
         if (criteria.Any(item => item?.Outcome == DeliveryCriterionOutcome.Blocked) ||
             risks.Any(item => item?.Classification == DeliveryRiskClassification.Blocking))
         {
             return OutcomeQaVerdict.BLOCKED;
         }
-        return criteria.Count > 0 &&
+        return planGaps.Count == 0 &&
+               criteria.Count > 0 &&
                criteria.All(item => item?.Outcome == DeliveryCriterionOutcome.Verified)
             ? OutcomeQaVerdict.PASS
             : OutcomeQaVerdict.FAIL;
@@ -702,7 +737,7 @@ public static class DeliveryReadinessPolicy
                 input.Qa,
                 input.AcceptancePlan!,
                 input.AcceptancePlanHash,
-                input.KnownEvidenceIds);
+                input.KnownEvidence);
             if (qaErrors.Count > 0)
             {
                 diagnostics.AddRange(qaErrors);
@@ -743,6 +778,9 @@ public static class DeliveryReadinessPolicy
                         input.QaStepId,
                         risk.PreMortemFindingId));
                 }
+                diagnostics.AddRange(input.Qa.PlanGaps!
+                    .Select(gap =>
+                        $"Verification found an acceptance-plan gap: {gap.Requirement.Trim()}"));
             }
         }
 
@@ -773,13 +811,11 @@ public static class DeliveryReadinessPolicy
         var state = DeriveState(criteria, risks, diagnostics, granted);
 
         return new DeliveryReadinessSnapshot(
-            DeliveryReadinessSnapshot.CurrentVersion,
             input.SnapshotId,
             input.FlowRunId,
             input.Iteration,
             input.Revision,
             state,
-            DeliveryReadinessReconciliation.Current,
             input.CandidateFingerprint,
             input.AcceptancePlanHash,
             input.OutcomeContractHash,
@@ -830,21 +866,21 @@ public static class DeliveryReadinessPolicy
     /// <summary>The exact set of customer actions the server will accept for a state.</summary>
     public static IReadOnlyList<DeliveryReadinessAction> AllowedActions(
         DeliveryReadinessState state) => state switch
-    {
-        DeliveryReadinessState.ReadyToApprove =>
-            [DeliveryReadinessAction.Accept, DeliveryReadinessAction.RequestRefinement],
-        DeliveryReadinessState.NeedsCustomerWaiver =>
-            [DeliveryReadinessAction.GrantWaiver, DeliveryReadinessAction.RequestRefinement],
-        DeliveryReadinessState.NeedsRefinement =>
-            [DeliveryReadinessAction.RequestRefinement],
-        DeliveryReadinessState.Blocked =>
-        [
-            DeliveryReadinessAction.Continue,
+        {
+            DeliveryReadinessState.ReadyToApprove =>
+                [DeliveryReadinessAction.Accept, DeliveryReadinessAction.RequestRefinement],
+            DeliveryReadinessState.NeedsCustomerWaiver =>
+                [DeliveryReadinessAction.GrantWaiver, DeliveryReadinessAction.RequestRefinement],
+            DeliveryReadinessState.NeedsRefinement =>
+                [DeliveryReadinessAction.RequestRefinement],
+            DeliveryReadinessState.Blocked =>
+            [
+                DeliveryReadinessAction.Continue,
             DeliveryReadinessAction.Replan,
             DeliveryReadinessAction.Abandon
-        ],
-        _ => [DeliveryReadinessAction.None]
-    };
+            ],
+            _ => [DeliveryReadinessAction.None]
+        };
 
     public static string SerializeSnapshot(DeliveryReadinessSnapshot snapshot)
     {
@@ -914,7 +950,6 @@ public static class DeliveryReadinessPolicy
 
     private static DeliveryAcceptancePlan Normalize(DeliveryAcceptancePlan plan) =>
         new(
-            DeliveryAcceptancePlan.CurrentVersion,
             plan.Criteria
                 .Select(criterion => new DeliveryAcceptanceCriterion
                 {
@@ -936,7 +971,8 @@ public static class DeliveryReadinessPolicy
         IReadOnlyList<string>? evidenceIds,
         string label,
         bool required,
-        IReadOnlyCollection<string>? knownEvidenceIds,
+        IReadOnlyCollection<DeliveryEvidenceItem>? knownEvidence,
+        IReadOnlyCollection<OutcomeEvidenceKind>? allowedKinds,
         ICollection<string> errors)
     {
         if (evidenceIds is null)
@@ -963,12 +999,31 @@ public static class DeliveryReadinessPolicy
                 errors.Add($"{label} contains an empty or oversized evidence id");
                 continue;
             }
-            // A supplied registry is authoritative: an identifier the host did not issue is a
-            // fabrication and fails closed, including when the registry itself is empty.
-            if (knownEvidenceIds is not null &&
-                !knownEvidenceIds.Contains(evidenceId))
+            if (knownEvidence is null)
+            {
+                continue;
+            }
+            var evidence = knownEvidence.SingleOrDefault(item =>
+                string.Equals(
+                    item.EvidenceId,
+                    evidenceId,
+                    StringComparison.Ordinal));
+            if (evidence is null)
             {
                 errors.Add($"{label} references unknown evidence id '{evidenceId}'");
+                continue;
+            }
+            if (required && !evidence.SupportsVerification)
+            {
+                errors.Add(
+                    $"{label} references unsuccessful evidence id '{evidenceId}'");
+            }
+            if (required &&
+                allowedKinds is not null &&
+                !allowedKinds.Contains(evidence.Kind))
+            {
+                errors.Add(
+                    $"{label} evidence id '{evidenceId}' has kind '{evidence.Kind}', which is not allowed by the acceptance plan");
             }
         }
     }
@@ -991,15 +1046,16 @@ public static class DeliveryReadinessPolicy
         {
             return ["QA result JSON must be an object"];
         }
-        RejectDuplicates(root, "outcome-qa-v2", errors);
+        RejectDuplicates(root, "outcome QA", errors);
         foreach (var name in new[]
                  {
-                     "Version", "AcceptancePlanHash", "Verdict", "Criteria", "ResidualRisks"
+                     "AcceptancePlanHash", "Verdict", "Criteria", "ResidualRisks",
+                     "PlanGaps"
                  })
         {
             if (!root.TryGetProperty(name, out _))
             {
-                errors.Add($"outcome-qa-v2 is missing required property '{name}'");
+                errors.Add($"verification result is missing required property '{name}'");
             }
         }
         return errors;

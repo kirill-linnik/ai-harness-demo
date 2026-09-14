@@ -27,8 +27,8 @@ public sealed class DynamicPlanningTests
                 [PlanDuty.Analyze, PlanDuty.PrepareOutcome],
                 owner: true)));
         var unknown = valid.Replace(
-            "\"Version\":",
-            "\"Unexpected\":true,\"Version\":",
+            "\"Disposition\":",
+            "\"Unexpected\":true,\"Disposition\":",
             StringComparison.Ordinal);
         Assert.Throws<TeamPlanContractException>(
             () => TeamPlanParser.Parse(WrapPlan(unknown)));
@@ -63,25 +63,25 @@ public sealed class DynamicPlanningTests
     public void OutcomeParser_RejectsUnknownFieldsTraversalAndArtifactByteOverflow()
     {
         var unknown = """
-            FLOW_OUTCOME_V1_BEGIN
-            {"Version":"flow-outcome-v1","Goal":"Assess","Summary":"Done","ImplementationDetails":["Use the result."],"Artifacts":[],"Unknown":true}
-            FLOW_OUTCOME_V1_END
+            FLOW_OUTCOME_BEGIN
+            {"Goal":"Assess","Summary":"Done","ImplementationDetails":["Use the result."],"Artifacts":[],"Unknown":true}
+            FLOW_OUTCOME_END
             """;
         Assert.Throws<FlowOutcomeContractException>(
             () => FlowOutcomeParser.Parse(unknown));
 
         var traversal = """
-            FLOW_OUTCOME_V1_BEGIN
-            {"Version":"flow-outcome-v1","Goal":"Assess","Summary":"Done","ImplementationDetails":["Use the result."],"Artifacts":[{"Path":"..\\secret.md","MediaType":"text/markdown","Content":"text"}]}
-            FLOW_OUTCOME_V1_END
+            FLOW_OUTCOME_BEGIN
+            {"Goal":"Assess","Summary":"Done","ImplementationDetails":["Use the result."],"Artifacts":[{"Path":"..\\secret.md","MediaType":"text/markdown","Content":"text"}]}
+            FLOW_OUTCOME_END
             """;
         Assert.Throws<FlowOutcomeContractException>(
             () => FlowOutcomeParser.Parse(traversal));
 
         var bytes = """
-            FLOW_OUTCOME_V1_BEGIN
-            {"Version":"flow-outcome-v1","Goal":"Assess","Summary":"Done","ImplementationDetails":["Use the result."],"Artifacts":[{"Path":"answer.md","MediaType":"text/markdown","Content":"éé"}]}
-            FLOW_OUTCOME_V1_END
+            FLOW_OUTCOME_BEGIN
+            {"Goal":"Assess","Summary":"Done","ImplementationDetails":["Use the result."],"Artifacts":[{"Path":"answer.md","MediaType":"text/markdown","Content":"éé"}]}
+            FLOW_OUTCOME_END
             """;
         Assert.Throws<FlowOutcomeContractException>(
             () => FlowOutcomeParser.Parse(bytes, maximumArtifactCount: 1, maximumTotalArtifactBytes: 3));
@@ -91,9 +91,9 @@ public sealed class DynamicPlanningTests
     public void OutcomeParser_AllowsInlineSentinelNamesButRejectsDuplicateStandaloneLines()
     {
         var valid = """
-            FLOW_OUTCOME_V1_BEGIN
-            {"Version":"flow-outcome-v1","Goal":"Assess","Summary":"Verified to close with FLOW_OUTCOME_V1_END.","ImplementationDetails":["Keep FLOW_OUTCOME_V1_BEGIN and FLOW_OUTCOME_V1_END as standalone protocol lines."],"Artifacts":[]}
-            FLOW_OUTCOME_V1_END
+            FLOW_OUTCOME_BEGIN
+            {"Goal":"Assess","Summary":"Verified to close with FLOW_OUTCOME_END.","ImplementationDetails":["Keep FLOW_OUTCOME_BEGIN and FLOW_OUTCOME_END as standalone protocol lines."],"Artifacts":[]}
+            FLOW_OUTCOME_END
             """;
 
         var parsed = FlowOutcomeParser.Parse(valid);
@@ -175,16 +175,16 @@ public sealed class DynamicPlanningTests
     [Theory]
     [InlineData("Account-Manager")]
     [InlineData("TEAM-LEAD")]
-    [InlineData("legacy-account-manager-alias")]
+    [InlineData("custom-account-manager-alias")]
     public void Validator_ReservesWorkersByExactCoreAgentIdOnlyNotByCaseOrRoleVariants(
         string agentId)
     {
-        // The snapshot's legacy Role metadata equals a core role ('account-manager'),
+        // The snapshot's alternate Role metadata equals a core role ('account-manager'),
         // but the AgentId itself is neither an exact-case core ID nor a canonical
         // core ID at all. Only the exact AgentId values ('account-manager',
         // 'team-lead', 'pre-mortem-sceptic') are reserved for workers; arbitrary
         // optional IDs (including case-variants of core IDs and IDs that merely
-        // carry a legacy core Role) must remain selectable.
+        // carry a core Role alias) must remain selectable.
         var snapshots = new List<FlowAgentSnapshot>
         {
             Snapshot(agentId, role: "account-manager"),
@@ -217,7 +217,7 @@ public sealed class DynamicPlanningTests
         // of what Role metadata a snapshot happens to carry.
         var snapshots = new List<FlowAgentSnapshot>
         {
-            Snapshot(coreAgentId, role: "some-unrelated-legacy-role"),
+            Snapshot(coreAgentId, role: "some-unrelated-role"),
             Snapshot("helper-specialist")
         };
 
@@ -411,7 +411,6 @@ public sealed class DynamicPlanningTests
 
         var noPublish = new TeamPlanDocument
         {
-            Version = TeamPlanParser.Version,
             Disposition = TeamPlanDisposition.Planned,
             Steps =
             [
@@ -435,7 +434,6 @@ public sealed class DynamicPlanningTests
         // stage can invent a criterion namespace from prose.
         var withoutCriteria = new TeamPlanDocument
         {
-            Version = TeamPlanParser.Version,
             Disposition = TeamPlanDisposition.Planned,
             Steps = DeliveryPlan().Steps,
             PreMortemCheckpoints = [],
@@ -478,7 +476,7 @@ public sealed class DynamicPlanningTests
             Snapshot("reviewer"),
             Snapshot("publisher")
         };
-        var separated = LegacySeparatedDeliveryPlan();
+        var separated = SeparatedDeliveryPlan();
 
         var exception = Assert.Throws<TeamPlanContractException>(
             () => _validator.Validate(
@@ -491,13 +489,6 @@ public sealed class DynamicPlanningTests
                 "final outcome owner to be the sole BeforeReview Verify-duty step",
                 StringComparison.Ordinal));
 
-        var persisted = _validator.Validate(
-            separated,
-            TeamPlanValidationContext.ForPersistedPlan(
-                FlowKind.Delivery,
-                snapshots,
-                preMortemEnabled: false));
-        Assert.Equal("prepare", persisted.OutcomeOwner?.Id);
     }
 
     [Fact]
@@ -532,7 +523,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_ManualPreMortemRestartKeepsOneCanonicalRoot()
+    public async Task DynamicFlow_ManualPreMortemRestartKeepsOneCanonicalRoot()
     {
         var plan = AdvisoryPlan(
                     Step(
@@ -592,7 +583,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_MaterializesOnlyPreReviewStepsAndUsesDistinctRepeatedAgentSessions()
+    public async Task DynamicFlow_MaterializesOnlyPreReviewStepsAndUsesDistinctRepeatedAgentSessions()
     {
         var plan = DeliveryPlan();
         await using var harness = await DynamicHarness.CreateAsync(
@@ -659,7 +650,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_InvalidWorkerContract_IsCorrectedWithoutFailingFlow()
+    public async Task DynamicFlow_InvalidWorkerContract_IsCorrectedWithoutFailingFlow()
     {
         var plan = AdvisoryPlan(
             Step(
@@ -694,7 +685,7 @@ public sealed class DynamicPlanningTests
             .ToArray();
         Assert.Equal(2, attempts.Length);
         Assert.Equal(
-            "Response omitted the studio-v2 machine envelope.",
+            "Response omitted the required machine envelope.",
             attempts[0].OutputSummary);
         Assert.StartsWith(
             "Correct invalid response from ",
@@ -710,7 +701,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_ExecutesOptionalAgentWhenLegacyRoleMatchesCoreRole()
+    public async Task DynamicFlow_ExecutesOptionalAgentWhenRoleMatchesCoreRole()
     {
         var plan = AdvisoryPlan(
             Step(
@@ -753,7 +744,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_PendingWorkersBindCurrentWorkflowAtTheirFirstLaunch()
+    public async Task DynamicFlow_PendingWorkersBindCurrentWorkflowAtTheirFirstLaunch()
     {
         await using var harness = await DynamicHarness.CreateAsync(
             FlowKind.Delivery,
@@ -804,7 +795,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_InvalidPlanGetsOneSameSessionCorrectionWithoutDuplicates()
+    public async Task DynamicFlow_InvalidPlanGetsOneSameSessionCorrectionWithoutDuplicates()
     {
         var plan = AdvisoryPlan(
             Step(
@@ -855,11 +846,10 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_MissingQualificationBlocksAfterCustomerSafeAccountManagerStep()
+    public async Task DynamicFlow_MissingQualificationBlocksAfterCustomerSafeAccountManagerStep()
     {
         var missing = new TeamPlanDocument
         {
-            Version = TeamPlanParser.Version,
             Disposition = TeamPlanDisposition.MissingQualification,
             Steps = [],
             PreMortemCheckpoints = [],
@@ -911,7 +901,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_PreMortemCheckpointUsesPlanStepKey()
+    public async Task DynamicFlow_PreMortemCheckpointUsesPlanStepKey()
     {
         var plan = AdvisoryPlan(
             Step(
@@ -993,7 +983,6 @@ public sealed class DynamicPlanningTests
             {
                 FlowRunId = harness.FlowId,
                 Iteration = 1,
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned.ToString(),
                 RawJson = rawPlan
             });
@@ -1058,168 +1047,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task PersistedDeliveryPlan_RecoversDeferredOutcomeOwnerBeforeVerificationRetry()
-    {
-        var plan = LegacySeparatedDeliveryPlan();
-        await using var harness = await DynamicHarness.CreateAsync(
-            FlowKind.Delivery,
-            plan,
-            [
-                Snapshot("generalist"),
-                Snapshot("reviewer"),
-                Snapshot("publisher")
-            ],
-            pushbackOwner: "implement");
-        harness.Runner.PushbackOwnerSelector = (_, attempt) =>
-            attempt <= 3
-                ? "implement"
-                : attempt == 4
-                    ? "prepare"
-                    : null;
-        var rawPlan = TeamPlanParser.Serialize(plan);
-        await using (var database =
-                     await harness.Factory.CreateDbContextAsync())
-        {
-            var lead = new FlowStep
-            {
-                FlowRunId = harness.FlowId,
-                Iteration = 1,
-                Sequence = 10,
-                AgentId = "team-lead",
-                AgentName = "Team Lead",
-                AgentRole = "team-lead",
-                Label = "Select the downstream team",
-                PlanStepKey = WorkflowEngine.TeamLeadPlanStepKey,
-                PlanDutiesJson = """["Analyze","Design"]""",
-                PlanStage = PlanStage.BeforeReview,
-                InvocationKind = ExecutionInvocationKind.Planning,
-                PermissionProfile =
-                    ExecutionPermissionProfile.ReadOnlySource,
-                Status = StepStatus.Completed,
-                Phase = AgentRunPhase.Succeeded,
-                OutputSummary =
-                    $"{TeamPlanParser.BeginSentinel}{Environment.NewLine}" +
-                    rawPlan +
-                    $"{Environment.NewLine}{TeamPlanParser.EndSentinel}",
-                CompletedAt = DateTimeOffset.UtcNow
-            };
-            lead.StableSemanticRootId = lead.Id;
-            database.FlowSteps.Add(lead);
-            database.FlowPlanDocuments.Add(new FlowPlanDocument
-            {
-                FlowRunId = harness.FlowId,
-                Iteration = 1,
-                Version = TeamPlanParser.Version,
-                Disposition = TeamPlanDisposition.Planned.ToString(),
-                RawJson = rawPlan
-            });
-            var settings = await database.Settings.SingleAsync();
-            settings.MaxHandoffRetries = 2;
-            await database.SaveChangesAsync();
-        }
-
-        await harness.Engine.RunAsync(
-            harness.FlowId,
-            CancellationToken.None);
-
-        await using (var failedDatabase =
-                     await harness.Factory.CreateDbContextAsync())
-        {
-            var failed = await failedDatabase.Flows
-                .Include(item => item.Steps)
-                .Include(item => item.Events)
-                .SingleAsync(item => item.Id == harness.FlowId);
-            Assert.Equal(FlowStatus.Failed, failed.Status);
-            Assert.Contains(
-                "still cannot continue after 2 handoff retries",
-                failed.FailureReason,
-                StringComparison.Ordinal);
-            Assert.Equal(
-                StepStatus.Skipped,
-                Assert.Single(
-                    failed.Steps,
-                    step => step.PlanStepKey == "prepare").Status);
-        }
-
-        var restarted = await harness.Engine.RestartFailedFlowAsync(
-            harness.FlowId,
-            CancellationToken.None);
-        var owner = Assert.Single(
-            restarted.Steps,
-            step => step.PlanStepKey == "prepare");
-        var verificationRetry = Assert.Single(
-            restarted.Steps,
-            step =>
-                step.PlanStepKey == "verify" &&
-                step.Status == StepStatus.Pending);
-        var implementation = restarted.Steps
-            .Where(step => step.PlanStepKey == "implement")
-            .OrderBy(step => step.Sequence)
-            .First();
-        Assert.Equal(StepStatus.Pending, owner.Status);
-        Assert.Equal(implementation.Id, owner.DependsOnStepId);
-        Assert.Contains(
-            "verification ran before this outcome-owner step",
-            owner.InputSummary,
-            StringComparison.Ordinal);
-        Assert.Equal(owner.Id, verificationRetry.DependsOnStepId);
-        Assert.Null(verificationRetry.PushbackRootStepId);
-        Assert.True(owner.Sequence < verificationRetry.Sequence);
-        Assert.Contains(
-            restarted.Events,
-            item => item.Type == "flow.verification-order-recovered");
-
-        await harness.Engine.RunAsync(
-            harness.FlowId,
-            CancellationToken.None);
-
-        await using var completedDatabase =
-            await harness.Factory.CreateDbContextAsync();
-        var completed = await completedDatabase.Flows
-            .AsSplitQuery()
-            .Include(item => item.Steps)
-            .Include(item => item.Events)
-            .SingleAsync(item => item.Id == harness.FlowId);
-        Assert.True(
-            completed.Status == FlowStatus.WaitingForFeedback,
-            completed.FailureReason + Environment.NewLine +
-            string.Join(
-                Environment.NewLine,
-                completed.Events.Select(item =>
-                    $"{item.Type}: {item.Message}")));
-        Assert.Empty(completed.FailureReason);
-        Assert.Equal(
-            StepStatus.Completed,
-            completed.Steps.Single(step => step.Id == owner.Id).Status);
-        Assert.Equal(
-            StepStatus.Pushback,
-            completed.Steps.Single(step => step.Id == verificationRetry.Id).Status);
-        Assert.Contains(
-            completed.Steps,
-            step =>
-                step.PlanStepKey == "verify" &&
-                step.Status == StepStatus.Completed);
-        Assert.Single(
-            completed.Events,
-            item => item.Type == "handoff.retry-limit-exhausted");
-        var ownerRun = harness.Runner.Contexts.FindIndex(context =>
-            context.PlanStepKey == "prepare");
-        var recoveredVerificationRun = harness.Runner.Contexts.FindLastIndex(context =>
-            context.PlanStepKey == "verify");
-        Assert.True(ownerRun >= 0);
-        Assert.True(ownerRun < recoveredVerificationRun);
-        var recoveredVerification =
-            harness.Runner.Contexts[recoveredVerificationRun];
-        Assert.Contains(
-            Assert.IsAssignableFrom<IReadOnlyList<StudioDependencyOutput>>(
-                recoveredVerification.StudioDependencyOutputs),
-            dependency =>
-                dependency.Kind == StudioDependencyKind.Direct &&
-                dependency.PlanStepKey == "prepare");
-    }
-
-    [Fact]
-    public async Task StudioV2_DynamicPushbackTargetsAncestorByPlanStepIdentity()
+    public async Task DynamicFlow_PushbackTargetsAncestorByPlanStepIdentity()
     {
         var plan = AdvisoryPlan(
             Step("evidence", "generalist", 10, [PlanDuty.Analyze]),
@@ -1254,7 +1082,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_OutcomeOwnerReceivesEveryDirectDependencyEffectiveAttempt()
+    public async Task DynamicFlow_OutcomeOwnerReceivesEveryDirectDependencyEffectiveAttempt()
     {
         var plan = AdvisoryPlan(
             Step("research-a", "generalist", 10, [PlanDuty.Analyze]),
@@ -1459,7 +1287,6 @@ public sealed class DynamicPlanningTests
             "Plan",
             [],
             [],
-            ContractVersion: "studio-v2",
             InvocationKind: invocationKind,
             StudioDependencyOutputs:
             [
@@ -1481,10 +1308,6 @@ public sealed class DynamicPlanningTests
         Assert.Contains(
             "PUSHBACK_OWNER_STEP_ID may name only one of these exact current-iteration plan-step IDs: current-analysis.",
             values["role.context"],
-            StringComparison.Ordinal);
-        Assert.DoesNotContain(
-            "prior-iteration",
-            values["handoffs"],
             StringComparison.Ordinal);
     }
 
@@ -1509,8 +1332,8 @@ public sealed class DynamicPlanningTests
             "Plan",
             [],
             [],
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.Worker,
+            RequiresDeliveryReadinessQa: true,
             StudioDependencyOutputs:
             [
                 new StudioDependencyOutput(
@@ -1593,9 +1416,9 @@ public sealed class DynamicPlanningTests
             context,
             """
             HANDOFF_STATUS: COMPLETE
-            FLOW_OUTCOME_V1_BEGIN
-            {"Version":"flow-outcome-v1","Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["All required checks passed."],"Artifacts":[]}
-            FLOW_OUTCOME_V1_END
+            FLOW_OUTCOME_BEGIN
+            {"Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["All required checks passed."],"Artifacts":[]}
+            FLOW_OUTCOME_END
             """);
 
         Assert.Contains(
@@ -1632,7 +1455,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public async Task StudioV2_RejectsPushbackTargetThatIsNotAnAncestor()
+    public async Task DynamicFlow_RejectsPushbackTargetThatIsNotAnAncestor()
     {
         var plan = AdvisoryPlan(
             Step("evidence", "generalist", 10, [PlanDuty.Analyze]),
@@ -1680,7 +1503,6 @@ public sealed class DynamicPlanningTests
     private static TeamPlanDocument AdvisoryPlan(params TeamPlanStep[] steps) =>
         new()
         {
-            Version = TeamPlanParser.Version,
             Disposition = TeamPlanDisposition.Planned,
             Steps = steps,
             PreMortemCheckpoints = [],
@@ -1690,7 +1512,6 @@ public sealed class DynamicPlanningTests
     private static TeamPlanDocument DeliveryPlan() =>
         new()
         {
-            Version = TeamPlanParser.Version,
             Disposition = TeamPlanDisposition.Planned,
             Steps =
             [
@@ -1716,10 +1537,9 @@ public sealed class DynamicPlanningTests
             MissingQualification = null
         };
 
-    private static TeamPlanDocument LegacySeparatedDeliveryPlan() =>
+    private static TeamPlanDocument SeparatedDeliveryPlan() =>
         new()
         {
-            Version = TeamPlanParser.Version,
             Disposition = TeamPlanDisposition.Planned,
             Steps =
             [
@@ -1910,7 +1730,6 @@ public sealed class DynamicPlanningTests
                   max_concurrent_agents: 1
                   max_attempts: 1
                 studio:
-                  version: 1
                   planning:
                     max_steps: 24
                     max_dependencies_per_step: 8
@@ -1957,7 +1776,6 @@ public sealed class DynamicPlanningTests
                 OriginalRequest = "Complete the dynamic plan.",
                 ConsolidatedRequest = "Complete the dynamic plan.",
                 Kind = kind,
-                ContractVersion = "studio-v2",
                 Status = FlowStatus.Queued,
                 RepositoryPath = root,
                 RepositoryKnowledge = "A configured test repository.",
@@ -2010,11 +1828,9 @@ public sealed class DynamicPlanningTests
             gate.SetTrustLevel(
                 HandoffActionType.RequestRevision,
                 HandoffTrustLevel.Auto);
-            gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
             var engine = new WorkflowEngine(
                 factory,
                 catalog,
-                new FlowPlanner(),
                 modelRouter ?? new FixedModelRouter(),
                 new BootstrapTaskProfileFactory(),
                 TestRoutingSupport.Recorder(factory),
@@ -2075,7 +1891,6 @@ public sealed class DynamicPlanningTests
             "Plan",
             [],
             [],
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.Worker,
             IsOutcomeOwner: isOutcomeOwner,
             PlanStepKey: "verify-redesign",
@@ -2097,7 +1912,8 @@ public sealed class DynamicPlanningTests
         public string? InvalidFirstContractAgentId { get; set; }
 
         public Func<AgentExecutionContext, int, string?>?
-            PushbackOwnerSelector { get; set; }
+            PushbackOwnerSelector
+        { get; set; }
 
         public async Task<AgentExecutionResult> ExecuteAsync(
             AgentExecutionContext context,
@@ -2125,9 +1941,9 @@ public sealed class DynamicPlanningTests
                 output = invalidFirstPlan && count == 1
                     ? """
                       HANDOFF_STATUS: COMPLETE
-                      TEAM_PLAN_V1_BEGIN
-                      {"Version":"team-plan-v1","Disposition":"Planned","Steps":[],"PreMortemCheckpoints":[],"MissingQualification":null,"Unknown":true}
-                      TEAM_PLAN_V1_END
+                      TEAM_PLAN_BEGIN
+                      {"Disposition":"Planned","Steps":[],"PreMortemCheckpoints":[],"MissingQualification":null,"Unknown":true}
+                      TEAM_PLAN_END
                       """
                     : $"HANDOFF_STATUS: COMPLETE{Environment.NewLine}{validPlan}";
             }
@@ -2135,9 +1951,9 @@ public sealed class DynamicPlanningTests
             {
                 output = """
                     HANDOFF_STATUS: COMPLETE
-                    INTAKE_V2_BEGIN
-                    {"Version":"intake-v2","Status":"NeedsClarification","FlowKind":null,"TaskTitle":"Review the request","CustomerReply":"The current team needs a safer path before continuing. Please revise the scope or retry after the available expertise is updated.","Brief":{"Goal":"","Details":[],"SuccessCriteria":[],"Constraints":[],"Assumptions":[]}}
-                    INTAKE_V2_END
+                    INTAKE_BEGIN
+                    {"Status":"NeedsClarification","FlowKind":null,"TaskTitle":"Review the request","CustomerReply":"The current team needs a safer path before continuing. Please revise the scope or retry after the available expertise is updated.","Brief":{"Goal":"","Details":[],"SuccessCriteria":[],"Constraints":[],"Assumptions":[]}}
+                    INTAKE_END
                     """;
             }
             else if (context.AgentId == "pre-mortem-sceptic")
@@ -2145,7 +1961,7 @@ public sealed class DynamicPlanningTests
                 output = $$"""
                     {{PreMortemRules.ClearStatus}}
                     {{PreMortemRules.FindingsBeginSentinel}}
-                    {"Version":"pre-mortem-findings-v1","Findings":[]}
+                    {"Findings":[]}
                     {{PreMortemRules.FindingsEndSentinel}}
                     """;
             }
@@ -2155,7 +1971,7 @@ public sealed class DynamicPlanningTests
                          StringComparison.Ordinal) &&
                      count == 1)
             {
-                output = "Response omitted the studio-v2 machine envelope.";
+                output = "Response omitted the required machine envelope.";
             }
             else if (selectedPushbackOwner is not null)
             {
@@ -2191,7 +2007,7 @@ public sealed class DynamicPlanningTests
                         FlowOutcomeParser.BeginSentinel +
                         Environment.NewLine +
                         """
-                        {"Version":"flow-outcome-v1","Goal":"Complete the dynamic plan.","Summary":"The planned outcome is ready for review.","ImplementationDetails":["The focused plan-step evidence was consolidated."],"Artifacts":[]}
+                        {"Goal":"Complete the dynamic plan.","Summary":"The planned outcome is ready for review.","ImplementationDetails":["The focused plan-step evidence was consolidated."],"Artifacts":[]}
                         """ +
                         Environment.NewLine +
                         FlowOutcomeParser.EndSentinel;
@@ -2208,7 +2024,20 @@ public sealed class DynamicPlanningTests
                 output,
                 "Fixture evidence.",
                 1,
-                []);
+                context.InvocationKind == ExecutionInvocationKind.Worker
+                    ? [
+                        new ToolCallRecord(
+                            "observe",
+                            "Inspect the planned result.",
+                            Succeeded: true,
+                            ToolType: "Observation",
+                            ResultDigest:
+                                OutcomeVerificationRules.ComputeSha256(
+                                    context.PlanStepKey),
+                            ResultSummary:
+                                "The planned result was observed successfully.")
+                    ]
+                    : []);
             if (AfterResult is not null)
             {
                 await AfterResult(context);
@@ -2227,7 +2056,6 @@ public sealed class DynamicPlanningTests
             string outcomeContractJson,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(new ReviewedCandidateIdentity(
-                ReviewedCandidateIdentity.CurrentVersion,
                 flow.Id,
                 flow.Iteration,
                 outcomeOwnerStepId,
@@ -2310,7 +2138,6 @@ file static class TeamPlanTestExtensions
         IReadOnlyList<string> checkpoints) =>
         new()
         {
-            Version = document.Version,
             Disposition = document.Disposition,
             Steps = document.Steps,
             PreMortemCheckpoints = checkpoints,

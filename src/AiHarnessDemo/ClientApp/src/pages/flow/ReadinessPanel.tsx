@@ -13,12 +13,8 @@ import { useToast } from "../../lib/toast";
 const MAX_ACKNOWLEDGEMENT_CHARACTERS = 4_000;
 const MAX_TOTAL_CHANGE_CHARACTERS = 16_000;
 
-/**
- * The exact customer-visible readiness state. Only `ReadyToApprove` is rendered green; an
- * unreconciled historical result renders as Blocked with `Published - readiness unverified`.
- */
+/** The exact customer-visible readiness state. Only `ReadyToApprove` is rendered green. */
 export function readinessTone(readiness: DeliveryReadinessDto): string {
-  if (readiness.reconciliation !== "Current") return "blocked";
   switch (readiness.state) {
     case "ReadyToApprove":
       return "ready";
@@ -49,8 +45,7 @@ export function ReadinessPanel({ flow }: { flow: FlowDetailDto }) {
   const canRequestRefinement =
     readiness.allowedActions.includes("RequestRefinement") &&
     readiness.state === "NeedsRefinement";
-  const canResolveBlock =
-    readiness.state === "Blocked" && readiness.reconciliation === "Current";
+  const canResolveBlock = readiness.state === "Blocked";
 
   async function resolve(
     action: ReadinessResolutionAction,
@@ -135,7 +130,6 @@ export function ReadinessPanel({ flow }: { flow: FlowDetailDto }) {
       className={`card readiness-card readiness-${tone}`}
       aria-labelledby="delivery-readiness-heading"
       data-readiness-state={readiness.state}
-      data-readiness-reconciliation={readiness.reconciliation}
     >
       <div className="card-header">
         <div>
@@ -314,12 +308,6 @@ export function ReadinessPanel({ flow }: { flow: FlowDetailDto }) {
               </button>
             </div>
           </div>
-        )}
-        {readiness.reconciliation !== "Current" && (
-          <p className="muted">
-            This historical result predates host-derived readiness verification. It requires an
-            explicit reconciliation before any later publication action.
-          </p>
         )}
       </div>
     </section>

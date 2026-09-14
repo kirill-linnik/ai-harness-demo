@@ -13,8 +13,6 @@ public enum TeamPlanDisposition
 
 public sealed class TeamPlanDocument
 {
-    public string Version { get; init; } = string.Empty;
-
     public TeamPlanDisposition? Disposition { get; init; }
 
     public IReadOnlyList<TeamPlanStep>? Steps { get; init; }
@@ -22,7 +20,7 @@ public sealed class TeamPlanDocument
     public IReadOnlyList<string>? PreMortemCheckpoints { get; init; }
 
     /// <summary>
-    /// The mandatory studio-v2 Delivery acceptance criteria. They are authored once during planning,
+    /// The mandatory Delivery acceptance criteria. They are authored once during planning,
     /// hashed by the host, and become the only criterion namespace that later verification and
     /// readiness derivation may use.
     /// </summary>
@@ -120,9 +118,8 @@ public sealed class TeamPlanContractException(IReadOnlyList<string> errors)
 
 public static class TeamPlanParser
 {
-    public const string Version = "team-plan-v1";
-    public const string BeginSentinel = "TEAM_PLAN_V1_BEGIN";
-    public const string EndSentinel = "TEAM_PLAN_V1_END";
+    public const string BeginSentinel = "TEAM_PLAN_BEGIN";
+    public const string EndSentinel = "TEAM_PLAN_END";
     public const int MaximumDocumentCharacters = 262_144;
 
     private static readonly JsonSerializerOptions JsonOptions = CreateOptions();
@@ -224,7 +221,7 @@ public static class TeamPlanParser
         RequireProperties(
             root,
             "team plan",
-            ["Version", "Disposition", "Steps", "PreMortemCheckpoints", "MissingQualification"],
+            ["Disposition", "Steps", "PreMortemCheckpoints", "MissingQualification"],
             errors);
 
         if (root.TryGetProperty("Steps", out var steps) &&

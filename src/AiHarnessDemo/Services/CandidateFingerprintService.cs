@@ -47,7 +47,12 @@ public sealed class CandidateFingerprintService(
     public const int MaximumPreviewFiles =
         CandidateManifest.MaximumPreviewArtifacts;
     public const long MaximumPreviewBytes = 100L * 1024 * 1024;
-    private const string SealJournalVersion = "candidate-seal-journal-v1";
+    private static readonly JsonSerializerOptions SealJournalJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = false,
+        UnmappedMemberHandling =
+            System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
+    };
 
     private static readonly string[] FingerprintDirectoryExclusions =
     [
@@ -161,7 +166,6 @@ public sealed class CandidateFingerprintService(
         }
 
         var manifest = new CandidateManifest(
-            OutcomeVerificationRules.CandidateManifestVersion,
             flow.Iteration,
             acceptancePlanHash,
             repositoryEntries
@@ -195,10 +199,6 @@ public sealed class CandidateFingerprintService(
             expected.Fingerprint,
             StringComparison.Ordinal);
     }
-
-    public static bool RequiresPreview(
-        OutcomeAcceptancePlanSnapshot? acceptancePlan) =>
-        acceptancePlan?.Criteria.Any(criterion => criterion.CustomerVisible) == true;
 
     public async Task<LocalCandidateSealResult> SealAsync(
         FlowRun flow,
@@ -318,7 +318,6 @@ public sealed class CandidateFingerprintService(
 
             var journal = new CandidateSealJournal
             {
-                Version = SealJournalVersion,
                 Repository = Path.GetFullPath(repository),
                 BranchName = targetBranch,
                 ExpectedHead = head,
@@ -610,15 +609,12 @@ public sealed class CandidateFingerprintService(
             await using var stream = File.OpenRead(path);
             var journal = await JsonSerializer.DeserializeAsync<CandidateSealJournal>(
                 stream,
+                SealJournalJsonOptions,
                 cancellationToken: cancellationToken);
-            if (journal is null ||
-                !string.Equals(
-                    journal.Version,
-                    SealJournalVersion,
-                    StringComparison.Ordinal))
+            if (journal is null)
             {
                 throw new CandidateValidationException(
-                    $"Candidate seal journal for '{repository}' has an unsupported version.");
+                    $"Candidate seal journal for '{repository}' is empty.");
             }
             return journal;
         }
@@ -649,6 +645,7 @@ public sealed class CandidateFingerprintService(
                 await JsonSerializer.SerializeAsync(
                     stream,
                     journal,
+                    SealJournalJsonOptions,
                     cancellationToken: cancellationToken);
                 await stream.FlushAsync(cancellationToken);
                 stream.Flush(flushToDisk: true);
@@ -867,27 +864,6 @@ public sealed class CandidateFingerprintService(
         CandidateGitSandbox sandbox)
     {
         var environmentVariables = sandbox.EnvironmentVariables;
-        var trackedContext = await RunGitAsync(
-            repository,
-            [
-                "ls-files", "-z", "--",
-                ".ai-harness/outcome-verification"
-            ],
-            TimeSpan.FromSeconds(20),
-            cancellationToken,
-            environmentVariables);
-        if (trackedContext.ExitCode != 0)
-        {
-            throw new CandidateValidationException(
-                $"Unable to inspect tracked QA context at '{repository}': {trackedContext.CombinedOutput}");
-        }
-        if (!string.IsNullOrWhiteSpace(
-                trackedContext.StandardOutput.Trim('\0', '\r', '\n')))
-        {
-            throw new CandidateValidationException(
-                "Derived .ai-harness/outcome-verification files must not be committed.");
-        }
-
         var head = await ReadGitIdentityAsync(
             repository,
             "HEAD",
@@ -1832,8 +1808,7 @@ public sealed class CandidateFingerprintService(
                 {
                     var name = Path.GetFileName(entry);
                     var relativePath = NormalizeRelativePath(root, entry);
-                    if (IsQaContextPath(relativePath) ||
-                        string.Equals(
+                    if (string.Equals(
                             name,
                             ".customer-preview",
                             StringComparison.OrdinalIgnoreCase) ||
@@ -1866,33 +1841,17 @@ public sealed class CandidateFingerprintService(
     private static IReadOnlyList<OutcomeTrustedRepository> ReadTrustedRepositories(
         FlowRun flow)
     {
-        if (string.Equals(
-                flow.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
-            flow.Kind == FlowKind.Delivery)
-        {
-            return StudioWorkspaceRepositoryMapLedger.Read(flow)
-                .Repositories
-                .Select(item => new OutcomeTrustedRepository(
-                    item.RelativePath,
-                    item.RemoteRepository))
-                .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
-                .ToArray();
-        }
-        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
+        if (flow.Kind != FlowKind.Delivery)
         {
             throw new CandidateValidationException(
-                "Candidate verification requires a governed trusted repository mapping.");
+                "Candidate verification is available only for Delivery flows.");
         }
-        var state = OutcomeVerificationRules.DeserializeAggregate(
-            flow.OutcomeVerificationJson);
-        if (state.TrustedRepositories.Count == 0)
-        {
-            throw new CandidateValidationException(
-                "Candidate verification has no trusted repository mapping from workspace creation.");
-        }
-        return state.TrustedRepositories
+
+        return StudioWorkspaceRepositoryMapLedger.Read(flow)
+            .Repositories
+            .Select(item => new OutcomeTrustedRepository(
+                item.RelativePath,
+                item.RemoteRepository))
             .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
             .ToArray();
     }
@@ -2622,11 +2581,7 @@ public sealed class CandidateFingerprintService(
         path.Equals(".playwright-browsers", StringComparison.OrdinalIgnoreCase) ||
         path.StartsWith(
             ".playwright-browsers/",
-            StringComparison.OrdinalIgnoreCase) ||
-        path.Equals(".ai-harness/outcome-verification", StringComparison.Ordinal) ||
-        path.StartsWith(
-            ".ai-harness/outcome-verification/",
-            StringComparison.Ordinal);
+            StringComparison.OrdinalIgnoreCase);
 
     private static bool IsApprovedIgnoredPath(
         string repository,
@@ -2763,14 +2718,6 @@ public sealed class CandidateFingerprintService(
         fileName.EndsWith(".suo", StringComparison.OrdinalIgnoreCase) ||
         fileName.EndsWith(".user", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsQaContextPath(string path) =>
-        path.Equals(
-            ".ai-harness/outcome-verification",
-            StringComparison.OrdinalIgnoreCase) ||
-        path.StartsWith(
-            ".ai-harness/outcome-verification/",
-            StringComparison.OrdinalIgnoreCase);
-
     private static bool IsLink(string path)
     {
         try
@@ -2857,8 +2804,6 @@ public sealed class CandidateFingerprintService(
 
     private sealed class CandidateSealJournal
     {
-        public string Version { get; set; } = SealJournalVersion;
-
         public string Repository { get; set; } = string.Empty;
 
         public string BranchName { get; set; } = string.Empty;

@@ -13,16 +13,13 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace AiHarnessDemo.Tests;
 
 /// <summary>
-/// Deterministic replay of the captured production incident for Delivery flow
+/// Deterministic replay of the regression scenario derived from Delivery flow
 /// <c>36aecd50-3007-4eeb-87a2-e3cd02576dcb</c>.
 ///
-/// Every input comes from the checked-in capture of that flow: its exact
-/// <c>OriginalRequest</c>, its exact confirmed <c>ConsolidatedRequest</c> brief, and its exact
-/// contradictory <c>flow-outcome-v1</c> document. The recorded result was
+/// Inputs come from the checked-in current-contract fixture. The recorded result was
 /// <c>Status = Approved</c>, <c>PublicationStatus = Published</c>, and an accepted
 /// <c>CustomerReview</c> — even though the outcome Summary says the result is "not yet ready for
-/// unconditional customer sign-off" and lists four confirmed gaps, and its outcome verification is
-/// <c>LegacyUnverified</c> with <c>releaseReady = false</c>.
+/// unconditional customer sign-off" and lists four confirmed gaps.
 ///
 /// The comparison is on machine-checkable facts only: host-derived readiness, gate creation,
 /// acceptance authorization, publisher call count, and flow status.
@@ -38,7 +35,6 @@ public sealed class IncidentReplayTests
         Assert.Equal(
             Guid.Parse("36aecd50-3007-4eeb-87a2-e3cd02576dcb"),
             reference.Id);
-        Assert.Equal("studio-v2", reference.Contract);
         Assert.Equal("Delivery", reference.Kind);
         Assert.Equal("Approved", reference.Status);
         Assert.Equal("Published", reference.PublicationStatus);
@@ -56,10 +52,6 @@ public sealed class IncidentReplayTests
             4,
             reference.Outcome.ImplementationDetails.Count(detail =>
                 detail.StartsWith("CONFIRMED GAP", StringComparison.Ordinal)));
-        Assert.Equal("LegacyUnverified", reference.OutcomeVerification.Status);
-        Assert.True(reference.OutcomeVerification.LegacyUnverified);
-        Assert.False(reference.OutcomeVerification.ReleaseReady);
-
         // The pre-change phrase heuristic had nothing to fire on in that outcome text.
         Assert.False(
             WorkflowEngine.ContainsContradictoryQualityProse(reference.Outcome.Summary));
@@ -346,12 +338,11 @@ public sealed class IncidentReplayTests
             "Plan summary.",
             [],
             [],
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.Worker,
             RequiresDeliveryReadinessQa: true);
 
     /// <summary>
-    /// A studio-v2 Delivery harness shaped like the captured incident: analyst, product designer,
+    /// A current dynamic Delivery harness shaped like the captured incident: analyst, product designer,
     /// implementing engineer, verifying outcome owner, and one AfterApproval publisher, driving a
     /// Commit outcome from the captured customer request and confirmed brief.
     /// </summary>
@@ -423,7 +414,6 @@ public sealed class IncidentReplayTests
                   max_concurrent_agents: 1
                   max_attempts: 1
                 studio:
-                  version: 1
                   planning:
                     max_steps: 24
                     max_dependencies_per_step: 8
@@ -465,7 +455,6 @@ public sealed class IncidentReplayTests
                 OriginalRequest = reference.OriginalRequest,
                 ConsolidatedRequest = reference.ConsolidatedRequest,
                 Kind = FlowKind.Delivery,
-                ContractVersion = "studio-v2",
                 Status = FlowStatus.Queued,
                 RepositoryPath = root,
                 RepositoryKnowledge = "The shared Angular site for both devclub brands.",
@@ -512,7 +501,6 @@ public sealed class IncidentReplayTests
             var gate = new HandoffGateEngine();
             gate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
             gate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
-            gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
             gate.SetTrustLevel(HandoffActionType.CustomerReview, HandoffTrustLevel.Gated);
             gate.SetTrustLevel(HandoffActionType.CustomerWaiver, HandoffTrustLevel.Gated);
             var runner = new IncidentAgentRunner(IncidentPlanJson());
@@ -523,7 +511,6 @@ public sealed class IncidentReplayTests
             var engine = new WorkflowEngine(
                 factory,
                 catalog,
-                new FlowPlanner(),
                 new FixedModelRouter(),
                 new BootstrapTaskProfileFactory(),
                 TestRoutingSupport.Recorder(factory),
@@ -594,7 +581,6 @@ public sealed class IncidentReplayTests
         {
             var plan = new TeamPlanDocument
             {
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned,
                 Steps =
                 [
@@ -682,7 +668,7 @@ public sealed class IncidentReplayTests
 
     /// <summary>
     /// Scripted agents. The outcome owner returns the captured incident's exact
-    /// <c>flow-outcome-v1</c> document, so the replay carries the original contradiction verbatim.
+    /// <c>flow outcome</c> document, so the replay carries the original contradiction verbatim.
     /// </summary>
     private sealed class IncidentAgentRunner(string plan) : IAgentRunner
     {
@@ -698,10 +684,10 @@ public sealed class IncidentReplayTests
                 "team-lead" => $"HANDOFF_STATUS: COMPLETE{Environment.NewLine}{plan}",
                 "account-manager" =>
                     "HANDOFF_STATUS: COMPLETE" + Environment.NewLine +
-                    IntakeV2Parser.BeginSentinel + Environment.NewLine +
-                    """{"Version":"intake-v2","Status":"Confirmed","FlowKind":"Delivery","TaskTitle":"Redesign devclub.eu and devclub.ee","CustomerReply":"I captured the Nordic Tech Minimal redesign for both brands.","Brief":""" +
+                    IntakeParser.BeginSentinel + Environment.NewLine +
+                    """{"Status":"Confirmed","FlowKind":"Delivery","TaskTitle":"Redesign devclub.eu and devclub.ee","CustomerReply":"I captured the Nordic Tech Minimal redesign for both brands.","Brief":""" +
                     reference.ConsolidatedRequest + "}" + Environment.NewLine +
-                    IntakeV2Parser.EndSentinel,
+                    IntakeParser.EndSentinel,
                 _ => """
                   HANDOFF_STATUS: COMPLETE
 
@@ -740,7 +726,7 @@ public sealed class IncidentReplayTests
                     Environment.NewLine +
                     RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
                     Environment.NewLine +
-                    $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
+                    """{"Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
                     Environment.NewLine +
                     RepositoryKnowledgeSynthesizer.RecapEndSentinel;
             }
@@ -748,7 +734,20 @@ public sealed class IncidentReplayTests
                 output,
                 "Fixture evidence.",
                 1,
-                []));
+                context.InvocationKind == ExecutionInvocationKind.Worker
+                    ? [
+                        new ToolCallRecord(
+                            "observe",
+                            "Inspect the redesigned sites.",
+                            Succeeded: true,
+                            ToolType: "Observation",
+                            ResultDigest:
+                                OutcomeVerificationRules.ComputeSha256(
+                                    context.PlanStepKey),
+                            ResultSummary:
+                                "The customer-visible behavior was observed.")
+                    ]
+                    : []));
         }
     }
 
@@ -805,7 +804,6 @@ public sealed class IncidentReplayTests
             ReviewedCandidateLedger.ValidateForFlow(flow, identity);
             return Task.FromResult(new OutcomeCandidateSnapshot(
                 new CandidateManifest(
-                    OutcomeVerificationRules.CandidateManifestVersion,
                     flow.Iteration,
                     identity.AcceptancePlanHash,
                     [.. identity.Repositories.Select(repository =>
@@ -827,7 +825,6 @@ public sealed class IncidentReplayTests
             string outcomeOwnerPlanStepKey,
             string outcomeContractJson) =>
             new(
-                ReviewedCandidateIdentity.CurrentVersion,
                 flow.Id,
                 flow.Iteration,
                 outcomeOwnerStepId,

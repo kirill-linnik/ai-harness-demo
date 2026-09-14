@@ -24,7 +24,6 @@ const step: FlowStepDto = {
   modelEffort: "high",
   modelReason: "Selected for cross-cutting planning.",
   taskProfile: {
-    version: "task-profile-v1",
     role: "team-lead",
     planStepKey: "team-plan",
     agentId: "team-lead",
@@ -50,7 +49,6 @@ const step: FlowStepDto = {
     uncertainty: 0.2,
     exploration: false,
     reason: "Highest conservative quality.",
-    algorithmVersion: "router-v1",
     rerouteCount: 0,
     alternatives: [
       {
@@ -77,9 +75,7 @@ const step: FlowStepDto = {
   startedAt: "2026-09-02T12:00:00Z",
   completedAt: "2026-09-02T12:01:00Z",
   durationMilliseconds: 60_000,
-  toolCalls: [],
-  assignedCriterionIds: ["AC-001"],
-  outcomeQaRound: null
+  toolCalls: []
 };
 
 afterEach(cleanup);
@@ -103,9 +99,8 @@ describe("StepDetail", () => {
     );
     expect(screen.getByRole("region", { name: "Task profile" })).toHaveTextContent("High risk");
     expect(screen.getByRole("region", { name: "Task profile" })).toHaveTextContent("Multiple boundaries.");
-    expect(screen.getByText("router-v1")).toBeInTheDocument();
+    expect(screen.getByText("Adaptive")).toBeInTheDocument();
     expect(screen.getByText(/0.50 premium requests/)).toBeInTheDocument();
-    expect(screen.getByLabelText("Outcome verification assignment")).toHaveTextContent("AC-001");
   });
 
   it("keeps an explicit placeholder while a running step has no output yet", () => {

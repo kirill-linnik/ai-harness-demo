@@ -50,7 +50,6 @@ export function ReviewCard({ flow }: { flow: FlowDetailDto }) {
     Boolean(review.gateId) &&
     !readinessBlocksDecision;
   const reviewedPreviewAvailable =
-    flow.contractVersion === "studio-v2" &&
     flow.kind === "Delivery" &&
     awaitingDecision &&
     Boolean(flow.reviewedPreviewUrl);

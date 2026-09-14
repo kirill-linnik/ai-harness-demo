@@ -25,7 +25,7 @@ public interface IModelRouter
 }
 
 /// <summary>
-/// router-v1: hierarchical recency-weighted Beta quality estimation with deterministic,
+/// Hierarchical recency-weighted Beta quality estimation with deterministic,
 /// bounded exploration and lexicographic strategy objectives.
 /// </summary>
 public sealed class AdaptiveModelRouter(
@@ -33,7 +33,7 @@ public sealed class AdaptiveModelRouter(
     ModelCatalogDiscovery catalogDiscovery,
     TimeProvider timeProvider) : IModelRouter
 {
-    public const string AlgorithmVersion = "router-v1";
+    private const string ExplorationSalt = "adaptive-router";
     private const double HalfLifeDays = 90;
     private static readonly TimeSpan ModelAvailabilityCooldown = TimeSpan.FromMinutes(30);
 
@@ -245,7 +245,6 @@ public sealed class AdaptiveModelRouter(
             Uncertainty = selected.Score.Uncertainty,
             Exploration = selected.Exploration,
             Reason = selected.Reason,
-            AlgorithmVersion = AlgorithmVersion,
             CreatedAt = timeProvider.GetUtcNow()
         };
         var eligibleRank = Rank(scored, request.Strategy, profile.Risk);
@@ -313,7 +312,7 @@ public sealed class AdaptiveModelRouter(
         return new Selection(
             uncertain,
             true,
-            $"Deterministic router-v1 exploration selected an uncertain quality-floor-eligible alternative ({bucket:P2} bucket).");
+            $"Deterministic exploration selected an uncertain quality-floor-eligible alternative ({bucket:P2} bucket).");
     }
 
     internal static List<CandidateScore> Rank(
@@ -502,7 +501,7 @@ public sealed class AdaptiveModelRouter(
     private static double DeterministicBucket(Guid stepId)
     {
         var bytes = SHA256.HashData(
-            Encoding.UTF8.GetBytes($"{stepId:D}:{AlgorithmVersion}"));
+            Encoding.UTF8.GetBytes($"{stepId:D}:{ExplorationSalt}"));
         var value = BitConverter.ToUInt64(bytes, 0);
         return value / ((double)ulong.MaxValue + 1);
     }

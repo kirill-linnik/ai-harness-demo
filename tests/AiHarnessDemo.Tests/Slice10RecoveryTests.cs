@@ -29,7 +29,6 @@ public sealed class FlowLifecycleCoordinatorTests
         { FlowStatus.Running, FlowStatus.Failed },
         { FlowStatus.WaitingForFeedback, FlowStatus.Queued },
         { FlowStatus.WaitingForFeedback, FlowStatus.Reworking },
-        { FlowStatus.WaitingForFeedback, FlowStatus.Approved },
         { FlowStatus.Failed, FlowStatus.Queued },
         { FlowStatus.Blocked, FlowStatus.Abandoning },
         { FlowStatus.Abandoning, FlowStatus.Abandoned }
@@ -104,14 +103,6 @@ public sealed class FlowLifecycleCoordinatorTests
 public sealed class Slice10RecoveryTests
 {
     [Fact]
-    public void StaticPlanner_IsLegacyOnly()
-    {
-        Assert.True(WorkflowEngine.UsesStaticPlanner("legacy-v1"));
-        Assert.False(WorkflowEngine.UsesStaticPlanner("studio-v2"));
-        Assert.False(WorkflowEngine.UsesStaticPlanner("future-v3"));
-    }
-
-    [Fact]
     public async Task Recovery_ReconcilesEveryDurableStudioStateIdempotently()
     {
         await using var fixture = await Slice10RecoveryFixture.CreateAsync();
@@ -137,24 +128,19 @@ public sealed class Slice10RecoveryTests
             FlowStatus.Failed,
             accepted: true);
         var blocked = fixture.AddBareFlow(
-            FlowStatus.Blocked,
-            contractVersion: "studio-v2");
+            FlowStatus.Blocked);
         blocked.CurrentBlockerCode =
             MissingQualificationCoordinator.BlockerCode;
         blocked.CurrentBlockerSummary = "A specialist is unavailable.";
         blocked.CurrentBlockerDataJson =
-            """{"Version":"missing-qualification-v1"}""";
+            """{"Code":"MissingQualification","Summary":"A specialist is unavailable.","Missing":["specialist"],"WhyRequired":"The requested work requires the missing specialty.","SuggestedAgent":null}""";
         var failed = fixture.AddBareFlow(
-            FlowStatus.Failed,
-            contractVersion: "studio-v2");
+            FlowStatus.Failed);
         failed.Steps.Add(Step(
             failed,
             "worker",
             "work",
             StepStatus.Failed));
-        var legacy = fixture.AddBareFlow(
-            FlowStatus.Running,
-            contractVersion: "legacy-v1");
         await fixture.SaveAsync();
 
         var first = await fixture.Engine.RecoverInterruptedFlowsAsync(
@@ -163,7 +149,6 @@ public sealed class Slice10RecoveryTests
             CancellationToken.None);
 
         Assert.Contains(acceptedDelivery.Id, first);
-        Assert.Contains(legacy.Id, first);
         Assert.DoesNotContain(waitingReview.Id, first);
         Assert.DoesNotContain(acceptedAdvisory.Id, first);
         Assert.DoesNotContain(failedPublication.Id, first);
@@ -182,7 +167,7 @@ public sealed class Slice10RecoveryTests
             gate => gate.ActionType == HandoffActionType.CustomerReview);
         Assert.Single(
             delivery.Steps,
-            step => ReviewCoordinator.IsStudioPublicationStep(delivery, step));
+            step => ReviewCoordinator.IsPublicationStep(delivery, step));
         Assert.Single(
             delivery.Events,
             item => item.Type == "flow.recovery-publication-materialized");
@@ -215,7 +200,7 @@ public sealed class Slice10RecoveryTests
             publicationFailure));
         Assert.Single(
             publicationFailure.Steps,
-            step => ReviewCoordinator.IsStudioPublicationStep(
+            step => ReviewCoordinator.IsPublicationStep(
                 publicationFailure,
                 step));
         Assert.Single(
@@ -230,7 +215,7 @@ public sealed class Slice10RecoveryTests
         Assert.Empty(repairedPublication.FailureReason);
         Assert.Single(
             repairedPublication.Steps,
-            step => ReviewCoordinator.IsStudioPublicationStep(
+            step => ReviewCoordinator.IsPublicationStep(
                 repairedPublication,
                 step));
         Assert.Single(
@@ -254,14 +239,6 @@ public sealed class Slice10RecoveryTests
             item =>
                 item.Type == "flow.recovery-manual-restart-required");
 
-        var legacyAfter = await fixture.LoadAsync(database, legacy.Id);
-        Assert.Equal(FlowStatus.Queued, legacyAfter.Status);
-        Assert.Empty(legacyAfter.AgentSnapshots);
-        Assert.DoesNotContain(
-            legacyAfter.Events,
-            item => item.Type.StartsWith(
-                "flow.recovery-publication",
-                StringComparison.Ordinal));
     }
 
     [Fact]
@@ -295,8 +272,7 @@ public sealed class Slice10RecoveryTests
     {
         await using var fixture = await Slice10RecoveryFixture.CreateAsync();
         var flow = fixture.AddBareFlow(
-            FlowStatus.Failed,
-            contractVersion: "studio-v2");
+            FlowStatus.Failed);
         flow.Kind = FlowKind.Delivery;
         var originalWorkflow = fixture.WorkflowProvider.GetEffective();
         var resolver = new PermissionProfileResolver();
@@ -308,10 +284,7 @@ public sealed class Slice10RecoveryTests
                 ImmutableArray.Create(PlanDuty.Implement),
                 DurableReviewDecision: null,
                 DurableApproval: false,
-                IsOnlyPlannedPublishStep: false,
-                ContractVersion: "studio-v2",
-                LegacyPublicationAuthorized: false,
-                IsGovernedOutcomeVerification: false),
+                IsOnlyPlannedPublishStep: false),
             PermissionProfileResolver.FromWorkflow(originalWorkflow));
         var failed = Step(
             flow,
@@ -373,8 +346,7 @@ public sealed class Slice10RecoveryTests
     {
         await using var fixture = await Slice10RecoveryFixture.CreateAsync();
         var flow = fixture.AddBareFlow(
-            FlowStatus.Queued,
-            contractVersion: "studio-v2");
+            FlowStatus.Queued);
         var step = Step(
             flow,
             "worker",
@@ -422,8 +394,7 @@ public sealed class Slice10RecoveryTests
             "plan",
             [],
             [],
-            FlowStepId: step.Id,
-            ContractVersion: "studio-v2");
+            FlowStepId: step.Id);
 
         var resolved =
             await CopilotReasoningHost.ResolveAndPersistPermissionAsync(
@@ -447,8 +418,7 @@ public sealed class Slice10RecoveryTests
     {
         await using var fixture = await Slice10RecoveryFixture.CreateAsync();
         var flow = fixture.AddBareFlow(
-            FlowStatus.Failed,
-            contractVersion: "studio-v2");
+            FlowStatus.Failed);
         var resolver = new PermissionProfileResolver();
         var currentWorkflow = fixture.WorkflowProvider.GetEffective();
         var currentPermission = resolver.Resolve(
@@ -459,10 +429,7 @@ public sealed class Slice10RecoveryTests
                 ImmutableArray.Create(PlanDuty.Implement),
                 DurableReviewDecision: null,
                 DurableApproval: false,
-                IsOnlyPlannedPublishStep: false,
-                ContractVersion: "studio-v2",
-                LegacyPublicationAuthorized: false,
-                IsGovernedOutcomeVerification: false),
+                IsOnlyPlannedPublishStep: false),
             PermissionProfileResolver.FromWorkflow(currentWorkflow));
         var originalPermission = currentPermission with
         {
@@ -511,8 +478,7 @@ public sealed class Slice10RecoveryTests
     {
         await using var fixture = await Slice10RecoveryFixture.CreateAsync();
         var flow = fixture.AddBareFlow(
-            FlowStatus.Failed,
-            contractVersion: "studio-v2");
+            FlowStatus.Failed);
         var resolver = new PermissionProfileResolver();
         var workflow = fixture.WorkflowProvider.GetEffective();
         var failedPermission = resolver.Resolve(
@@ -522,9 +488,6 @@ public sealed class Slice10RecoveryTests
                 PlanStage.BeforeReview,
                 ImmutableArray.Create(PlanDuty.Implement),
                 null,
-                false,
-                false,
-                "studio-v2",
                 false,
                 false),
             PermissionProfileResolver.FromWorkflow(workflow));
@@ -608,7 +571,7 @@ public sealed class Slice10RecoveryTests
         Assert.Equal(FlowStatus.Failed, recovered.Status);
         Assert.DoesNotContain(
             recovered.Steps,
-            step => ReviewCoordinator.IsStudioPublicationStep(
+            step => ReviewCoordinator.IsPublicationStep(
                 recovered,
                 step));
         Assert.Equal(
@@ -655,7 +618,7 @@ public sealed class Slice10RecoveryTests
         var recovered = await fixture.LoadAsync(database, flow.Id);
         var publication = Assert.Single(
             recovered.Steps,
-            step => ReviewCoordinator.IsStudioPublicationStep(
+            step => ReviewCoordinator.IsPublicationStep(
                 recovered,
                 step));
         Assert.Equal(retry.Id, publication.DependsOnStepId);
@@ -695,7 +658,7 @@ public sealed class Slice10RecoveryTests
         Assert.Equal(FlowStatus.Failed, recovered.Status);
         Assert.DoesNotContain(
             recovered.Steps,
-            step => ReviewCoordinator.IsStudioPublicationStep(
+            step => ReviewCoordinator.IsPublicationStep(
                 recovered,
                 step));
         Assert.Equal(
@@ -729,8 +692,7 @@ public sealed class Slice10RecoveryTests
     {
         await using var fixture = await Slice10RecoveryFixture.CreateAsync();
         var flow = fixture.AddBareFlow(
-            FlowStatus.Queued,
-            contractVersion: "studio-v2");
+            FlowStatus.Queued);
         await fixture.SaveAsync();
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -742,52 +704,13 @@ public sealed class Slice10RecoveryTests
     }
 
     [Fact]
-    public async Task FailedLegacyFlow_CapturesMigrationSnapshotOnlyWhenExplicitlyRestarted()
-    {
-        await using var fixture = await Slice10RecoveryFixture.CreateAsync();
-        var flow = fixture.AddBareFlow(
-            FlowStatus.Failed,
-            contractVersion: "legacy-v1");
-        flow.FailureReason = "Historical worker failed.";
-        var failed = Step(
-            flow,
-            "worker",
-            string.Empty,
-            StepStatus.Failed);
-        failed.AgentRole = "worker";
-        failed.PlanDutiesJson = "[]";
-        flow.Steps.Add(failed);
-        await fixture.SaveAsync();
-
-        await using (var before = await fixture.Factory.CreateDbContextAsync())
-        {
-            Assert.Empty(await before.FlowAgentSnapshots.ToListAsync());
-        }
-
-        var restarted = await fixture.Engine.RestartFailedFlowAsync(
-            flow.Id,
-            CancellationToken.None);
-
-        Assert.Equal(FlowStatus.Queued, restarted.Status);
-        Assert.Contains(
-            restarted.AgentSnapshots,
-            snapshot => snapshot.AgentId == "worker");
-        Assert.Single(
-            restarted.Events,
-            item =>
-                item.Type ==
-                "flow.agent-snapshot-migrated-on-restart");
-    }
-
-    [Fact]
     public async Task DuplicateRunClaim_DoesNotStartTwoAttemptsForOneFlow()
     {
         var workspace = new BlockingWorkspaceManager();
         await using var fixture =
             await Slice10RecoveryFixture.CreateAsync(workspace);
         var flow = fixture.AddBareFlow(
-            FlowStatus.Queued,
-            contractVersion: "studio-v2");
+            FlowStatus.Queued);
         flow.AgentSnapshots.Add(new FlowAgentSnapshot
         {
             FlowRunId = flow.Id,
@@ -865,7 +788,6 @@ public sealed class Slice10RecoveryTests
                 "Persisted the reviewed retry candidate identity.",
             DataJson = ReviewedCandidateLedger.Serialize(
                 new ReviewedCandidateIdentity(
-                    ReviewedCandidateIdentity.CurrentVersion,
                     flow.Id,
                     flow.Iteration,
                     retry.Id,
@@ -910,7 +832,7 @@ public sealed class Slice10RecoveryTests
             PlanStage = PlanStage.BeforeReview,
             IsOutcomeOwner = true,
             PermissionProfile = ExecutionPermissionProfile.ReadOnlySource,
-            WorkflowRevision = "workflow-v1",
+            WorkflowRevision = "workflow-revision",
             Status = status,
             Phase = status == StepStatus.Failed
                 ? AgentRunPhase.Failed
@@ -1002,7 +924,7 @@ public sealed class Slice10RecoveryTests
                 agents,
                 "worker",
                 "Worker",
-                "Completes legacy work.");
+                "Completes current work.");
             await File.WriteAllTextAsync(
                 Path.Combine(root, "WORKFLOW.md"),
                 WorkflowText("WorkspaceWrite"));
@@ -1033,7 +955,6 @@ public sealed class Slice10RecoveryTests
             var engine = new WorkflowEngine(
                 factory,
                 catalog,
-                new FlowPlanner(),
                 new FixedModelRouter(),
                 new BootstrapTaskProfileFactory(),
                 TestRoutingSupport.Recorder(factory),
@@ -1055,16 +976,13 @@ public sealed class Slice10RecoveryTests
                 engine);
         }
 
-        public FlowRun AddBareFlow(
-            FlowStatus status,
-            string contractVersion)
+        public FlowRun AddBareFlow(FlowStatus status)
         {
             var flow = new FlowRun
             {
-                Title = $"{contractVersion} {status}",
+                Title = $"Current flow {status}",
                 OriginalRequest = "Recover durable work.",
                 ConsolidatedRequest = "Recover durable work.",
-                ContractVersion = contractVersion,
                 Kind = FlowKind.Delivery,
                 Status = status,
                 RepositoryPath = Root,
@@ -1084,7 +1002,7 @@ public sealed class Slice10RecoveryTests
             bool accepted,
             StepStatus? publicationStatus = null)
         {
-            var flow = AddBareFlow(status, "studio-v2");
+            var flow = AddBareFlow(status);
             flow.Kind = kind;
             flow.Outcome = kind == FlowKind.Advisory
                 ? OutcomeType.None
@@ -1126,7 +1044,6 @@ public sealed class Slice10RecoveryTests
                 {
                     FlowRunId = flow.Id,
                     Iteration = flow.Iteration,
-                    Version = TeamPlanParser.Version,
                     Disposition = TeamPlanDisposition.Planned.ToString(),
                     RawJson = DeliveryPlanJson
                 });
@@ -1150,10 +1067,7 @@ public sealed class Slice10RecoveryTests
                         ImmutableArray.Create(PlanDuty.Publish),
                         DurableReviewDecision: ReviewDecision.Accepted,
                         DurableApproval: true,
-                        IsOnlyPlannedPublishStep: true,
-                        ContractVersion: "studio-v2",
-                        LegacyPublicationAuthorized: false,
-                        IsGovernedOutcomeVerification: false),
+                        IsOnlyPlannedPublishStep: true),
                     PermissionProfileResolver.FromWorkflow(workflow));
                 flow.Events.Add(new FlowEvent
                 {
@@ -1164,7 +1078,6 @@ public sealed class Slice10RecoveryTests
                         "Persisted planned publication policy for the recovery fixture.",
                     DataJson = JsonSerializer.Serialize(
                         new DeferredPermissionSnapshot(
-                            DeferredPermissionSnapshot.CurrentVersion,
                             flow.Iteration,
                             "publish",
                             workflow.Revision,
@@ -1179,7 +1092,6 @@ public sealed class Slice10RecoveryTests
                         "Persisted the reviewed candidate identity for recovery.",
                     DataJson = ReviewedCandidateLedger.Serialize(
                         new ReviewedCandidateIdentity(
-                            ReviewedCandidateIdentity.CurrentVersion,
                             flow.Id,
                             flow.Iteration,
                             owner.Id,
@@ -1225,7 +1137,7 @@ public sealed class Slice10RecoveryTests
                         PlanStage = PlanStage.AfterApproval,
                         PermissionProfile =
                             ExecutionPermissionProfile.Publish,
-                        WorkflowRevision = "workflow-v1",
+                        WorkflowRevision = "workflow-revision",
                         Status = attemptStatus,
                         Phase = attemptStatus == StepStatus.Failed
                             ? AgentRunPhase.Failed
@@ -1327,7 +1239,6 @@ public sealed class Slice10RecoveryTests
               max_concurrent_agents: 2
               max_attempts: 1
             studio:
-              version: 1
               flow_kinds:
                 advisory:
                   required_duties: [PrepareOutcome]
@@ -1379,9 +1290,7 @@ public sealed class Slice10RecoveryTests
                  """);
 
         private const string DeliveryPlanJson = """
-            {
-              "Version": "team-plan-v1",
-              "Disposition": "Planned",
+            {"Disposition": "Planned",
               "Steps": [
                 {
                   "Id": "outcome",

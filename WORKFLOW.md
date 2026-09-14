@@ -28,11 +28,7 @@ copilot:
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
   maximum_quality_stall_timeout_ms: 1800000
-outcome_verification:
-  enabled: true
-  max_rounds: 3
 studio:
-  version: 1
   planning:
     max_steps: 12
     max_dependencies_per_step: 8
@@ -83,9 +79,9 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
 
 ## Studio orchestration policy
 
-- This is the strict Studio workflow extension. Account Manager confirms `intake-v2`; Team Lead
-  selects arbitrary enabled snapshot agents with `team-plan-v1`; the declared outcome owner returns
-  `flow-outcome-v1`.
+- This is the strict Studio workflow extension. Account Manager confirms `intake`; Team Lead
+  selects arbitrary enabled snapshot agents with `team plan`; the declared outcome owner returns
+  `flow outcome`.
 - Execute plan steps sequentially. Dependencies establish order and pushback ownership; do not
   invent parallel fan-out, fan-in, or an integration join.
 - Advisory work is read-only and never publishes. Delivery work may modify only the isolated
@@ -94,26 +90,29 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
   only after durable customer acceptance and is not tied to a particular agent name.
 - A missing qualification is a structured blocker, not a failed attempt. Do not retry it
   automatically.
-- Legacy outcome-verification flows retain their static Release Engineer and Quality Engineer gates;
-  do not infer those roles for a `studio-v2` plan.
 
 ### Delivery readiness gates
 
-- A `studio-v2` Delivery `team-plan-v1` must declare `AcceptanceCriteria`. Every criterion needs a
+- A Delivery `team plan` must declare `AcceptanceCriteria`. Every criterion needs a
   stable `AC-000` identifier, a requirement, an independently observable verification, owner roles,
   evidence kinds, and its customer visibility. The host hashes this plan; it is the only criterion
   namespace any later turn may use.
 - Exactly one plan step carries the `Verify` duty: the final `BeforeReview` outcome owner, which also
   carries `PrepareOutcome`. Every candidate-changing step, including creation of required
   `.customer-preview` artifacts, must be its earlier dependency. That step must return exactly one
-  strict `outcome-qa-v2` block between `OUTCOME_QA_V2_BEGIN` and `OUTCOME_QA_V2_END`. The host
+  strict QA block between `OUTCOME_QA_BEGIN` and `OUTCOME_QA_END`. The host
   injects the exact `AcceptancePlanHash`, the planned criteria, and the complete set of host-issued
-  evidence identifiers into that turn's assignment; the response must echo the hash verbatim,
-  cover every criterion, and cite only those identifiers. It must contain one result for every planned
+  prior evidence identifiers and the current step's reserved evidence prefix into that turn's
+  assignment; the response must echo the hash verbatim, cover every criterion, and cite only
+  successful identifiers whose evidence kind is allowed by that criterion. Current-step tool calls
+  use the reserved prefix plus their one-based, three-digit call order. The context-only identifier
+  ending in `-000` cannot prove a verified result. It must
+  contain one result for every planned
   criterion (`Verified`, `Failed`, or `Blocked`, exact casing) plus zero or more residual risks
   classified `NonBlockingDisclosure`, `WaiverRequired`, or `Blocking`. A non-verified criterion
-  must state remediation. The host derives the verdict; a supplied verdict must equal the
-  derivation and grants no authority on its own.
+  must state remediation. `PlanGaps` is required and lists any confirmed requirement omitted from
+  the acceptance plan; any gap prevents `PASS`. The host derives the verdict; a supplied verdict
+  must equal the derivation and grants no authority on its own.
 - Evidence identifiers are minted by the host from its own execution records (`EV-Snnn-nnn`) and
   recorded durably before the verification turn is dispatched. A fabricated identifier fails the
   turn closed.
@@ -132,8 +131,8 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
   preview that renders with `connect-src 'none'`. A live demo is a separate, non-authoritative
   convenience and is never readiness or publication evidence.
 - Only when the confirmed assignment explicitly requests a live demo, the outcome owner must include
-  `.customer-preview\<variant>\customer-demo.json` before candidate sealing. The strict
-  `customer-demo-v1` object uses exactly `Version`, `ArtifactId`, `LaunchProfile`,
+  `.customer-preview\<variant>\customer-demo.json` before candidate sealing. The strict object uses
+  exactly `ArtifactId`, `LaunchProfile`,
   `WorkingDirectory`, `Arguments`, `HealthPath`, and `StartupTimeoutSeconds`; unknown or
   case-mismatched fields fail. `Arguments` is an array with exactly one `{port}` token.
   `LaunchProfile` is one of `npm`, `dotnet`, or `python`; executable paths, shell command strings,
@@ -145,7 +144,7 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
   option, in split or equals form, whose value is exactly `127.0.0.1`; wildcard, hostname,
   duplicate, conflicting, and unknown host-affecting options are rejected.
 
-## Current outcome-verification assignment
+## Delivery verification assignment
 
 {{ outcome.context }}
 

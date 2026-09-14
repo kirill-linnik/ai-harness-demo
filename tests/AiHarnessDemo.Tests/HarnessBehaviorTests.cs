@@ -16,316 +16,6 @@ using System.Text;
 
 namespace AiHarnessDemo.Tests;
 
-public sealed class FlowPlannerTests
-{
-    [Fact]
-    public void Plan_SelectsOnlyEnabledRelevantSpecialistsInDeliveryOrder()
-    {
-        var planner = new FlowPlanner();
-        var agents = new[]
-        {
-            Agent("lead", "team-lead"),
-            Agent("architect", "architect"),
-            Agent("designer", "product-designer"),
-            Agent("data", "data-engineer"),
-            Agent("engineer", "software-engineer"),
-            Agent("security", "security-engineer"),
-            Agent("qa", "quality-engineer"),
-            Agent("writer", "technical-writer", enabled: false),
-            Agent("release", "release-engineer")
-        };
-
-        var plan = planner.Plan(
-            "Redesign the admin dashboard and add secure role-based access backed by a database.",
-            agents);
-
-        Assert.Equal(
-            [
-                "team-lead",
-                "architect",
-                "product-designer",
-                "data-engineer",
-                "software-engineer",
-                "security-engineer",
-                "release-engineer",
-                "quality-engineer"
-            ],
-            plan.Select(item => item.Agent.Role));
-        Assert.DoesNotContain(plan, item => item.Agent.Role == "technical-writer");
-    }
-
-    [Theory]
-    [InlineData(
-        "Implement a small behavior change.",
-        "software-engineer")]
-    [InlineData(
-        "Implement and document a public API behavior change.",
-        "technical-writer")]
-    public void GovernedOrder_DrivesReleaseAndQaPushbackOwners(
-        string request,
-        string expectedReleaseOwner)
-    {
-        var planner = new FlowPlanner();
-        var agents = new[]
-        {
-            Agent("qa", "quality-engineer"),
-            Agent("release", "release-engineer"),
-            Agent("writer", "technical-writer"),
-            Agent("engineer", "software-engineer"),
-            Agent("lead", "team-lead")
-        };
-
-        var plan = planner.Plan(request, agents);
-        var owners = WorkflowEngine.BuildUpstreamOwners(plan);
-        var roles = plan.Select(item => item.Agent.Role).ToArray();
-
-        Assert.True(
-            Array.IndexOf(roles, "release-engineer") <
-            Array.IndexOf(roles, "quality-engineer"));
-        Assert.Equal(expectedReleaseOwner, owners["release"].Role);
-        Assert.Equal("release-engineer", owners["qa"].Role);
-    }
-
-    [Fact]
-    public void Plan_RejectsAFlowWithoutAnEnabledImplementationAgent()
-    {
-        var planner = new FlowPlanner();
-        var agents = new[]
-        {
-            Agent("lead", "team-lead"),
-            Agent("engineer", "software-engineer", enabled: false),
-            Agent("qa", "quality-engineer")
-        };
-
-        var exception = Assert.Throws<InvalidOperationException>(
-            () => planner.Plan("Add a small button.", agents));
-
-        Assert.Contains("software-engineer", exception.Message);
-    }
-
-    private static AgentRecord Agent(string id, string role, bool enabled = true) =>
-        new()
-        {
-            Id = id,
-            Name = role,
-            Description = role,
-            Role = role,
-            SourcePath = $"{id}.agent.md",
-            Enabled = enabled
-        };
-}
-
-public sealed class IntakeCoordinatorTests
-{
-    [Fact]
-    public void ParseResponse_LoadsClarifyingQuestion()
-    {
-        var result = IntakeCoordinator.ParseResponse("""
-            INTAKE_STATUS: NEEDS_CLARIFICATION
-            TASK_TITLE: Clarify onboarding outcome
-            CUSTOMER_REPLY: What observable result defines success?
-            TASK_BRIEF: NONE
-            """);
-
-        Assert.False(result.Ready);
-        Assert.Equal(AccountManagerIntakeStatus.NeedsClarification, result.Status);
-        Assert.Equal("Clarify onboarding outcome", result.TaskTitle);
-        Assert.Contains("observable result", result.Reply);
-        Assert.Empty(result.TaskBrief);
-    }
-
-    [Fact]
-    public void ParseResponse_LoadsBriefAwaitingCustomerConfirmation()
-    {
-        var result = IntakeCoordinator.ParseResponse("""
-            INTAKE_STATUS: AWAITING_CONFIRMATION
-            TASK_TITLE: Add persistent onboarding checklist
-            CUSTOMER_REPLY: Do I understand correctly that you want a persistent onboarding checklist? If yes, I'll ask the team to implement it.
-            TASK_BRIEF:
-            Outcome: Add a persistent onboarding checklist.
-            Acceptance:
-            - Supports keyboard navigation.
-            - Includes automated tests.
-            """);
-
-        Assert.False(result.Ready);
-        Assert.True(result.AwaitingConfirmation);
-        Assert.Equal("Add persistent onboarding checklist", result.TaskTitle);
-        Assert.Contains("persistent onboarding", result.TaskBrief);
-        Assert.Contains("keyboard navigation", result.TaskBrief);
-        Assert.Contains("automated tests", result.TaskBrief);
-    }
-
-    [Fact]
-    public void ParseResponse_LoadsCustomerConfirmedBrief()
-    {
-        var result = IntakeCoordinator.ParseResponse("""
-            INTAKE_STATUS: CONFIRMED
-            TASK_TITLE: Add persistent onboarding checklist
-            CUSTOMER_REPLY: Thanks - I'll ask the team to implement it now.
-            TASK_BRIEF:
-            Outcome: Add a persistent onboarding checklist.
-            """);
-
-        Assert.True(result.Ready);
-        Assert.Equal(AccountManagerIntakeStatus.Confirmed, result.Status);
-        Assert.Equal("Add persistent onboarding checklist", result.TaskTitle);
-    }
-
-    [Fact]
-    public void ParseResponse_FailsClosedWhenCopilotOmitsContractMarkers()
-    {
-        var exception = Assert.Throws<InvalidOperationException>(
-            () => IntakeCoordinator.ParseResponse("Looks clear to me."));
-
-        Assert.Contains("invalid intake contract", exception.Message);
-    }
-
-    [Fact]
-    public void ParseResponse_FailsClosedWhenTaskTitleIsMissing()
-    {
-        var exception = Assert.Throws<InvalidOperationException>(
-            () => IntakeCoordinator.ParseResponse("""
-                INTAKE_STATUS: AWAITING_CONFIRMATION
-                CUSTOMER_REPLY: Do I understand correctly that you want a refreshed public site?
-                TASK_BRIEF: Outcome: Refresh the public site.
-                """));
-
-        Assert.Contains("TASK_TITLE", exception.Message);
-    }
-
-    [Fact]
-    public void AccountManagerContract_RequiresExplicitConfirmationWithoutAnInterview()
-    {
-        var contract = CopilotReasoningHost.ResponseContract("account-manager");
-
-        Assert.Contains("Default to AWAITING_CONFIRMATION", contract);
-        Assert.Contains("explicitly and unambiguously approves", contract);
-        Assert.Contains("most recent AWAITING_CONFIRMATION brief", contract);
-        Assert.Contains("TASK_TITLE", contract);
-        Assert.Contains("never copy or truncate the opening message", contract);
-        Assert.Contains("something the customer can click is actionable", contract);
-        Assert.Contains("Never ask about technologies", contract);
-        Assert.Contains("deployment, hosting, credentials", contract);
-    }
-
-    [Fact]
-    public void DialogueTask_RequiresConfirmationAndKeepsDeliveryChoicesOutOfIntake()
-    {
-        var messages = new[]
-        {
-            new FlowMessage
-            {
-                Role = ConversationRole.Customer,
-                Content = "Give me a new design I can click."
-            },
-            new FlowMessage
-            {
-                Role = ConversationRole.AccountManager,
-                Content = "Which site should the redesign cover?",
-                IsQuestion = true
-            },
-            new FlowMessage
-            {
-                Role = ConversationRole.Customer,
-                Content = "Both."
-            }
-        };
-
-        var task = IntakeCoordinator.BuildDialogueTask(messages, OutcomeType.PullRequest);
-
-        Assert.Contains("must not return CONFIRMED", task);
-        Assert.Contains("return AWAITING_CONFIRMATION", task);
-        Assert.Contains("Ask at most one focused clarification question in this turn", task);
-        Assert.Contains("design the customer can click is actionable", task);
-        Assert.Contains("configured delivery outcome is PullRequest", task);
-        Assert.Contains("do not ask the customer", task);
-    }
-
-    [Fact]
-    public void DialogueTask_PassesTheProposedBriefIntoTheApprovalTurn()
-    {
-        const string proposedBrief = "Outcome: Refresh the public pages with an interactive design.";
-        var messages = new[]
-        {
-            new FlowMessage
-            {
-                Role = ConversationRole.AccountManager,
-                Content = "Do I understand correctly that you want a fresh public-site design?",
-                IsQuestion = true
-            },
-            new FlowMessage
-            {
-                Role = ConversationRole.Customer,
-                Content = "Yes."
-            }
-        };
-
-        var task = IntakeCoordinator.BuildDialogueTask(
-            messages,
-            OutcomeType.PullRequest,
-            proposedBrief);
-
-        Assert.Contains("Return CONFIRMED only if", task);
-        Assert.Contains("UNCONFIRMED_TASK_BRIEF", task);
-        Assert.Contains(proposedBrief, task);
-    }
-
-    [Fact]
-    public void ConfirmationGate_RejectsConfirmationWithoutAProposedBrief()
-    {
-        var response = new AccountManagerResponse(
-            AccountManagerIntakeStatus.Confirmed,
-            "I'll ask the team to implement it now.",
-            "Add persistent onboarding checklist",
-            "Unreviewed brief");
-
-        var exception = Assert.Throws<InvalidOperationException>(
-            () => IntakeCoordinator.ApplyConfirmationGate(response, pendingConfirmationBrief: null));
-
-        Assert.Contains("has not reviewed", exception.Message);
-    }
-
-    [Fact]
-    public void ConfirmationGate_PreservesTheBriefTheCustomerReviewed()
-    {
-        const string approvedBrief = "Outcome: Refresh the public pages.";
-        var response = new AccountManagerResponse(
-            AccountManagerIntakeStatus.Confirmed,
-            "I'll ask the team to implement it now.",
-            "Refresh public pages",
-            "A changed brief");
-
-        var confirmed = IntakeCoordinator.ApplyConfirmationGate(response, approvedBrief);
-
-        Assert.Equal(approvedBrief, confirmed.TaskBrief);
-        Assert.Equal("Refresh public pages", confirmed.TaskTitle);
-    }
-
-    [Fact]
-    public void IntakeOutcome_AppliesGeneratedTitleAndQueuesConfirmedBrief()
-    {
-        var flow = new FlowRun
-        {
-            Title = "I want new fresh design for our site because old one",
-            OriginalRequest = "Give the public pages a fresh design."
-        };
-        var response = new AccountManagerResponse(
-            AccountManagerIntakeStatus.Confirmed,
-            "I'll ask the team to implement it now.",
-            "Refresh public site design",
-            "Outcome: Refresh the public pages.");
-
-        var queuedEvent = IntakeCoordinator.ApplyIntakeOutcome(flow, response);
-
-        Assert.NotNull(queuedEvent);
-        Assert.Equal("Refresh public site design", flow.Title);
-        Assert.Equal(FlowStatus.Queued, flow.Status);
-        Assert.Equal("flow.queued", queuedEvent.Type);
-        Assert.Contains(queuedEvent, flow.Events);
-    }
-}
-
 public sealed class AdaptiveModelRouterTests
 {
     [Theory]
@@ -495,41 +185,6 @@ public sealed class PreviewArtifactCatalogTests
     }
 
     [Fact]
-    public void PreviewCompatibilityLayer_InjectsStorageBeforeApplicationScripts()
-    {
-        var source = Encoding.UTF8.GetBytes(
-            "<!doctype html><html><head><script>window.localStorage.getItem('x')</script></head><body></body></html>");
-
-        var transformed = Encoding.UTF8.GetString(
-            DemoApi.ApplyPreviewCompatibilityLayer(
-                source,
-                "text/html; charset=utf-8"));
-
-        var bootstrap = transformed.IndexOf(
-            "data-ai-harness-preview-bootstrap",
-            StringComparison.Ordinal);
-        var application = transformed.IndexOf(
-            "<script>window.localStorage",
-            StringComparison.Ordinal);
-        Assert.True(bootstrap >= 0);
-        Assert.True(bootstrap < application);
-        Assert.Contains(
-            "Object.defineProperty(window, name",
-            transformed,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain(
-            "allow-same-origin",
-            transformed,
-            StringComparison.Ordinal);
-        Assert.Equal(
-            transformed,
-            Encoding.UTF8.GetString(
-                DemoApi.ApplyPreviewCompatibilityLayer(
-                    Encoding.UTF8.GetBytes(transformed),
-                    "text/html")));
-    }
-
-    [Fact]
     public async Task IsolatedPreviewView_RendersAnOpaqueScriptOnlyArtifactFrame()
     {
         using var services = new ServiceCollection()
@@ -630,12 +285,6 @@ public sealed class CopilotReasoningHostTests
     [Theory]
     [InlineData("software-engineer", "HANDOFF_STATUS: COMPLETE", true)]
     [InlineData("software-engineer", "Still working.", false)]
-    [InlineData(
-        "account-manager",
-        "INTAKE_STATUS: CONFIRMED\nTASK_TITLE: Refresh site\nCUSTOMER_REPLY: Confirmed.\nTASK_BRIEF: Refresh the site.",
-        true)]
-    [InlineData("account-manager", "INTAKE_STATUS: INVALID", false)]
-    [InlineData("product-manager", "REWORK_TARGET_ROLES: NONE", true)]
     public void RecoverableOutput_RequiresTheRolesTerminalContract(
         string role,
         string output,
@@ -650,16 +299,15 @@ public sealed class CopilotReasoningHostTests
     public void StudioRecoverableOutput_DispatchesByInvocationKindNotAgentRole()
     {
         var confirmedIntake =
-            IntakeV2Parser.BeginSentinel +
+            IntakeParser.BeginSentinel +
             Environment.NewLine +
-            IntakeV2Parser.Serialize(new IntakeV2Document
+            IntakeParser.Serialize(new IntakeDocument
             {
-                Version = IntakeV2Parser.Version,
-                Status = IntakeV2Status.Confirmed,
+                Status = IntakeStatus.Confirmed,
                 FlowKind = FlowKind.Delivery,
                 TaskTitle = "Implement recovery",
                 CustomerReply = "The implementation is confirmed.",
-                Brief = new IntakeV2Brief
+                Brief = new IntakeBrief
                 {
                     Goal = "Implement recovery.",
                     Details = ["Preserve invocation kind."],
@@ -669,34 +317,24 @@ public sealed class CopilotReasoningHostTests
                 }
             }) +
             Environment.NewLine +
-            IntakeV2Parser.EndSentinel;
+            IntakeParser.EndSentinel;
 
         Assert.True(CopilotReasoningHost.IsRecoverableCompletedOutput(
             "account-manager",
             confirmedIntake,
-            contractVersion: "studio-v2",
             invocationKind: ExecutionInvocationKind.Intake));
         Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
             "account-manager",
             confirmedIntake,
-            contractVersion: "studio-v2",
             invocationKind:
                 ExecutionInvocationKind.BlockerExplanation));
         Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
             "team-lead",
             "HANDOFF_STATUS: COMPLETE",
-            contractVersion: "studio-v2",
             invocationKind: ExecutionInvocationKind.Planning));
-        Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
-            "account-manager",
-            "HANDOFF_STATUS: COMPLETE",
-            contractVersion: "studio-v2",
-            invocationKind:
-                ExecutionInvocationKind.ReviewClassification));
         Assert.False(CopilotReasoningHost.IsRecoverableCompletedOutput(
             "outcome-writer",
             "HANDOFF_STATUS: COMPLETE",
-            contractVersion: "studio-v2",
             invocationKind: ExecutionInvocationKind.Worker,
             isOutcomeOwner: true));
     }
@@ -847,8 +485,7 @@ public sealed class CopilotReasoningHostTests
             Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
                 CopilotReasoningHost.BuildProcessEnvironment(
                     ExecutionInvocationKind.Worker,
-                    allowRemotePublication: true,
-                    isGovernedOutcomeVerification: true));
+                    allowRemotePublication: false));
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\worktree",
             @"C:\harness",
@@ -858,7 +495,6 @@ public sealed class CopilotReasoningHostTests
             "high",
             Guid.Parse("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
             "Execute the governed turn.",
-            isGovernedOutcomeVerification: true,
             blockRemotePublication: true);
 
         Assert.Null(environment["GH_TOKEN"]);
@@ -866,7 +502,7 @@ public sealed class CopilotReasoningHostTests
         Assert.Null(environment["SSH_AUTH_SOCK"]);
         Assert.Equal("0", environment["GIT_TERMINAL_PROMPT"]);
         Assert.Equal(
-            "disabled://governed-host-publication-only",
+            "disabled://publication-not-authorized",
             environment["GIT_CONFIG_VALUE_0"]);
         AssertGovernedNonPublicationToolPolicy(arguments);
     }
@@ -934,7 +570,6 @@ public sealed class CopilotReasoningHostTests
             Guid.Parse("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
             "Prepare the publication narrative.",
             isHostControlledPublication: true,
-            isGovernedOutcomeVerification: true,
             blockRemotePublication: true);
 
         Assert.Contains("--available-tools=view,grep,glob", arguments);
@@ -996,7 +631,6 @@ public sealed class CopilotReasoningHostTests
             "high",
             Guid.Parse("ffffffff-ffff-4fff-8fff-ffffffffffff"),
             prompt,
-            isGovernedOutcomeVerification: true,
             blockRemotePublication: true);
 
     private static void AssertGovernedNonPublicationToolPolicy(
@@ -1013,17 +647,6 @@ public sealed class CopilotReasoningHostTests
         Assert.Contains("--disable-builtin-mcps", arguments);
         Assert.DoesNotContain("--allow-all-tools", arguments);
         Assert.DoesNotContain("--deny-tool=shell(git:*)", arguments);
-        Assert.Contains("--deny-tool=shell(git.exe:*)", arguments);
-        Assert.Contains("--deny-tool=shell(git commit)", arguments);
-        Assert.Contains("--deny-tool=shell(git.exe commit)", arguments);
-        Assert.Contains("--deny-tool=shell(git merge)", arguments);
-        Assert.Contains("--deny-tool=shell(git rebase)", arguments);
-        Assert.Contains("--deny-tool=shell(git commit-tree)", arguments);
-        Assert.Contains("--deny-tool=shell(git branch)", arguments);
-        Assert.Contains("--deny-tool=shell(git checkout)", arguments);
-        Assert.Contains("--deny-tool=shell(git switch)", arguments);
-        Assert.Contains("--deny-tool=shell(git tag)", arguments);
-        Assert.Contains("--deny-tool=shell(git update-ref)", arguments);
         Assert.Contains("--deny-tool=shell(git push)", arguments);
         Assert.Contains("--deny-tool=shell(git send-pack)", arguments);
         Assert.Contains("--deny-tool=shell(gh:*)", arguments);
@@ -1262,13 +885,28 @@ public sealed class CopilotReasoningHostTests
             Guid.NewGuid(),
             AiHarnessDemo.Core.Domain.OutcomeType.PullRequest,
             "Team Lead -> Architect -> Product Designer -> Software Engineer",
-            [
-                "Team Lead handoff",
-                "Architect handoff",
-                "Product Designer handoff"
-            ],
             [],
-            Progress: null);
+            [],
+            Progress: null,
+            StudioDependencyOutputs:
+            [
+                new StudioDependencyOutput(
+                    "architecture",
+                    "architect",
+                    StudioDependencyKind.Ancestor,
+                    2,
+                    1,
+                    20,
+                    "Architect handoff"),
+                new StudioDependencyOutput(
+                    "design",
+                    "product-designer",
+                    StudioDependencyKind.Direct,
+                    1,
+                    1,
+                    30,
+                    "Product Designer handoff")
+            ]);
 
         var values = CopilotReasoningHost.BuildPromptValues(
             context,
@@ -1373,7 +1011,6 @@ public sealed class CopilotReasoningHostTests
             "Review the architecture.",
             [],
             [],
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.PreMortem);
         var values = CopilotReasoningHost.BuildPromptValues(
             context,
@@ -1429,7 +1066,6 @@ public sealed class CopilotReasoningHostTests
             "Implement the redesign.",
             [],
             [],
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.Worker,
             StudioDependencyOutputs:
             [
@@ -1493,7 +1129,7 @@ public sealed class CopilotReasoningHostTests
             Enumerable.Range(1, 6).Select(index =>
                 $"- AC-{index:000}: complete requirement {index} | verification: complete check {index}"));
         const string outcomeContract =
-            "OUTCOME_QA_V2_BEGIN\nReturn all AC-001 through AC-006.\nOUTCOME_QA_V2_END";
+            "OUTCOME_QA_BEGIN\nReturn all AC-001 through AC-006.\nOUTCOME_QA_END";
         var context = new AgentExecutionContext(
             Guid.NewGuid(),
             1,
@@ -1514,7 +1150,6 @@ public sealed class CopilotReasoningHostTests
             [],
             OutcomeContext: outcomeContext,
             OutcomeContract: outcomeContract,
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.Worker,
             RequiresDeliveryReadinessQa: true);
         var values = CopilotReasoningHost.BuildPromptValues(
@@ -1635,7 +1270,6 @@ public sealed class CopilotReasoningHostTests
             "Publish the accepted result.",
             [],
             [],
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.Publication);
         var promptValues = CopilotReasoningHost.BuildPromptValues(
             context,
@@ -1652,7 +1286,7 @@ public sealed class CopilotReasoningHostTests
             Environment.NewLine +
             RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
             Environment.NewLine +
-            $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The accepted change does not alter durable repository knowledge.","Knowledge":null}""" +
+            """{"Changed":false,"Reason":"The accepted change does not alter durable repository knowledge.","Knowledge":null}""" +
             Environment.NewLine +
             RepositoryKnowledgeSynthesizer.RecapEndSentinel;
 
@@ -1674,7 +1308,6 @@ public sealed class CopilotReasoningHostTests
             CopilotReasoningHost.IsRecoverableCompletedOutput(
                 context.AgentRole,
                 validRecap,
-                contractVersion: context.ContractVersion,
                 invocationKind: context.InvocationKind));
     }
 
@@ -1824,12 +1457,25 @@ public sealed class PushbackRecoveryTests
             Role = "software-engineer",
             SourcePath = "software-engineer.agent.md"
         };
+        var upstreamStep = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = 40,
+            AgentId = upstream.Id,
+            AgentName = upstream.Name,
+            AgentRole = upstream.Role,
+            PlanStepKey = "implement",
+            PlanDutiesJson = """["Implement"]""",
+            Status = StepStatus.Completed
+        };
 
         var (revision, retry) = WorkflowEngine.CreateRecoverySteps(
             flow,
             blocked,
             upstream,
-            revisionAttempt: 2);
+            revisionAttempt: 2,
+            upstreamStep);
 
         Assert.Equal("software-engineer", revision.AgentId);
         Assert.Equal(60, revision.Sequence);
@@ -1874,12 +1520,25 @@ public sealed class PushbackRecoveryTests
             Role = "software-engineer",
             SourcePath = "software-engineer.agent.md"
         };
+        var upstreamStep = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = 40,
+            AgentId = upstream.Id,
+            AgentName = upstream.Name,
+            AgentRole = upstream.Role,
+            PlanStepKey = "implement",
+            PlanDutiesJson = """["Implement"]""",
+            Status = StepStatus.Completed
+        };
 
         var (_, retry) = WorkflowEngine.CreateRecoverySteps(
             flow,
             blocked,
             upstream,
-            revisionAttempt: 3);
+            revisionAttempt: 3,
+            upstreamStep);
 
         Assert.Equal(rootFailureId, retry.RetryOfStepId);
     }
@@ -1950,8 +1609,10 @@ public sealed class WorkflowPushbackLoopTests
         Directory.CreateDirectory(workspacePath);
         foreach (var (id, name) in new[]
                  {
+                     ("account-manager", "Account Manager"),
                      ("team-lead", "Team Lead"),
                      ("software-engineer", "Software Engineer"),
+                     ("pre-mortem-sceptic", "Pre-mortem Sceptic"),
                      ("quality-engineer", "Quality Engineer"),
                      ("release-engineer", "Release Engineer")
                  })
@@ -1990,9 +1651,11 @@ public sealed class WorkflowPushbackLoopTests
             Title = "Implement feature",
             OriginalRequest = "Implement feature",
             ConsolidatedRequest = "Implement a focused product feature.",
+            Kind = FlowKind.Advisory,
             Status = FlowStatus.Queued,
             RepositoryPath = root,
-            RepositoryKnowledge = "Test repository."
+            RepositoryKnowledge = "Test repository.",
+            Outcome = OutcomeType.None
         };
         await using (var database = await databaseFactory.CreateDbContextAsync())
         {
@@ -2016,15 +1679,23 @@ public sealed class WorkflowPushbackLoopTests
             new WorkflowLoader(),
             NullLogger<WorkflowDefinitionProvider>.Instance);
         await workflowProvider.StartAsync(CancellationToken.None);
+        var catalog = new AgentCatalog(paths, databaseFactory);
+        var catalogStatus = await catalog.LoadAsync();
+        Assert.True(catalogStatus.Ready, catalogStatus.LastError);
+        var snapshots = new FlowAgentSnapshotService(databaseFactory, catalog);
+        await using (var database = await databaseFactory.CreateDbContextAsync())
+        {
+            var stored = await database.Flows.SingleAsync(item => item.Id == flow.Id);
+            snapshots.CaptureForNewFlow(database, stored);
+            await database.SaveChangesAsync();
+        }
         var runner = new PushbackLoopAgentRunner();
         using var handoffGate = new HandoffGateEngine();
         handoffGate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
         handoffGate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
-        handoffGate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
         var engine = new WorkflowEngine(
             databaseFactory,
-            new AgentCatalog(paths, databaseFactory),
-            new FlowPlanner(),
+            catalog,
             new FixedModelRouter(),
             new BootstrapTaskProfileFactory(),
             TestRoutingSupport.Recorder(databaseFactory),
@@ -2033,7 +1704,8 @@ public sealed class WorkflowPushbackLoopTests
             handoffGate,
             new CopilotSessionJournal(),
             workflowProvider,
-            NullLogger<WorkflowEngine>.Instance);
+            NullLogger<WorkflowEngine>.Instance,
+            flowAgentSnapshotService: snapshots);
 
         try
         {
@@ -2062,19 +1734,14 @@ public sealed class WorkflowPushbackLoopTests
                 .ToList();
 
             Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
-            Assert.Equal(4, profiles.Count);
-            Assert.Equal(2, leadRuns.Count);
+            Assert.Equal(7, profiles.Count);
+            Assert.Single(leadRuns);
             Assert.False(leadRuns[0].ResumeSession);
-            Assert.True(leadRuns[1].ResumeSession);
             Assert.All(
                 runner.Contexts,
                 context => Assert.Equal("fixture-effort", context.ModelEffort));
-            Assert.Contains(
-                "do not create commits, branches, tags, remotes, pushes",
-                releaseRuns[0].Task,
-                StringComparison.OrdinalIgnoreCase);
             Assert.Equal(
-                [StepStatus.Completed],
+                [StepStatus.Completed, StepStatus.Completed, StepStatus.Completed],
                 stored.Steps
                     .Where(item => item.AgentRole == "software-engineer")
                     .OrderBy(item => item.Attempt)
@@ -2087,37 +1754,32 @@ public sealed class WorkflowPushbackLoopTests
                     .OrderBy(item => item.Attempt)
                     .Select(item => item.Status)
                     .ToArray());
-            Assert.Single(engineerRuns);
+            Assert.Equal(3, engineerRuns.Count);
             Assert.Single(engineerRuns.Select(item => item.CopilotSessionId).Distinct());
             Assert.False(engineerRuns[0].ResumeSession);
-            Assert.Equal(3, releaseRuns.Count);
-            Assert.Single(releaseRuns.Select(item => item.CopilotSessionId).Distinct());
-            Assert.False(releaseRuns[0].ResumeSession);
-            Assert.All(releaseRuns.Skip(1), context => Assert.True(context.ResumeSession));
+            Assert.All(engineerRuns.Skip(1), context => Assert.True(context.ResumeSession));
+            Assert.Empty(releaseRuns);
             Assert.Equal(3, qualityRuns.Count);
             Assert.Single(qualityRuns.Select(item => item.CopilotSessionId).Distinct());
             Assert.False(qualityRuns[0].ResumeSession);
             Assert.All(qualityRuns.Skip(1), context => Assert.True(context.ResumeSession));
             Assert.Contains(
                 "Quality Engineer cannot continue",
-                releaseRuns[^1].Task);
+                engineerRuns[^1].Task);
             Assert.Contains(
-                releaseRuns[^1].Learnings,
+                engineerRuns[^1].Learnings,
                 item => item.Category == "Handoff pushback");
             Assert.Contains(
-                "Release Engineer responded to your pushback",
+                "Software Engineer responded to your pushback",
                 qualityRuns[^1].Task);
-            Assert.Equal("release-engineer", learning.AgentId);
+            Assert.Equal("software-engineer", learning.AgentId);
             Assert.Equal(2, learning.TimesObserved);
             Assert.True(learning.TimesApplied >= 2);
             Assert.Contains(
                 stored.Events,
                 item =>
                     item.Type == "agent.session-resumed" &&
-                    item.Message.StartsWith("Release Engineer", StringComparison.Ordinal));
-            Assert.Contains(
-                stored.Events,
-                item => item.Type == "profile.validation-correction");
+                    item.Message.StartsWith("Software Engineer", StringComparison.Ordinal));
             Assert.All(
                 stored.Steps,
                 step => Assert.Contains(
@@ -2156,6 +1818,7 @@ public sealed class WorkflowPushbackLoopTests
                 context.AgentRole == "quality-engineer" && context.Attempt <= 2
                     ? """
                       HANDOFF_STATUS: PUSHBACK
+                      PUSHBACK_OWNER_STEP_ID: implement
                       PUSHBACK_REASON: Software Engineer omitted the acceptance-to-test mapping.
 
                       ## PUSHBACK
@@ -2187,25 +1850,30 @@ public sealed class WorkflowPushbackLoopTests
                       """;
             if (context.AgentRole == "team-lead")
             {
-                var teamLeadAttempt = Contexts.Count(item =>
-                    item.AgentRole == "team-lead");
-                if (teamLeadAttempt == 1)
-                {
-                    return Task.FromResult(new AgentExecutionResult(
-                        output,
-                        "Fake runner evidence.",
-                        1,
-                        []));
-                }
-                output += """
-
-                    TEAM_TASK_PROFILES_V1_BEGIN
-                    {"Version":"task-profile-v1","Profiles":[{"Role":"software-engineer","Complexity":5,"ReasoningDepth":6,"ContextDemand":5,"ToolIntensity":8,"TaskTypeTags":["Implementation"],"Risk":"Medium","RiskReason":"Implementation changes product behavior.","Confidence":0.8,"Rationales":["Code and tests are required."]},{"Role":"quality-engineer","Complexity":5,"ReasoningDepth":6,"ContextDemand":6,"ToolIntensity":7,"TaskTypeTags":["Quality"],"Risk":"Medium","RiskReason":"Independent validation is required.","Confidence":0.8,"Rationales":["Acceptance evidence must be checked."]},{"Role":"release-engineer","Complexity":4,"ReasoningDepth":4,"ContextDemand":6,"ToolIntensity":6,"TaskTypeTags":["Release"],"Risk":"High","RiskReason":"Packaging changes repository state.","Confidence":0.8,"Rationales":["Verified work must be packaged."]}]}
-                    TEAM_TASK_PROFILES_V1_END
-                    PRE_MORTEM_PLAN_V1_BEGIN
-                    {"Version":"pre-mortem-plan-v1","AfterRoles":[]}
-                    PRE_MORTEM_PLAN_V1_END
-                    """;
+                output +=
+                    Environment.NewLine +
+                    TeamPlanParser.BeginSentinel +
+                    Environment.NewLine +
+                    """
+                    {"Disposition":"Planned","Steps":[{"Id":"implement","AgentId":"software-engineer","Order":10,"Stage":"BeforeReview","Assignment":"Implement the focused change.","Justification":"The engineer owns implementation.","DependsOn":[],"Duties":["Analyze"],"OutcomeOwner":false,"TaskProfile":{"Complexity":5,"ReasoningDepth":6,"ContextDemand":5,"ToolIntensity":8,"TaskTypeTags":["Implementation"],"Risk":"Medium","RiskReason":"Implementation changes product behavior.","Confidence":0.8,"Rationales":["Code and tests are required."]}},{"Id":"verify","AgentId":"quality-engineer","Order":20,"Stage":"BeforeReview","Assignment":"Verify the result and prepare the Advisory outcome.","Justification":"Independent verification closes the Advisory.","DependsOn":["implement"],"Duties":["PrepareOutcome"],"OutcomeOwner":true,"TaskProfile":{"Complexity":5,"ReasoningDepth":6,"ContextDemand":6,"ToolIntensity":7,"TaskTypeTags":["Quality"],"Risk":"Medium","RiskReason":"Independent validation is required.","Confidence":0.8,"Rationales":["Acceptance evidence must be checked."]}}],"PreMortemCheckpoints":[],"AcceptanceCriteria":null,"MissingQualification":null}
+                    """ +
+                    Environment.NewLine +
+                    TeamPlanParser.EndSentinel;
+            }
+            else if (context.IsOutcomeOwner &&
+                     !output.Contains(
+                         "HANDOFF_STATUS: PUSHBACK",
+                         StringComparison.Ordinal))
+            {
+                output +=
+                    Environment.NewLine +
+                    FlowOutcomeParser.BeginSentinel +
+                    Environment.NewLine +
+                    """
+                    {"Goal":"Verify the focused result.","Summary":"The result is ready for review.","ImplementationDetails":["The implementation and validation handoff completed."],"Artifacts":[]}
+                    """ +
+                    Environment.NewLine +
+                    FlowOutcomeParser.EndSentinel;
             }
             return Task.FromResult(new AgentExecutionResult(
                 output,
@@ -2302,668 +1970,4 @@ public sealed class PersistenceTests
         }
     }
 
-    [Fact]
-    public async Task SettingsSchema_AddsHandoffRetryLimitToExistingDatabase()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                CREATE TABLE Settings (
-                    Id INTEGER NOT NULL CONSTRAINT PK_Settings PRIMARY KEY,
-                    RepositoryPath TEXT NOT NULL,
-                    RepositoryKnowledge TEXT NOT NULL,
-                    Outcome TEXT NOT NULL,
-                    ExecutionMode TEXT NOT NULL,
-                    UpdatedAt INTEGER NOT NULL
-                );
-                INSERT INTO Settings
-                    (Id, RepositoryPath, RepositoryKnowledge, Outcome, ExecutionMode, UpdatedAt)
-                VALUES
-                    (1, '', '', 'PullRequest', 'LiveCopilot', 0);
-                """;
-            await command.ExecuteNonQueryAsync();
-        }
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        await using var database = new HarnessDbContext(options);
-
-        await DatabaseInitializer.EnsureSettingsSchemaAsync(database);
-        var settings = await database.Settings.SingleAsync();
-
-        Assert.Equal(2, settings.MaxHandoffRetries);
-        Assert.Equal(System.Data.ConnectionState.Open, connection.State);
-    }
-
-    [Fact]
-    public async Task FlowStepSchema_AddsExecutionPromptToExistingDatabase()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                CREATE TABLE FlowSteps (
-                    Id TEXT NOT NULL CONSTRAINT PK_FlowSteps PRIMARY KEY,
-                    FlowRunId TEXT NOT NULL,
-                    Iteration INTEGER NOT NULL,
-                    Sequence INTEGER NOT NULL,
-                    AgentId TEXT NOT NULL,
-                    AgentName TEXT NOT NULL,
-                    Attempt INTEGER NOT NULL,
-                    Label TEXT NOT NULL,
-                    Status TEXT NOT NULL,
-                    Phase TEXT NOT NULL DEFAULT 'PreparingWorkspace'
-                );
-                CREATE TABLE FlowEvents (
-                    Id TEXT NOT NULL CONSTRAINT PK_FlowEvents PRIMARY KEY,
-                    FlowRunId TEXT NOT NULL,
-                    FlowStepId TEXT NULL,
-                    Type TEXT NOT NULL
-                );
-                INSERT INTO FlowSteps
-                    (Id, FlowRunId, Iteration, Sequence, AgentId, AgentName, Attempt, Label, Status)
-                VALUES
-                    ('failed-step', 'flow', 1, 10, 'software-engineer', 'Software Engineer', 1, 'Execute Software Engineer contract', 'Failed'),
-                    ('retry-step', 'flow', 1, 20, 'software-engineer', 'Software Engineer', 2, 'Manual restart of Software Engineer', 'Pending'),
-                    ('pushback-step', 'flow', 1, 30, 'quality-engineer', 'Quality Engineer', 1, 'Execute Quality Engineer contract', 'Pushback'),
-                    ('revision-step', 'flow', 1, 40, 'software-engineer', 'Software Engineer', 3, 'Revision after Quality Engineer pushback', 'Pushback'),
-                    ('effective-revision', 'flow', 1, 45, 'software-engineer', 'Software Engineer', 4, 'Retry after Architect revision', 'Completed'),
-                    ('handoff-retry', 'flow', 1, 50, 'quality-engineer', 'Quality Engineer', 2, 'Retry after Software Engineer revision', 'Failed'),
-                    ('manual-handoff-retry', 'flow', 1, 60, 'quality-engineer', 'Quality Engineer', 3, 'Manual restart of Quality Engineer', 'Pending'),
-                    ('legacy-qa-pushback', 'flow', 1, 70, 'quality-engineer', 'Quality Engineer', 4, 'Execute Quality Engineer contract', 'Pushback'),
-                    ('legacy-qa-revision', 'flow', 1, 80, 'software-engineer', 'Software Engineer', 5, 'Revision after QA pushback', 'Completed'),
-                    ('legacy-revalidate', 'flow', 1, 90, 'quality-engineer', 'Quality Engineer', 5, 'Re-validate corrected handoff', 'Pending'),
-                    ('old-pushback', 'flow', 1, 100, 'quality-engineer', 'Quality Engineer', 6, 'Execute Quality Engineer contract', 'Pushback'),
-                    ('old-revision', 'flow', 1, 110, 'software-engineer', 'Software Engineer', 6, 'Revision after Quality Engineer pushback', 'Completed'),
-                    ('latest-pushback', 'flow', 1, 120, 'quality-engineer', 'Quality Engineer', 7, 'Execute Quality Engineer contract', 'Pushback'),
-                    ('latest-revision', 'flow', 1, 130, 'software-engineer', 'Software Engineer', 7, 'Revision after Quality Engineer pushback', 'Running'),
-                    ('latest-retry', 'flow', 1, 140, 'quality-engineer', 'Quality Engineer', 8, 'Retry after Software Engineer revision', 'Pending'),
-                    ('legacy-invalid-correction', 'flow', 1, 150, 'team-lead', 'Team Lead', 2, 'Correct Team Lead task profiles', 'Completed');
-                INSERT INTO FlowEvents (Id, FlowRunId, FlowStepId, Type)
-                VALUES ('invalid-event', 'flow', 'legacy-invalid-correction', 'profile.validation-failed');
-                """;
-            await command.ExecuteNonQueryAsync();
-        }
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        await using var database = new HarnessDbContext(options);
-
-        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
-        await using var probe = connection.CreateCommand();
-        probe.CommandText = "SELECT name FROM pragma_table_info('FlowSteps');";
-        var columns = new List<string>();
-        await using (var reader = await probe.ExecuteReaderAsync())
-        {
-            while (await reader.ReadAsync())
-            {
-                columns.Add(reader.GetString(0));
-            }
-        }
-
-        Assert.Contains("ExecutionPrompt", columns);
-        Assert.Contains("CopilotSessionId", columns);
-        Assert.Contains("CopilotSessionHome", columns);
-        Assert.Contains("RemotePublicationAllowed", columns);
-        Assert.Contains("RetryOfStepId", columns);
-        Assert.Contains("DependsOnStepId", columns);
-        Assert.Contains("PushbackRootStepId", columns);
-        Assert.Contains("PreMortemOriginStepId", columns);
-        Assert.Contains("PreMortemTargetStepId", columns);
-        Assert.Contains("PreMortemReviewStepId", columns);
-        Assert.Contains("Kind", columns);
-        Assert.Contains("OutcomeQaRound", columns);
-        Assert.Contains("OutcomePlanHash", columns);
-        Assert.Contains("StableSemanticRootId", columns);
-        Assert.Contains("PlanStepKey", columns);
-        Assert.Contains("PlanDutiesJson", columns);
-        Assert.Contains("PlanStage", columns);
-        Assert.Contains("IsOutcomeOwner", columns);
-        Assert.Contains("PermissionProfile", columns);
-        Assert.Contains("InvocationKind", columns);
-        Assert.Contains("EffectivePermissionJson", columns);
-        Assert.Contains("WorkflowRevision", columns);
-        await using var invocationDefaultProbe = connection.CreateCommand();
-        invocationDefaultProbe.CommandText =
-            "SELECT dflt_value FROM pragma_table_info('FlowSteps') " +
-            "WHERE name = 'InvocationKind';";
-        Assert.Equal(
-            "'Worker'",
-            await invocationDefaultProbe.ExecuteScalarAsync());
-        await using var backfillProbe = connection.CreateCommand();
-        backfillProbe.CommandText =
-            "SELECT RetryOfStepId FROM FlowSteps WHERE Id = 'retry-step';";
-        Assert.Equal("failed-step", await backfillProbe.ExecuteScalarAsync());
-        await using var dependencyProbe = connection.CreateCommand();
-        dependencyProbe.CommandText =
-            "SELECT DependsOnStepId || '|' || PushbackRootStepId " +
-            "FROM FlowSteps WHERE Id = 'handoff-retry';";
-        Assert.Equal(
-            "effective-revision|pushback-step",
-            await dependencyProbe.ExecuteScalarAsync());
-        await using var lineageProbe = connection.CreateCommand();
-        lineageProbe.CommandText =
-            "SELECT RetryOfStepId || '|' || PushbackRootStepId " +
-            "FROM FlowSteps WHERE Id = 'manual-handoff-retry';";
-        Assert.Equal(
-            "pushback-step|pushback-step",
-            await lineageProbe.ExecuteScalarAsync());
-        await using var historicalProbe = connection.CreateCommand();
-        historicalProbe.CommandText =
-            "SELECT RetryOfStepId || '|' || DependsOnStepId || '|' || PushbackRootStepId " +
-            "FROM FlowSteps WHERE Id = 'legacy-revalidate';";
-        Assert.Equal(
-            "legacy-qa-pushback|legacy-qa-revision|legacy-qa-pushback",
-            await historicalProbe.ExecuteScalarAsync());
-        await using var nearestProbe = connection.CreateCommand();
-        nearestProbe.CommandText =
-            "SELECT DependsOnStepId FROM FlowSteps WHERE Id = 'latest-retry';";
-        Assert.Equal(
-            "latest-revision",
-            await nearestProbe.ExecuteScalarAsync());
-        await using var correctionProbe = connection.CreateCommand();
-        correctionProbe.CommandText =
-            "SELECT Status || '|' || Phase " +
-            "FROM FlowSteps WHERE Id = 'legacy-invalid-correction';";
-        Assert.Equal(
-            "Failed|Failed",
-            await correctionProbe.ExecuteScalarAsync());
-        await using var rootProbe = connection.CreateCommand();
-        rootProbe.CommandText =
-            "SELECT StableSemanticRootId FROM FlowSteps WHERE Id = 'manual-handoff-retry';";
-        Assert.Equal(
-            "pushback-step",
-            await rootProbe.ExecuteScalarAsync());
-        Assert.Equal(System.Data.ConnectionState.Open, connection.State);
-    }
-
-    [Fact]
-    public async Task FlowStepSchema_BackfillsTypedGovernedMetadataFromOutcomeLedger()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        await using var database = new HarnessDbContext(options);
-        await database.Database.EnsureCreatedAsync();
-
-        var flow = new FlowRun
-        {
-            Title = "Governed backfill",
-            OriginalRequest = "Governed backfill",
-            ConsolidatedRequest = "Governed backfill",
-            Status = FlowStatus.WaitingForFeedback,
-            RepositoryPath = "workspace",
-            RepositoryKnowledge = "Test repository.",
-            WorkspacePath = "workspace",
-            BranchName = "test/outcome"
-        };
-        var now = DateTimeOffset.UtcNow;
-        var planStep = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 10,
-            AgentId = "team-lead",
-            AgentName = "Team Lead",
-            AgentRole = "team-lead",
-            Label = "Define acceptance plan and delivery system",
-            Status = StepStatus.Completed
-        };
-        var deliveryStep = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 20,
-            AgentId = "software-engineer",
-            AgentName = "Software Engineer",
-            AgentRole = "software-engineer",
-            Label = "Execute Software Engineer contract",
-            Status = StepStatus.Completed
-        };
-        var releaseStep = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 30,
-            AgentId = "release-engineer",
-            AgentName = "Release Engineer",
-            AgentRole = "release-engineer",
-            Label = WorkflowEngine.ReleaseCandidateLabel,
-            Status = StepStatus.Completed
-        };
-        var qaStep = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 40,
-            AgentId = "quality-engineer",
-            AgentName = "Quality Engineer",
-            AgentRole = "quality-engineer",
-            Label = $"{WorkflowEngine.OutcomeQaLabelPrefix}1)",
-            Status = StepStatus.Completed
-        };
-        var qaRetry = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 50,
-            AgentId = "quality-engineer",
-            AgentName = "Quality Engineer",
-            AgentRole = "quality-engineer",
-            Label = "Manual restart of Quality Engineer",
-            Status = StepStatus.Pending,
-            RetryOfStepId = qaStep.Id
-        };
-        var planCorrection = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 60,
-            AgentId = "team-lead",
-            AgentName = "Team Lead",
-            AgentRole = "team-lead",
-            Label = $"{WorkflowEngine.OutcomePlanCorrectionLabelPrefix}1",
-            Status = StepStatus.Pending
-        };
-        var ownerCorrection = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 70,
-            AgentId = "software-engineer",
-            AgentName = "Software Engineer",
-            AgentRole = "software-engineer",
-            Label = $"{WorkflowEngine.OutcomeCorrectionLabelPrefix}1: Software Engineer",
-            Status = StepStatus.Pending
-        };
-        var candidateRefresh = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 80,
-            AgentId = "release-engineer",
-            AgentName = "Release Engineer",
-            AgentRole = "release-engineer",
-            Label = $"{WorkflowEngine.OutcomeCandidateRefreshLabelPrefix}1",
-            Status = StepStatus.Pending
-        };
-        var publication = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 90,
-            AgentId = "release-engineer",
-            AgentName = "Release Engineer",
-            AgentRole = "release-engineer",
-            Label = WorkflowEngine.ApprovedPublicationLabel,
-            RemotePublicationAllowed = true,
-            Status = StepStatus.Pending
-        };
-        var accountManager = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = -10,
-            AgentId = "account-manager",
-            AgentName = "Account Manager",
-            AgentRole = "account-manager",
-            Label = "Review customer intake",
-            Status = StepStatus.Completed
-        };
-        var preMortem = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 25,
-            AgentId = "pre-mortem-sceptic",
-            AgentName = "Pre-mortem Sceptic",
-            AgentRole = WorkflowEngine.PreMortemRole,
-            Label = "Pre-mortem review of Software Engineer (round 1)",
-            Status = StepStatus.Completed,
-            PreMortemOriginStepId = deliveryStep.Id,
-            PreMortemTargetStepId = deliveryStep.Id
-        };
-        var preMortemRevision = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 27,
-            AgentId = "software-engineer",
-            AgentName = "Software Engineer",
-            AgentRole = "software-engineer",
-            Label = "Revise after pre-mortem review",
-            Status = StepStatus.Completed,
-            PreMortemReviewStepId = preMortem.Id
-        };
-        var rejectedGateSource = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 2,
-            Sequence = 5,
-            AgentId = "release-engineer",
-            AgentName = "Release Engineer",
-            AgentRole = "release-engineer",
-            Label = "Rejected release review",
-            Status = StepStatus.Completed
-        };
-        var rejectedReleaseCandidate = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 2,
-            Sequence = 10,
-            AgentId = "release-engineer",
-            AgentName = "Release Engineer",
-            AgentRole = "release-engineer",
-            Label = "Unapproved legacy publication candidate",
-            RemotePublicationAllowed = true,
-            Status = StepStatus.Pending
-        };
-        var plan = new OutcomeAcceptancePlan(
-            OutcomeVerificationRules.AcceptanceVersion,
-            [
-                new OutcomeAcceptanceCriterion(
-                    "AC-001",
-                    "The focused product behavior is implemented.",
-                    "Run the focused test and observe that the focused product behavior passes.",
-                    ["software-engineer"],
-                    [OutcomeEvidenceKind.Test],
-                    false)
-            ]);
-        var snapshot = OutcomeVerificationRules.CreateAcceptanceSnapshot(
-            plan,
-            planStep.Id);
-        var repositoryHead = new string('a', 40);
-        var repositoryTree = new string('b', 40);
-        var candidateManifest = new CandidateManifest(
-            OutcomeVerificationRules.CandidateManifestVersion,
-            1,
-            snapshot.Hash,
-            [new CandidateRepositoryManifest(".", repositoryHead, repositoryTree, "example/repository")],
-            [],
-            []);
-        var candidateFingerprint =
-            OutcomeVerificationRules.HashCandidateManifest(candidateManifest);
-        var evidence = new OutcomeEvidence(
-            "E-" + Guid.NewGuid().ToString("D"),
-            "AC-001",
-            OutcomeEvidenceDisposition.Supports,
-            OutcomeEvidenceKind.Test,
-            "dotnet test",
-            "Focused test passed",
-            0,
-            null,
-            "software-engineer",
-            deliveryStep.Id,
-            now);
-        var qaResult = new OutcomeQaResult(
-            OutcomeVerificationRules.QaVersion,
-            snapshot.Hash,
-            candidateFingerprint,
-            OutcomeQaVerdict.PASS,
-            [
-                new OutcomeQaCriterionResult(
-                    "AC-001",
-                    OutcomeCriterionStatus.PASS,
-                    [],
-                    [
-                        new OutcomeQaCheck(
-                            OutcomeEvidenceKind.Test,
-                            "dotnet test",
-                            "Focused test passed",
-                            0)
-                    ],
-                    "The focused behavior was independently checked.",
-                    [],
-                    null)
-            ],
-            []);
-        var state = OutcomeVerificationRules.CreateInitialState(1, 3);
-        state.Status = OutcomeVerificationStatus.Passed;
-        state.TrustedRepositories =
-            [new OutcomeTrustedRepository(".", "example/repository")];
-        state.PlannedRoles =
-            ["software-engineer", "quality-engineer", "release-engineer"];
-        state.AcceptancePlan = snapshot;
-        state.Evidence.Add(evidence);
-        state.EvidenceProcessing.Add(new OutcomeEvidenceProcessing(
-            deliveryStep.Id,
-            snapshot.Hash,
-            "software-engineer",
-            ["AC-001"],
-            now));
-        state.CurrentCandidate = new OutcomeCandidateSnapshot(
-            candidateManifest,
-            candidateFingerprint,
-            releaseStep.Id,
-            now);
-        state.Rounds.Add(new OutcomeQaRound
-        {
-            Round = 1,
-            QaStepId = qaStep.Id,
-            AcceptancePlanHash = snapshot.Hash,
-            CandidateFingerprint = candidateFingerprint,
-            ContextHash = "sha256:" + new string('d', 64),
-            Verdict = OutcomeQaVerdict.PASS,
-            Result = qaResult,
-            CompletedAt = now
-        });
-        state.Publication = new OutcomePublicationJournal
-        {
-            StepId = publication.Id,
-            CandidateFingerprint = candidateFingerprint,
-            Status = OutcomePublicationStatus.Published,
-            Repositories =
-            [
-                new OutcomeRepositoryPublication
-                {
-                    RelativePath = ".",
-                    Head = repositoryHead,
-                    Tree = repositoryTree,
-                    RemoteRepository = "example/repository",
-                    PullRequestUrl = "https://github.com/example/repository/pull/42",
-                    Status = OutcomeRepositoryPublicationStatus.Published
-                }
-            ]
-        };
-        state.VerifiedCandidateFingerprint = candidateFingerprint;
-        state.VerifiedAt = now;
-        flow.OutcomeVerificationJson =
-            OutcomeVerificationRules.SerializeAggregate(state);
-        flow.GateRecords.AddRange(
-            new HandoffGateRecord
-            {
-                FlowRunId = flow.Id,
-                FlowStepId = releaseStep.Id,
-                ActionType = HandoffActionType.Release,
-                Decision = HandoffGateDecision.AwaitingHumanApproval,
-                TrustLevelAtDecision = HandoffTrustLevel.Gated,
-                Resolved = true,
-                Approved = true
-            },
-            new HandoffGateRecord
-            {
-                FlowRunId = flow.Id,
-                FlowStepId = rejectedGateSource.Id,
-                ActionType = HandoffActionType.Release,
-                Decision = HandoffGateDecision.AwaitingHumanApproval,
-                TrustLevelAtDecision = HandoffTrustLevel.Gated,
-                Resolved = true,
-                Approved = false
-            });
-
-        database.Flows.Add(flow);
-        database.FlowSteps.AddRange(
-            accountManager,
-            planStep,
-            deliveryStep,
-            preMortem,
-            preMortemRevision,
-            releaseStep,
-            qaStep,
-            qaRetry,
-            planCorrection,
-            ownerCorrection,
-            candidateRefresh,
-            publication,
-            rejectedGateSource,
-            rejectedReleaseCandidate);
-        await database.SaveChangesAsync();
-
-        await database.Database.ExecuteSqlRawAsync(
-            """
-            UPDATE FlowSteps
-            SET Kind = 'Standard',
-                OutcomeQaRound = NULL,
-                OutcomePlanHash = '',
-                StableSemanticRootId = NULL;
-            PRAGMA foreign_keys = OFF;
-            CREATE TABLE FlowStepsLegacy AS
-            SELECT Id, FlowRunId, Iteration, Sequence, AgentId, AgentName,
-                   AgentRole, Label, Kind, OutcomeQaRound, OutcomePlanHash,
-                   StableSemanticRootId, Model, ModelEffort, ModelReason,
-                   RemotePublicationAllowed, Status, Phase, Attempt,
-                   ExecutionAttempts, InputSummary, ExecutionPrompt,
-                   CopilotSessionId, CopilotSessionHome, OutputSummary,
-                   PushbackReason, RetryOfStepId, DependsOnStepId,
-                   PushbackRootStepId, PreMortemOriginStepId,
-                   PreMortemTargetStepId, PreMortemReviewStepId, StartedAt,
-                   CompletedAt, DurationMilliseconds
-            FROM FlowSteps;
-            DROP TABLE FlowSteps;
-            ALTER TABLE FlowStepsLegacy RENAME TO FlowSteps;
-            PRAGMA foreign_keys = ON;
-            """);
-
-        database.ChangeTracker.Clear();
-        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
-        database.ChangeTracker.Clear();
-        var firstRejectedBackfill = await database.FlowSteps
-            .AsNoTracking()
-            .SingleAsync(item =>
-                item.Id == rejectedReleaseCandidate.Id);
-        Assert.Equal(
-            ExecutionInvocationKind.Worker,
-            firstRejectedBackfill.InvocationKind);
-        Assert.False(firstRejectedBackfill.RemotePublicationAllowed);
-        await database.Database.ExecuteSqlInterpolatedAsync(
-            $"""
-             UPDATE FlowSteps
-             SET PlanDutiesJson = '["Publish"]',
-                 PlanStage = 'AfterApproval',
-                 PermissionProfile = 'Publish',
-                 InvocationKind = 'Publication'
-             WHERE Id = {rejectedReleaseCandidate.Id};
-             """);
-
-        database.ChangeTracker.Clear();
-        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
-        await DatabaseInitializer.EnsureFlowStepSchemaAsync(database);
-        database.ChangeTracker.Clear();
-
-        var reloaded = await database.FlowSteps
-            .AsNoTracking()
-            .OrderBy(item => item.Sequence)
-            .ToDictionaryAsync(item => item.Label);
-
-        Assert.Equal(FlowStepKind.OutcomePlan, reloaded[planStep.Label].Kind);
-        Assert.Equal(snapshot.Hash, reloaded[planStep.Label].OutcomePlanHash);
-        Assert.NotNull(reloaded[planStep.Label].StableSemanticRootId);
-        Assert.Equal(
-            ExecutionInvocationKind.Intake,
-            reloaded[accountManager.Label].InvocationKind);
-        Assert.Equal(
-            ExecutionPermissionProfile.ReadOnlySource,
-            reloaded[accountManager.Label].PermissionProfile);
-        Assert.Equal(
-            """["Analyze"]""",
-            reloaded[accountManager.Label].PlanDutiesJson);
-        Assert.Equal(
-            ExecutionInvocationKind.Planning,
-            reloaded[planStep.Label].InvocationKind);
-        Assert.Equal(
-            ExecutionPermissionProfile.ReadOnlySource,
-            reloaded[planStep.Label].PermissionProfile);
-        Assert.Equal(
-            """["Analyze","Design"]""",
-            reloaded[planStep.Label].PlanDutiesJson);
-
-        Assert.Equal(
-            FlowStepKind.OutcomeDelivery,
-            reloaded[deliveryStep.Label].Kind);
-        Assert.Equal(
-            FlowStepKind.OutcomeLocalReleaseCandidate,
-            reloaded[releaseStep.Label].Kind);
-        Assert.Equal(snapshot.Hash, reloaded[releaseStep.Label].OutcomePlanHash);
-
-        Assert.Equal(FlowStepKind.OutcomeQa, reloaded[qaStep.Label].Kind);
-        Assert.Equal(1, reloaded[qaStep.Label].OutcomeQaRound);
-        Assert.Equal(snapshot.Hash, reloaded[qaStep.Label].OutcomePlanHash);
-
-        Assert.Equal(FlowStepKind.OutcomeQa, reloaded[qaRetry.Label].Kind);
-        Assert.Equal(1, reloaded[qaRetry.Label].OutcomeQaRound);
-        Assert.Equal(
-            reloaded[qaStep.Label].StableSemanticRootId,
-            reloaded[qaRetry.Label].StableSemanticRootId);
-
-        Assert.Equal(
-            FlowStepKind.OutcomePlanCorrection,
-            reloaded[planCorrection.Label].Kind);
-        Assert.Equal(1, reloaded[planCorrection.Label].OutcomeQaRound);
-        Assert.Equal(snapshot.Hash, reloaded[planCorrection.Label].OutcomePlanHash);
-
-        Assert.Equal(
-            FlowStepKind.OutcomeOwnerCorrection,
-            reloaded[ownerCorrection.Label].Kind);
-        Assert.Equal(1, reloaded[ownerCorrection.Label].OutcomeQaRound);
-        Assert.Equal(snapshot.Hash, reloaded[ownerCorrection.Label].OutcomePlanHash);
-
-        Assert.Equal(
-            FlowStepKind.OutcomeCandidateRefresh,
-            reloaded[candidateRefresh.Label].Kind);
-        Assert.Equal(1, reloaded[candidateRefresh.Label].OutcomeQaRound);
-
-        Assert.Equal(
-            FlowStepKind.OutcomeApprovedPublication,
-            reloaded[publication.Label].Kind);
-        Assert.Equal(1, reloaded[publication.Label].OutcomeQaRound);
-        Assert.Equal(snapshot.Hash, reloaded[publication.Label].OutcomePlanHash);
-        Assert.Equal(
-            ExecutionInvocationKind.Publication,
-            reloaded[publication.Label].InvocationKind);
-        Assert.Equal(
-            PlanStage.AfterApproval,
-            reloaded[publication.Label].PlanStage);
-        Assert.Equal(
-            """["Publish"]""",
-            reloaded[publication.Label].PlanDutiesJson);
-        Assert.Equal(
-            ExecutionPermissionProfile.WorkspaceWrite,
-            reloaded[publication.Label].PermissionProfile);
-        Assert.Equal(
-            ExecutionInvocationKind.PreMortem,
-            reloaded[preMortem.Label].InvocationKind);
-        Assert.Equal(
-            ExecutionPermissionProfile.PreMortemReadOnly,
-            reloaded[preMortem.Label].PermissionProfile);
-        Assert.Equal(
-            ExecutionInvocationKind.Worker,
-            reloaded[preMortemRevision.Label].InvocationKind);
-        Assert.Equal(
-            ExecutionPermissionProfile.WorkspaceWrite,
-            reloaded[preMortemRevision.Label].PermissionProfile);
-        Assert.Equal(
-            ExecutionInvocationKind.Worker,
-            reloaded[rejectedReleaseCandidate.Label].InvocationKind);
-        Assert.Equal(
-            PlanStage.BeforeReview,
-            reloaded[rejectedReleaseCandidate.Label].PlanStage);
-        Assert.False(
-            reloaded[rejectedReleaseCandidate.Label]
-                .RemotePublicationAllowed);
-    }
 }

@@ -17,7 +17,7 @@ Prepare the configured delivery outcome without crossing the customer approval b
 - A live demo never replaces that offline reviewed preview and never contributes to readiness or
   publication. Only when the assignment explicitly requests a live demo, write
   `.customer-preview\<variant>\customer-demo.json` before sealing. Use exactly these case-sensitive
-  fields: `Version: "customer-demo-v1"`, matching `ArtifactId`, an approved `LaunchProfile`
+  fields: matching `ArtifactId`, an approved `LaunchProfile`
   (`npm`, `dotnet`, or `python`), workspace-relative `WorkingDirectory`, string-array
   `Arguments` with exactly one `{port}` placeholder, loopback `HealthPath`, and bounded
   `StartupTimeoutSeconds`. Never write an executable path, a shell command string, or infer launch
@@ -28,8 +28,6 @@ Prepare the configured delivery outcome without crossing the customer approval b
 - Do not run `git add` or otherwise stage files before review; the host uses its own temporary index
   to seal the exact working-tree bytes.
 - The harness seals the local flow-branch commit(s) from the actual working-tree product bytes before fingerprinting; your job is to package the intended candidate safely and report the repository scope plus release evidence.
-- During candidate preparation and refresh, never add
-  `.ai-harness\outcome-verification` to a commit; it is runtime-derived QA context.
 - Report strict criterion-linked evidence for assigned packaging, preview, publication, and release
   criteria.
 - Leave no dirty tracked files or unapproved untracked product files after the harness seals the candidate, and do not claim to have created the final commit or tree identities yourself.

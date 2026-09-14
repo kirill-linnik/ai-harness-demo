@@ -12,7 +12,6 @@ public sealed class PreMortemValidationException(IReadOnlyList<string> errors)
 }
 
 public sealed record PreMortemPlanDocument(
-    string Version,
     IReadOnlyList<string> AfterRoles);
 
 public sealed record PreMortemFinding(
@@ -22,7 +21,6 @@ public sealed record PreMortemFinding(
     string Prevention);
 
 public sealed record PreMortemFindingsDocument(
-    string Version,
     IReadOnlyList<PreMortemFinding> Findings);
 
 public enum PreMortemDisposition
@@ -37,12 +35,10 @@ public sealed record PreMortemReview(
 
 public static class PreMortemRules
 {
-    public const string PlanVersion = "pre-mortem-plan-v1";
-    public const string PlanBeginSentinel = "PRE_MORTEM_PLAN_V1_BEGIN";
-    public const string PlanEndSentinel = "PRE_MORTEM_PLAN_V1_END";
-    public const string FindingsVersion = "pre-mortem-findings-v1";
-    public const string FindingsBeginSentinel = "PRE_MORTEM_FINDINGS_V1_BEGIN";
-    public const string FindingsEndSentinel = "PRE_MORTEM_FINDINGS_V1_END";
+    public const string PlanBeginSentinel = "PRE_MORTEM_PLAN_BEGIN";
+    public const string PlanEndSentinel = "PRE_MORTEM_PLAN_END";
+    public const string FindingsBeginSentinel = "PRE_MORTEM_FINDINGS_BEGIN";
+    public const string FindingsEndSentinel = "PRE_MORTEM_FINDINGS_END";
     public const string ClearStatus = "PRE_MORTEM_STATUS: CLEAR";
     public const string FindingsStatus = "PRE_MORTEM_STATUS: FINDINGS";
     public const string AdjustedDisposition = "PRE_MORTEM_DISPOSITION: ADJUSTED";
@@ -68,11 +64,6 @@ public static class PreMortemRules
             PlanEndSentinel,
             "pre-mortem plan");
         var errors = new List<string>();
-        if (!string.Equals(document.Version, PlanVersion, StringComparison.Ordinal))
-        {
-            errors.Add($"version must be exactly '{PlanVersion}'");
-        }
-
         if (document.AfterRoles is null)
         {
             errors.Add("afterRoles is required");
@@ -145,10 +136,6 @@ public static class PreMortemRules
             FindingsBeginSentinel,
             FindingsEndSentinel,
             "pre-mortem findings");
-        if (!string.Equals(document.Version, FindingsVersion, StringComparison.Ordinal))
-        {
-            errors.Add($"version must be exactly '{FindingsVersion}'");
-        }
         if (document.Findings is null)
         {
             errors.Add("findings is required");

@@ -62,7 +62,7 @@ public sealed class DurablePromptRecoveryTests
         await using var fixture =
             await DurablePromptFixture.CreateAsync(
                 originalPrompt,
-                ExecutionInvocationKind.ReviewClassification);
+                ExecutionInvocationKind.Worker);
         var stager = new AgentManifestStager();
         var stagedAgent = await stager.StageAsync(
             fixture.CopilotHome,
@@ -83,7 +83,8 @@ public sealed class DurablePromptRecoveryTests
                     fixture.Context with
                     {
                         RecoverInterruptedSession = true,
-                        ResumeSession = true
+                        ResumeSession = true,
+                        RequiresDeliveryReadinessQa = true
                     },
                     current,
                     "Changed review instructions.",
@@ -294,7 +295,6 @@ public sealed class DurablePromptRecoveryTests
                 OriginalRequest = "Preserve the original execution instructions.",
                 ConsolidatedRequest =
                     "Preserve the original execution instructions.",
-                ContractVersion = "studio-v2",
                 Kind = FlowKind.Delivery,
                 Status = FlowStatus.Running,
                 RepositoryPath = root,
@@ -343,7 +343,6 @@ public sealed class DurablePromptRecoveryTests
                 [],
                 [],
                 FlowStepId: step.Id,
-                ContractVersion: flow.ContractVersion,
                 InvocationKind: invocationKind,
                 PlanStepKey: step.PlanStepKey,
                 FlowKind: flow.Kind);
@@ -437,7 +436,6 @@ public sealed class DurablePromptRecoveryTests
                     max_concurrent_agents: 1
                     max_attempts: 1
                   studio:
-                    version: 1
                     flow_kinds:
                       advisory:
                         required_duties: [PrepareOutcome]

@@ -98,7 +98,7 @@ internal static partial class AgentHandoffInspector
         if (statuses.Count != 1)
         {
             throw new InvalidOperationException(
-                "studio-v2 output must contain exactly one exact " +
+                "Studio output must contain exactly one exact " +
                 "'HANDOFF_STATUS: COMPLETE' or 'HANDOFF_STATUS: PUSHBACK' line.");
         }
         var status = statuses[0].Groups[1].Value;
@@ -121,7 +121,7 @@ internal static partial class AgentHandoffInspector
             if (ownerLines.Length != 0 || reasonLines.Length != 0)
             {
                 throw new InvalidOperationException(
-                    "studio-v2 COMPLETE output cannot contain pushback owner or reason markers.");
+                    "Studio COMPLETE output cannot contain pushback owner or reason markers.");
             }
             return new DynamicHandoffStatus(false, null, null);
         }
@@ -129,7 +129,7 @@ internal static partial class AgentHandoffInspector
         if (ownerLines.Length != 1 || reasonLines.Length != 1)
         {
             throw new InvalidOperationException(
-                "studio-v2 PUSHBACK output must contain exactly one " +
+                "Studio PUSHBACK output must contain exactly one " +
                 "PUSHBACK_OWNER_STEP_ID and one PUSHBACK_REASON line.");
         }
         var owner = ownerLines[0]["PUSHBACK_OWNER_STEP_ID:".Length..].Trim();

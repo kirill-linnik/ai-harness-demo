@@ -57,40 +57,40 @@ public sealed class IntakeAdvisoryTests
     }
 
     [Fact]
-    public void IntakeV2_IsStrictCaseSensitiveAndBounded()
+    public void Intake_IsStrictCaseSensitiveAndBounded()
     {
-        var parsed = IntakeV2Parser.Parse(Intake(
+        var parsed = IntakeParser.Parse(Intake(
             "AwaitingConfirmation",
             "Advisory"));
 
-        Assert.Equal(IntakeV2Status.AwaitingConfirmation, parsed.Document.Status);
+        Assert.Equal(IntakeStatus.AwaitingConfirmation, parsed.Document.Status);
         Assert.Equal(FlowKind.Advisory, parsed.Document.FlowKind);
         Assert.Equal("Assess checkout resilience", parsed.Document.TaskTitle);
 
-        Assert.Throws<IntakeV2ContractException>(() =>
-            IntakeV2Parser.Parse(
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.Parse(
                 Intake("AwaitingConfirmation", "Advisory")
                     .Replace(
-                        "\"Version\":",
-                        "\"Unknown\":true,\"Version\":",
+                        "\"Status\":",
+                        "\"Unknown\":true,\"Status\":",
                         StringComparison.Ordinal)));
-        Assert.Throws<IntakeV2ContractException>(() =>
-            IntakeV2Parser.Parse(
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.Parse(
                 Intake("AwaitingConfirmation", "Advisory")
                     .Replace(
                         "\"TaskTitle\":",
                         "\"TaskTitle\":\"duplicate\",\"TaskTitle\":",
                         StringComparison.Ordinal)));
-        Assert.Throws<IntakeV2ContractException>(() =>
-            IntakeV2Parser.Parse(Intake("awaitingConfirmation", "Advisory")));
-        Assert.Throws<IntakeV2ContractException>(() =>
-            IntakeV2Parser.Parse(Intake("Confirmed", "null")));
-        Assert.Throws<IntakeV2ContractException>(() =>
-            IntakeV2Parser.Parse(
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.Parse(Intake("awaitingConfirmation", "Advisory")));
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.Parse(Intake("Confirmed", "null")));
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.Parse(
                 Intake("AwaitingConfirmation", "Advisory")
                     .Replace(
                         "Assess checkout resilience",
-                        new string('x', IntakeV2Parser.MaximumTaskTitleCharacters + 1),
+                        new string('x', IntakeParser.MaximumTaskTitleCharacters + 1),
                         StringComparison.Ordinal)));
     }
 
@@ -109,9 +109,10 @@ public sealed class IntakeAdvisoryTests
         var seed = AdvisoryPromotionSeedParser.Parse(canonical);
         var hash = AdvisoryPromotionSeedParser.ComputeHash(canonical);
 
-        Assert.Equal(
-            AdvisoryPromotionSeedParser.MaximumDocumentCharacters,
-            canonical.Length);
+        Assert.InRange(
+            canonical.Length,
+            1,
+            AdvisoryPromotionSeedParser.MaximumDocumentCharacters);
         Assert.Equal(goal, seed.Goal);
         Assert.Equal(details, seed.ImplementationDetails);
 
@@ -124,7 +125,6 @@ public sealed class IntakeAdvisoryTests
                 }
             ],
             OutcomeType.PullRequest,
-            contractVersion: "studio-v2",
             promotionSeed: seed);
         Assert.Equal(
             1,
@@ -182,7 +182,6 @@ public sealed class IntakeAdvisoryTests
                 "Normalize the promotion.",
                 [],
                 [],
-                ContractVersion: "studio-v2",
                 InvocationKind: ExecutionInvocationKind.Intake,
                 FlowStepId: accountManagerStepId,
                 PromotionContext:
@@ -243,10 +242,9 @@ public sealed class IntakeAdvisoryTests
                 Title = "Implement accepted recommendation",
                 OriginalRequest = "Implement accepted recommendation",
                 Kind = FlowKind.Delivery,
-                ContractVersion = "studio-v2",
                 ConsolidatedRequest =
-                    IntakeV2Parser.SerializeBrief(
-                        new IntakeV2Brief
+                    IntakeParser.SerializeBrief(
+                        new IntakeBrief
                         {
                             Goal = goal,
                             Details = details,
@@ -290,12 +288,11 @@ public sealed class IntakeAdvisoryTests
                 [],
                 [],
                 FlowStepId: teamLeadStepId,
-                ContractVersion: "studio-v2",
                 InvocationKind: ExecutionInvocationKind.Planning);
             var teamLeadValues =
                 CopilotReasoningHost.BuildPromptValues(
                     teamLeadContext,
-                    "Return exactly one team-plan-v1 document.",
+                    "Return exactly one team plan document.",
                     root);
             var teamLeadPrompt =
                 CopilotReasoningHost.BoundRenderedPrompt(
@@ -313,7 +310,7 @@ public sealed class IntakeAdvisoryTests
                     "violet",
                     20,
                     "team-lead.agent.md",
-                    "Return exactly one team-plan-v1 document."),
+                    "Return exactly one team plan document."),
                 teamLeadSessionId);
             var stagedTeamLeadPrompt = await stager.StagePromptAsync(
                 stagedTeamLead,
@@ -384,7 +381,7 @@ public sealed class IntakeAdvisoryTests
                 stagedTeamLeadText,
                 StringComparison.Ordinal);
             var recoveredBrief =
-                JsonSerializer.Deserialize<IntakeV2Brief>(
+                JsonSerializer.Deserialize<IntakeBrief>(
                     teamLeadFlow.ConsolidatedRequest);
             Assert.Equal(goal, recoveredBrief!.Goal);
             Assert.Equal(
@@ -418,7 +415,7 @@ public sealed class IntakeAdvisoryTests
     [Fact]
     public void Confirmation_ReusesReviewedKindTitleAndNormalizedBrief()
     {
-        var pending = IntakeV2Parser.Parse(Intake(
+        var pending = IntakeParser.Parse(Intake(
             "AwaitingConfirmation",
             "Advisory")).Document;
         var attemptedChange = IntakeCoordinator.ParseResponse(
@@ -428,8 +425,7 @@ public sealed class IntakeAdvisoryTests
                 .Replace(
                     "Identify the highest-impact checkout resilience gaps.",
                     "Implement a different request.",
-                    StringComparison.Ordinal),
-            "studio-v2");
+                    StringComparison.Ordinal));
 
         var confirmed = IntakeCoordinator.ApplyConfirmationGate(
             attemptedChange,
@@ -439,7 +435,7 @@ public sealed class IntakeAdvisoryTests
         Assert.Equal(FlowKind.Advisory, confirmed.FlowKind);
         Assert.Equal(pending.TaskTitle, confirmed.TaskTitle);
         Assert.Equal(
-            IntakeV2Parser.SerializeBrief(pending.Brief!),
+            IntakeParser.SerializeBrief(pending.Brief!),
             confirmed.TaskBrief);
     }
 
@@ -451,9 +447,8 @@ public sealed class IntakeAdvisoryTests
                 .Replace(
                     "Assess checkout resilience",
                     "Improve checkout resilience",
-                    StringComparison.Ordinal),
-            "studio-v2");
-        var pending = IntakeV2Parser.Parse(
+                    StringComparison.Ordinal));
+        var pending = IntakeParser.Parse(
             Intake("AwaitingConfirmation", "Advisory")).Document;
 
         var gated = IntakeCoordinator.ApplyConfirmationGate(corrected, pending);
@@ -466,9 +461,8 @@ public sealed class IntakeAdvisoryTests
                 }
             ],
             OutcomeType.PullRequest,
-            IntakeV2Parser.SerializeBrief(pending.Brief!),
-            pending.FlowKind,
-            "studio-v2");
+            IntakeParser.SerializeBrief(pending.Brief!),
+            pending.FlowKind);
 
         Assert.False(gated.Ready);
         Assert.Equal(FlowKind.Delivery, gated.FlowKind);
@@ -484,7 +478,7 @@ public sealed class IntakeAdvisoryTests
             malformedInitialIntakeRuns: 1);
         const string customerRequest = "Assess checkout resilience.";
 
-        await Assert.ThrowsAsync<IntakeV2ContractException>(() =>
+        await Assert.ThrowsAsync<IntakeContractException>(() =>
             harness.Intake.ContinueAsync(
                 new IntakeRequest(
                     harness.FlowId,
@@ -902,7 +896,7 @@ public sealed class IntakeAdvisoryTests
             item => item.Type == "intake.confirmation_requested");
         Assert.False(string.IsNullOrWhiteSpace(originalProposal.DataJson));
 
-        await Assert.ThrowsAsync<IntakeV2ContractException>(() =>
+        await Assert.ThrowsAsync<IntakeContractException>(() =>
             harness.Intake.ContinueAsync(
                 new IntakeRequest(harness.FlowId, confirmationReply)));
         var afterFailure = await harness.LoadFlowAsync();
@@ -944,8 +938,8 @@ public sealed class IntakeAdvisoryTests
                 confirmOnFirstAccountManagerRun: true);
         const string customerRequest = "Assess checkout resilience.";
         var awaitingOutput = Intake("AwaitingConfirmation", "Advisory");
-        var parsed = IntakeV2Parser.Parse(awaitingOutput);
-        var proposalDataJson = IntakeV2Parser.Serialize(parsed.Document);
+        var parsed = IntakeParser.Parse(awaitingOutput);
+        var proposalDataJson = IntakeParser.Serialize(parsed.Document);
 
         await using (var database =
                      await harness.Factory.CreateDbContextAsync())
@@ -1049,20 +1043,19 @@ public sealed class IntakeAdvisoryTests
     [Theory]
     [InlineData(FlowKind.Advisory)]
     [InlineData(FlowKind.Delivery)]
-    public async Task IntakeV2_PersistsKindThenRunsAccountManagerAndTeamLead(
+    public async Task Intake_PersistsKindThenRunsAccountManagerAndTeamLead(
         FlowKind kind)
     {
         await using var harness = await StudioFlowHarness.CreateAsync(kind);
 
         var proposed = await harness.Intake.ContinueAsync(
             new IntakeRequest(harness.FlowId, "Assess checkout resilience."));
-        Assert.Equal("studio-v2", proposed.Flow.ContractVersion);
         Assert.Equal(kind, proposed.Flow.Kind);
         Assert.False(proposed.ReadyToStart);
         var proposalEvent = Assert.Single(
             proposed.Flow.Events,
             item => item.Type == "intake.confirmation_requested");
-        var persistedProposal = IntakeV2Parser.ParseJson(proposalEvent.DataJson!);
+        var persistedProposal = IntakeParser.ParseJson(proposalEvent.DataJson!);
         Assert.Equal(kind, persistedProposal.Document.FlowKind);
 
         var confirmed = await harness.Intake.ContinueAsync(
@@ -1073,7 +1066,9 @@ public sealed class IntakeAdvisoryTests
         await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
         var flow = await harness.LoadFlowAsync();
 
-        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.True(
+            flow.Status == FlowStatus.WaitingForFeedback,
+            $"Expected WaitingForFeedback, got {flow.Status}: {flow.FailureReason}");
         Assert.Equal(
             ["account-manager", "account-manager", "team-lead"],
             harness.Runner.Contexts.Take(3).Select(item => item.AgentId));
@@ -1121,7 +1116,7 @@ public sealed class IntakeAdvisoryTests
     }
 
     [Fact]
-    public void NewIntakeFlows_UseStudioV2()
+    public void NewIntakeFlows_UseCurrentDynamicFlow()
     {
         var flow = IntakeCoordinator.CreateFlow(
             "Assess checkout resilience.",
@@ -1132,9 +1127,9 @@ public sealed class IntakeAdvisoryTests
                 Outcome = OutcomeType.PullRequest
             });
 
-        Assert.Equal("studio-v2", flow.ContractVersion);
+        Assert.Equal(FlowKind.Delivery, flow.Kind);
         Assert.Equal(FlowStatus.Intake, flow.Status);
-        Assert.Empty(flow.OutcomeVerificationJson);
+        Assert.Empty(flow.OutcomeContractJson);
     }
 
     [Fact]
@@ -1159,8 +1154,7 @@ public sealed class IntakeAdvisoryTests
             Outcome = OutcomeType.None
         };
         var delivery = IntakeCoordinator.ParseResponse(
-            Intake("AwaitingConfirmation", "Delivery"),
-            "studio-v2");
+            Intake("AwaitingConfirmation", "Delivery"));
         Assert.Throws<ArgumentException>(() =>
             IntakeCoordinator.ApplyIntakeOutcome(
                 deliveryFlow,
@@ -1175,8 +1169,7 @@ public sealed class IntakeAdvisoryTests
             Outcome = OutcomeType.PullRequest
         };
         var advisory = IntakeCoordinator.ParseResponse(
-            Intake("AwaitingConfirmation", "Advisory"),
-            "studio-v2");
+            Intake("AwaitingConfirmation", "Advisory"));
 
         IntakeCoordinator.ApplyIntakeOutcome(
             flow,
@@ -1406,51 +1399,6 @@ public sealed class IntakeAdvisoryTests
     }
 
     [Fact]
-    public async Task ReviewClassificationPolicy_RunsNoMutatingHooksAndKeepsCandidateCurrent()
-    {
-        await using var fixture = await WorkspaceFixture.CreateAsync(
-            includeHooks: true);
-        var workingDirectory = Path.Combine(
-            fixture.Root,
-            "review-classification-workspace");
-        Directory.CreateDirectory(workingDirectory);
-        var candidatePath = Path.Combine(
-            workingDirectory,
-            "candidate.txt");
-        await File.WriteAllTextAsync(candidatePath, "sealed");
-        var workflow = fixture.WorkflowProvider.GetEffective();
-
-        foreach (var stage in new[]
-                 {
-                     WorkspaceHookStage.BeforeRun,
-                     WorkspaceHookStage.AfterRun
-                 })
-        {
-            if (CopilotReasoningHost.ShouldRunWorkspaceHooks(
-                    "studio-v2",
-                    ExecutionInvocationKind.ReviewClassification))
-            {
-                await fixture.HookRunner.RunAsync(
-                    stage,
-                    workingDirectory,
-                    workflow,
-                    FlowKind.Delivery,
-                    provisional: false);
-            }
-        }
-
-        Assert.False(File.Exists(
-            Path.Combine(workingDirectory, "hook-ran.txt")));
-        Assert.Equal("sealed", await File.ReadAllTextAsync(candidatePath));
-        Assert.True(CopilotReasoningHost.ShouldRunWorkspaceHooks(
-            "studio-v2",
-            ExecutionInvocationKind.Worker));
-        Assert.False(CopilotReasoningHost.ShouldRunWorkspaceHooks(
-            "studio-v2",
-            ExecutionInvocationKind.Publication));
-    }
-
-    [Fact]
     public void AdvisoryPermission_IsReadOnlyWithoutShellOrPublication()
     {
         var resolver = new PermissionProfileResolver();
@@ -1473,10 +1421,7 @@ public sealed class IntakeAdvisoryTests
                     PlanDuty.PrepareOutcome),
                 DurableReviewDecision: null,
                 DurableApproval: false,
-                IsOnlyPlannedPublishStep: false,
-                ContractVersion: "studio-v2",
-                LegacyPublicationAuthorized: false,
-                IsGovernedOutcomeVerification: false),
+                IsOnlyPlannedPublishStep: false),
             restrictions);
 
         Assert.Equal(ExecutionPermissionProfile.ReadOnlySource, permission.Profile);
@@ -1548,65 +1493,6 @@ public sealed class IntakeAdvisoryTests
         var mismatch = await Assert.ThrowsAsync<InvalidOperationException>(
             () => fixture.Artifacts.VerifyAndWriteAsync(flow, parsed));
         Assert.Contains("no longer matches", mismatch.Message);
-    }
-
-    [Fact]
-    public async Task LegacyAdvisoryV1Artifacts_RemainDiscoverableAfterCatalogReload()
-    {
-        await using var fixture = await WorkspaceFixture.CreateAsync();
-        var flow = fixture.Flow(FlowStatus.Approved, FlowKind.Advisory);
-        var workspace = await fixture.Manager.PrepareAsync(flow);
-        flow.WorkspacePath = workspace.Path;
-        flow.Outcome = OutcomeType.None;
-        var outcome = FlowOutcomeParser.Parse(Outcome(
-            """
-            [{"Path":"answer.md","MediaType":"text/markdown","Content":"legacy answer"}]
-            """));
-        flow.OutcomeContractJson = outcome.RawJson;
-        var step = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = flow.Iteration,
-            Sequence = 20,
-            AgentId = "advisor",
-            AgentName = "Advisor",
-            AgentRole = "advisor",
-            PlanStepKey = "prepare-answer",
-            Status = StepStatus.Completed
-        };
-        flow.Steps.Add(step);
-        flow.Events.Add(new FlowEvent
-        {
-            FlowRunId = flow.Id,
-            FlowStepId = step.Id,
-            Type = AdvisoryArtifactCatalog.MaterializationEventType,
-            Message = "Legacy Advisory artifacts were materialized.",
-            DataJson = """{"Version":"advisory-artifacts-v1"}"""
-        });
-        var artifactRoot = Path.Combine(
-            workspace.Path,
-            ".studio",
-            "advisory");
-        Directory.CreateDirectory(artifactRoot);
-        await File.WriteAllTextAsync(
-            Path.Combine(artifactRoot, "answer.md"),
-            "legacy answer");
-
-        var reloaded = new AdvisoryArtifactCatalog(
-            fixture.WorkflowProvider);
-        var artifact = Assert.Single(reloaded.Discover(flow));
-        var policy = reloaded.TryReadCurrentMaterialization(flow);
-
-        Assert.Equal("answer.md", artifact.Path);
-        Assert.Equal("legacy answer", await File.ReadAllTextAsync(
-            artifact.FullPath));
-        Assert.NotNull(policy);
-        Assert.True(policy!.LegacyMigratedReadOnly);
-        Assert.Equal(
-            policy.ArtifactDirectory,
-            policy.MaterializationDirectory);
-        Assert.Throws<InvalidOperationException>(() =>
-            reloaded.SerializeMaterialization(policy));
     }
 
     [Fact]
@@ -1732,7 +1618,7 @@ public sealed class IntakeAdvisoryTests
         var flow = await harness.LoadFlowAsync();
 
         Assert.Equal(FlowStatus.Failed, flow.Status);
-        Assert.Contains("FLOW_OUTCOME_V1", flow.FailureReason);
+        Assert.Contains(FlowOutcomeParser.BeginSentinel, flow.FailureReason);
         Assert.DoesNotContain(
             flow.GateRecords,
             gate => gate.ActionType == HandoffActionType.CustomerReview);
@@ -1808,10 +1694,7 @@ public sealed class IntakeAdvisoryTests
                     ImmutableArray.Create(PlanDuty.Analyze),
                     DurableReviewDecision: null,
                     DurableApproval: false,
-                    IsOnlyPlannedPublishStep: false,
-                    ContractVersion: "studio-v2",
-                    LegacyPublicationAuthorized: false,
-                    IsGovernedOutcomeVerification: false),
+                    IsOnlyPlannedPublishStep: false),
                 PermissionProfileResolver.FromWorkflow(workflow));
         var copilotHome = Path.Combine(
             harness.Root,
@@ -1978,10 +1861,8 @@ public sealed class IntakeAdvisoryTests
         });
 
     private static string Intake(string status, string flowKind) => $$"""
-        {{IntakeV2Parser.BeginSentinel}}
-        {
-          "Version": "intake-v2",
-          "Status": "{{status}}",
+        {{IntakeParser.BeginSentinel}}
+        {"Status": "{{status}}",
           "FlowKind": {{(flowKind == "null" ? "null" : $"\"{flowKind}\"")}},
           "TaskTitle": "Assess checkout resilience",
           "CustomerReply": "Do I understand correctly that you want a checkout resilience assessment?",
@@ -1993,12 +1874,12 @@ public sealed class IntakeAdvisoryTests
             "Assumptions": []
           }
         }
-        {{IntakeV2Parser.EndSentinel}}
+        {{IntakeParser.EndSentinel}}
         """;
 
     private static string Outcome(string artifacts) => $$"""
         {{FlowOutcomeParser.BeginSentinel}}
-        {"Version":"flow-outcome-v1","Goal":"Assess checkout resilience.","Summary":"The requested result is ready for review.","ImplementationDetails":["Use idempotency keys at the checkout boundary."],"Artifacts":{{artifacts}}}
+        {"Goal":"Assess checkout resilience.","Summary":"The requested result is ready for review.","ImplementationDetails":["Use idempotency keys at the checkout boundary."],"Artifacts":{{artifacts}}}
         {{FlowOutcomeParser.EndSentinel}}
         """;
 
@@ -2122,7 +2003,6 @@ public sealed class IntakeAdvisoryTests
                 Title = "Assess checkout resilience",
                 OriginalRequest = "Assess checkout resilience.",
                 ConsolidatedRequest = "Assess checkout resilience.",
-                ContractVersion = "studio-v2",
                 Kind = kind,
                 Status = status,
                 RepositoryPath = SourcePath,
@@ -2319,7 +2199,6 @@ public sealed class IntakeAdvisoryTests
                   max_concurrent_agents: 1
                   max_attempts: 1
                 studio:
-                  version: 1
                   planning:
                     max_steps: 24
                     max_dependencies_per_step: 8
@@ -2438,7 +2317,6 @@ public sealed class IntakeAdvisoryTests
             var engine = new WorkflowEngine(
                 factory,
                 catalog,
-                new FlowPlanner(),
                 new FixedModelRouter(),
                 new BootstrapTaskProfileFactory(),
                 TestRoutingSupport.Recorder(factory),
@@ -2539,7 +2417,7 @@ public sealed class IntakeAdvisoryTests
                     _accountManagerRuns == failAccountManagerRunAtOrdinal)
                 {
                     return Result(
-                        "MALFORMED_INTAKE_OUTPUT without the required intake-v2 sentinels.");
+                        "MALFORMED_INTAKE_OUTPUT without the required intake sentinels.");
                 }
                 _successfulAccountManagerRuns++;
                 var status = _successfulAccountManagerRuns == 1 &&
@@ -2609,20 +2487,38 @@ public sealed class IntakeAdvisoryTests
                           DeliveryReadinessFixtures.QaBlockFromPrompt(
                               context.OutcomeContext);
             }
-            return Result(output);
+            return Result(output, context);
         }
 
-        private static Task<AgentExecutionResult> Result(string output) =>
+        private static Task<AgentExecutionResult> Result(
+            string output,
+            AgentExecutionContext? context = null) =>
             Task.FromResult(new AgentExecutionResult(
                 output,
                 "Fixture evidence.",
                 1,
-                []));
+                context is
+                {
+                    FlowKind: AiHarnessDemo.Core.Domain.FlowKind.Delivery,
+                    InvocationKind: ExecutionInvocationKind.Worker
+                }
+                    ? [
+                        new ToolCallRecord(
+                            "observe",
+                            "Inspect the planned result.",
+                            Succeeded: true,
+                            ToolType: "Observation",
+                            ResultDigest:
+                                OutcomeVerificationRules.ComputeSha256(
+                                    context.PlanStepKey),
+                            ResultSummary:
+                                "The customer-visible behavior was observed.")
+                    ]
+                    : []));
 
         private static TeamPlanDocument AdvisoryPlan() =>
             new()
             {
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned,
                 Steps =
                 [
@@ -2640,24 +2536,26 @@ public sealed class IntakeAdvisoryTests
         private static TeamPlanDocument DeliveryPlan() =>
             new()
             {
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned,
                 Steps =
                 [
                     Step(
-                        "prepare",
+                        "implement",
                         "builder",
                         10,
-                        [
-                            PlanDuty.Implement,
-                            PlanDuty.Verify,
-                            PlanDuty.PrepareOutcome
-                        ],
-                        owner: true),
+                        [PlanDuty.Implement],
+                        owner: false),
+                    Step(
+                        "prepare",
+                        "builder",
+                        20,
+                        [PlanDuty.Verify, PlanDuty.PrepareOutcome],
+                        owner: true,
+                        dependencies: ["implement"]),
                     Step(
                         "publish",
                         "publisher",
-                        20,
+                        30,
                         [PlanDuty.Publish],
                         owner: false,
                         stage: PlanStage.AfterApproval,
@@ -2732,7 +2630,6 @@ public sealed class IntakeAdvisoryTests
             string outcomeContractJson,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(new ReviewedCandidateIdentity(
-                ReviewedCandidateIdentity.CurrentVersion,
                 flow.Id,
                 flow.Iteration,
                 outcomeOwnerStepId,

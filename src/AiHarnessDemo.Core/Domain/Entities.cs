@@ -74,7 +74,6 @@ public enum ExecutionInvocationKind
     Planning,
     Worker,
     PreMortem,
-    ReviewClassification,
     BlockerExplanation,
     Publication
 }
@@ -156,19 +155,6 @@ public enum DemoInstanceState
     Failed
 }
 
-public enum FlowStepKind
-{
-    Standard,
-    OutcomePlan,
-    OutcomeDelivery,
-    OutcomeLocalReleaseCandidate,
-    OutcomeQa,
-    OutcomeOwnerCorrection,
-    OutcomePlanCorrection,
-    OutcomeCandidateRefresh,
-    OutcomeApprovedPublication
-}
-
 public enum ConversationRole
 {
     Customer,
@@ -191,9 +177,6 @@ public sealed class HarnessSettings
 
     public ModelSelectionStrategy ModelSelectionStrategy { get; set; } =
         ModelSelectionStrategy.MaximumQuality;
-
-    // Retains compatibility with databases created before Copilot CLI became the only host.
-    public string RuntimeMarker { get; set; } = "LiveCopilot";
 
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
@@ -243,8 +226,6 @@ public sealed class FlowRun
 
     public FlowKind Kind { get; set; } = FlowKind.Delivery;
 
-    public string ContractVersion { get; set; } = "legacy-v1";
-
     public Guid? ParentFlowRunId { get; set; }
 
     public FlowRun? ParentFlowRun { get; set; }
@@ -282,9 +263,6 @@ public sealed class FlowRun
     public ModelSelectionStrategy ModelSelectionStrategy { get; set; } =
         ModelSelectionStrategy.MaximumQuality;
 
-    // Retains compatibility with databases created before Copilot CLI became the only host.
-    public string RuntimeMarker { get; set; } = "LiveCopilot";
-
     public string WorkspacePath { get; set; } = string.Empty;
 
     public string BranchName { get; set; } = string.Empty;
@@ -294,8 +272,6 @@ public sealed class FlowRun
     public string OutcomeLabel { get; set; } = string.Empty;
 
     public string FailureReason { get; set; } = string.Empty;
-
-    public string OutcomeVerificationJson { get; set; } = string.Empty;
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
@@ -412,12 +388,6 @@ public sealed class FlowStep
 
     public string WorkflowRevision { get; set; } = string.Empty;
 
-    public FlowStepKind Kind { get; set; } = FlowStepKind.Standard;
-
-    public int? OutcomeQaRound { get; set; }
-
-    public string OutcomePlanHash { get; set; } = string.Empty;
-
     public Guid? StableSemanticRootId { get; set; }
 
     public string Model { get; set; } = string.Empty;
@@ -439,8 +409,6 @@ public sealed class FlowStep
     public string InputSummary { get; set; } = string.Empty;
 
     public string ExecutionPrompt { get; set; } = string.Empty;
-
-    public string ReviewClassificationStateJson { get; set; } = string.Empty;
 
     public Guid? CopilotSessionId { get; set; }
 
@@ -473,9 +441,7 @@ public sealed class FlowStep
     public List<RoutingDecision> RoutingDecisions { get; set; } = [];
 }
 
-/// <summary>
-/// Versioned normalized routing input. Task text and repository content are deliberately excluded.
-/// </summary>
+/// <summary>Normalized routing input. Task text and repository content are deliberately excluded.</summary>
 public sealed class TaskProfile
 {
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -489,8 +455,6 @@ public sealed class TaskProfile
     public string PlanStepKey { get; set; } = string.Empty;
 
     public string AgentId { get; set; } = string.Empty;
-
-    public string Version { get; set; } = "task-profile-v1";
 
     public required string Role { get; set; }
 
@@ -602,8 +566,6 @@ public sealed class RoutingDecision
     public bool Exploration { get; set; }
 
     public required string Reason { get; set; }
-
-    public string AlgorithmVersion { get; set; } = "router-v1";
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
@@ -784,8 +746,6 @@ public sealed class FlowPlanDocument
     public FlowRun? FlowRun { get; set; }
 
     public int Iteration { get; set; }
-
-    public required string Version { get; set; }
 
     public required string Disposition { get; set; }
 

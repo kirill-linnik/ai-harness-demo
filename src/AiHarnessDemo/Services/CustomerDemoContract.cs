@@ -11,16 +11,12 @@ public sealed class CustomerDemoContractException(string message)
     : InvalidOperationException(message);
 
 public sealed record CustomerDemoManifest(
-    string Version,
     string ArtifactId,
     string LaunchProfile,
     string WorkingDirectory,
     IReadOnlyList<string> Arguments,
     string HealthPath,
-    int StartupTimeoutSeconds)
-{
-    public const string CurrentVersion = "customer-demo-v1";
-}
+    int StartupTimeoutSeconds);
 
 public sealed record DemoLaunchProfile(
     string Name,
@@ -432,7 +428,6 @@ public static partial class CustomerDemoManifestParser
 
     private static readonly string[] RequiredProperties =
     [
-        "Version",
         "ArtifactId",
         "LaunchProfile",
         "WorkingDirectory",
@@ -501,16 +496,6 @@ public static partial class CustomerDemoManifestParser
             {
                 throw new CustomerDemoContractException(
                     $"The demo manifest is missing required field(s): {string.Join(", ", missing)}.");
-            }
-
-            var version = ReadString(values, "Version", 64);
-            if (!string.Equals(
-                    version,
-                    CustomerDemoManifest.CurrentVersion,
-                    StringComparison.Ordinal))
-            {
-                throw new CustomerDemoContractException(
-                    $"Version must be exactly '{CustomerDemoManifest.CurrentVersion}'.");
             }
 
             var artifactId = ReadString(values, "ArtifactId", 120);
@@ -594,7 +579,6 @@ public static partial class CustomerDemoManifestParser
             }
 
             return new CustomerDemoManifest(
-                version,
                 artifactId,
                 launchProfile,
                 workingDirectory,
@@ -720,8 +704,7 @@ public sealed class SealedDemoManifestService(
             throw new CustomerDemoContractException(
                 "The requested demo artifact ID is invalid.");
         }
-        if (!string.Equals(flow.ContractVersion, "studio-v2", StringComparison.Ordinal) ||
-            flow.Kind != FlowKind.Delivery)
+        if (flow.Kind != FlowKind.Delivery)
         {
             return null;
         }
@@ -798,7 +781,6 @@ public sealed class SealedDemoManifestService(
         var launchIdentity = OutcomeVerificationRules.ComputeSha256(
             string.Join(
                 "\n",
-                CustomerDemoManifest.CurrentVersion,
                 candidate.Fingerprint,
                 digest,
                 workspace,

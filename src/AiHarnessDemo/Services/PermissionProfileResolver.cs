@@ -6,14 +6,10 @@ using AiHarnessDemo.Core.Workflow;
 namespace AiHarnessDemo.Services;
 
 internal sealed record DeferredPermissionSnapshot(
-    string Version,
     int Iteration,
     string PlanStepKey,
     string WorkflowRevision,
-    EffectiveExecutionPermission Permission)
-{
-    public const string CurrentVersion = "deferred-permission-v1";
-}
+    EffectiveExecutionPermission Permission);
 
 public sealed class PermissionProfileResolver
 {
@@ -130,10 +126,6 @@ public sealed class PermissionProfileResolver
                 ExecutionPermissionProfile.PreMortemReadOnly;
         var publish = profile == ExecutionPermissionProfile.Publish;
         var hostControlledPublish =
-            string.Equals(
-                request.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
             request.FlowKind == FlowKind.Delivery &&
             request.PlanStage == PlanStage.AfterApproval &&
             request.PlanDuties.Length == 1 &&
@@ -172,14 +164,10 @@ public sealed class PermissionProfileResolver
             publish && !hostControlledPublish ? [] : PublicationUrls,
             DisableBuiltinMcps: true,
             DisableCustomInstructions: true,
-            DisallowTemporaryDirectory: readOnly ||
-                hostControlledPublish ||
-                request.IsGovernedOutcomeVerification,
+            DisallowTemporaryDirectory: readOnly || hostControlledPublish,
             GuardPublicationCredentials: !publish || hostControlledPublish,
             AllowRemotePublication: publish,
-            GovernedGitMetadataIsolation:
-                hostControlledPublish ||
-                request.IsGovernedOutcomeVerification && !publish);
+            GovernedGitMetadataIsolation: hostControlledPublish);
     }
 
     public static WorkflowPermissionRestrictions FromWorkflow(
@@ -318,8 +306,7 @@ public sealed class PermissionProfileResolver
                 throw new InvalidOperationException(
                     "The persisted permission grants publication outside the durable approved publication shape.");
             }
-            if (request.ContractVersion == "studio-v2" &&
-                publicationShape &&
+            if (publicationShape &&
                 (!permission.GuardPublicationCredentials ||
                  permission.AllowedTools.Contains("create") ||
                  permission.AllowedTools.Contains("edit") ||
@@ -330,7 +317,7 @@ public sealed class PermissionProfileResolver
                  !permission.GovernedGitMetadataIsolation))
             {
                 throw new InvalidOperationException(
-                    "The persisted studio-v2 Publish policy is not host-controlled and source-sealed.");
+                    "The persisted Publish policy is not host-controlled and source-sealed.");
             }
             if ((request.FlowKind == FlowKind.Advisory ||
                  IsReadOnlyLifecycleInvocation(request.InvocationKind)) &&
@@ -375,22 +362,6 @@ public sealed class PermissionProfileResolver
                     "Intake, planning, review classification, and blocker explanation must remain read-only before review.");
             }
             return ExecutionPermissionProfile.ReadOnlySource;
-        }
-
-        if (request.ContractVersion == "legacy-v1")
-        {
-            if (request.InvocationKind == ExecutionInvocationKind.Publication &&
-                !request.LegacyPublicationAuthorized)
-            {
-                throw new InvalidOperationException(
-                    "Legacy publication requires durable host authorization.");
-            }
-            return request.IsGovernedOutcomeVerification
-                ? ExecutionPermissionProfile.WorkspaceWrite
-                : request.InvocationKind == ExecutionInvocationKind.Publication &&
-                  request.LegacyPublicationAuthorized
-                ? ExecutionPermissionProfile.Publish
-                : ExecutionPermissionProfile.WorkspaceWrite;
         }
 
         if (request.FlowKind == FlowKind.Advisory)
@@ -464,7 +435,6 @@ public sealed class PermissionProfileResolver
             ExecutionInvocationKind.Intake or
             ExecutionInvocationKind.Planning or
             ExecutionInvocationKind.PreMortem or
-            ExecutionInvocationKind.ReviewClassification or
             ExecutionInvocationKind.BlockerExplanation;
 
     private static int PermissionRank(ExecutionPermissionProfile profile) => profile switch

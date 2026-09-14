@@ -1,7 +1,7 @@
 namespace AiHarnessDemo.Core.Domain;
 
 /// <summary>
-/// Durable lifecycle of one repository inside a reviewed studio-v2 publication.
+/// Durable lifecycle of one repository inside a reviewed Studio publication.
 /// Every stage is persisted <em>before</em> the external side effect it authorizes so a crash,
 /// restart, or concurrent invocation reconciles against the recorded intent instead of pushing
 /// twice or opening a duplicate pull request.

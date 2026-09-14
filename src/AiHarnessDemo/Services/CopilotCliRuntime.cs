@@ -40,6 +40,7 @@ public sealed partial class CopilotCliRuntime(
         "--no-remote",
         "--no-remote-export",
         "--output-format",
+        "--reasoning-effort",
         "--secret-env-vars",
         "--session-id"
     ];
@@ -182,20 +183,6 @@ public sealed partial class CopilotCliRuntime(
                         option,
                         StringComparison.Ordinal))
                 .ToList();
-            var reasoningEffortOption =
-                helpResult.StandardOutput.Contains(
-                    "--reasoning-effort",
-                    StringComparison.Ordinal)
-                    ? "--reasoning-effort"
-                    : helpResult.StandardOutput.Contains(
-                        "--effort",
-                        StringComparison.Ordinal)
-                        ? "--effort"
-                        : string.Empty;
-            if (string.IsNullOrEmpty(reasoningEffortOption))
-            {
-                missingOptions.Add("--reasoning-effort (or legacy --effort)");
-            }
             if (missingOptions.Count > 0)
             {
                 return Publish(Failed(
@@ -219,7 +206,7 @@ public sealed partial class CopilotCliRuntime(
                     ? "Copilot CLI is ready for non-interactive JSON execution."
                     : $"GitHub Copilot CLI {version} is ready for non-interactive JSON execution.",
                 CheckedAt: timeProvider.GetUtcNow(),
-                ReasoningEffortOption: reasoningEffortOption);
+                ReasoningEffortOption: "--reasoning-effort");
             return Publish(status);
         }
         finally

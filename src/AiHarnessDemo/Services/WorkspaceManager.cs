@@ -50,7 +50,6 @@ public sealed partial class WorkspaceManager(
             flow,
             suppressAfterCreateHook:
                 !CopilotReasoningHost.ShouldRunWorkspaceHooks(
-                    flow.ContractVersion,
                     invocationKind),
             cancellationToken);
 
@@ -366,30 +365,6 @@ public sealed partial class WorkspaceManager(
             .Select(repository => NormalizeRepositoryPath(projectPath, repository))
             .Order(StringComparer.Ordinal)
             .ToArray();
-        if (!string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
-        {
-            var state = OutcomeVerificationRules.DeserializeAggregate(
-                flow.OutcomeVerificationJson);
-            if (state.TrustedRepositories.Count > 0)
-            {
-                var persistedPaths = state.TrustedRepositories
-                    .Select(item => item.RelativePath)
-                    .ToArray();
-                if (!persistedPaths.SequenceEqual(
-                        relativePaths,
-                        StringComparer.Ordinal))
-                {
-                    throw new InvalidOperationException(
-                        "The selected source repository set changed after workspace authorization.");
-                }
-                return state.TrustedRepositories
-                    .Select(item => new WorkspaceRepositoryIdentity(
-                        item.RelativePath,
-                        item.RemoteRepository))
-                    .ToArray();
-            }
-        }
-
         var result = new List<WorkspaceRepositoryIdentity>(repositories.Count);
         foreach (var repository in repositories)
         {
@@ -504,14 +479,9 @@ public sealed partial class WorkspaceManager(
         var persistedMode = await _advisoryArtifacts.GetWorkspaceModeAsync(
             flow.Id,
             cancellationToken);
-        var studioV2 = string.Equals(
-            flow.ContractVersion,
-            "studio-v2",
-            StringComparison.Ordinal);
         var guardedSnapshot =
             persistedMode is
                 WorkspaceMode.ProvisionalReadOnly or WorkspaceMode.AdvisoryReadOnly ||
-            studioV2 &&
             persistedMode != WorkspaceMode.Delivery &&
             (flow.Kind == FlowKind.Advisory ||
              string.IsNullOrWhiteSpace(flow.BranchName));
@@ -742,13 +712,6 @@ public sealed partial class WorkspaceManager(
 
     private static WorkspaceMode ResolveMode(FlowRun flow)
     {
-        if (!string.Equals(
-                flow.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal))
-        {
-            return WorkspaceMode.Delivery;
-        }
         if (flow.Status == FlowStatus.Intake)
         {
             return WorkspaceMode.ProvisionalReadOnly;

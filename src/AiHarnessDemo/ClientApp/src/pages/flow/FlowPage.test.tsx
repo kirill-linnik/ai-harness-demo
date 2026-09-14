@@ -63,9 +63,7 @@ const bootstrap: BootstrapDto = {
     lastError: null,
     maxConcurrentAgents: 1,
     maxAttempts: 1,
-    workspaceRoot: "E:\\projects\\demo\\data\\worktrees",
-    outcomeVerificationEnabled: true,
-    outcomeVerificationMaxRounds: 3
+    workspaceRoot: "E:\\projects\\demo\\data\\worktrees"
   },
   agentCatalog: {
     ready: true,
@@ -121,8 +119,6 @@ function step(overrides: Partial<FlowStepDto> = {}): FlowStepDto {
     completedAt: timestamp,
     durationMilliseconds: 300_000,
     toolCalls: [],
-    assignedCriterionIds: [],
-    outcomeQaRound: null,
     ...overrides
   };
 }
@@ -134,7 +130,6 @@ function failedFlow(): FlowDetailDto {
     originalRequest: "Refresh the public site.",
     consolidatedRequest: "Refresh the public site.",
     kind: "Delivery",
-    contractVersion: "legacy-v1",
     parentFlowRunId: null,
     parentIteration: null,
     linkKind: null,
@@ -174,27 +169,7 @@ function failedFlow(): FlowDetailDto {
       decision: null,
       publicationStatus: "NotApplicable"
     },
-    publicationStatus: "NotApplicable",
-    outcomeVerification: {
-      status: "LegacyUnverified",
-      legacyUnverified: true,
-      currentRound: 0,
-      maxRounds: 0,
-      planHashPrefix: "",
-      candidateFingerprintPrefix: "",
-      candidateFingerprint: "",
-      releaseGateId: null,
-      criteria: [],
-      evidence: [],
-      latestResults: [],
-      failedCriterionIds: [],
-      pendingOwnerRoles: [],
-      stale: false,
-      previewRequired: false,
-      releaseReady: false,
-      verifiedAt: null,
-      humanResolutionGate: null
-    }
+    publicationStatus: "NotApplicable"
   };
 }
 
@@ -215,7 +190,6 @@ function studioAdvisoryFlow(): FlowDetailDto {
     phase: "Succeeded",
     model: "gpt-5.4",
     taskProfile: {
-      version: "task-profile-v1",
       role: "research-specialist",
       planStepKey: "inspect-current-system",
       agentId: "research-specialist",
@@ -252,7 +226,6 @@ function studioAdvisoryFlow(): FlowDetailDto {
     originalRequest: "Assess checkout resilience.",
     consolidatedRequest: "{}",
     kind: "Advisory",
-    contractVersion: "studio-v2",
     parentFlowRunId: parentId,
     parentIteration: 3,
     linkKind: "QualificationScopeRevision",
@@ -509,80 +482,6 @@ describe("FlowPage manual restart", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("Only a failed flow can be restarted.")).not.toBeInTheDocument();
     expect(screen.getAllByText("Manual restart of Software Engineer").length).toBeGreaterThan(0);
-  });
-
-  it("requires a reason before resolving an exhausted outcome cycle", async () => {
-    const flow: FlowDetailDto = {
-      ...failedFlow(),
-      status: "WaitingForFeedback",
-      failureReason: "",
-      outcomeVerification: {
-        status: "AwaitingHumanResolution",
-        legacyUnverified: false,
-        currentRound: 3,
-        maxRounds: 3,
-        planHashPrefix: "sha256:aaaaaaaaaaaa",
-        candidateFingerprintPrefix: "sha256:bbbbbbbbbbbb",
-        candidateFingerprint:
-          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        releaseGateId: "33333333-3333-4333-8333-333333333333",
-        criteria: [],
-        evidence: [],
-        latestResults: [],
-        failedCriterionIds: ["AC-001"],
-        pendingOwnerRoles: [],
-        stale: false,
-        previewRequired: false,
-        releaseReady: false,
-        verifiedAt: null,
-        humanResolutionGate: {
-          gateId: "44444444-4444-4444-8444-444444444444",
-          decision: "AwaitingHumanApproval",
-          summary: "QA budget exhausted.",
-          createdAt: timestamp
-        }
-      }
-    };
-    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
-    vi.spyOn(api, "flow").mockResolvedValue(flow);
-    const resolve = vi.spyOn(api, "resolveOutcome").mockResolvedValue({
-      ...flow,
-      status: "Queued"
-    });
-    const queryClient = new QueryClient({
-      defaultOptions: {
-        queries: { retry: false },
-        mutations: { retry: false }
-      }
-    });
-    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
-
-    render(
-      <QueryClientProvider client={queryClient}>
-        <ToastProvider>
-          <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
-            <Routes>
-              <Route path="/factory/:id" element={<FlowPage />} />
-            </Routes>
-          </MemoryRouter>
-        </ToastProvider>
-      </QueryClientProvider>
-    );
-
-    fireEvent.click(await screen.findByRole("button", { name: "Grant one QA round" }));
-    expect(resolve).not.toHaveBeenCalled();
-    fireEvent.change(screen.getByLabelText("Operator reason"), {
-      target: { value: "Dependency restored." }
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Grant one QA round" }));
-    await waitFor(() =>
-      expect(resolve).toHaveBeenCalledWith(flowId, {
-        gateId: "44444444-4444-4444-8444-444444444444",
-        action: "Continue",
-        reason: "Dependency restored."
-      })
-    );
-    expect(screen.queryByText("Approve this result or request changes")).not.toBeInTheDocument();
   });
 
   it("renders repeated dynamic agents as a persisted sequential plan with lineage and review", async () => {

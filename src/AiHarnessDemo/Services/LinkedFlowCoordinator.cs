@@ -79,13 +79,10 @@ public sealed class LinkedFlowCoordinator(
             OriginalRequest = seed,
             ConsolidatedRequest = seed,
             Kind = kind,
-            ContractVersion = "studio-v2",
             RepositoryPath = parent.RepositoryPath,
             RepositoryKnowledge = parent.RepositoryKnowledge,
             Outcome = outcome,
-            ModelSelectionStrategy = settings.ModelSelectionStrategy,
-            RuntimeMarker = "LiveCopilot",
-            OutcomeVerificationJson = string.Empty
+            ModelSelectionStrategy = settings.ModelSelectionStrategy
         };
         lifecycle.InitializeLinkedSuccessor(parent, successor, linkKind);
         database.Flows.Add(successor);
@@ -98,7 +95,6 @@ public sealed class LinkedFlowCoordinator(
                 $"Created a fresh {linkKind} successor from flow {parent.Id:D}, iteration {parent.Iteration}.",
             DataJson = JsonSerializer.Serialize(new
             {
-                Version = "flow-link-v1",
                 ParentFlowRunId = parent.Id,
                 ParentIteration = parent.Iteration,
                 LinkKind = linkKind.ToString(),
@@ -252,7 +248,6 @@ public sealed class LinkedFlowCoordinator(
                         "The linked flow was created, but its initial Account Manager turn did not complete.",
                     DataJson = JsonSerializer.Serialize(new
                     {
-                        Version = "linked-intake-failure-v1",
                         Error = failure
                     })
                 });

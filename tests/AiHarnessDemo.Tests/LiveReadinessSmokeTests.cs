@@ -216,7 +216,6 @@ public sealed class LiveReadinessSmokeTests(ITestOutputHelper testOutput)
             Return exactly one strict JSON document and nothing else between a standalone
             {DeliveryReadinessPolicy.QaBeginMarker} line and a standalone
             {DeliveryReadinessPolicy.QaEndMarker} line. The JSON must have exactly these properties:
-            "Version" (exactly "{DeliveryReadinessPolicy.QaVersion}"),
             "AcceptancePlanHash" (exactly "{planHash}"),
             "Verdict" (exactly "PASS", "FAIL", or "BLOCKED"),
             "Criteria" (one entry per planned criterion, each with "CriterionId",
@@ -227,16 +226,18 @@ public sealed class LiveReadinessSmokeTests(ITestOutputHelper testOutput)
             and "ResidualRisks" (an array, each entry with "RiskId" matching RR-000,
             "Classification" exactly "NonBlockingDisclosure", "WaiverRequired", or "Blocking",
             "Severity" exactly "Low", "Medium", "High", or "Critical", "Statement", "Impact",
-            "EvidenceIds", "CriterionIds", and "PreMortemFindingId" (null or matching PM-000)).
+            "EvidenceIds", "CriterionIds", and "PreMortemFindingId" (null or matching PM-000)),
+            and "PlanGaps" (an array of omitted confirmed requirements, each with "Requirement",
+            "Verification", "OwnerRoles", and "Rationale").
 
             Verdict must be BLOCKED when any criterion is Blocked or any risk is Blocking, PASS only
-            when every criterion is Verified, and FAIL otherwise. Enum casing is exact.
+            when every criterion is Verified and PlanGaps is empty, and FAIL otherwise. Enum casing
+            is exact.
             """;
     }
 
     private static DeliveryAcceptancePlan IncidentAcceptancePlan() =>
         new(
-            DeliveryAcceptancePlan.CurrentVersion,
             [.. new[]
             {
                 "Every page and shared section on both brands reflects the Nordic Tech Minimal look with the correct brand accent color.",

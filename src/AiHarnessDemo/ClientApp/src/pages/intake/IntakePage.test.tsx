@@ -55,9 +55,7 @@ const bootstrap: BootstrapDto = {
     lastError: null,
     maxConcurrentAgents: 1,
     maxAttempts: 1,
-    workspaceRoot: "E:\\projects\\demo\\.workspaces",
-    outcomeVerificationEnabled: true,
-    outcomeVerificationMaxRounds: 3
+    workspaceRoot: "E:\\projects\\demo\\.workspaces"
   },
   agentCatalog: {
     ready: true,
@@ -87,7 +85,6 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
     originalRequest: "Give the public site a fresh design.",
     consolidatedRequest: "Outcome: Refresh the public site with an interactive design.",
     kind: "Delivery",
-    contractVersion: "studio-v2",
     parentFlowRunId: null,
     parentIteration: null,
     linkKind: null,
@@ -151,27 +148,7 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
       decision: null,
       publicationStatus: "AwaitingApproval"
     },
-    publicationStatus: "AwaitingApproval",
-    outcomeVerification: {
-      status: "NotStarted",
-      legacyUnverified: false,
-      currentRound: 0,
-      maxRounds: 3,
-      planHashPrefix: "",
-      candidateFingerprintPrefix: "",
-      candidateFingerprint: "",
-      releaseGateId: null,
-      criteria: [],
-      evidence: [],
-      latestResults: [],
-      failedCriterionIds: [],
-      pendingOwnerRoles: [],
-      stale: false,
-      previewRequired: false,
-      releaseReady: false,
-      verifiedAt: null,
-      humanResolutionGate: null
-    }
+    publicationStatus: "AwaitingApproval"
   };
 }
 

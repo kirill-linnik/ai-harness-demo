@@ -64,24 +64,8 @@ public sealed class FlowAgentSnapshotService(
             .ToListAsync(cancellationToken);
         if (snapshots.Count == 0)
         {
-            var contractVersion = await database.Flows
-                .AsNoTracking()
-                .Where(item => item.Id == flowRunId)
-                .Select(item => item.ContractVersion)
-                .SingleOrDefaultAsync(cancellationToken)
-                ?? throw new KeyNotFoundException(
-                    $"Flow '{flowRunId}' was not found.");
-            if (string.Equals(
-                    contractVersion,
-                    "studio-v2",
-                    StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"studio-v2 flow '{flowRunId}' has no immutable agent snapshot; the current catalog will not be substituted.");
-            }
-            return catalog.GetEffectiveSnapshot().Definitions
-                .Select(item => ToRecord(item.Record))
-                .ToList();
+            throw new InvalidOperationException(
+                $"Flow '{flowRunId}' has no immutable agent snapshot; the current catalog will not be substituted.");
         }
         return snapshots.Select(item => new AgentRecord
         {
@@ -100,92 +84,6 @@ public sealed class FlowAgentSnapshotService(
             SortOrder = OrderFor(item.Role),
             UpdatedAt = item.CapturedAt
         }).ToList();
-    }
-
-    public async Task<int> MigrateLegacyNonterminalAsync(
-        CancellationToken cancellationToken = default)
-    {
-        if (!catalog.Status().Ready)
-        {
-            return 0;
-        }
-        var effective = catalog.GetEffectiveSnapshot();
-        await using var database =
-            await databaseFactory.CreateDbContextAsync(cancellationToken);
-        var flows = await database.Flows
-            .Include(item => item.AgentSnapshots)
-            .Where(item =>
-                item.ContractVersion == "legacy-v1" &&
-                item.Status != FlowStatus.Approved &&
-                item.Status != FlowStatus.Abandoned &&
-                item.Status != FlowStatus.Failed &&
-                item.AgentSnapshots.Count == 0)
-            .ToListAsync(cancellationToken);
-
-        foreach (var flow in flows)
-        {
-            flow.AgentCatalogRevision = effective.Revision;
-            foreach (var definition in effective.Definitions)
-            {
-                var row = Create(
-                    flow.Id,
-                    definition.Record,
-                    definition.Manifest!);
-                flow.AgentSnapshots.Add(row);
-            }
-            flow.Events.Add(new FlowEvent
-            {
-                FlowRunId = flow.Id,
-                Type = "flow.agent-snapshot-migrated",
-                Message =
-                    "Captured the startup effective agent catalog for this nonterminal legacy flow."
-            });
-        }
-        await database.SaveChangesAsync(cancellationToken);
-        return flows.Count;
-    }
-
-    public bool CaptureForLegacyReactivation(
-        HarnessDbContext database,
-        FlowRun flow)
-    {
-        ArgumentNullException.ThrowIfNull(database);
-        ArgumentNullException.ThrowIfNull(flow);
-        if (!string.Equals(
-                flow.ContractVersion,
-                "legacy-v1",
-                StringComparison.Ordinal) ||
-            flow.Status != FlowStatus.Failed)
-        {
-            throw new InvalidOperationException(
-                "Only an explicitly restarted failed legacy flow can receive a migration snapshot.");
-        }
-        if (flow.AgentSnapshots.Count > 0)
-        {
-            return false;
-        }
-
-        var effective = catalog.GetEffectiveSnapshot();
-        flow.AgentCatalogRevision = effective.Revision;
-        foreach (var definition in effective.Definitions)
-        {
-            var row = Create(
-                flow.Id,
-                definition.Record,
-                definition.Manifest
-                ?? throw new InvalidOperationException(
-                    $"Effective catalog definition '{definition.Record.Id}' has no manifest."));
-            flow.AgentSnapshots.Add(row);
-            database.FlowAgentSnapshots.Add(row);
-        }
-        flow.Events.Add(new FlowEvent
-        {
-            FlowRunId = flow.Id,
-            Type = "flow.agent-snapshot-migrated-on-restart",
-            Message =
-                "Captured the effective agent catalog when a terminal legacy flow was explicitly reactivated; original historical instructions were unavailable."
-        });
-        return true;
     }
 
     private static FlowAgentSnapshot Create(
@@ -218,25 +116,6 @@ public sealed class FlowAgentSnapshotService(
             item.SourceFileName,
             item.Instructions,
             item.DefinitionHash);
-
-    private static AgentRecord ToRecord(AgentRecord item) => new()
-    {
-        Id = item.Id,
-        Name = item.Name,
-        Description = item.Description,
-        Role = item.Role,
-        SourcePath = item.SourcePath,
-        Accent = item.Accent,
-        Enabled = item.Enabled,
-        DefinitionStatus = item.DefinitionStatus,
-        ValidationError = item.ValidationError,
-        Required = item.Required,
-        Switchable = item.Switchable,
-        DefinitionHash = item.DefinitionHash,
-        LoadedAt = item.LoadedAt,
-        SortOrder = item.SortOrder,
-        UpdatedAt = item.UpdatedAt
-    };
 
     private static string AccentFor(string role) => role switch
     {

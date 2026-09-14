@@ -99,8 +99,7 @@ export function IntakePage() {
     latestIntakeEvent?.type === "intake.confirmation_requested" ||
     latestIntakeEvent?.type === "intake.ready";
   const proposedKind =
-    flow?.contractVersion === "studio-v2" &&
-    (awaitingConfirmation || confirmed)
+    flow && (awaitingConfirmation || confirmed)
       ? flow.kind
       : null;
 

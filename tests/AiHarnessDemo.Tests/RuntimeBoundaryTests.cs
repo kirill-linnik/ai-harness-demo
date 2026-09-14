@@ -172,7 +172,6 @@ public sealed class PermissionProfileResolverTests
                 DurableApproval = true,
                 DurableReviewDecision = ReviewDecision.Accepted,
                 IsOnlyPlannedPublishStep = true,
-                ContractVersion = "studio-v2"
             },
             restrictions);
 
@@ -186,28 +185,7 @@ public sealed class PermissionProfileResolverTests
         Assert.DoesNotContain("create", permission.AllowedTools);
         Assert.DoesNotContain("edit", permission.AllowedTools);
         Assert.False(CopilotReasoningHost.ShouldRunWorkspaceHooks(
-            "studio-v2",
             ExecutionInvocationKind.Publication));
-    }
-
-    [Fact]
-    public void GovernedLegacyPublication_RemainsWorkspaceWriteAndRemoteGuarded()
-    {
-        var permission = _resolver.Resolve(
-            Request() with
-            {
-                ContractVersion = "legacy-v1",
-                LegacyPublicationAuthorized = true,
-                IsGovernedOutcomeVerification = true
-            },
-            Restrictions());
-
-        Assert.Equal(
-            ExecutionPermissionProfile.WorkspaceWrite,
-            permission.Profile);
-        Assert.True(permission.GovernedGitMetadataIsolation);
-        Assert.True(permission.GuardPublicationCredentials);
-        Assert.False(permission.AllowRemotePublication);
     }
 
     [Fact]
@@ -218,7 +196,6 @@ public sealed class PermissionProfileResolverTests
             InvocationKind = ExecutionInvocationKind.Publication,
             PlanStage = PlanStage.AfterApproval,
             IsOnlyPlannedPublishStep = true,
-            ContractVersion = "studio-v2"
         };
         Assert.Throws<InvalidOperationException>(() =>
             _resolver.Resolve(candidate, Restrictions()));
@@ -268,10 +245,6 @@ public sealed class PermissionProfileResolverTests
         Assert.Contains("--deny-tool=shell(git push)", arguments);
         Assert.Contains("--no-remote", arguments);
         Assert.False(CopilotReasoningHost.ShouldRunWorkspaceHooks(
-            "studio-v2",
-            ExecutionInvocationKind.Publication));
-        Assert.True(CopilotReasoningHost.ShouldRunWorkspaceHooks(
-            "legacy-v1",
             ExecutionInvocationKind.Publication));
     }
 
@@ -330,7 +303,6 @@ public sealed class PermissionProfileResolverTests
         {
             Title = "Permission persistence",
             OriginalRequest = "Persist policy",
-            ContractVersion = "studio-v2",
             Kind = FlowKind.Delivery
         };
         var step = new FlowStep
@@ -378,7 +350,6 @@ public sealed class PermissionProfileResolverTests
             [],
             [],
             FlowStepId: step.Id,
-            ContractVersion: "studio-v2",
             InvocationKind: ExecutionInvocationKind.Worker);
 
         var permission =
@@ -404,9 +375,6 @@ public sealed class PermissionProfileResolverTests
             PlanStage.BeforeReview,
             duties.ToImmutableArray(),
             null,
-            false,
-            false,
-            "contract-v2",
             false,
             false);
 
@@ -516,7 +484,7 @@ public sealed class PromptStagingTests
                 root,
                 agent.Root,
                 agent.AgentId,
-                ExecutionInvocationKind.ReviewClassification,
+                ExecutionInvocationKind.Planning,
                 "model",
                 "high",
                 sessionId,
@@ -549,141 +517,6 @@ public sealed class PromptStagingTests
                              Path.GetFullPath(agent.Root)
                                  .Replace('\\', '/'),
                              StringComparison.Ordinal));
-            Assert.True(
-                CopilotReasoningHost.EstimateCliCommandLineCharacters(
-                    "copilot",
-                    arguments) <
-                CopilotReasoningHost.MaximumProcessCommandLineCharacters);
-        }
-        finally
-        {
-            if (Directory.Exists(root))
-            {
-                Directory.Delete(root, recursive: true);
-            }
-        }
-    }
-
-    [Fact]
-    public async Task MaximumReviewClassificationPrompt_IsCompleteOnlyInStagedFile()
-    {
-        static string Fill(string marker, char fill, int length) =>
-            marker + new string(fill, length - marker.Length);
-        var details = Enumerable.Range(1, 24)
-            .Select(index => Fill(
-                $"review-detail-{index:D2}:",
-                (char)('a' + index % 26),
-                FlowOutcomeParser.MaximumImplementationDetailCharacters))
-            .ToArray();
-        var outcomeJson = JsonSerializer.Serialize(
-            new FlowOutcomeDocument
-            {
-                Version = FlowOutcomeParser.Version,
-                Goal = Fill(
-                    "review-goal:",
-                    'g',
-                    FlowOutcomeParser.MaximumGoalCharacters),
-                Summary = new string('s', 12_000),
-                ImplementationDetails = details,
-                Artifacts = []
-            });
-        _ = FlowOutcomeParser.ParseJson(outcomeJson);
-        var feedback = Fill(
-            "review-feedback-last:",
-            'f',
-            ReviewFeedbackParser.MaximumRequestedChangeCharacters);
-        var task = ReviewCoordinator.BuildFeedbackClassificationTask(
-            FlowKind.Advisory,
-            outcomeJson,
-            feedback);
-        var flowId = Guid.NewGuid();
-        var stepId = Guid.NewGuid();
-        var sessionId = Guid.NewGuid();
-        var root = Path.Combine(
-            Path.GetTempPath(),
-            $"review-prompt-{Guid.NewGuid():N}");
-        try
-        {
-            var context = new AgentExecutionContext(
-                flowId,
-                1,
-                "account-manager",
-                "Account Manager",
-                "account-manager",
-                "model",
-                "high",
-                1,
-                task,
-                "Repository facts.",
-                root,
-                root,
-                sessionId,
-                OutcomeType.None,
-                "Classify review.",
-                [],
-                [],
-                FlowStepId: stepId,
-                ContractVersion: "studio-v2",
-                InvocationKind:
-                    ExecutionInvocationKind.ReviewClassification);
-            var values = CopilotReasoningHost.BuildPromptValues(
-                context,
-                "Return review-feedback-v1.",
-                root);
-            var rendered = CopilotReasoningHost.BoundRenderedPrompt(
-                context,
-                new WorkflowPromptRenderer().Render(
-                    "{{ task }}\n\n{{ agent.instructions }}",
-                    values));
-
-            Assert.Equal(task, values["task"]);
-            Assert.Contains(details[11], rendered, StringComparison.Ordinal);
-            Assert.Contains(details[^1], rendered, StringComparison.Ordinal);
-            Assert.Contains(feedback, rendered, StringComparison.Ordinal);
-            Assert.True(
-                rendered.Length >
-                CopilotReasoningHost.MaximumInlinePromptCharacters);
-
-            var stager = new AgentManifestStager();
-            var agent = await stager.StageAsync(
-                root,
-                Manifest(),
-                sessionId);
-            var staged = await stager.StagePromptAsync(
-                agent,
-                rendered,
-                sessionId,
-                flowId,
-                stepId,
-                attempt: 1);
-            var instruction =
-                AgentManifestStager.BuildPromptReferenceInstruction(
-                    staged,
-                    recoveringInterruptedSession: false);
-            var arguments = CopilotReasoningHost.BuildCliArguments(
-                root,
-                agent.Root,
-                agent.AgentId,
-                ExecutionInvocationKind.ReviewClassification,
-                "model",
-                "high",
-                sessionId,
-                instruction);
-
-            var stagedText = await File.ReadAllTextAsync(staged.Path);
-            Assert.Contains(details[11], stagedText, StringComparison.Ordinal);
-            Assert.Contains(details[^1], stagedText, StringComparison.Ordinal);
-            Assert.Contains(feedback, stagedText, StringComparison.Ordinal);
-            Assert.DoesNotContain(
-                arguments,
-                argument => argument.Contains(
-                    details[11],
-                    StringComparison.Ordinal));
-            Assert.DoesNotContain(
-                arguments,
-                argument => argument.Contains(
-                    feedback,
-                    StringComparison.Ordinal));
             Assert.True(
                 CopilotReasoningHost.EstimateCliCommandLineCharacters(
                     "copilot",
@@ -818,7 +651,7 @@ public sealed class PromptStagingTests
                 @"C:\workspace",
                 @"C:\agent",
                 "account-manager",
-                ExecutionInvocationKind.ReviewClassification,
+                ExecutionInvocationKind.Worker,
                 "model",
                 "high",
                 Guid.NewGuid(),
@@ -1190,9 +1023,9 @@ public sealed class AgentHandoffInspectorTests
 
             **HANDOFF_STATUS: COMPLETE**
 
-            TEAM_PLAN_V1_BEGIN
+            TEAM_PLAN_BEGIN
             {}
-            TEAM_PLAN_V1_END
+            TEAM_PLAN_END
             """);
 
         Assert.False(status.IsPushback);
@@ -1286,8 +1119,7 @@ public sealed class GovernedPublicationBoundaryTests
             Assert.IsAssignableFrom<IReadOnlyDictionary<string, string?>>(
                 CopilotReasoningHost.BuildProcessEnvironment(
                     ExecutionInvocationKind.Worker,
-                    allowRemotePublication: true,
-                    isGovernedOutcomeVerification: true));
+                    allowRemotePublication: false));
         var arguments = CopilotReasoningHost.BuildCliArguments(
             @"C:\governed-worktree",
             @"C:\harness",
@@ -1297,7 +1129,6 @@ public sealed class GovernedPublicationBoundaryTests
             "high",
             Guid.NewGuid(),
             "Governed turn",
-            isGovernedOutcomeVerification: true,
             blockRemotePublication: true);
 
         Assert.Null(environment["GH_TOKEN"]);
@@ -1315,13 +1146,6 @@ public sealed class GovernedPublicationBoundaryTests
         Assert.Contains("--disable-builtin-mcps", arguments);
         Assert.DoesNotContain("--allow-all-tools", arguments);
         Assert.DoesNotContain("--deny-tool=shell(git:*)", arguments);
-        Assert.Contains("--deny-tool=shell(git.exe:*)", arguments);
-        Assert.Contains("--deny-tool=shell(git commit)", arguments);
-        Assert.Contains("--deny-tool=shell(git.exe commit)", arguments);
-        Assert.Contains("--deny-tool=shell(git branch)", arguments);
-        Assert.Contains("--deny-tool=shell(git checkout)", arguments);
-        Assert.Contains("--deny-tool=shell(git switch)", arguments);
-        Assert.Contains("--deny-tool=shell(git tag)", arguments);
         Assert.Contains("--deny-tool=shell(git push)", arguments);
         Assert.Contains("--deny-tool=shell(git send-pack)", arguments);
         Assert.Contains("--deny-tool=shell(gh:*)", arguments);
@@ -1372,7 +1196,6 @@ public sealed class GovernedPublicationBoundaryTests
             Guid.NewGuid(),
             "Prepare the host-controlled publication narrative.",
             isHostControlledPublication: true,
-            isGovernedOutcomeVerification: true,
             blockRemotePublication: true);
 
         Assert.Contains("--available-tools=view,grep,glob", arguments);
@@ -1540,6 +1363,8 @@ public sealed class GovernedPublicationBoundaryTests
                 Assert.NotEqual(0, childShadowLookup.ExitCode);
                 isolation.RestoreAndValidate();
                 Assert.True(isolation.UnauthorizedMetadataMutationDetected);
+                Assert.True(isolation.GitBoundaryViolationDetected);
+                Assert.NotEmpty(isolation.UnauthorizedMetadataMutationDetails);
             }
 
             Assert.False(Directory.Exists(isolationRoot));
@@ -1593,6 +1418,190 @@ public sealed class GovernedPublicationBoundaryTests
                 {
                     // Test cleanup only.
                 }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GovernedGitIsolation_PublicationInspectionCommandsRemainReadOnly()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"governed-git-publication-inspection-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var worktree = Path.Combine(root, "worktree");
+        Directory.CreateDirectory(source);
+        try
+        {
+            RunGit(source, "init", "--quiet");
+            RunGit(source, "config", "user.email", "tests@example.invalid");
+            RunGit(source, "config", "user.name", "Governed Isolation Tests");
+            await File.WriteAllTextAsync(
+                Path.Combine(source, "tracked.txt"),
+                "initial");
+            RunGit(source, "add", "tracked.txt");
+            RunGit(source, "commit", "--quiet", "-m", "initial");
+            RunGit(
+                source,
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "test/publication-inspection",
+                worktree);
+
+            string[][] commands =
+            [
+                ["status", "--porcelain=v1", "--branch"],
+                ["log", "--oneline", "-10"],
+                ["diff", "--stat"],
+                ["diff", "--cached", "--stat"],
+                ["show", "--stat", "HEAD"],
+                ["show", "HEAD"],
+                ["remote", "-v"],
+                ["branch", "--show-current"],
+                ["rev-parse", "HEAD"],
+                ["rev-parse", "HEAD^{tree}"],
+                ["show", "-s", "--format=commit=%H%ntree=%T%nparent=%P", "HEAD"],
+                ["status", "--porcelain", "--ignored"]
+            ];
+            var mutations = new List<string>();
+            foreach (var command in commands)
+            {
+                using var isolation =
+                    CopilotReasoningHost.GovernedGitIsolationScope.Create(
+                        worktree);
+                var result = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    command);
+                Assert.Equal(0, result.ExitCode);
+                isolation.RestoreAndValidate();
+                if (isolation.UnauthorizedMetadataMutationDetected)
+                {
+                    mutations.Add(string.Join(' ', command));
+                }
+            }
+
+            Assert.Empty(mutations);
+
+            using (var isolation =
+                   CopilotReasoningHost.GovernedGitIsolationScope.Create(
+                       worktree))
+            {
+                foreach (var command in commands)
+                {
+                    var result = await RunGitProcessAsync(
+                        worktree,
+                        isolation.EnvironmentVariables,
+                        command);
+                    Assert.Equal(0, result.ExitCode);
+                }
+                isolation.RestoreAndValidate();
+                Assert.False(isolation.UnauthorizedMetadataMutationDetected);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(source))
+            {
+                _ = TryRunGit(
+                    source,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree);
+            }
+            if (Directory.Exists(root))
+            {
+                foreach (var file in Directory.EnumerateFiles(
+                             root,
+                             "*",
+                             SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GovernedGitIsolation_DiscardsShadowOnlyMutationWithoutBoundaryViolation()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"governed-git-shadow-only-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var worktree = Path.Combine(root, "worktree");
+        Directory.CreateDirectory(source);
+        try
+        {
+            RunGit(source, "init", "--quiet");
+            RunGit(source, "config", "user.email", "tests@example.invalid");
+            RunGit(source, "config", "user.name", "Governed Isolation Tests");
+            await File.WriteAllTextAsync(
+                Path.Combine(source, "tracked.txt"),
+                "initial");
+            RunGit(source, "add", "tracked.txt");
+            RunGit(source, "commit", "--quiet", "-m", "initial");
+            RunGit(
+                source,
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "test/shadow-only",
+                worktree);
+            var realHead = RunGitOutput(worktree, "rev-parse", "HEAD").Trim();
+
+            using (var isolation =
+                   CopilotReasoningHost.GovernedGitIsolationScope.Create(
+                       worktree))
+            {
+                var mutation = await RunGitProcessAsync(
+                    worktree,
+                    isolation.EnvironmentVariables,
+                    "update-ref",
+                    "refs/heads/disposable-shadow",
+                    realHead);
+                Assert.Equal(0, mutation.ExitCode);
+                isolation.RestoreAndValidate();
+                Assert.True(isolation.UnauthorizedMetadataMutationDetected);
+                Assert.False(isolation.GitBoundaryViolationDetected);
+                Assert.NotEmpty(isolation.UnauthorizedMetadataMutationDetails);
+            }
+
+            Assert.NotEqual(
+                0,
+                TryRunGit(
+                    worktree,
+                    "show-ref",
+                    "--verify",
+                    "refs/heads/disposable-shadow"));
+            Assert.Equal(realHead, RunGitOutput(worktree, "rev-parse", "HEAD").Trim());
+        }
+        finally
+        {
+            if (Directory.Exists(source))
+            {
+                _ = TryRunGit(
+                    source,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree);
+            }
+            if (Directory.Exists(root))
+            {
+                foreach (var file in Directory.EnumerateFiles(
+                             root,
+                             "*",
+                             SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                Directory.Delete(root, recursive: true);
             }
         }
     }
@@ -1979,37 +1988,6 @@ public sealed class CopilotCliRuntimeTests
                     StringComparison.OrdinalIgnoreCase),
                 $"Expected '{command}', resolved '{status.ResolvedPath}'.");
             Assert.Contains("non-interactive JSON execution", status.Detail);
-        }
-        finally
-        {
-            Directory.Delete(root, recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task RefreshAsync_AcceptsLegacyEffortOption()
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
-        var root = Path.Combine(
-            Path.GetTempPath(),
-            $"ai-harness-copilot-legacy-effort-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(root);
-
-        try
-        {
-            var command = CreateCliShim(
-                root,
-                "--add-dir --acp --agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
-                "--effort --model --no-ask-user --no-custom-instructions " +
-                "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
-            var status = await CreateRuntime(root).RefreshAsync(command);
-
-            Assert.True(status.Ready);
-            Assert.Equal("--effort", status.ReasoningEffortOption);
         }
         finally
         {
@@ -2884,7 +2862,7 @@ public sealed class RepositoryBrowserTests
     }
 
     [Fact]
-    public async Task AcceptedKnowledgeRecap_DoesNotOverwriteNewerUserEdits()
+    public async Task AcceptedKnowledgeRecap_StaysFlowScopedUntilSourceReanalysis()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -2922,17 +2900,16 @@ public sealed class RepositoryBrowserTests
                     Changed: true,
                     Reason: "Architecture changed.",
                     Knowledge: refreshed),
-                DateTimeOffset.UtcNow,
                 CancellationToken.None);
             await database.SaveChangesAsync();
             database.ChangeTracker.Clear();
 
             var settings = await database.Settings.SingleAsync();
-            Assert.Equal(refreshed, settings.RepositoryKnowledge);
+            Assert.Equal(baseline, settings.RepositoryKnowledge);
             Assert.Contains(
                 await database.FlowEvents.ToListAsync(),
                 item => item.Type ==
-                        WorkflowEngine.RepositoryKnowledgeRefreshedEventType);
+                        WorkflowEngine.RepositoryKnowledgeRefreshSkippedEventType);
 
             settings.RepositoryKnowledge = "User-authored newer knowledge.";
             await database.SaveChangesAsync();
@@ -2951,7 +2928,6 @@ public sealed class RepositoryBrowserTests
                     Changed: true,
                     Reason: "A later architecture change.",
                     Knowledge: "Agent-generated replacement."),
-                DateTimeOffset.UtcNow,
                 CancellationToken.None);
             await database.SaveChangesAsync();
             database.ChangeTracker.Clear();
@@ -3188,7 +3164,7 @@ public sealed class RepositoryBrowserTests
             return
                 RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
                 Environment.NewLine +
-                $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":true,"Reason":"The accepted implementation changed durable architecture.","Knowledge":{{knowledgeJson}}}""" +
+                $$"""{"Changed":true,"Reason":"The accepted implementation changed durable architecture.","Knowledge":{{knowledgeJson}}}""" +
                 Environment.NewLine +
                 RepositoryKnowledgeSynthesizer.RecapEndSentinel;
         }
@@ -3196,7 +3172,7 @@ public sealed class RepositoryBrowserTests
         public string UnchangedRecap() =>
             RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
             Environment.NewLine +
-            $$"""{"Version":"{{RepositoryKnowledgeSynthesizer.RecapVersion}}","Changed":false,"Reason":"The accepted implementation does not change durable repository knowledge.","Knowledge":null}""" +
+            """{"Changed":false,"Reason":"The accepted implementation does not change durable repository knowledge.","Knowledge":null}""" +
             Environment.NewLine +
             RepositoryKnowledgeSynthesizer.RecapEndSentinel;
 
@@ -3211,7 +3187,6 @@ public sealed class RepositoryBrowserTests
         {
             var document = new
             {
-                Version = RepositoryKnowledgeSynthesizer.Version,
                 Project = Path.GetFileName(Root),
                 ProductAndScope = new[]
                 {
@@ -3306,7 +3281,6 @@ public sealed class RepositoryBrowserTests
                 Title = "Knowledge recap",
                 OriginalRequest = "Update durable behavior.",
                 ConsolidatedRequest = "Update durable behavior.",
-                ContractVersion = "studio-v2",
                 RepositoryPath = repositoryPath,
                 RepositoryKnowledge = repositoryKnowledge,
                 WorkspacePath = repositoryPath
@@ -3384,7 +3358,8 @@ public sealed class WorkspaceManagerTests
         {
             Title = "Update the project",
             OriginalRequest = "Update the project",
-            RepositoryPath = project
+            RepositoryPath = project,
+            Status = FlowStatus.Queued
         };
 
         try
@@ -3410,20 +3385,6 @@ public sealed class WorkspaceManagerTests
             var recovered = await manager.PrepareAsync(flow);
             Assert.False(recovered.CreatedNow);
             Assert.Equal(workspace.Path, recovered.Path);
-
-            await RunGitAsync(
-                processRunner,
-                Path.Combine(workspace.Path, "site"),
-                ["checkout", "--detach", "HEAD"]);
-            var mismatch = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => manager.PrepareAsync(flow));
-            Assert.Contains(
-                "is not on the durable flow branch",
-                mismatch.Message);
-            await RunGitAsync(
-                processRunner,
-                Path.Combine(workspace.Path, "site"),
-                ["checkout", workspace.BranchName]);
 
             var cleanup = await manager.RemoveAsync(flow);
 
@@ -3454,10 +3415,19 @@ public sealed class WorkspaceManagerTests
                 if (Directory.Exists(repositoryPath) &&
                     Directory.Exists(repositoryWorkspace))
                 {
-                    await RunGitAsync(
+                    var worktrees = await RunGitAsync(
                         processRunner,
                         repositoryPath,
-                        ["worktree", "remove", "--force", repositoryWorkspace]);
+                        ["worktree", "list", "--porcelain"]);
+                    if (worktrees.StandardOutput.Contains(
+                            Path.GetFullPath(repositoryWorkspace),
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        await RunGitAsync(
+                            processRunner,
+                            repositoryPath,
+                            ["worktree", "remove", "--force", repositoryWorkspace]);
+                    }
                 }
             }
             DeleteDirectory(root);
@@ -3465,7 +3435,7 @@ public sealed class WorkspaceManagerTests
     }
 
     [Fact]
-    public async Task SensitiveStudioInvocations_SuppressAfterCreateHook()
+    public async Task PublicationInvocation_SuppressesAfterCreateHook()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -3514,40 +3484,28 @@ public sealed class WorkspaceManagerTests
 
         try
         {
-            foreach (var invocationKind in new[]
-                     {
-                         ExecutionInvocationKind.ReviewClassification,
-                         ExecutionInvocationKind.Publication
-                     })
+            var publication = new FlowRun
             {
-                var flow = new FlowRun
-                {
-                    Title = $"Sensitive {invocationKind}",
-                    OriginalRequest = "Use the sealed candidate.",
-                    ContractVersion = "studio-v2",
-                    Kind = FlowKind.Delivery,
-                    Status = invocationKind ==
-                             ExecutionInvocationKind.Publication
-                        ? FlowStatus.Queued
-                        : FlowStatus.WaitingForFeedback,
-                    RepositoryPath = project
-                };
-                created.Add(flow);
-                var workspace = await manager.PrepareForInvocationAsync(
-                    flow,
-                    invocationKind);
-                flow.WorkspacePath = workspace.Path;
-                flow.BranchName = workspace.BranchName;
-                Assert.False(File.Exists(Path.Combine(
-                    workspace.Path,
-                    "after-create-hook.txt")));
-            }
+                Title = "Sensitive Publication",
+                OriginalRequest = "Use the sealed candidate.",
+                Kind = FlowKind.Delivery,
+                Status = FlowStatus.Queued,
+                RepositoryPath = project
+            };
+            created.Add(publication);
+            var publicationWorkspace = await manager.PrepareForInvocationAsync(
+                publication,
+                ExecutionInvocationKind.Publication);
+            publication.WorkspacePath = publicationWorkspace.Path;
+            publication.BranchName = publicationWorkspace.BranchName;
+            Assert.False(File.Exists(Path.Combine(
+                publicationWorkspace.Path,
+                "after-create-hook.txt")));
 
             var worker = new FlowRun
             {
                 Title = "Normal worker",
                 OriginalRequest = "Run normal Delivery work.",
-                ContractVersion = "studio-v2",
                 Kind = FlowKind.Delivery,
                 Status = FlowStatus.Running,
                 RepositoryPath = project
@@ -3778,9 +3736,8 @@ public sealed class CopilotReasoningHostAfterRunHookPolicyFallbackTests
             if (flowRowExists)
             {
                 // Even when a lookup would have succeeded, a sensitive invocation
-                // (ReviewClassification/Publication under studio-v2) must never
-                // attempt the after_run hook at all: runWorkspaceHooks already
-                // gates this before any policy is resolved.
+                // Publication invocations must never attempt the after_run hook:
+                // runWorkspaceHooks already gates this before policy resolution.
                 await SeedFlowAsync(
                     factory,
                     flowId,
@@ -3919,7 +3876,6 @@ public sealed class CopilotReasoningHostAfterRunHookPolicyFallbackTests
             Id = flowId,
             Title = "After-run hook policy fallback",
             OriginalRequest = "Exercise the after_run hook fallback path.",
-            ContractVersion = "studio-v2",
             Kind = kind,
             Status = status
         });

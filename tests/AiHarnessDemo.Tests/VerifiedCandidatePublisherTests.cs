@@ -34,7 +34,6 @@ public sealed class VerifiedCandidatePublisherTests
             {
                 Title = "Malformed Delivery",
                 OriginalRequest = "Publish.",
-                ContractVersion = "studio-v2",
                 Kind = FlowKind.Delivery,
                 Status = FlowStatus.Queued,
                 RepositoryPath = "must-not-be-inspected",
@@ -106,7 +105,6 @@ public sealed class VerifiedCandidatePublisherTests
             Title = "Publish reviewed candidate",
             OriginalRequest = "Publish the reviewed candidate.",
             ConsolidatedRequest = "Publish the reviewed candidate.",
-            ContractVersion = "studio-v2",
             Kind = FlowKind.Delivery,
             Status = FlowStatus.Queued,
             RepositoryPath = workspace.SourceRepository,
@@ -120,7 +118,7 @@ public sealed class VerifiedCandidatePublisherTests
             OutcomeOwnerPlanStepKey = "outcome",
             PublicationPlanStepKey = "publish",
             OutcomeContractJson =
-                """{"Version":"flow-outcome-v1","Goal":"Publish.","Summary":"Reviewed.","ImplementationDetails":["Exact bytes."],"Artifacts":[]}"""
+                """{"Goal":"Publish.","Summary":"Reviewed.","ImplementationDetails":["Exact bytes."],"Artifacts":[]}"""
         };
         flow.Events.Add(new FlowEvent
         {
@@ -161,7 +159,7 @@ public sealed class VerifiedCandidatePublisherTests
                 ExecutionPermissionProfile.Publish,
             EffectivePermissionJson = JsonSerializer.Serialize(
                 PublicationPermission()),
-            WorkflowRevision = "publication-workflow-v1",
+            WorkflowRevision = "publication-workflow",
             RemotePublicationAllowed = true,
             Status = StepStatus.Running,
             DependsOnStepId = owner.Id
@@ -247,10 +245,7 @@ public sealed class VerifiedCandidatePublisherTests
                 ImmutableArray.Create(PlanDuty.Publish),
                 DurableReviewDecision: ReviewDecision.Accepted,
                 DurableApproval: true,
-                IsOnlyPlannedPublishStep: true,
-                ContractVersion: "studio-v2",
-                LegacyPublicationAuthorized: false,
-                IsGovernedOutcomeVerification: false),
+                IsOnlyPlannedPublishStep: true),
             new WorkflowPermissionRestrictions(
                 ExecutionPermissionProfile.ReadOnlySource,
                 ExecutionPermissionProfile.WorkspaceWrite,

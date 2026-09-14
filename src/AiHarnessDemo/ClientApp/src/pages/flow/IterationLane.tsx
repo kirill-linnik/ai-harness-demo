@@ -74,11 +74,6 @@ function PlanStepCard({
             Depends on: <span className="mono">{dependencies.join(", ")}</span>
           </span>
         )}
-        {step.assignedCriterionIds.length > 0 && (
-          <span className="plan-step-dependencies">
-            Criteria: <span className="mono">{step.assignedCriterionIds.join(", ")}</span>
-          </span>
-        )}
       </span>
     </button>
   );

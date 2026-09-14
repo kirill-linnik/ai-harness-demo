@@ -770,7 +770,7 @@ public sealed class DemoRuntimeManager(
                 cancellationToken)
                 ?? throw new DemoRuntimeException(
                     DemoConflictCodes.ManifestStale,
-                    "This artifact has no sealed customer-demo-v1 manifest.");
+                    "This artifact has no sealed customer demo manifest.");
             RequireRequestBinding(
                 binding,
                 candidateFingerprint,

@@ -261,737 +261,6 @@ public sealed class BlockerPromotionTests
     }
 
     [Fact]
-    public async Task FreeTextReview_LooksGoodAcceptsOnceThroughReadOnlyAccountManager()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        harness.Runner.QueueReviewFeedbackOutput(ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — I recorded your acceptance."));
-
-        var first = await harness.Reviews.RespondToFeedbackAsync(
-            harness.ParentId,
-            "looks good");
-        var replay = await harness.Reviews.RespondToFeedbackAsync(
-            harness.ParentId,
-            "  looks good  ");
-        var stored = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(ReviewIntent.Accept, first.Intent);
-        Assert.Equal(FlowStatus.Approved, first.Flow.Status);
-        Assert.Equal(first.Reply, replay.Reply);
-        Assert.Equal(
-            ReviewDecision.Accepted,
-            Assert.Single(stored.GateRecords).ReviewDecision);
-        var classifier = Assert.Single(stored.Steps, step =>
-            step.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(
-            ExecutionPermissionProfile.ReadOnlySource,
-            classifier.PermissionProfile);
-        var context = Assert.Single(harness.Runner.Contexts, item =>
-            item.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-        Assert.Contains("looks good", context.Task, StringComparison.Ordinal);
-        Assert.Contains(
-            stored.OutcomeContractJson,
-            context.Task,
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task FreeTextReview_ExplicitImplementationPromotesAdvisory()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        harness.Runner.QueueReviewFeedbackOutput(ReviewFeedbackOutput(
-            ReviewIntent.PromoteToDelivery,
-            "I’ll start a separate Delivery flow for this accepted recommendation.",
-            explicitImplementationAdoption: true));
-
-        var result = await harness.Reviews.RespondToFeedbackAsync(
-            harness.ParentId,
-            "let's implement this");
-        var parent = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(ReviewIntent.PromoteToDelivery, result.Intent);
-        Assert.Equal(FlowStatus.Approved, parent.Status);
-        Assert.Equal(
-            ReviewDecision.PromotedToDelivery,
-            Assert.Single(parent.GateRecords).ReviewDecision);
-        Assert.Single(
-            parent.LinkedFlowRuns,
-            child => child.LinkKind == FlowLinkKind.AdvisoryPromotion);
-        Assert.Single(harness.Runner.Contexts, item =>
-            item.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-    }
-
-    [Fact]
-    public async Task FreeTextReview_RefinementUsesTypedReviewAndAmbiguousStaysOpen()
-    {
-        await using var refinementHarness =
-            await Slice8Harness.CreateAsync(ParentState.AdvisoryReview);
-        refinementHarness.Runner.QueueReviewFeedbackOutput(
-            ReviewFeedbackOutput(
-                ReviewIntent.RequestRefinement,
-                "I’ll ask the team to narrow the recommendation.",
-                goal: "Focus on checkout retries.",
-                requestedChanges: ["Exclude account services."]));
-
-        var refined =
-            await refinementHarness.Reviews.RespondToFeedbackAsync(
-                refinementHarness.ParentId,
-                "Please narrow this to checkout.");
-        var refinedFlow = await refinementHarness.LoadAsync(
-            refinementHarness.ParentId);
-
-        Assert.Equal(ReviewIntent.RequestRefinement, refined.Intent);
-        Assert.Equal(2, refinedFlow.Iteration);
-        Assert.Equal(FlowStatus.Reworking, refinedFlow.Status);
-        Assert.Equal(
-            ReviewDecision.RefinementRequested,
-            Assert.Single(refinedFlow.GateRecords).ReviewDecision);
-
-        await using var ambiguousHarness =
-            await Slice8Harness.CreateAsync(ParentState.AdvisoryReview);
-        ambiguousHarness.Runner.QueueReviewFeedbackOutput(
-            ReviewFeedbackOutput(
-                ReviewIntent.Ambiguous,
-                "Would you like to accept this recommendation, refine it, or implement it?"));
-
-        var ambiguous =
-            await ambiguousHarness.Reviews.RespondToFeedbackAsync(
-                ambiguousHarness.ParentId,
-                "Maybe.");
-        var replay =
-            await ambiguousHarness.Reviews.RespondToFeedbackAsync(
-                ambiguousHarness.ParentId,
-                "Maybe.");
-        var unchanged = await ambiguousHarness.LoadAsync(
-            ambiguousHarness.ParentId);
-
-        Assert.Equal(ReviewIntent.Ambiguous, ambiguous.Intent);
-        Assert.Equal(ambiguous.Reply, replay.Reply);
-        Assert.Equal(1, unchanged.Iteration);
-        Assert.Equal(FlowStatus.WaitingForFeedback, unchanged.Status);
-        Assert.False(Assert.Single(unchanged.GateRecords).Resolved);
-        Assert.Single(ambiguousHarness.Runner.Contexts, item =>
-            item.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-        Assert.Contains(
-            unchanged.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-applied");
-    }
-
-    [Fact]
-    public async Task FreeTextReview_MalformedCorrectionFailsClosedWithoutRawOutput()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        harness.Runner.QueueReviewFeedbackOutput("not a contract");
-        harness.Runner.QueueReviewFeedbackOutput("still not a contract");
-
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => harness.Reviews.RespondToFeedbackAsync(
-                harness.ParentId,
-                "I think this might be okay."));
-        var unchanged = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Contains(
-            "remains unresolved",
-            exception.Message,
-            StringComparison.Ordinal);
-        Assert.Equal(FlowStatus.WaitingForFeedback, unchanged.Status);
-        Assert.False(Assert.Single(unchanged.GateRecords).Resolved);
-        var classifier = Assert.Single(unchanged.Steps, step =>
-            step.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(StepStatus.Failed, classifier.Status);
-        Assert.DoesNotContain(
-            "still not a contract",
-            classifier.PushbackReason,
-            StringComparison.Ordinal);
-        Assert.Equal(
-            2,
-            harness.Runner.Contexts.Count(item =>
-                item.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification));
-        Assert.Contains(
-            unchanged.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-correction");
-        Assert.Contains(
-            unchanged.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-failed");
-    }
-
-    [Fact]
-    public async Task FreeTextReview_DeliveryPromotionIsCorrectedBeforeCompletion()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.DeliveryReview);
-        harness.Runner.QueueReviewFeedbackOutput(ReviewFeedbackOutput(
-            ReviewIntent.PromoteToDelivery,
-            "I’ll start implementation.",
-            explicitImplementationAdoption: true));
-        harness.Runner.QueueReviewFeedbackOutput(ReviewFeedbackOutput(
-            ReviewIntent.Ambiguous,
-            "Would you like to accept this Delivery result or request changes?"));
-
-        var result = await harness.Reviews.RespondToFeedbackAsync(
-            harness.ParentId,
-            "Ship this.");
-        var unchanged = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(ReviewIntent.Ambiguous, result.Intent);
-        Assert.Equal(FlowStatus.WaitingForFeedback, unchanged.Status);
-        Assert.False(Assert.Single(unchanged.GateRecords).Resolved);
-        var classifier = Assert.Single(unchanged.Steps, step =>
-            step.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(StepStatus.Completed, classifier.Status);
-        Assert.Equal(
-            ReviewIntent.Ambiguous,
-            ReviewFeedbackParser.ParseJson(
-                classifier.OutputSummary).Document.Intent);
-        Assert.Equal(
-            2,
-            harness.Runner.Contexts.Count(item =>
-                item.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification));
-        Assert.Equal(3, harness.ReviewedCandidates.VerifyCalls);
-        Assert.Contains(
-            "PromoteToDelivery is valid only for an Advisory flow.",
-            harness.Runner.Contexts.Last(item =>
-                    item.InvocationKind ==
-                    ExecutionInvocationKind.ReviewClassification)
-                .Task,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            unchanged.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-correction");
-    }
-
-    [Fact]
-    public async Task FreeTextReview_RepeatedDeliveryPromotionFailsClosedUnresolved()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.DeliveryReview);
-        harness.Runner.QueueReviewFeedbackOutput(ReviewFeedbackOutput(
-            ReviewIntent.PromoteToDelivery,
-            "I’ll start implementation.",
-            explicitImplementationAdoption: true));
-        harness.Runner.QueueReviewFeedbackOutput(ReviewFeedbackOutput(
-            ReviewIntent.PromoteToDelivery,
-            "I’ll start implementation.",
-            explicitImplementationAdoption: true));
-
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            harness.Reviews.RespondToFeedbackAsync(
-                harness.ParentId,
-                "Ship this."));
-        var unchanged = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(FlowStatus.WaitingForFeedback, unchanged.Status);
-        Assert.False(Assert.Single(unchanged.GateRecords).Resolved);
-        Assert.Empty(unchanged.LinkedFlowRuns);
-        var classifier = Assert.Single(unchanged.Steps, step =>
-            step.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(StepStatus.Failed, classifier.Status);
-        Assert.DoesNotContain(
-            unchanged.Events,
-            item => item.Type == "review.feedback-classified");
-        Assert.DoesNotContain(
-            unchanged.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-applied");
-    }
-
-    [Theory]
-    [InlineData(StepStatus.Pending)]
-    [InlineData(StepStatus.Completed)]
-    public async Task Recovery_AppliesDurableReviewClassificationExactlyOnce(
-        StepStatus classifierStatus)
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Looks good after restart.";
-        var output = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — I recovered and recorded your acceptance.");
-        if (classifierStatus == StepStatus.Pending)
-        {
-            harness.Runner.QueueReviewFeedbackOutput(output);
-        }
-        await harness.SeedReviewClassificationAsync(
-            classifierStatus,
-            feedback,
-            output);
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        var recovered = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(FlowStatus.Approved, recovered.Status);
-        Assert.Equal(
-            ReviewDecision.Accepted,
-            Assert.Single(recovered.GateRecords).ReviewDecision);
-        Assert.Single(recovered.Steps, step =>
-            step.InvocationKind ==
-            ExecutionInvocationKind.ReviewClassification);
-        Assert.Single(
-            recovered.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-applied");
-        Assert.Single(
-            recovered.Events,
-            item => item.Type == "flow.review-accepted");
-        Assert.Equal(
-            classifierStatus == StepStatus.Pending ? 1 : 0,
-            harness.Runner.Contexts.Count(item =>
-                item.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification));
-    }
-
-    [Fact]
-    public async Task Recovery_AppliesJournalCompletedRunningClassificationWithoutRerun()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Looks good from the recovered session.";
-        var output = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — I recovered and recorded your acceptance.");
-        await harness.SeedReviewClassificationAsync(
-            StepStatus.Running,
-            feedback,
-            output,
-            journalCompleted: true);
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        var recovered = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(FlowStatus.Approved, recovered.Status);
-        Assert.Equal(
-            ReviewDecision.Accepted,
-            Assert.Single(recovered.GateRecords).ReviewDecision);
-        Assert.Equal(
-            0,
-            harness.Runner.Contexts.Count(item =>
-                item.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification));
-        Assert.Single(
-            recovered.Events,
-            item => item.Type == "review.feedback-classified");
-        Assert.Single(
-            recovered.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-applied");
-    }
-
-    [Fact]
-    public async Task Recovery_InterruptedCorrectionResumesPersistedCorrectionTurn()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Looks good after correction recovery.";
-        const string correctionTask =
-            "PERSISTED_CORRECTION_PROMPT_WITH_EXACT_ERRORS";
-        var output = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — I recovered the correction and recorded acceptance.");
-        harness.Runner.QueueReviewFeedbackOutput(output);
-        await harness.SeedReviewClassificationAsync(
-            StepStatus.Running,
-            feedback,
-            output,
-            journalInterrupted: true,
-            attempt: 2,
-            persistedTask: correctionTask,
-            persistedErrors: ["missing exact sentinel"]);
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-
-        var context = Assert.Single(
-            harness.Runner.Contexts,
-            item => item.InvocationKind ==
-                    ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(2, context.Attempt);
-        Assert.Equal(correctionTask, context.Task);
-        Assert.True(context.ResumeSession);
-        Assert.True(context.RecoverInterruptedSession);
-        Assert.Equal(
-            FlowStatus.Approved,
-            (await harness.LoadAsync(harness.ParentId)).Status);
-    }
-
-    [Fact]
-    public async Task Recovery_PersistedCorrectionDoesNotConsumePriorCompletedTurn()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback =
-            "Recover the correction after its launch boundary crashed.";
-        const string priorOutput =
-            "MALFORMED_INITIAL_CLASSIFIER_RESULT";
-        var corrected = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — I ran the persisted correction exactly once.");
-        harness.Runner.QueueReviewFeedbackOutput(corrected);
-        await harness.SeedReviewClassificationAsync(
-            StepStatus.Running,
-            feedback,
-            priorOutput,
-            journalCompleted: true,
-            attempt: 2,
-            persistedTask: "Persisted correction after prior malformed output.",
-            persistedErrors: ["initial result malformed"],
-            journalOutput: priorOutput,
-            priorOutput: priorOutput);
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-
-        var context = Assert.Single(
-            harness.Runner.Contexts,
-            item => item.InvocationKind ==
-                    ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(2, context.Attempt);
-        Assert.True(context.ResumeSession);
-        Assert.False(context.RecoverInterruptedSession);
-        Assert.Equal(
-            FlowStatus.Approved,
-            (await harness.LoadAsync(harness.ParentId)).Status);
-    }
-
-    [Fact]
-    public async Task Recovery_MissingClassifierJournalStartsFreshWithoutResume()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Looks good after a fresh classifier session.";
-        var output = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — I recorded acceptance in a fresh session.");
-        harness.Runner.QueueReviewFeedbackOutput(output);
-        var stepId = await harness.SeedReviewClassificationAsync(
-            StepStatus.Running,
-            feedback,
-            output);
-        var before = await harness.LoadAsync(harness.ParentId);
-        var oldSessionId = before.Steps.Single(
-            step => step.Id == stepId).CopilotSessionId;
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-
-        var context = Assert.Single(
-            harness.Runner.Contexts,
-            item => item.InvocationKind ==
-                    ExecutionInvocationKind.ReviewClassification);
-        Assert.False(context.ResumeSession);
-        Assert.False(context.RecoverInterruptedSession);
-        Assert.NotEqual(oldSessionId, context.CopilotSessionId);
-        var recovered = await harness.LoadAsync(harness.ParentId);
-        Assert.Contains(
-            recovered.Events,
-            item => item.Type ==
-                    "review.feedback-classification-session-restarted");
-        Assert.Equal(FlowStatus.Approved, recovered.Status);
-    }
-
-    [Fact]
-    public async Task Recovery_ActiveClassifierDefersWithoutConcurrentExecution()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Wait for the active classifier.";
-        var placeholder = ReviewFeedbackOutput(
-            ReviewIntent.Ambiguous,
-            "Still classifying.");
-        var stepId = await harness.SeedReviewClassificationAsync(
-            StepStatus.Running,
-            feedback,
-            placeholder);
-        var before = await harness.LoadAsync(harness.ParentId);
-        var step = before.Steps.Single(item => item.Id == stepId);
-        harness.Reviews.SessionInspectorOverride =
-            (home, sessionId, _) => Task.FromResult(
-                new CopilotSessionSnapshot(
-                    sessionId,
-                    home,
-                    Path.Combine(
-                        home,
-                        "session-state",
-                        sessionId.ToString("D")),
-                    CopilotSessionJournalState.Active,
-                    before.WorkspacePath,
-                    "Account Manager",
-                    step.StartedAt,
-                    CompletedAt: null,
-                    Result: null,
-                    ActiveProcessIds: [12345],
-                    Detail: "Fixture active owner."));
-        harness.Reviews.ActiveSessionStopperOverride =
-            _ => false;
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-
-        var deferred = await harness.LoadAsync(harness.ParentId);
-        Assert.Equal(FlowStatus.WaitingForFeedback, deferred.Status);
-        Assert.Equal(
-            StepStatus.Running,
-            deferred.Steps.Single(item => item.Id == stepId).Status);
-        Assert.Empty(harness.Runner.Contexts);
-        Assert.DoesNotContain(
-            deferred.Events,
-            item => item.Type ==
-                    "review.feedback-classification-failed");
-    }
-
-    [Fact]
-    public async Task Recovery_InvalidCompletedInitialClassifierRunsOnePersistedCorrection()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Looks good after a recovered correction.";
-        var corrected = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — the recovered correction is valid.");
-        harness.Runner.QueueReviewFeedbackOutput(corrected);
-        await harness.SeedReviewClassificationAsync(
-            StepStatus.Running,
-            feedback,
-            corrected,
-            journalCompleted: true,
-            journalOutput: "MALFORMED_RECOVERED_CLASSIFICATION");
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-
-        var context = Assert.Single(
-            harness.Runner.Contexts,
-            item => item.InvocationKind ==
-                    ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(2, context.Attempt);
-        Assert.True(context.ResumeSession);
-        Assert.Contains(
-            "Validation errors:",
-            context.Task,
-            StringComparison.Ordinal);
-        var recovered = await harness.LoadAsync(harness.ParentId);
-        Assert.Equal(FlowStatus.Approved, recovered.Status);
-        var step = Assert.Single(
-            recovered.Steps,
-            item => item.InvocationKind ==
-                    ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(2, step.Attempt);
-        Assert.Contains(
-            "review-classification-turn-v1",
-            step.ReviewClassificationStateJson,
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task Recovery_InvalidCompletedCorrectionFailsClosedWithoutThirdTurn()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Classifier correction crashed.";
-        var validPlaceholder = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "This placeholder is not used.");
-        await harness.SeedReviewClassificationAsync(
-            StepStatus.Running,
-            feedback,
-            validPlaceholder,
-            journalCompleted: true,
-            attempt: 2,
-            persistedTask: "Persisted correction input.",
-            persistedErrors: ["first result malformed"],
-            journalOutput: "MALFORMED_RECOVERED_CORRECTION");
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-
-        var recovered = await harness.LoadAsync(harness.ParentId);
-        Assert.Equal(
-            FlowStatus.WaitingForFeedback,
-            recovered.Status);
-        var step = Assert.Single(
-            recovered.Steps,
-            item => item.InvocationKind ==
-                    ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(StepStatus.Failed, step.Status);
-        Assert.Equal(2, step.Attempt);
-        Assert.Empty(harness.Runner.Contexts);
-        Assert.Single(
-            recovered.Events,
-            item => item.Type ==
-                    "review.feedback-classification-failed");
-    }
-
-    [Fact]
-    public async Task Recovery_MarksAlreadyAppliedClassificationExactlyOnce()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Looks good before the crash.";
-        var output = ReviewFeedbackOutput(
-            ReviewIntent.Accept,
-            "Thanks — I recorded your acceptance.");
-        await harness.SeedReviewClassificationAsync(
-            StepStatus.Completed,
-            feedback,
-            output);
-        var before = await harness.LoadAsync(harness.ParentId);
-        var gate = Assert.Single(
-            before.GateRecords,
-            item => item.ActionType == HandoffActionType.CustomerReview);
-        await harness.Reviews.ReviewAsync(
-            harness.ParentId,
-            new DirectReviewRequest
-            {
-                GateId = gate.Id,
-                Intent = ReviewIntent.Accept
-            });
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        var recovered = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(FlowStatus.Approved, recovered.Status);
-        Assert.Single(
-            recovered.Events,
-            item => item.Type == "flow.review-accepted");
-        Assert.Single(
-            recovered.Events,
-            item =>
-                item.Type ==
-                "review.feedback-classification-applied");
-        Assert.Equal(
-            0,
-            harness.Runner.Contexts.Count(item =>
-                item.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification));
-    }
-
-    [Theory]
-    [InlineData(ReviewIntent.Accept, StepStatus.Completed)]
-    [InlineData(ReviewIntent.RequestRefinement, StepStatus.Completed)]
-    [InlineData(ReviewIntent.PromoteToDelivery, StepStatus.Completed)]
-    [InlineData(ReviewIntent.Accept, StepStatus.Pending)]
-    [InlineData(ReviewIntent.Accept, StepStatus.Running)]
-    public async Task Recovery_SupersedesPriorIterationClassificationWithoutTouchingCurrentGate(
-        ReviewIntent staleIntent,
-        StepStatus classifierStatus)
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.AdvisoryReview);
-        const string feedback = "Apply this only to the original review.";
-        var output = ReviewFeedbackOutput(
-            staleIntent,
-            "This completed classification belongs to the original review.",
-            goal: staleIntent == ReviewIntent.RequestRefinement
-                ? "Use the original requested scope."
-                : null,
-            requestedChanges: staleIntent == ReviewIntent.RequestRefinement
-                ? ["Keep the original review identity."]
-                : null,
-            explicitImplementationAdoption:
-                staleIntent == ReviewIntent.PromoteToDelivery);
-        var classifierId = await harness.SeedReviewClassificationAsync(
-            classifierStatus,
-            feedback,
-            output);
-        var original = await harness.LoadAsync(harness.ParentId);
-        var originalGate = Assert.Single(
-            original.GateRecords,
-            item =>
-                item.ActionType == HandoffActionType.CustomerReview &&
-                !item.Resolved);
-
-        await harness.Reviews.ReviewAsync(
-            harness.ParentId,
-            new DirectReviewRequest
-            {
-                GateId = originalGate.Id,
-                Intent = ReviewIntent.RequestRefinement,
-                Refinement = new DirectReviewRefinement
-                {
-                    Goal = "Advance to a distinct review.",
-                    RequestedChanges = ["Produce a new iteration."]
-                }
-            });
-        var currentGateId = await harness.AttachCurrentReviewAsync();
-
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        await harness.Engine.RecoverInterruptedFlowsAsync(
-            CancellationToken.None);
-        var recovered = await harness.LoadAsync(harness.ParentId);
-
-        Assert.Equal(2, recovered.Iteration);
-        Assert.Equal(FlowStatus.WaitingForFeedback, recovered.Status);
-        var currentGate = Assert.Single(
-            recovered.GateRecords,
-            item => item.Id == currentGateId);
-        Assert.False(currentGate.Resolved);
-        Assert.Null(currentGate.ReviewDecision);
-        Assert.Single(
-            recovered.Steps,
-            item =>
-                item.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification);
-        Assert.Equal(
-            classifierStatus == StepStatus.Completed
-                ? StepStatus.Completed
-                : StepStatus.Skipped,
-            recovered.Steps.Single(item =>
-                item.Id == classifierId).Status);
-        Assert.Single(
-            recovered.Events,
-            item =>
-                item.FlowStepId == classifierId &&
-                item.Type ==
-                "review.feedback-classification-superseded");
-        Assert.DoesNotContain(
-            recovered.Events,
-            item =>
-                item.FlowStepId == classifierId &&
-                item.Type ==
-                "review.feedback-classification-applied");
-        Assert.Equal(
-            0,
-            harness.Runner.Contexts.Count(item =>
-                item.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification));
-    }
-
-    [Fact]
     public async Task AdvisoryPromotion_IsAtomicCleanFreshAndConcurrentIdempotent()
     {
         await using var harness = await Slice8Harness.CreateAsync(
@@ -1108,7 +377,6 @@ public sealed class BlockerPromotionTests
         var maximumOutcome = JsonSerializer.Serialize(
             new FlowOutcomeDocument
             {
-                Version = FlowOutcomeParser.Version,
                 Goal = goal,
                 Summary = "Every accepted implementation detail must be adopted.",
                 ImplementationDetails = details,
@@ -1456,13 +724,13 @@ public sealed class BlockerPromotionTests
         var parent = await harness.LoadAsync(harness.ParentId);
         var gate = Assert.Single(parent.GateRecords);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsAsync<ArgumentException>(() =>
             harness.Reviews.ReviewAsync(
                 parent.Id,
                 new DirectReviewRequest
                 {
                     GateId = gate.Id,
-                    Intent = ReviewIntent.Ambiguous
+                    Intent = (ReviewIntent)int.MaxValue
                 }));
         Assert.False(
             (await harness.LoadAsync(parent.Id)).GateRecords.Single().Resolved);
@@ -1701,40 +969,12 @@ public sealed class BlockerPromotionTests
         Assert.Equal(FlowStatus.WaitingForFeedback, corrected.Status);
     }
 
-    [Fact]
-    public async Task SuccessorUniqueIndexUpgrade_IsIdempotentAndEnforced()
-    {
-        await using var harness = await Slice8Harness.CreateAsync(
-            ParentState.Blocked);
-        await using var database =
-            await harness.Factory.CreateDbContextAsync();
-
-        await DatabaseInitializer.EnsureFlowRunSchemaAsync(database);
-        await DatabaseInitializer.EnsureFlowRunSchemaAsync(database);
-        await using var command = database.Database.GetDbConnection().CreateCommand();
-        await database.Database.OpenConnectionAsync();
-        command.CommandText =
-            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'IX_Flows_UniqueLinkedSuccessor';";
-        var sql = Convert.ToString(await command.ExecuteScalarAsync());
-        Assert.Contains("UNIQUE INDEX", sql, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("WHERE", sql, StringComparison.OrdinalIgnoreCase);
-
-        var parent = await database.Flows.SingleAsync(item =>
-            item.Id == harness.ParentId);
-        database.Flows.AddRange(
-            BareChild(parent, FlowLinkKind.QualificationRosterRepair),
-            BareChild(parent, FlowLinkKind.QualificationRosterRepair));
-        await Assert.ThrowsAsync<DbUpdateException>(
-            () => database.SaveChangesAsync());
-    }
-
     private static FlowRun BareChild(FlowRun parent, FlowLinkKind linkKind) =>
         new()
         {
             Title = "Duplicate successor",
             OriginalRequest = "seed",
             ConsolidatedRequest = "seed",
-            ContractVersion = "studio-v2",
             Kind = parent.Kind,
             Status = FlowStatus.Intake,
             ParentFlowRunId = parent.Id,
@@ -1743,35 +983,6 @@ public sealed class BlockerPromotionTests
             RepositoryPath = parent.RepositoryPath,
             RepositoryKnowledge = parent.RepositoryKnowledge
         };
-
-    private static string ReviewFeedbackOutput(
-        ReviewIntent intent,
-        string customerReply,
-        string? goal = null,
-        IReadOnlyList<string>? requestedChanges = null,
-        bool explicitImplementationAdoption = false) =>
-        ReviewFeedbackParser.BeginSentinel +
-        Environment.NewLine +
-        ReviewFeedbackParser.Serialize(new ReviewFeedbackDocument
-        {
-            Version = ReviewFeedbackParser.Version,
-            Intent = intent,
-            CustomerReply = customerReply,
-            Refinement = intent == ReviewIntent.RequestRefinement
-                ? new ReviewFeedbackRefinement
-                {
-                    Goal = goal ?? throw new ArgumentNullException(
-                        nameof(goal)),
-                    RequestedChanges = requestedChanges ??
-                        throw new ArgumentNullException(
-                            nameof(requestedChanges))
-                }
-                : null,
-            ExplicitImplementationAdoption =
-                explicitImplementationAdoption
-        }) +
-        Environment.NewLine +
-        ReviewFeedbackParser.EndSentinel;
 
     private enum ParentState
     {
@@ -1823,7 +1034,7 @@ public sealed class BlockerPromotionTests
             };
 
         public const string ValidOutcomeJson =
-            """{"Version":"flow-outcome-v1","Goal":"Accepted checkout goal","Summary":"SUMMARY MUST NOT MOVE","ImplementationDetails":["Implement retry behavior","Add bounded failure handling"],"Artifacts":[]}""";
+            """{"Goal":"Accepted checkout goal","Summary":"SUMMARY MUST NOT MOVE","ImplementationDetails":["Implement retry behavior","Add bounded failure handling"],"Artifacts":[]}""";
 
         private readonly string _root;
         private readonly WorkflowDefinitionProvider _workflowProvider;
@@ -1844,7 +1055,6 @@ public sealed class BlockerPromotionTests
             MutableAdmission admission,
             FlowLifecycleCoordinator lifecycle,
             LinkedFlowCoordinator links,
-            Slice8ReviewedCandidateService reviewedCandidates,
             WorkflowEngine engine,
             QualificationResolutionCoordinator qualifications,
             ReviewCoordinator reviews)
@@ -1861,7 +1071,6 @@ public sealed class BlockerPromotionTests
             Admission = admission;
             Lifecycle = lifecycle;
             Links = links;
-            ReviewedCandidates = reviewedCandidates;
             Engine = engine;
             Qualifications = qualifications;
             Reviews = reviews;
@@ -1880,8 +1089,6 @@ public sealed class BlockerPromotionTests
         public FlowLifecycleCoordinator Lifecycle { get; }
 
         public LinkedFlowCoordinator Links { get; }
-
-        public Slice8ReviewedCandidateService ReviewedCandidates { get; }
 
         public WorkflowEngine Engine { get; }
 
@@ -2014,8 +1221,6 @@ public sealed class BlockerPromotionTests
                 admission,
                 linked,
                 lifecycle);
-            var reviewedCandidates =
-                new Slice8ReviewedCandidateService();
             var reviews = new ReviewCoordinator(
                 factory,
                 gate,
@@ -2023,19 +1228,10 @@ public sealed class BlockerPromotionTests
                 lifecycle,
                 workflowProvider,
                 admission,
-                linked,
-                modelRouter: modelRouter,
-                profileFactory: profileFactory,
-                observationRecorder: routingRecorder,
-                agentRunner: runner,
-                workspaceManager: workspace,
-                sessionJournal: new CopilotSessionJournal(),
-                reviewedCandidateService:
-                    reviewedCandidates);
+                linked);
             var engine = new WorkflowEngine(
                 factory,
                 catalog,
-                new FlowPlanner(),
                 modelRouter,
                 profileFactory,
                 routingRecorder,
@@ -2049,7 +1245,6 @@ public sealed class BlockerPromotionTests
                 teamPlanValidator: new TeamPlanValidator(),
                 missingQualificationCoordinator: missing,
                 lifecycleCoordinator: lifecycle,
-                reviewCoordinator: reviews,
                 linkedFlowCoordinator: linked);
             return new Slice8Harness(
                 root,
@@ -2064,7 +1259,6 @@ public sealed class BlockerPromotionTests
                 admission,
                 lifecycle,
                 linked,
-                reviewedCandidates,
                 engine,
                 qualifications,
                 reviews);
@@ -2458,247 +1652,6 @@ public sealed class BlockerPromotionTests
             return (step.Id, stagedRoot);
         }
 
-        public async Task<Guid> SeedReviewClassificationAsync(
-            StepStatus status,
-            string feedback,
-            string output,
-            bool journalCompleted = false,
-            bool journalInterrupted = false,
-            int attempt = 1,
-            string? persistedTask = null,
-            IReadOnlyList<string>? persistedErrors = null,
-            string? journalOutput = null,
-            string? priorOutput = null)
-        {
-            await using var database = await Factory.CreateDbContextAsync();
-            var flow = await database.Flows
-                .Include(item => item.Steps)
-                .Include(item => item.Events)
-                .Include(item => item.GateRecords)
-                .SingleAsync(item => item.Id == ParentId);
-            var gate = Assert.Single(
-                flow.GateRecords,
-                item =>
-                    item.ActionType ==
-                    HandoffActionType.CustomerReview &&
-                    !item.Resolved);
-            var requestHash = OutcomeVerificationRules.ComputeSha256(
-                JsonSerializer.Serialize(new
-                {
-                    Version = "review-feedback-request-v1",
-                    FlowId = flow.Id,
-                    Iteration = flow.Iteration,
-                    GateId = gate.Id,
-                    Message = feedback
-                }));
-            var feedbackHash = OutcomeVerificationRules.ComputeSha256(
-                JsonSerializer.Serialize(new
-                {
-                    Version = "review-feedback-message-v1",
-                    Message = feedback
-                }));
-            var rawJson = status == StepStatus.Completed
-                ? ReviewFeedbackParser.Parse(output).RawJson
-                : string.Empty;
-            var sessionId = Guid.NewGuid();
-            var copilotHome = Path.Combine(
-                _root,
-                "copilot-home-" + sessionId.ToString("N"));
-            var startedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
-            var step = new FlowStep
-            {
-                FlowRunId = flow.Id,
-                Iteration = flow.Iteration,
-                Sequence = flow.Steps.Max(item => item.Sequence) + 10,
-                AgentId = "account-manager",
-                AgentName = "Account Manager",
-                AgentRole = "account-manager",
-                Label = "Classify customer review feedback",
-                PlanStepKey =
-                    ReviewCoordinator.FeedbackClassificationPlanStepPrefix +
-                    requestHash["sha256:".Length..],
-                PlanDutiesJson = """["Analyze"]""",
-                PlanStage = PlanStage.BeforeReview,
-                InvocationKind =
-                    ExecutionInvocationKind.ReviewClassification,
-                PermissionProfile =
-                    ExecutionPermissionProfile.ReadOnlySource,
-                WorkflowRevision =
-                    _workflowProvider.GetEffective().Revision,
-                Status = status,
-                Phase = status == StepStatus.Completed
-                    ? AgentRunPhase.Succeeded
-                    : status == StepStatus.Running
-                        ? AgentRunPhase.StreamingTurn
-                        : AgentRunPhase.PreparingWorkspace,
-                Attempt = attempt,
-                InputSummary = feedback,
-                ExecutionPrompt = persistedTask ?? string.Empty,
-                Model = status == StepStatus.Running
-                    ? "fixture-model"
-                    : string.Empty,
-                ModelEffort = status == StepStatus.Running
-                    ? "medium"
-                    : string.Empty,
-                StartedAt = status == StepStatus.Pending
-                    ? null
-                    : startedAt,
-                CompletedAt = status == StepStatus.Completed
-                    ? startedAt.AddSeconds(10)
-                    : null,
-                CopilotSessionId = status == StepStatus.Running
-                    ? sessionId
-                    : null,
-                CopilotSessionHome = status == StepStatus.Running
-                    ? copilotHome
-                    : string.Empty,
-                OutputSummary = status == StepStatus.Completed
-                    ? rawJson
-                    : string.Empty
-            };
-            if (attempt == 2)
-            {
-                step.ReviewClassificationStateJson =
-                    JsonSerializer.Serialize(new
-                    {
-                        Version =
-                            "review-classification-turn-v1",
-                        Attempt = 2,
-                        Kind = "Correction",
-                        Task = persistedTask ??
-                            "Persisted correction prompt.",
-                        ValidationErrors =
-                            persistedErrors?.ToArray() ??
-                            ["Persisted classifier error."],
-                        SessionId = sessionId,
-                        SessionGeneration = 1,
-                        PriorOutputSha256 = priorOutput is null
-                            ? null
-                            : OutcomeVerificationRules
-                                .ComputeSha256(priorOutput),
-                        PriorJournalCompletedAt = priorOutput is null
-                            ? (DateTimeOffset?)null
-                            : startedAt.AddSeconds(6)
-                    });
-            }
-            step.StableSemanticRootId = step.Id;
-            flow.Steps.Add(step);
-            flow.Events.Add(new FlowEvent
-            {
-                FlowRunId = flow.Id,
-                FlowStepId = step.Id,
-                Type = "review.feedback-classification-requested",
-                Message = "Persisted classification request.",
-                DataJson = JsonSerializer.Serialize(new
-                {
-                    Version = "review-feedback-request-v1",
-                    FlowStepId = step.Id,
-                    GateId = gate.Id,
-                    ReviewIteration = flow.Iteration,
-                    RequestHash = requestHash,
-                    FeedbackHash = feedbackHash
-                })
-            });
-            if (status == StepStatus.Completed)
-            {
-                flow.Events.Add(new FlowEvent
-                {
-                    FlowRunId = flow.Id,
-                    FlowStepId = step.Id,
-                    Type = "review.feedback-classified",
-                    Message = "Persisted valid classification.",
-                    DataJson = JsonSerializer.Serialize(new
-                    {
-                        Version = "review-feedback-classification-v1",
-                        GateId = gate.Id,
-                        RequestHash = requestHash,
-                        Intent = ReviewIntent.Accept.ToString(),
-                        ContractHash =
-                            OutcomeVerificationRules.ComputeSha256(rawJson)
-                    })
-                });
-            }
-            database.TaskProfiles.Add(
-                new BootstrapTaskProfileFactory().Create(
-                    "account-manager",
-                    feedback,
-                    flow.Id,
-                    flow.Iteration,
-                    step.Id,
-                    step.PlanStepKey,
-                    step.AgentId));
-            await database.SaveChangesAsync();
-
-            if (journalCompleted || journalInterrupted)
-            {
-                var sessionDirectory = Path.Combine(
-                    copilotHome,
-                    "session-state",
-                    sessionId.ToString("D"));
-                Directory.CreateDirectory(sessionDirectory);
-                var journalStarted = startedAt.AddSeconds(1);
-                var lines = new List<string>
-                {
-                        RecoveryFixture.Serialize(
-                            "session.start",
-                            journalStarted,
-                            new
-                            {
-                                sessionId,
-                                context = new
-                                {
-                                    cwd = flow.WorkspacePath
-                                }
-                            }),
-                        RecoveryFixture.Serialize(
-                            "subagent.selected",
-                            journalStarted.AddSeconds(1),
-                            new
-                            {
-                                agentName = "Account Manager",
-                                agentDisplayName = "Account Manager"
-                            }),
-                        RecoveryFixture.Serialize(
-                            "assistant.turn_start",
-                            journalStarted.AddSeconds(2),
-                            new
-                            {
-                                turnId = "0"
-                            })
-                };
-                if (journalCompleted)
-                {
-                    lines.Add(RecoveryFixture.Serialize(
-                        "assistant.message",
-                        journalStarted.AddSeconds(3),
-                        new
-                        {
-                            turnId = "0",
-                            content = journalOutput ?? output,
-                            toolRequests = Array.Empty<object>()
-                        }));
-                    lines.Add(RecoveryFixture.Serialize(
-                        "assistant.turn_end",
-                        journalStarted.AddSeconds(4),
-                        new
-                        {
-                            turnId = "0"
-                        }));
-                    lines.Add(RecoveryFixture.Serialize(
-                        "session.shutdown",
-                        journalStarted.AddSeconds(5),
-                        new
-                        {
-                            shutdownType = "routine"
-                        }));
-                }
-                await File.WriteAllLinesAsync(
-                    Path.Combine(sessionDirectory, "events.jsonl"),
-                    lines);
-            }
-            return step.Id;
-        }
-
         public async Task<Guid> AttachCurrentReviewAsync()
         {
             await using var database = await Factory.CreateDbContextAsync();
@@ -2782,7 +1735,6 @@ public sealed class BlockerPromotionTests
                 Kind = state == ParentState.DeliveryReview
                     ? FlowKind.Delivery
                     : FlowKind.Advisory,
-                ContractVersion = "studio-v2",
                 Status = state switch
                 {
                     ParentState.QueuedMissingQualification => FlowStatus.Queued,
@@ -2874,7 +1826,6 @@ public sealed class BlockerPromotionTests
                     Message = "Sealed the Delivery review fixture.",
                     DataJson = ReviewedCandidateLedger.Serialize(
                         new ReviewedCandidateIdentity(
-                            ReviewedCandidateIdentity.CurrentVersion,
                             flow.Id,
                             flow.Iteration,
                             owner.Id,
@@ -2903,7 +1854,6 @@ public sealed class BlockerPromotionTests
             {
                 FlowRunId = flow.Id,
                 Iteration = 1,
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned.ToString(),
                 RawJson = TeamPlanParser.Serialize(AdvisoryPlan())
             });
@@ -2922,7 +1872,6 @@ public sealed class BlockerPromotionTests
         private static TeamPlanDocument AdvisoryPlan() =>
             new()
             {
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned,
                 Steps =
                 [
@@ -2996,7 +1945,6 @@ public sealed class BlockerPromotionTests
               stall_timeout_ms: 30000
               maximum_quality_stall_timeout_ms: 30000
             studio:
-              version: 1
               planning:
                 max_steps: 24
                 max_dependencies_per_step: 8
@@ -3034,21 +1982,12 @@ public sealed class BlockerPromotionTests
         : IAgentRunner
     {
         private readonly Lock _lock = new();
-        private readonly Queue<string> _reviewFeedbackOutputs = new();
         private readonly Queue<string> _refinementIntakeOutputs = new();
 
         public List<AgentExecutionContext> Contexts { get; } = [];
 
         public PromotionIntakeBehavior PromotionBehavior { get; set; } =
             PromotionIntakeBehavior.DirectConfirmed;
-
-        public void QueueReviewFeedbackOutput(string output)
-        {
-            lock (_lock)
-            {
-                _reviewFeedbackOutputs.Enqueue(output);
-            }
-        }
 
         public void QueueRefinementIntakeOutput(string output)
         {
@@ -3066,26 +2005,11 @@ public sealed class BlockerPromotionTests
             {
                 Contexts.Add(context);
             }
-            if (context.InvocationKind ==
-                ExecutionInvocationKind.ReviewClassification)
-            {
-                lock (_lock)
-                {
-                    if (_reviewFeedbackOutputs.TryDequeue(
-                            out var classification))
-                    {
-                        return Success(classification);
-                    }
-                }
-                throw new InvalidOperationException(
-                    "No review-feedback classifier result was queued.");
-            }
             if (context.AgentId == "team-lead")
             {
                 var plan = returnMissingQualification
                     ? new TeamPlanDocument
                     {
-                        Version = TeamPlanParser.Version,
                         Disposition =
                             TeamPlanDisposition.MissingQualification,
                         Steps = [],
@@ -3124,7 +2048,7 @@ public sealed class BlockerPromotionTests
                         AgentRunFailureKind.InvalidOutput);
                 }
                 return Success(IntakeOutput(
-                    IntakeV2Status.NeedsClarification,
+                    IntakeStatus.NeedsClarification,
                     flowKind: null,
                     "The current team needs a safer path before continuing. Please revise the scope or retry after the available expertise is updated."));
             }
@@ -3142,7 +2066,7 @@ public sealed class BlockerPromotionTests
                     }
                 }
                 return Success(IntakeOutput(
-                    IntakeV2Status.Confirmed,
+                    IntakeStatus.Confirmed,
                     FlowKind.Advisory,
                     "I normalized the requested refinement for the team.",
                     "Narrow the checkout recommendation."));
@@ -3150,7 +2074,7 @@ public sealed class BlockerPromotionTests
             if (context.AgentId == "account-manager")
             {
                 return Success(IntakeOutput(
-                    IntakeV2Status.AwaitingConfirmation,
+                    IntakeStatus.AwaitingConfirmation,
                     context.Task.Contains(
                         "QualificationRosterRepair",
                         StringComparison.Ordinal)
@@ -3179,7 +2103,7 @@ public sealed class BlockerPromotionTests
                 Environment.NewLine +
                 FlowOutcomeParser.BeginSentinel +
                 Environment.NewLine +
-                """{"Version":"flow-outcome-v1","Goal":"Narrow the checkout recommendation.","Summary":"The refined recommendation is ready.","ImplementationDetails":["Cover retry behavior only."],"Artifacts":[]}""" +
+                """{"Goal":"Narrow the checkout recommendation.","Summary":"The refined recommendation is ready.","ImplementationDetails":["Cover retry behavior only."],"Artifacts":[]}""" +
                 Environment.NewLine +
                 FlowOutcomeParser.EndSentinel);
         }
@@ -3192,19 +2116,19 @@ public sealed class BlockerPromotionTests
                     "MALFORMED_REFINEMENT_OUTPUT",
                 RefinementIntakeFailure.WrongKind =>
                     IntakeOutput(
-                        IntakeV2Status.Confirmed,
+                        IntakeStatus.Confirmed,
                         FlowKind.Delivery,
                         "I changed the flow kind incorrectly.",
                         "Narrow the checkout recommendation."),
                 RefinementIntakeFailure.FalseConfirmation =>
                     IntakeOutput(
-                        IntakeV2Status.AwaitingConfirmation,
+                        IntakeStatus.AwaitingConfirmation,
                         FlowKind.Advisory,
                         "Please confirm the refinement again.",
                         "Narrow the checkout recommendation."),
                 RefinementIntakeFailure.None =>
                     IntakeOutput(
-                        IntakeV2Status.Confirmed,
+                        IntakeStatus.Confirmed,
                         FlowKind.Advisory,
                         "I normalized the requested refinement for the team.",
                         "Narrow the checkout recommendation."),
@@ -3222,22 +2146,21 @@ public sealed class BlockerPromotionTests
                 []));
 
         private static string IntakeOutput(
-            IntakeV2Status status,
+            IntakeStatus status,
             FlowKind? flowKind,
             string reply,
             string goal = "") =>
             "HANDOFF_STATUS: COMPLETE" +
             Environment.NewLine +
-            IntakeV2Parser.BeginSentinel +
+            IntakeParser.BeginSentinel +
             Environment.NewLine +
-            IntakeV2Parser.Serialize(new IntakeV2Document
+            IntakeParser.Serialize(new IntakeDocument
             {
-                Version = IntakeV2Parser.Version,
                 Status = status,
                 FlowKind = flowKind,
                 TaskTitle = "Implement accepted recommendation",
                 CustomerReply = reply,
-                Brief = new IntakeV2Brief
+                Brief = new IntakeBrief
                 {
                     Goal = goal,
                     Details = string.IsNullOrWhiteSpace(goal)
@@ -3251,7 +2174,7 @@ public sealed class BlockerPromotionTests
                 }
             }) +
             Environment.NewLine +
-            IntakeV2Parser.EndSentinel;
+            IntakeParser.EndSentinel;
 
         internal static string PromotionIntakeOutput(
             AgentExecutionContext context,
@@ -3280,22 +2203,21 @@ public sealed class BlockerPromotionTests
             return
             "HANDOFF_STATUS: COMPLETE" +
             Environment.NewLine +
-            IntakeV2Parser.BeginSentinel +
+            IntakeParser.BeginSentinel +
             Environment.NewLine +
-            IntakeV2Parser.Serialize(new IntakeV2Document
+            IntakeParser.Serialize(new IntakeDocument
             {
-                Version = IntakeV2Parser.Version,
                 Status = behavior ==
                          PromotionIntakeBehavior.AwaitingConfirmation
-                    ? IntakeV2Status.AwaitingConfirmation
-                    : IntakeV2Status.Confirmed,
+                    ? IntakeStatus.AwaitingConfirmation
+                    : IntakeStatus.Confirmed,
                 FlowKind = FlowKind.Delivery,
                 TaskTitle = "Implement accepted checkout goal",
                 CustomerReply = behavior ==
                                 PromotionIntakeBehavior.AwaitingConfirmation
                     ? "Please confirm the accepted implementation scope."
                     : "The accepted implementation scope is queued.",
-                Brief = new IntakeV2Brief
+                Brief = new IntakeBrief
                 {
                     Goal = seed.Goal,
                     Details = details,
@@ -3305,13 +2227,12 @@ public sealed class BlockerPromotionTests
                 }
             }) +
             Environment.NewLine +
-            IntakeV2Parser.EndSentinel;
+            IntakeParser.EndSentinel;
         }
 
         private static TeamPlanDocument GetAdvisoryPlan() =>
             new()
             {
-                Version = TeamPlanParser.Version,
                 Disposition = TeamPlanDisposition.Planned,
                 Steps =
                 [
@@ -3343,29 +2264,6 @@ public sealed class BlockerPromotionTests
                 PreMortemCheckpoints = [],
                 MissingQualification = null
             };
-    }
-
-    private sealed class Slice8ReviewedCandidateService
-        : IReviewedCandidateService
-    {
-        public int VerifyCalls { get; private set; }
-
-        public Task<ReviewedCandidateIdentity> SealAsync(
-            FlowRun flow,
-            Guid outcomeOwnerStepId,
-            string outcomeOwnerPlanStepKey,
-            string outcomeContractJson,
-            CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
-
-        public Task<OutcomeCandidateSnapshot> VerifyAsync(
-            FlowRun flow,
-            ReviewedCandidateIdentity identity,
-            CancellationToken cancellationToken = default)
-        {
-            VerifyCalls++;
-            return Task.FromResult<OutcomeCandidateSnapshot>(null!);
-        }
     }
 
     private sealed class Slice8WorkspaceManager(string root) : IWorkspaceManager

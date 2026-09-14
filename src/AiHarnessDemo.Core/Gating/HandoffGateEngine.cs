@@ -14,8 +14,6 @@ public enum HandoffActionType
 {
     Advance,
     RequestRevision,
-    Release,
-    OutcomeResolution,
     CustomerReview,
 
     /// <summary>
@@ -188,8 +186,6 @@ public sealed class HandoffGateEngine : IDisposable
         }
         if (trustLevel == HandoffTrustLevel.Auto &&
             actionType is
-                HandoffActionType.Release or
-                HandoffActionType.OutcomeResolution or
                 HandoffActionType.CustomerReview or
                 HandoffActionType.CustomerWaiver)
         {
@@ -473,9 +469,7 @@ public sealed class HandoffGateEngine : IDisposable
         {
             return HandoffGateDecision.LoggedShadow;
         }
-        if (proposal.ActionType is
-                HandoffActionType.Release or HandoffActionType.OutcomeResolution ||
-            proposal.BlastRadius == HandoffBlastRadius.High ||
+        if (proposal.BlastRadius == HandoffBlastRadius.High ||
             trustLevel == HandoffTrustLevel.Gated)
         {
             return HandoffGateDecision.AwaitingHumanApproval;
@@ -487,31 +481,26 @@ public sealed class HandoffGateEngine : IDisposable
     private static string DecisionReason(
         HandoffProposal proposal,
         HandoffGateDecision decision) => decision switch
-    {
-        HandoffGateDecision.BlockedKillSwitch =>
-            "The global harness kill switch is engaged.",
-        HandoffGateDecision.LoggedShadow =>
-            "This action is in shadow mode and was observed without execution.",
-        HandoffGateDecision.AwaitingHumanApproval when proposal.ActionType == HandoffActionType.Release =>
-            "Customer approval is required before the release outcome is final.",
-        HandoffGateDecision.AwaitingHumanApproval
-            when proposal.ActionType == HandoffActionType.OutcomeResolution =>
-            "Operator resolution is required before outcome verification can continue.",
-        HandoffGateDecision.AwaitingHumanApproval
-            when proposal.ActionType == HandoffActionType.CustomerReview =>
-            "Customer review requires an explicit durable human decision.",
-        HandoffGateDecision.AwaitingHumanApproval
-            when proposal.ActionType == HandoffActionType.CustomerWaiver =>
-            "Waiver-required residual risks need explicit informed customer consent before review.",
-        HandoffGateDecision.AwaitingHumanApproval =>
-            "The proposal is gated because its trust level or blast radius requires human approval.",
-        HandoffGateDecision.AutoApproved
-            when proposal.ActionType == HandoffActionType.RequestRevision =>
-            "The revision request was accepted at the configured automatic trust level.",
-        HandoffGateDecision.AutoApproved =>
-            "The handoff contract passed at the configured automatic trust level.",
-        _ => throw new ArgumentOutOfRangeException(nameof(decision), decision, null)
-    };
+        {
+            HandoffGateDecision.BlockedKillSwitch =>
+                "The global harness kill switch is engaged.",
+            HandoffGateDecision.LoggedShadow =>
+                "This action is in shadow mode and was observed without execution.",
+            HandoffGateDecision.AwaitingHumanApproval
+                when proposal.ActionType == HandoffActionType.CustomerReview =>
+                "Customer review requires an explicit durable human decision.",
+            HandoffGateDecision.AwaitingHumanApproval
+                when proposal.ActionType == HandoffActionType.CustomerWaiver =>
+                "Waiver-required residual risks need explicit informed customer consent before review.",
+            HandoffGateDecision.AwaitingHumanApproval =>
+                "The proposal is gated because its trust level or blast radius requires human approval.",
+            HandoffGateDecision.AutoApproved
+                when proposal.ActionType == HandoffActionType.RequestRevision =>
+                "The revision request was accepted at the configured automatic trust level.",
+            HandoffGateDecision.AutoApproved =>
+                "The handoff contract passed at the configured automatic trust level.",
+            _ => throw new ArgumentOutOfRangeException(nameof(decision), decision, null)
+        };
 
     private HandoffGateRecord RequireRecord(Guid recordId) =>
         _history.FirstOrDefault(item => item.Id == recordId)

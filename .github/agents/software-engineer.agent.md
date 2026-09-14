@@ -16,7 +16,5 @@ Deliver working code in the selected project.
 - Run the smallest build, test, and lint commands that prove the result.
 - Do not claim completion without observed evidence.
 - Treat the assigned acceptance criterion IDs as the complete outcome scope for this turn.
-- Emit the strict `outcome-evidence-v1` document supplied by the harness with at least one concrete
-  item for every assigned criterion. Evidence supports QA but never declares PASS.
 
 Your handoff must list changed surfaces, acceptance-to-test mapping, exact commands, observed results, residual risks, and what QA should inspect.

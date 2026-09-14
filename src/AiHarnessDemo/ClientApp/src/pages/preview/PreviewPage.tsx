@@ -1,8 +1,6 @@
 import { type MouseEvent, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { useNavigate, useParams } from "react-router-dom";
-import { useDecideFlowMutation, usePreviewQuery } from "../../api/queries";
+import { useParams } from "react-router-dom";
+import { usePreviewQuery } from "../../api/queries";
 import { api } from "../../api/endpoints";
 import type { DemoRuntimeStatus } from "../../api/types";
 import { FatalScreen } from "../../components/FatalScreen";
@@ -10,9 +8,6 @@ import { BootScreen } from "../../components/BootScreen";
 import { BackIcon, CheckIcon, ExternalIcon, RefreshIcon } from "../../lib/icons";
 import { formatDuration } from "../../lib/format";
 import { useToast } from "../../lib/toast";
-import { ApiError } from "../../api/client";
-import { AbandonFlowButton } from "../flow/AbandonFlowButton";
-import { OutcomeVerificationPanel } from "../flow/OutcomeVerificationPanel";
 
 function openPreviewInNewTab(event: MouseEvent<HTMLAnchorElement>, url: string) {
   if (
@@ -35,12 +30,9 @@ function openPreviewInNewTab(event: MouseEvent<HTMLAnchorElement>, url: string) 
 
 export function PreviewPage() {
   const { id } = useParams<{ id: string }>();
-  const navigate = useNavigate();
   const toast = useToast();
   const previewQuery = usePreviewQuery(id);
-  const decideFlow = useDecideFlowMutation();
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
-  const [feedback, setFeedback] = useState("");
   const [demoPending, setDemoPending] = useState<string | null>(null);
   const [demoError, setDemoError] = useState<string | null>(null);
   const [demoOverrides, setDemoOverrides] = useState<Record<string, DemoRuntimeStatus>>({});
@@ -61,8 +53,6 @@ export function PreviewPage() {
 
   const preview = previewQuery.data;
   if (!preview) return null;
-  const reviewedOutcome = preview.outcomeVerification;
-  const legacyPreview = preview.contractVersion === "legacy-v1";
   const advisory = preview.kind === "Advisory";
 
   const contributors = preview.deliveredBy.filter(step => step.status === "Completed");
@@ -92,8 +82,6 @@ export function PreviewPage() {
         demoManifestHash: selectedDemo!.manifestHash
       }
     : undefined;
-  const deciding = decideFlow.isPending;
-
   async function mutateDemo(action: "start" | "restart" | "stop") {
     if (
       !id ||
@@ -136,48 +124,6 @@ export function PreviewPage() {
     }
   }
 
-  async function decide(approve: boolean) {
-    if (!id) return;
-    const customerFeedback = feedback.trim();
-    if (!approve && !customerFeedback) {
-      toast("Describe what should change before requesting another iteration.", "error");
-      return;
-    }
-
-    try {
-      const decisionBody = {
-        approve,
-        gateId: reviewedOutcome.releaseGateId ?? "",
-        candidateFingerprint: reviewedOutcome.candidateFingerprint,
-        feedback: approve ? "" : customerFeedback
-      };
-      const result = await decideFlow.mutateAsync({
-        flowId: id,
-        body: decisionBody
-      });
-      if (result.outcome === "RefreshQueued") {
-        toast(
-          "The candidate changed during approval. Refresh and re-verification were queued; approval was not recorded.",
-          "error"
-        );
-        navigate(`/factory/${id}`);
-        return;
-      }
-      toast(result.message, "success");
-      navigate(`/factory/${id}`);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 409) {
-        await previewQuery.refetch();
-        toast(
-          "This reviewed gate or candidate is stale. The preview was refreshed; review the current candidate before deciding.",
-          "error"
-        );
-        return;
-      }
-      toast(error instanceof Error ? error.message : String(error), "error");
-    }
-  }
-
   return (
     <div className="preview-shell">
       <header className="preview-topbar">
@@ -195,9 +141,7 @@ export function PreviewPage() {
       </header>
       <main className="preview-main">
         <section className="preview-hero">
-          {(legacyPreview
-            ? preview.outcomeVerification.releaseReady
-            : preview.review.resolved && preview.review.approved === true) && (
+          {preview.review.resolved && preview.review.approved === true && (
             <div className="preview-check">
               <CheckIcon />
             </div>
@@ -210,44 +154,18 @@ export function PreviewPage() {
               : `The AI factory prepared this customer-checkable Delivery outcome for ${preview.repositoryName}.`}
           </p>
           <div className="preview-meta">
-            {legacyPreview ? (
-              <span
-                className={`status-pill ${
-                  preview.outcomeVerification.releaseReady
-                    ? "approved"
-                    : preview.outcomeVerification.legacyUnverified
-                      ? "pending"
-                      : "failed"
-                }`}
-              >
-                {preview.outcomeVerification.releaseReady
-                  ? "Outcome verified"
-                  : preview.outcomeVerification.legacyUnverified
-                    ? "Legacy unverified"
-                    : preview.outcomeVerification.status}
-              </span>
-            ) : (
-              <span className={`status-pill ${preview.review.resolved ? "approved" : "waitingforfeedback"}`}>
-                {preview.review.resolved
-                  ? preview.review.decision ?? "Reviewed"
-                  : "Customer review pending"}
-              </span>
-            )}
+            <span className={`status-pill ${preview.review.resolved ? "approved" : "waitingforfeedback"}`}>
+              {preview.review.resolved
+                ? preview.review.decision ?? "Reviewed"
+                : "Customer review pending"}
+            </span>
             <span className="model-chip">
               {advisory ? "Read-only recommendation" : preview.outcomeLabel || "Delivery result"}
             </span>
             <span className="model-chip">{contributors.length} completed handoffs</span>
           </div>
         </section>
-        {legacyPreview && <OutcomeVerificationPanel outcome={preview.outcomeVerification} />}
-        {legacyPreview && (
-          <section className="callout preview-responsibilities" aria-label="Decision responsibilities">
-            <strong>Independent QA verification</strong> proves the candidate against the criterion matrix.{" "}
-            <strong>Product Manager feedback</strong> interprets customer comments.{" "}
-            <strong>Customer release approval</strong> is a separate final decision and never overrides failed QA.
-          </section>
-        )}
-        {!legacyPreview && preview.outcomeResult && (
+        {preview.outcomeResult && (
           <section className="preview-outcome-summary" aria-labelledby="normalized-outcome-heading">
             <div className="eyebrow">Normalized result</div>
             <h2 id="normalized-outcome-heading">{preview.outcomeResult.goal}</h2>
@@ -260,7 +178,7 @@ export function PreviewPage() {
             </ul>
           </section>
         )}
-        {!legacyPreview && preview.deliveryReadiness && (
+        {preview.deliveryReadiness && (
           <section className="preview-outcome-summary" aria-labelledby="preview-readiness-heading">
             <div className="eyebrow">Delivery readiness</div>
             <h2 id="preview-readiness-heading">{preview.deliveryReadiness.label}</h2>
@@ -292,24 +210,6 @@ export function PreviewPage() {
                 </ul>
               </>
             )}
-          </section>
-        )}
-        {legacyPreview && preview.historicalDeliveryEvidence && (
-          <section className="preview-outcome-summary" aria-labelledby="historical-evidence-heading">
-            <div className="eyebrow">Non-authoritative</div>
-            <h2 id="historical-evidence-heading">Historical delivery evidence</h2>
-            <p>
-              This bounded projection preserves completed historical handoffs for customer context.
-              It does not prove readiness or authorize publication.
-            </p>
-            {preview.historicalDeliveryEvidence.items.map(item => (
-              <article key={`${item.kind}:${item.agentName}`} className="detail-markdown">
-                <h3>{item.kind} · {item.agentName}</h3>
-                <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>
-                  {item.markdown}
-                </ReactMarkdown>
-              </article>
-            ))}
           </section>
         )}
         <section className="delivery-strip">
@@ -400,11 +300,7 @@ export function PreviewPage() {
             <div className="pushback-callout">
               {advisory
                 ? "This Advisory result contains no downloadable artifacts."
-                : !legacyPreview
-                  ? "This Delivery result contains no browser artifact. Review the normalized result above."
-                  : preview.outcomeVerification.previewRequired
-                    ? "The verified outcome requires a browser artifact, but none is available. Release approval is disabled."
-                    : "This outcome does not require a browser artifact; review the verified criterion matrix above."}
+                : "This Delivery result contains no browser artifact. Review the normalized result above."}
             </div>
           )}
           {!advisory && selectedArtifact && (
@@ -419,10 +315,9 @@ export function PreviewPage() {
                 <div className="pushback-callout">
                   <strong>Offline preview only</strong>
                   <p>
-                    No valid sealed customer-demo-v1 manifest is available for this reviewed candidate.
+                    No valid sealed customer demo manifest is available for this reviewed candidate.
                   </p>
-                  {((legacyPreview && reviewedOutcome.releaseGateId) ||
-                    (!legacyPreview && preview.review.available && !preview.review.resolved)) ? (
+                  {preview.review.available && !preview.review.resolved ? (
                     <a className="button" href={`#/factory/${preview.flowId}`}>
                       <RefreshIcon /> Rebuild and verify preview
                     </a>
@@ -483,7 +378,7 @@ export function PreviewPage() {
             </section>
           )}
         </section>
-        {!legacyPreview && preview.status === "WaitingForFeedback" && (
+        {preview.status === "WaitingForFeedback" && (
           <section className="preview-decision" aria-labelledby="studio-review-heading">
             <div>
               <div className="eyebrow">Customer decision</div>
@@ -496,99 +391,6 @@ export function PreviewPage() {
             </div>
             <a className="button primary" href={`#/factory/${preview.flowId}`}>
               <BackIcon /> Review result
-            </a>
-          </section>
-        )}
-        {legacyPreview && preview.status === "WaitingForFeedback" &&
-          !preview.outcomeVerification.legacyUnverified &&
-          (preview.outcomeVerification.releaseReady &&
-              (!preview.outcomeVerification.previewRequired ||
-                preview.artifacts.length > 0)) &&
-          preview.outcomeVerification.releaseGateId && (
-          <section className="preview-decision" aria-labelledby="customer-decision-heading">
-            <div>
-              <div className="eyebrow">Final customer gate</div>
-              <h2 id="customer-decision-heading">Approve this result or request changes</h2>
-              <p className="muted">
-                Approval publishes the prepared pull request and closes the flow after publication succeeds. A change
-                request keeps this result and starts a new iteration with your feedback.
-              </p>
-            </div>
-            <label className="field" htmlFor="preview-feedback">
-              <span>What should change?</span>
-              <textarea
-                id="preview-feedback"
-                rows={3}
-                value={feedback}
-                placeholder="Required only when requesting changes."
-                onChange={event => setFeedback(event.target.value)}
-              />
-            </label>
-            <div className="feedback-actions">
-              <AbandonFlowButton flowId={preview.flowId} />
-              <button
-                className="button danger"
-                disabled={deciding}
-                onClick={() => void decide(false)}
-              >
-                <RefreshIcon /> {deciding ? "Working..." : "Request changes"}
-              </button>
-              <button
-                className="button success"
-                disabled={deciding}
-                onClick={() => void decide(true)}
-              >
-                <CheckIcon /> {deciding ? "Working..." : "Approve and publish"}
-              </button>
-            </div>
-          </section>
-        )}
-        {legacyPreview &&
-          preview.status === "WaitingForFeedback" &&
-          preview.outcomeVerification.legacyUnverified &&
-          preview.outcomeVerification.releaseGateId && (
-            <section className="preview-decision" aria-labelledby="legacy-refinement-heading">
-              <div>
-                <div className="eyebrow">Historical result</div>
-                <h2 id="legacy-refinement-heading">Approval is unavailable</h2>
-                <p className="muted">
-                  This legacy result has no authoritative QA PASS. Request a rebuild and verification;
-                  historical prose cannot authorize publication.
-                </p>
-              </div>
-              <label className="field" htmlFor="preview-feedback">
-                <span>What should change?</span>
-                <textarea
-                  id="preview-feedback"
-                  rows={3}
-                  value={feedback}
-                  placeholder="Describe the rebuild or correction required."
-                  onChange={event => setFeedback(event.target.value)}
-                />
-              </label>
-              <div className="feedback-actions">
-                <AbandonFlowButton flowId={preview.flowId} />
-                <button
-                  className="button danger"
-                  disabled={deciding}
-                  onClick={() => void decide(false)}
-                >
-                  <RefreshIcon /> {deciding ? "Working..." : "Request changes"}
-                </button>
-              </div>
-            </section>
-          )}
-        {legacyPreview && preview.outcomeVerification.status === "AwaitingHumanResolution" && (
-          <section className="preview-decision" aria-labelledby="verification-resolution-heading">
-            <div>
-              <h2 id="verification-resolution-heading">Release approval is unavailable</h2>
-              <p className="muted">
-                QA did not produce a current all-criteria PASS. Return to execution details to continue one round,
-                replan the requirements, or abandon the flow.
-              </p>
-            </div>
-            <a className="button" href={`#/factory/${preview.flowId}`}>
-              <BackIcon /> Resolve verification
             </a>
           </section>
         )}

@@ -257,11 +257,7 @@ public sealed class QualificationResolutionCoordinator(
 
     private static void EnsureResolvableParent(FlowRun parent)
     {
-        if (!string.Equals(
-                parent.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) ||
-            parent.Status != FlowStatus.Blocked ||
+        if (parent.Status != FlowStatus.Blocked ||
             !string.Equals(
                 parent.CurrentBlockerCode,
                 MissingQualificationCoordinator.BlockerCode,
@@ -269,7 +265,7 @@ public sealed class QualificationResolutionCoordinator(
             string.IsNullOrWhiteSpace(parent.CurrentBlockerDataJson))
         {
             throw new InvalidOperationException(
-                "Qualification resolution requires a blocked studio-v2 missing-qualification flow.");
+                "Qualification resolution requires a blocked missing-qualification flow.");
         }
     }
 
@@ -279,13 +275,9 @@ public sealed class QualificationResolutionCoordinator(
         FlowLinkKind linkKind,
         string? expectedRequestHash)
     {
-        if (        successor.ParentFlowRunId != parent.Id ||
-        successor.ParentIteration != parent.Iteration ||
-        successor.LinkKind != linkKind ||
-        !string.Equals(
-                successor.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) ||
+        if (successor.ParentFlowRunId != parent.Id ||
+            successor.ParentIteration != parent.Iteration ||
+            successor.LinkKind != linkKind ||
             !string.Equals(
                 successor.RepositoryPath,
                 parent.RepositoryPath,
@@ -348,7 +340,6 @@ public sealed class QualificationResolutionCoordinator(
         NormalizedBrief brief) =>
         JsonSerializer.Serialize(new
         {
-            Version = "qualification-resolution-seed-v1",
             Action = action.ToString(),
             brief.Goal,
             brief.Details,
@@ -362,7 +353,6 @@ public sealed class QualificationResolutionCoordinator(
         string requestHash) =>
         JsonSerializer.Serialize(new
         {
-            Version = "qualification-resolution-seed-v2",
             Action = QualificationResolutionAction.ScopeRevision.ToString(),
             RequestHash = requestHash,
             Goal = revision.Goal,
@@ -377,7 +367,6 @@ public sealed class QualificationResolutionCoordinator(
         string requestHash) =>
         JsonSerializer.Serialize(new
         {
-            Version = "qualification-scope-request-v1",
             RequestHash = requestHash,
             Goal = revision.Goal,
             Scope = revision.Scope
@@ -388,7 +377,6 @@ public sealed class QualificationResolutionCoordinator(
         OutcomeVerificationRules.ComputeSha256(
             JsonSerializer.Serialize(new
             {
-                Version = "qualification-scope-request-v1",
                 Goal = revision.Goal,
                 Scope = revision.Scope
             }));
@@ -400,11 +388,6 @@ public sealed class QualificationResolutionCoordinator(
             using var document = JsonDocument.Parse(seed);
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object ||
-                !root.TryGetProperty("Version", out var version) ||
-                !string.Equals(
-                    version.GetString(),
-                    "qualification-resolution-seed-v2",
-                    StringComparison.Ordinal) ||
                 !root.TryGetProperty("Action", out var action) ||
                 !string.Equals(
                     action.GetString(),

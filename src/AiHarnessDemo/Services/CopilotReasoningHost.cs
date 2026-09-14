@@ -41,26 +41,19 @@ public sealed partial class CopilotReasoningHost(
     internal const int MaximumPlanningRosterCharacters =
         TeamPlanParser.MaximumDocumentCharacters;
     internal const int MaximumPlanningBriefCharacters =
-        IntakeV2Parser.MaximumJsonCharacters >
+        IntakeParser.MaximumJsonCharacters >
         AdvisoryPromotionSeedParser.MaximumDocumentCharacters
-            ? IntakeV2Parser.MaximumJsonCharacters
+            ? IntakeParser.MaximumJsonCharacters
             : AdvisoryPromotionSeedParser.MaximumDocumentCharacters;
     internal const int MaximumPlanningTaskCharacters =
         MaximumPlanningBriefCharacters +
         MaximumPlanningRosterCharacters +
         32_768;
-    internal const int MaximumReviewClassificationTaskCharacters =
-        FlowOutcomeParser.MaximumDocumentCharacters +
-        ReviewFeedbackParser.MaximumRequestedChangeCharacters +
-        8_192;
     internal const int MaximumDeliveryVerificationTaskCharacters =
         MaximumPlanningBriefCharacters + 8_192;
     private const int MaximumPlanningPromptCharacters =
         MaximumPlanningTaskCharacters +
         TeamPlanParser.MaximumDocumentCharacters;
-    private const int MaximumReviewClassificationPromptCharacters =
-        MaximumReviewClassificationTaskCharacters +
-        ReviewFeedbackParser.MaximumDocumentCharacters;
     private const int MaximumDeliveryVerificationPromptCharacters =
         MaximumDeliveryVerificationTaskCharacters +
         DeliveryReadinessPolicy.MaximumSnapshotBytes +
@@ -68,13 +61,13 @@ public sealed partial class CopilotReasoningHost(
     private const int ProductManagerLedgerCharacters = 6_000;
     internal const int MaximumStudioDependencyContextCharacters = 3_200;
     internal const string RepositoryKnowledgeBegin =
-        "REPOSITORY_KNOWLEDGE_V1_BEGIN";
+        "REPOSITORY_KNOWLEDGE_BEGIN";
     internal const string RepositoryKnowledgeEnd =
-        "REPOSITORY_KNOWLEDGE_V1_END";
+        "REPOSITORY_KNOWLEDGE_END";
     internal const string StudioPlanContextBegin =
-        "STUDIO_PLAN_CONTEXT_V1_BEGIN";
+        "STUDIO_PLAN_CONTEXT_BEGIN";
     internal const string StudioPlanContextEnd =
-        "STUDIO_PLAN_CONTEXT_V1_END";
+        "STUDIO_PLAN_CONTEXT_END";
     private const string PromptCompactionMarker =
         "\n...[prompt context compacted]...\n";
     private const int MinimumDirectDependencyOutputCharacters = 64;
@@ -239,7 +232,6 @@ public sealed partial class CopilotReasoningHost(
                     : null;
             copilotSessionHome = ResolveCopilotSessionHome();
             runWorkspaceHooks = ShouldRunWorkspaceHooks(
-                context.ContractVersion,
                 context.InvocationKind);
             hookPolicy = await ResolveWorkspaceHookPolicyAsync(
                 databaseFactory,
@@ -474,11 +466,17 @@ public sealed partial class CopilotReasoningHost(
             }
 
             governedGitIsolation?.RestoreAndValidate();
-            if (governedGitIsolation?.UnauthorizedMetadataMutationDetected == true)
+            if (governedGitIsolation?.GitBoundaryViolationDetected == true)
             {
+                var details = string.Join(
+                    "; ",
+                    governedGitIsolation.UnauthorizedMetadataMutationDetails);
                 return Failure(
                     "Governed execution modified disposable Git metadata.",
-                    "The host rejected and cleaned a .git mutation; authoritative Git metadata was restored unchanged.",
+                    "The host rejected and cleaned a .git mutation; authoritative Git metadata was restored unchanged." +
+                    (string.IsNullOrWhiteSpace(details)
+                        ? string.Empty
+                        : $" Changed metadata: {details}"),
                     AgentRunFailureKind.InvalidOutput);
             }
 
@@ -496,10 +494,31 @@ public sealed partial class CopilotReasoningHost(
                         : null);
             }
 
-            return CopilotJsonlParser.Parse(
+            var parsed = CopilotJsonlParser.Parse(
                 result.StandardOutput,
                 result.StandardError,
                 request.WorkingDirectory);
+            if (governedGitIsolation?.UnauthorizedMetadataMutationDetected == true)
+            {
+                var details = string.Join(
+                    "; ",
+                    governedGitIsolation.UnauthorizedMetadataMutationDetails);
+                logger.LogWarning(
+                    "Governed execution changed only disposable shadow Git metadata; " +
+                    "the host restored the authoritative metadata. Details: {Details}",
+                    details);
+                parsed.ToolCalls.Add(new ToolCallRecord(
+                    "host.git-shadow-restored",
+                    "Disposable shadow Git metadata changed during governed inspection.",
+                    Succeeded: true,
+                    ToolType: "HostGuard",
+                    ResultSummary:
+                        "The host discarded the shadow-only change and restored authoritative Git metadata." +
+                        (string.IsNullOrWhiteSpace(details)
+                            ? string.Empty
+                            : $" {details}")));
+            }
+            return parsed;
         }
         finally
         {
@@ -555,7 +574,7 @@ public sealed partial class CopilotReasoningHost(
     /// complete. If both the initial lookup and this cleanup re-resolution fail,
     /// the flow's kind is genuinely unknown and the hook must never run -- an
     /// unrecognized flow could be Advisory, or the invocation could be a
-    /// sensitive ReviewClassification/Publication step, either of which must
+    /// sensitive Publication step, which must
     /// never execute the after_run script. The lookup failure is logged, not
     /// thrown, so the remaining cleanup (Git isolation restore, publication
     /// guard disposal, staged-context cleanup) always still runs.
@@ -618,17 +637,12 @@ public sealed partial class CopilotReasoningHost(
             .Select(item => new
             {
                 item.Kind,
-                item.Status,
-                item.ContractVersion
+                item.Status
             })
             .SingleAsync(cancellationToken);
-        var studioV2 = string.Equals(
-            flow.ContractVersion,
-            "studio-v2",
-            StringComparison.Ordinal);
         return new WorkspaceHookPolicy(
-            studioV2 ? flow.Kind : FlowKind.Delivery,
-            studioV2 && flow.Status == FlowStatus.Intake);
+            flow.Kind,
+            flow.Status == FlowStatus.Intake);
     }
 
     internal sealed record WorkspaceHookPolicy(
@@ -636,15 +650,8 @@ public sealed partial class CopilotReasoningHost(
         bool Provisional);
 
     internal static bool ShouldRunWorkspaceHooks(
-        string contractVersion,
         ExecutionInvocationKind invocationKind) =>
-        !string.Equals(
-            contractVersion,
-            "studio-v2",
-            StringComparison.Ordinal) ||
-        invocationKind is not (
-            ExecutionInvocationKind.ReviewClassification or
-            ExecutionInvocationKind.Publication);
+        invocationKind != ExecutionInvocationKind.Publication;
 
     internal static IReadOnlyList<string> BuildCliArguments(
         string workingDirectory,
@@ -763,12 +770,6 @@ public sealed partial class CopilotReasoningHost(
             ApplyToolPolicyRange(
                 arguments,
                 GovernedGitMarkerWriteDenials(workingDirectory));
-            ApplyToolPolicy(
-                arguments,
-                $"--deny-tool=write({Path.GetFullPath(Path.Combine(
-                    workingDirectory,
-                    ".ai-harness",
-                    "outcome-verification")).Replace('\\', '/')})");
         }
 
         ApplyToolPolicy(
@@ -789,7 +790,6 @@ public sealed partial class CopilotReasoningHost(
         string prompt,
         bool resumeSession = false,
         bool isHostControlledPublication = false,
-        bool isGovernedOutcomeVerification = false,
         bool blockRemotePublication = false)
     {
         if (!Enum.IsDefined(invocationKind))
@@ -828,10 +828,10 @@ public sealed partial class CopilotReasoningHost(
                 : [],
             true,
             true,
-            readOnly || isGovernedOutcomeVerification,
-            blockRemotePublication || isGovernedOutcomeVerification,
+            readOnly,
+            blockRemotePublication,
             false,
-            isGovernedOutcomeVerification);
+            false);
         return BuildCliArguments(
             workingDirectory,
             harnessRoot,
@@ -1034,41 +1034,23 @@ public sealed partial class CopilotReasoningHost(
                 exception);
         }
 
-        ReviewDecision? reviewDecision;
-        bool accepted;
-        if (flow.ContractVersion == "studio-v2")
-        {
-            reviewDecision = await (
-                    from gate in database.GateRecords.AsNoTracking()
-                    join reviewedStep in database.FlowSteps.AsNoTracking()
-                        on gate.FlowStepId equals reviewedStep.Id
-                    where gate.FlowRunId == flow.Id &&
-                          gate.ActionType == HandoffActionType.CustomerReview &&
-                          gate.Resolved &&
-                          gate.Approved == true &&
-                          gate.ReviewDecision == ReviewDecision.Accepted &&
-                          reviewedStep.FlowRunId == flow.Id &&
-                          reviewedStep.Iteration == step.Iteration &&
-                          reviewedStep.IsOutcomeOwner &&
-                          reviewedStep.PlanStepKey == flow.OutcomeOwnerPlanStepKey
-                    orderby gate.ResolvedAt descending
-                    select gate.ReviewDecision)
-                .FirstOrDefaultAsync(cancellationToken);
-            accepted = reviewDecision == ReviewDecision.Accepted;
-        }
-        else
-        {
-            accepted = await database.GateRecords
-                .AsNoTracking()
-                .AnyAsync(
-                    gate =>
-                        gate.FlowRunId == flow.Id &&
-                        gate.Resolved &&
-                        gate.Approved == true &&
-                        gate.ActionType == HandoffActionType.Release,
-                    cancellationToken);
-            reviewDecision = null;
-        }
+        var reviewDecision = await (
+                from gate in database.GateRecords.AsNoTracking()
+                join reviewedStep in database.FlowSteps.AsNoTracking()
+                    on gate.FlowStepId equals reviewedStep.Id
+                where gate.FlowRunId == flow.Id &&
+                      gate.ActionType == HandoffActionType.CustomerReview &&
+                      gate.Resolved &&
+                      gate.Approved == true &&
+                      gate.ReviewDecision == ReviewDecision.Accepted &&
+                      reviewedStep.FlowRunId == flow.Id &&
+                      reviewedStep.Iteration == step.Iteration &&
+                      reviewedStep.IsOutcomeOwner &&
+                      reviewedStep.PlanStepKey == flow.OutcomeOwnerPlanStepKey
+                orderby gate.ResolvedAt descending
+                select gate.ReviewDecision)
+            .FirstOrDefaultAsync(cancellationToken);
+        var accepted = reviewDecision == ReviewDecision.Accepted;
         var request = new PermissionResolutionRequest(
             flow.Kind,
             step.InvocationKind,
@@ -1080,15 +1062,9 @@ public sealed partial class CopilotReasoningHost(
             string.Equals(
                 flow.PublicationPlanStepKey,
                 step.PlanStepKey,
-                StringComparison.Ordinal),
-            flow.ContractVersion,
-            flow.ContractVersion == "legacy-v1" &&
-            step.RemotePublicationAllowed &&
-            accepted,
-            context.IsGovernedOutcomeVerification);
+                StringComparison.Ordinal));
 
-        if (flow.ContractVersion == "studio-v2" &&
-            !string.IsNullOrWhiteSpace(step.EffectivePermissionJson))
+        if (!string.IsNullOrWhiteSpace(step.EffectivePermissionJson))
         {
             EffectiveExecutionPermission persisted;
             try
@@ -1111,7 +1087,7 @@ public sealed partial class CopilotReasoningHost(
             if (string.IsNullOrWhiteSpace(step.WorkflowRevision))
             {
                 throw new InvalidOperationException(
-                    "The persisted studio-v2 permission has no workflow revision.");
+                    "The persisted permission has no workflow revision.");
             }
             if (context.RecoverInterruptedSession)
             {
@@ -1161,12 +1137,10 @@ public sealed partial class CopilotReasoningHost(
             request,
             PermissionProfileResolver.FromWorkflow(workflow));
         var unboundPendingAttempt =
-            flow.ContractVersion == "studio-v2" &&
             step.Status == StepStatus.Pending &&
             step.StartedAt is null &&
             string.IsNullOrWhiteSpace(step.EffectivePermissionJson);
-        if (flow.ContractVersion == "studio-v2" &&
-            !string.IsNullOrWhiteSpace(step.WorkflowRevision) &&
+        if (!string.IsNullOrWhiteSpace(step.WorkflowRevision) &&
             !string.Equals(
                 step.WorkflowRevision,
                 workflow.Revision,
@@ -1174,22 +1148,18 @@ public sealed partial class CopilotReasoningHost(
             !unboundPendingAttempt)
         {
             throw new InvalidOperationException(
-                "A started studio-v2 attempt cannot be rebound to a different workflow revision; execution failed closed.");
+                "A started attempt cannot be rebound to a different workflow revision; execution failed closed.");
         }
 
         step.PermissionProfile = resolvedPermission.Profile;
         step.EffectivePermissionJson =
             JsonSerializer.Serialize(resolvedPermission);
-        if (flow.ContractVersion == "studio-v2")
-        {
-            step.RemotePublicationAllowed =
-                step.RemotePublicationAllowed &&
-                PermissionProfileResolver.GrantsRemotePublication(
-                    resolvedPermission);
-        }
+        step.RemotePublicationAllowed =
+            step.RemotePublicationAllowed &&
+            PermissionProfileResolver.GrantsRemotePublication(
+                resolvedPermission);
         if (unboundPendingAttempt ||
-            string.IsNullOrWhiteSpace(step.WorkflowRevision) ||
-            flow.ContractVersion == "legacy-v1")
+            string.IsNullOrWhiteSpace(step.WorkflowRevision))
         {
             step.WorkflowRevision = workflow.Revision;
         }
@@ -1418,21 +1388,14 @@ public sealed partial class CopilotReasoningHost(
     internal static int ResolveMaximumRenderedPromptCharacters(
         AgentExecutionContext context)
     {
-        var baseMaximum = context.ContractVersion == "studio-v2"
-            ? context.RequiresDeliveryReadinessQa
-                ? MaximumDeliveryVerificationPromptCharacters
-                : context.InvocationKind switch
-                {
-                    ExecutionInvocationKind.Planning =>
-                        MaximumPlanningPromptCharacters,
-                    ExecutionInvocationKind.ReviewClassification =>
-                        MaximumReviewClassificationPromptCharacters,
-                    _ => MaximumPromptCharacters
-                }
-            : context.InvocationKind ==
-              ExecutionInvocationKind.ReviewClassification
-                ? 131_072
-                : MaximumPromptCharacters;
+        var baseMaximum = context.RequiresDeliveryReadinessQa
+            ? MaximumDeliveryVerificationPromptCharacters
+            : context.InvocationKind switch
+            {
+                ExecutionInvocationKind.Planning =>
+                    MaximumPlanningPromptCharacters,
+                _ => MaximumPromptCharacters
+            };
         var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
             context.RepositoryKnowledge,
             context.SourceProjectPath);
@@ -1441,11 +1404,8 @@ public sealed partial class CopilotReasoningHost(
 
     private static bool IsStructuredLargePrompt(
         AgentExecutionContext context) =>
-        context.ContractVersion == "studio-v2" &&
-        (context.RequiresDeliveryReadinessQa ||
-         context.InvocationKind is
-             ExecutionInvocationKind.Planning or
-             ExecutionInvocationKind.ReviewClassification);
+        context.RequiresDeliveryReadinessQa ||
+        context.InvocationKind == ExecutionInvocationKind.Planning;
 
     internal static CopilotExecutionTimeouts ResolveExecutionTimeouts(
         CopilotConfig config,
@@ -1517,8 +1477,6 @@ public sealed partial class CopilotReasoningHost(
                 context.AgentRole,
                 recovered.OutputSummary,
                 context.IsPreMortemRevision,
-                context.IsOutcomeQa,
-                context.ContractVersion,
                 context.InvocationKind,
                 context.IsOutcomeOwner,
                 context.PlanStepKey,
@@ -1556,18 +1514,12 @@ public sealed partial class CopilotReasoningHost(
         string agentRole,
         string output,
         bool isPreMortemRevision = false,
-        bool isOutcomeQa = false,
-        string contractVersion = "legacy-v1",
         ExecutionInvocationKind invocationKind =
             ExecutionInvocationKind.Worker,
         bool isOutcomeOwner = false,
         string planStepKey = "",
         FlowKind? expectedFlowKind = null)
     {
-        if (isOutcomeQa)
-        {
-            return HasOutcomeQaMarkers(output);
-        }
         if (isPreMortemRevision)
         {
             try
@@ -1585,42 +1537,23 @@ public sealed partial class CopilotReasoningHost(
             }
         }
 
-        if (contractVersion == "studio-v2" &&
-            invocationKind ==
-            ExecutionInvocationKind.ReviewClassification)
-        {
-            try
-            {
-                _ = ReviewFeedbackParser.Parse(output);
-                return true;
-            }
-            catch (ReviewFeedbackContractException)
-            {
-                return false;
-            }
-        }
-        if (contractVersion == "studio-v2" &&
-            invocationKind == ExecutionInvocationKind.Intake)
+        if (invocationKind == ExecutionInvocationKind.Intake)
         {
             return HasValidIntakeContract(
                 output,
-                contractVersion,
                 planStepKey,
                 expectedFlowKind);
         }
-        if (contractVersion == "studio-v2" &&
-            invocationKind ==
+        if (invocationKind ==
             ExecutionInvocationKind.BlockerExplanation)
         {
             return HasValidBlockerExplanationContract(output);
         }
-        if (contractVersion == "studio-v2" &&
-            invocationKind == ExecutionInvocationKind.PreMortem)
+        if (invocationKind == ExecutionInvocationKind.PreMortem)
         {
             return HasValidPreMortemContract(output);
         }
-        if (contractVersion == "studio-v2" &&
-            invocationKind is
+        if (invocationKind is
                 ExecutionInvocationKind.Worker or
                 ExecutionInvocationKind.Publication or
                 ExecutionInvocationKind.Planning)
@@ -1656,23 +1589,17 @@ public sealed partial class CopilotReasoningHost(
             }
         }
 
-        return agentRole switch
-        {
-            "account-manager" => HasValidIntakeContract(output, contractVersion),
-            "product-manager" => FeedbackCoordinator.HasReworkTargetMarker(output),
-            "pre-mortem-sceptic" => HasValidPreMortemContract(output),
-            _ => AgentHandoffInspector.HasTerminalStatus(output)
-        };
+        return AgentHandoffInspector.HasTerminalStatus(output);
     }
 
     private static bool HasValidBlockerExplanationContract(string output)
     {
         try
         {
-            var parsed = IntakeV2Parser.Parse(output);
+            var parsed = IntakeParser.Parse(output);
             var brief = parsed.Document.Brief;
             return parsed.Document.Status ==
-                   IntakeV2Status.NeedsClarification &&
+                   IntakeStatus.NeedsClarification &&
                    parsed.Document.FlowKind is null &&
                    brief is not null &&
                    string.IsNullOrEmpty(brief.Goal) &&
@@ -1681,7 +1608,7 @@ public sealed partial class CopilotReasoningHost(
                    brief.Constraints is { Count: 0 } &&
                    brief.Assumptions is { Count: 0 };
         }
-        catch (IntakeV2ContractException)
+        catch (IntakeContractException)
         {
             return false;
         }
@@ -1696,16 +1623,13 @@ public sealed partial class CopilotReasoningHost(
 
     private static bool HasValidIntakeContract(
         string output,
-        string contractVersion,
         string planStepKey = "",
         FlowKind? expectedFlowKind = null)
     {
         try
         {
-            var response =
-                IntakeCoordinator.ParseResponse(output, contractVersion);
-            if (contractVersion == "studio-v2" &&
-                string.Equals(
+            var response = IntakeCoordinator.ParseResponse(output);
+            if (string.Equals(
                     planStepKey,
                     WorkflowEngine.RefinementIntakePlanStepKey,
                     StringComparison.Ordinal) &&
@@ -1736,22 +1660,6 @@ public sealed partial class CopilotReasoningHost(
         }
     }
 
-    private static bool HasOutcomeQaMarkers(string output)
-    {
-        var lines = output.ReplaceLineEndings("\n")
-            .Split('\n')
-            .Select(line => line.Trim())
-            .ToArray();
-        return lines.Count(line => string.Equals(
-                   line,
-                   OutcomeVerificationRules.QaBeginMarker,
-                   StringComparison.Ordinal)) == 1 &&
-               lines.Count(line => string.Equals(
-                   line,
-                   OutcomeVerificationRules.QaEndMarker,
-                   StringComparison.Ordinal)) == 1;
-    }
-
     internal static IReadOnlyDictionary<string, string> BuildPromptValues(
         AgentExecutionContext context,
         string agentInstructions,
@@ -1760,14 +1668,7 @@ public sealed partial class CopilotReasoningHost(
     {
         var isAccountManager = context.InvocationKind is
             ExecutionInvocationKind.Intake or
-            ExecutionInvocationKind.ReviewClassification or
             ExecutionInvocationKind.BlockerExplanation;
-        var isProductManager =
-            !string.Equals(
-                context.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
-            IsProductManager(context.AgentRole);
         var isPreMortem =
             context.InvocationKind == ExecutionInvocationKind.PreMortem;
         var usesCompactPreMortemContext =
@@ -1776,32 +1677,16 @@ public sealed partial class CopilotReasoningHost(
         var repositoryKnowledge = PrepareRepositoryKnowledgeContent(
             context.RepositoryKnowledge,
             context.SourceProjectPath);
-        var studioDependencyContext =
-            string.Equals(
-                context.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
+        var dependencyContext =
             context.InvocationKind == ExecutionInvocationKind.Worker &&
             context.StudioDependencyOutputs is { Count: > 0 }
                 ? FormatStudioDependencyContext(
                     context.StudioDependencyOutputs,
                     context.SourceProjectPath)
                 : string.Empty;
-        var handoffs = !string.IsNullOrWhiteSpace(studioDependencyContext)
-            ? studioDependencyContext
-            : isAccountManager || usesCompactPreMortemContext
-                ? string.Empty
-                : isProductManager
-                ? CompactExecutionLedger(
-                    context.PreviousOutputs,
-                    context.SourceProjectPath,
-                    ProductManagerLedgerCharacters)
-                : string.Join(
-                    $"{Environment.NewLine}{Environment.NewLine}",
-                    context.PreviousOutputs.TakeLast(2).Select(item =>
-                        Clip(
-                            RemoveSourceProjectPath(item, context.SourceProjectPath),
-                            1_600)));
+        var handoffs = isAccountManager || usesCompactPreMortemContext
+            ? string.Empty
+            : dependencyContext;
         var learnings = usesCompactPreMortemContext
             ? string.Empty
             : string.Join(
@@ -1820,18 +1705,11 @@ public sealed partial class CopilotReasoningHost(
         {
             roleContext.Add(repositoryKnowledgeBlock);
         }
-        if (!string.IsNullOrWhiteSpace(handoffs))
+        if (!string.IsNullOrWhiteSpace(dependencyContext))
         {
-            roleContext.Add(string.IsNullOrWhiteSpace(studioDependencyContext)
-                ? $"## {(isProductManager ? "Execution ledger" : "Relevant upstream handoffs")}" +
-                  $"{Environment.NewLine}{Environment.NewLine}{handoffs}"
-                : handoffs);
+            roleContext.Add(dependencyContext);
         }
-        if (string.Equals(
-                context.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
-            context.InvocationKind is
+        if (context.InvocationKind is
                 ExecutionInvocationKind.Worker or
                 ExecutionInvocationKind.Publication)
         {
@@ -1850,15 +1728,8 @@ public sealed partial class CopilotReasoningHost(
                       string.Join(", ", pushbackOwners) +
                       ". Never name a prior-iteration or inferred step."));
         }
-        if (string.Equals(
-                context.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
-            context.InvocationKind == ExecutionInvocationKind.Worker &&
-            string.Equals(
-                context.AgentRole,
-                "quality-engineer",
-                StringComparison.Ordinal))
+        if (context.InvocationKind == ExecutionInvocationKind.Worker &&
+            context.RequiresDeliveryReadinessQa)
         {
             roleContext.Add(
                 "## Quality verdict handoff" +
@@ -1896,13 +1767,8 @@ public sealed partial class CopilotReasoningHost(
             ? PreMortemRevisionResponseContract()
             : ResponseContract(
                 context.InvocationKind,
-                context.AgentRole,
-                context.ContractVersion);
-        if (string.Equals(
-                context.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
-            context.InvocationKind == ExecutionInvocationKind.Publication)
+                context.AgentRole);
+        if (context.InvocationKind == ExecutionInvocationKind.Publication)
         {
             responseContract +=
                 $"{Environment.NewLine}{Environment.NewLine}" +
@@ -1925,15 +1791,7 @@ public sealed partial class CopilotReasoningHost(
                 roleContext),
             ["response.contract"] = responseContract,
             ["outcome.context"] = context.OutcomeContext,
-            ["outcome.contract"] = context.OutcomeContract,
-            // Retain legacy variables so a hot-reloaded older WORKFLOW.md remains valid.
-            ["repository.knowledge"] = string.IsNullOrWhiteSpace(repositoryKnowledgeBlock)
-                ? workspace
-                : $"{workspace}{Environment.NewLine}{Environment.NewLine}{repositoryKnowledgeBlock}",
-            ["plan"] = Clip(context.PlanSummary, 1_000),
-            ["handoffs"] = handoffs,
-            ["learnings"] = learnings,
-            ["feedback"] = feedback
+            ["outcome.contract"] = context.OutcomeContract
         };
     }
 
@@ -1941,39 +1799,32 @@ public sealed partial class CopilotReasoningHost(
         AgentExecutionContext context,
         bool usesCompactPreMortemContext)
     {
-        if (context.ContractVersion == "studio-v2")
-        {
-            var maximum = context.RequiresDeliveryReadinessQa
-                ? MaximumDeliveryVerificationTaskCharacters
-                : context.InvocationKind switch
-                {
-                    ExecutionInvocationKind.Planning =>
-                        MaximumPlanningTaskCharacters,
-                    ExecutionInvocationKind.ReviewClassification =>
-                        MaximumReviewClassificationTaskCharacters,
-                    _ => 0
-                };
-            if (maximum > 0)
+        var maximum = context.RequiresDeliveryReadinessQa
+            ? MaximumDeliveryVerificationTaskCharacters
+            : context.InvocationKind switch
             {
-                if (context.Task.Length > maximum)
-                {
-                    var taskKind = context.RequiresDeliveryReadinessQa
-                        ? "Delivery verification"
-                        : context.InvocationKind.ToString();
-                    throw new InvalidOperationException(
-                        $"The {taskKind} task contains {context.Task.Length} characters, exceeding its contract-derived hard limit of {maximum}. The host will not truncate confirmed structured context.");
-                }
-                return context.Task;
+                ExecutionInvocationKind.Planning =>
+                    MaximumPlanningTaskCharacters,
+                _ => 0
+            };
+        if (maximum > 0)
+        {
+            if (context.Task.Length > maximum)
+            {
+                var taskKind = context.RequiresDeliveryReadinessQa
+                    ? "Delivery verification"
+                    : context.InvocationKind.ToString();
+                throw new InvalidOperationException(
+                    $"The {taskKind} task contains {context.Task.Length} characters, exceeding its contract-derived hard limit of {maximum}. The host will not truncate confirmed structured context.");
             }
+            return context.Task;
         }
 
         return Clip(
             context.Task,
             usesCompactPreMortemContext
                 ? 10_000
-                : context.InvocationKind is
-                    ExecutionInvocationKind.Planning or
-                    ExecutionInvocationKind.ReviewClassification
+                : context.InvocationKind == ExecutionInvocationKind.Planning
                     ? 131_072
                     : 6_000);
     }
@@ -2293,20 +2144,17 @@ public sealed partial class CopilotReasoningHost(
 
     internal static IReadOnlyDictionary<string, string?>? BuildProcessEnvironment(
         ExecutionInvocationKind invocationKind,
-        bool allowRemotePublication,
-        bool isGovernedOutcomeVerification = false)
+        bool allowRemotePublication)
     {
-        if (allowRemotePublication && !isGovernedOutcomeVerification)
+        if (allowRemotePublication)
         {
             return null;
         }
 
         return BuildGuardedEnvironment(
-            isGovernedOutcomeVerification
-                ? "governed-host-publication-only"
-                : invocationKind == ExecutionInvocationKind.PreMortem
-                    ? "pre-mortem-read-only"
-                    : "publication-not-authorized");
+            invocationKind == ExecutionInvocationKind.PreMortem
+                ? "pre-mortem-read-only"
+                : "publication-not-authorized");
     }
 
     private static IReadOnlyDictionary<string, string?> BuildGuardedEnvironment(
@@ -2448,57 +2296,49 @@ public sealed partial class CopilotReasoningHost(
         string AgentId);
 
     internal static string ResponseContract(
-        string agentRole,
-        string contractVersion = "legacy-v1") =>
+        string agentRole) =>
         ResponseContract(
-            contractVersion == "studio-v2" &&
             string.Equals(agentRole, "team-lead", StringComparison.Ordinal)
                 ? ExecutionInvocationKind.Planning
-                : contractVersion == "studio-v2" &&
-                  string.Equals(
+                : string.Equals(
                       agentRole,
                       "account-manager",
                       StringComparison.Ordinal)
                     ? ExecutionInvocationKind.Intake
-                    : contractVersion == "studio-v2" &&
-                      string.Equals(
+                    : string.Equals(
                           agentRole,
                           "pre-mortem-sceptic",
                           StringComparison.Ordinal)
                         ? ExecutionInvocationKind.PreMortem
                         : ExecutionInvocationKind.Worker,
-            agentRole,
-            contractVersion);
+            agentRole);
 
     internal static string ResponseContract(
         ExecutionInvocationKind invocationKind,
-        string agentRole,
-        string contractVersion = "legacy-v1")
+        string agentRole)
     {
-        if (contractVersion == "studio-v2" &&
-            invocationKind == ExecutionInvocationKind.Planning)
+        if (invocationKind == ExecutionInvocationKind.Planning)
         {
             return """
               Select the smallest suitable downstream team from the exact enabled snapshot roster in the assignment.
               Start with exactly: HANDOFF_STATUS: COMPLETE
-              Return exactly one strict team-plan-v1 JSON document between TEAM_PLAN_V1_BEGIN and TEAM_PLAN_V1_END.
+              Return exactly one strict team plan JSON document between TEAM_PLAN_BEGIN and TEAM_PLAN_END.
               Use only exact roster Id values. Account Manager, Team Lead, and Pre-mortem Sceptic are never workers.
               Return either Planned or MissingQualification and follow every supplied property, enum, bound, duty, stage, dependency, outcome-owner, publication, and checkpoint rule exactly.
-              Do not emit legacy TEAM_TASK_PROFILES or PRE_MORTEM_PLAN documents, Markdown fences, or duplicate sentinels.
+              Do not emit additional planning documents, Markdown fences, or duplicate sentinels.
               """;
         }
-        if (contractVersion == "studio-v2" &&
-            invocationKind is
+        if (invocationKind is
                 ExecutionInvocationKind.Intake or
                 ExecutionInvocationKind.BlockerExplanation)
         {
             return """
               Classify the repository-grounded request as Advisory (inspect, recommend, or explain without source changes/publication) or Delivery (implement or change the product).
               Discuss customer outcomes, never workspace, branch, hook, tooling, or publication mechanics.
-              Return exactly one strict JSON object between standalone INTAKE_V2_BEGIN and INTAKE_V2_END sentinels, with no Markdown fence and no duplicate sentinel:
-              INTAKE_V2_BEGIN
-              {"Version":"intake-v2","Status":"AwaitingConfirmation","FlowKind":"Advisory","TaskTitle":"Assess checkout resilience","CustomerReply":"Do I understand correctly that you want an assessment of checkout risks and a recommended approach?","Brief":{"Goal":"Identify the highest-impact checkout resilience gaps.","Details":["Inspect the configured source project."],"SuccessCriteria":["The customer receives an evidence-based recommendation."],"Constraints":["Do not change source files."],"Assumptions":[]}}
-              INTAKE_V2_END
+              Return exactly one strict JSON object between standalone INTAKE_BEGIN and INTAKE_END sentinels, with no Markdown fence and no duplicate sentinel:
+              INTAKE_BEGIN
+              {"Status":"AwaitingConfirmation","FlowKind":"Advisory","TaskTitle":"Assess checkout resilience","CustomerReply":"Do I understand correctly that you want an assessment of checkout risks and a recommended approach?","Brief":{"Goal":"Identify the highest-impact checkout resilience gaps.","Details":["Inspect the configured source project."],"SuccessCriteria":["The customer receives an evidence-based recommendation."],"Constraints":["Do not change source files."],"Assumptions":[]}}
+              INTAKE_END
               Property names and enum casing are exact. Status is NeedsClarification, AwaitingConfirmation, or Confirmed. FlowKind is Advisory, Delivery, or null, and is mandatory for AwaitingConfirmation and Confirmed. Every Brief list is required, even when empty.
               Default to AwaitingConfirmation once meaningful work can begin. NeedsClarification asks at most one material customer-outcome question.
               Confirmed is valid only when the latest customer turn explicitly approves the immediately preceding proposal without a correction, unless the host assignment contains DURABLE_ADVISORY_PROMOTION_AUTHORIZATION for a linked Delivery first turn.
@@ -2506,23 +2346,7 @@ public sealed partial class CopilotReasoningHost(
               On ordinary confirmation, reproduce the pending FlowKind, TaskTitle, and complete normalized Brief exactly. Never silently change the kind or brief.
               """;
         }
-        if (contractVersion == "studio-v2" &&
-            invocationKind == ExecutionInvocationKind.ReviewClassification)
-        {
-            return """
-              Classify only the customer's current free-text review message against the supplied normalized result.
-              Return exactly one strict JSON object between standalone REVIEW_FEEDBACK_V1_BEGIN and REVIEW_FEEDBACK_V1_END sentinels, with no Markdown fence and no duplicate sentinel:
-              REVIEW_FEEDBACK_V1_BEGIN
-              {"Version":"review-feedback-v1","Intent":"RequestRefinement","CustomerReply":"I’ll ask the team to narrow the result.","Refinement":{"Goal":"Limit the recommendation to checkout resilience.","RequestedChanges":["Exclude catalog and account services."]},"ExplicitImplementationAdoption":false}
-              REVIEW_FEEDBACK_V1_END
-              Property names and enum casing are exact. Intent is Accept, RequestRefinement, PromoteToDelivery, or Ambiguous.
-              Use Accept only for unambiguous approval of the current result. Use PromoteToDelivery only when an Advisory customer explicitly asks to implement, build, ship, or otherwise adopt the result; set ExplicitImplementationAdoption to true. Use RequestRefinement only for requested changes and include a complete non-empty Goal plus 1-24 concrete RequestedChanges. Use Ambiguous when intent is not safe to infer and return one short customer-safe clarification.
-              Refinement must be null unless Intent is RequestRefinement. ExplicitImplementationAdoption must be false unless Intent is PromoteToDelivery.
-              Never expose tool logs, internal prompts, agent IDs, or operator diagnostics in CustomerReply.
-              """;
-        }
-        if (contractVersion == "studio-v2" &&
-            invocationKind is
+        if (invocationKind is
                 ExecutionInvocationKind.Worker or
                 ExecutionInvocationKind.Publication)
         {
@@ -2530,73 +2354,30 @@ public sealed partial class CopilotReasoningHost(
               Complete only the assigned plan step in the isolated workspace.
               Start with exactly one standalone line: HANDOFF_STATUS: COMPLETE or HANDOFF_STATUS: PUSHBACK.
               For PUSHBACK, immediately include exactly one PUSHBACK_OWNER_STEP_ID naming an earlier dependency or ancestor plan-step ID and exactly one bounded PUSHBACK_REASON.
-              Do not use legacy role ownership markers. Return concise Decision, Deliverable, Evidence, and Next owner sections.
-              When the supplied outcome contract requires flow-outcome-v1, emit that complete strict document after the handoff. It is mandatory for the final outcome owner.
+              Use plan-step IDs rather than role names for pushback ownership. Return concise Decision, Deliverable, Evidence, and Next owner sections.
+              When the supplied outcome contract requires a flow outcome, emit that complete strict document after the handoff. It is mandatory for the final outcome owner.
               """;
         }
 
-        return agentRole switch
-        {
-            "account-manager" => """
-              Move a workable customer request toward delivery without treating clarity as customer approval.
-              Return exactly these plain-text markers with no text before INTAKE_STATUS:
-              INTAKE_STATUS: NEEDS_CLARIFICATION, AWAITING_CONFIRMATION, or CONFIRMED
-              TASK_TITLE: a 3-8 word action phrase naming the concrete product change, with no conversational framing or trailing punctuation; never copy or truncate the opening message
-              CUSTOMER_REPLY: one short plain-language line; ask one focused question when clarification is essential, ask the customer to validate your concise understanding when awaiting confirmation, or state that the confirmed brief is going to the team
-              TASK_BRIEF: the complete proposed brief when awaiting confirmation or confirmed, otherwise NONE; the brief may continue on following lines
-              Default to AWAITING_CONFIRMATION as soon as the delivery team can take a meaningful first action.
-              Use NEEDS_CLARIFICATION only when the target product or visible outcome cannot be identified and no safe reversible assumption lets work start.
-              Treat every earlier answer as settled and never ask for the same detail twice. The one allowed recap is the complete understanding presented for final confirmation.
-              Use AWAITING_CONFIRMATION to ask "Do I understand correctly that you want ...? If yes, I'll ask the team to implement it."
-              Return CONFIRMED only when the latest customer turn explicitly and unambiguously approves the most recent AWAITING_CONFIRMATION brief without changing it.
-              When CONFIRMED, copy the approved TASK_BRIEF exactly and tell the customer you are asking the team to implement it now.
-              If the customer rejects or corrects the proposed understanding, do not return CONFIRMED. Incorporate the correction, then clarify only a material gap or present a revised AWAITING_CONFIRMATION brief.
-              A request for something the customer can click is actionable and requires an interactive result; do not ask whether it means pictures, a prototype, implementation, or deployment.
-              Never ask about technologies, tools, file formats, implementation approaches, deployment, hosting, credentials, live release, pull requests, builds, or who deploys.
-              Put reversible assumptions and decisions owned by designers, engineers, or release staff in TASK_BRIEF instead of asking the customer.
-              """,
-            "team-lead" => """
-              Complete the assigned role in the isolated workspace; do not merely advise.
-              Start with exactly: HANDOFF_STATUS: COMPLETE
-              Return concise sections named Decision, Deliverable, Evidence, and Next owner.
-              After those sections, output exactly one strict JSON task-profile document between these standalone sentinels:
-              TEAM_TASK_PROFILES_V1_BEGIN
-              {"Version":"task-profile-v1","Profiles":[{"Role":"software-engineer","Complexity":1,"ReasoningDepth":1,"ContextDemand":1,"ToolIntensity":1,"TaskTypeTags":["Implementation"],"Risk":"Low","RiskReason":"nonempty bounded reason","Confidence":0.8,"Rationales":["nonempty bounded rationale"]}]}
-              TEAM_TASK_PROFILES_V1_END
-              Property names and enum casing are exact. Integers are 1-10, confidence is 0-1, risk is Low/Medium/High/Critical, reasons are nonempty, and rationales contain 1-5 bounded entries.
-              Allowed task tags are CustomerDialogue, Planning, Architecture, Design, Data, Implementation, Security, Quality, Documentation, Release, Feedback, and CrossCutting.
-              Include exactly one profile for every already-planned downstream role in the supplied plan, excluding team-lead. Do not add, remove, or select roles; FlowPlanner remains role-selection authority.
-              Then output exactly one strict pre-mortem plan between these standalone sentinels:
-              PRE_MORTEM_PLAN_V1_BEGIN
-              {"Version":"pre-mortem-plan-v1","AfterRoles":[]}
-              PRE_MORTEM_PLAN_V1_END
-              AfterRoles may contain only exact role IDs from the supplied downstream plan. Keep it empty when the assignment says the sceptic is unavailable. Do not emit any sentinel more than once.
-              """,
-            "pre-mortem-sceptic" => """
+        return agentRole == "pre-mortem-sceptic"
+            ? """
               Investigate the evaluated result independently. Do not modify product files.
               Start with exactly one marker: PRE_MORTEM_STATUS: CLEAR or PRE_MORTEM_STATUS: FINDINGS.
               Then output exactly one strict JSON document between these standalone sentinels:
-              PRE_MORTEM_FINDINGS_V1_BEGIN
-              {"Version":"pre-mortem-findings-v1","Findings":[{"FailureMode":"specific six-month failure chain","Evidence":"verifiable files, commands, observations, or authoritative URLs","MissedSignal":"current fact the evaluated result missed","Prevention":"precise change that breaks the failure chain"}]}
-              PRE_MORTEM_FINDINGS_V1_END
+              PRE_MORTEM_FINDINGS_BEGIN
+              {"Findings":[{"FailureMode":"specific six-month failure chain","Evidence":"verifiable files, commands, observations, or authoritative URLs","MissedSignal":"current fact the evaluated result missed","Prevention":"precise change that breaks the failure chain"}]}
+              PRE_MORTEM_FINDINGS_END
               CLEAR requires an empty Findings array. FINDINGS requires 1-5 entries. Every entry needs concrete evidence; omit speculative, generic, duplicate, stylistic, or already-covered concerns.
               Keep the entire response under 9,000 characters and every finding field under 800 characters.
               Do not emit HANDOFF_STATUS, PUSHBACK, or PRE_MORTEM_DISPOSITION markers.
-              """,
-            "product-manager" => """
-              Respond directly to the customer in concise plain language after reviewing the original brief and execution ledger.
-              End with exactly one standalone marker:
-              REWORK_TARGET_ROLES: NONE
-              Replace NONE with a comma-separated list of exact delivery role IDs from the ledger only when the customer's requested rework can be attributed to those roles. Do not guess or blame every role.
-              """,
-            _ => """
+              """
+            : """
               Complete the assigned role in the isolated workspace; do not merely advise.
               Start with exactly one marker: HANDOFF_STATUS: COMPLETE or HANDOFF_STATUS: PUSHBACK.
               When pushing back, follow it with PUSHBACK_REASON: the exact missing detail and responsible upstream owner.
               Return concise sections named Decision, Deliverable, Evidence, and Next owner.
               If an upstream handoff is insufficient, stop this turn and select the PUSHBACK status.
-              """
-        };
+              """;
     }
 
     internal static string PreMortemRevisionResponseContract() => """
@@ -3011,6 +2792,7 @@ public sealed partial class CopilotReasoningHost(
         private readonly string _stateRootPath;
         private readonly IReadOnlyList<GovernedGitMarkerState> _markerStates;
         private readonly IReadOnlySet<string> _initialForeignGitEntries;
+        private readonly List<string> _unauthorizedMetadataMutationDetails = [];
         private bool _restored;
 
         private GovernedGitIsolationScope(
@@ -3034,6 +2816,11 @@ public sealed partial class CopilotReasoningHost(
         public IReadOnlyDictionary<string, string?> EnvironmentVariables { get; }
 
         public bool UnauthorizedMetadataMutationDetected { get; private set; }
+
+        public bool GitBoundaryViolationDetected { get; private set; }
+
+        public IReadOnlyList<string> UnauthorizedMetadataMutationDetails =>
+            _unauthorizedMetadataMutationDetails;
 
         public static GovernedGitIsolationScope Create(
             string workingDirectory,
@@ -3188,17 +2975,33 @@ public sealed partial class CopilotReasoningHost(
                          !_initialForeignGitEntries.Contains(path)))
             {
                 UnauthorizedMetadataMutationDetected = true;
+                GitBoundaryViolationDetected = true;
+                _unauthorizedMetadataMutationDetails.Add(
+                    $"unexpected .git entry '{Path.GetRelativePath(_workspace, entry)}'");
                 DeleteGitEntry(entry);
             }
             foreach (var markerState in _markerStates)
             {
                 var markerPath = Path.Combine(markerState.Repository, ".git");
-                if (!Directory.Exists(markerPath) ||
-                    !MetadataManifestEquals(
-                        markerState.InitialShadowManifest,
-                        CaptureMetadataManifest(markerPath)))
+                if (!Directory.Exists(markerPath))
                 {
                     UnauthorizedMetadataMutationDetected = true;
+                    GitBoundaryViolationDetected = true;
+                    _unauthorizedMetadataMutationDetails.Add(
+                        $"missing shadow metadata for '{Path.GetRelativePath(_workspace, markerState.Repository)}'");
+                    continue;
+                }
+                var currentManifest = CaptureMetadataManifest(markerPath);
+                if (!MetadataManifestEquals(
+                        markerState.InitialShadowManifest,
+                        currentManifest))
+                {
+                    UnauthorizedMetadataMutationDetected = true;
+                    _unauthorizedMetadataMutationDetails.AddRange(
+                        DescribeMetadataManifestChanges(
+                            markerState.Repository,
+                            markerState.InitialShadowManifest,
+                            currentManifest));
                 }
             }
             RecoverFromStateRoot(
@@ -3446,6 +3249,40 @@ public sealed partial class CopilotReasoningHost(
             IReadOnlyList<string> expected,
             IReadOnlyList<string> actual) =>
             expected.SequenceEqual(actual, StringComparer.Ordinal);
+
+        private static IReadOnlyList<string> DescribeMetadataManifestChanges(
+            string repository,
+            IReadOnlyList<string> expected,
+            IReadOnlyList<string> actual)
+        {
+            var label = Path.GetFileName(repository);
+            var added = actual.Except(expected, StringComparer.Ordinal)
+                .Take(8)
+                .Select(entry => $"{label}: added/changed {ManifestPath(entry)}");
+            var removed = expected.Except(actual, StringComparer.Ordinal)
+                .Take(8)
+                .Select(entry => $"{label}: removed/changed {ManifestPath(entry)}");
+            return added.Concat(removed).Distinct(StringComparer.Ordinal).ToArray();
+        }
+
+        private static string ManifestPath(string entry)
+        {
+            var value = entry.Length > 2 ? entry[2..] : entry;
+            if (entry.StartsWith("F:", StringComparison.Ordinal))
+            {
+                var hashSeparator = value.LastIndexOf(':');
+                if (hashSeparator > 0)
+                {
+                    value = value[..hashSeparator];
+                    var lengthSeparator = value.LastIndexOf(':');
+                    if (lengthSeparator > 0)
+                    {
+                        value = value[..lengthSeparator];
+                    }
+                }
+            }
+            return value;
+        }
 
         private static void DeleteGitEntry(string markerPath)
         {

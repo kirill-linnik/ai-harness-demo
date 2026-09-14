@@ -9,7 +9,7 @@ namespace AiHarnessDemo.Tests;
 /// <summary>
 /// Shared deterministic fixtures for the host-derived Delivery readiness contracts.
 ///
-/// The scripted verification agents build their <c>outcome-qa-v2</c> document by reading the
+/// The scripted verification agents build their strict outcome-QA document by reading the
 /// acceptance plan hash, the criterion identifiers, and the host-issued evidence identifiers back
 /// out of the prompt the host actually rendered. Nothing is pre-shared with the runner, so a test
 /// only passes when the production prompt really carries those host-computed values.
@@ -26,7 +26,10 @@ internal static class DeliveryReadinessFixtures
         @"(?m)^- (AC-[0-9]{3}) \(",
         RegexOptions.CultureInvariant);
     private static readonly Regex EvidencePattern = new(
-        @"(?m)^- (EV-S[0-9]{3}-[0-9]{3}) \[",
+        @"(?m)^- (EV-S[0-9]{3}-[0-9]{3}) \[[^\]]*supportsVerification=true",
+        RegexOptions.CultureInvariant);
+    private static readonly Regex CurrentEvidencePrefixPattern = new(
+        @"(?m)^Current verification step evidence prefix: (EV-S[0-9]{3}-)$",
         RegexOptions.CultureInvariant);
 
     public static IReadOnlyList<DeliveryAcceptanceCriterion> Criteria(
@@ -47,7 +50,7 @@ internal static class DeliveryReadinessFixtures
             })];
 
     public static DeliveryAcceptancePlan Plan(int count = 1) =>
-        new(DeliveryAcceptancePlan.CurrentVersion, Criteria(count));
+        new(Criteria(count));
 
     public static string PlanHash(int count = 1) =>
         DeliveryReadinessPolicy.HashAcceptancePlan(Plan(count));
@@ -66,13 +69,25 @@ internal static class DeliveryReadinessFixtures
             .Distinct(StringComparer.Ordinal)];
 
     /// <summary>The host-issued evidence identifiers the host rendered into this turn's prompt.</summary>
-    public static IReadOnlyList<string> EvidenceIdsFromPrompt(string? prompt) =>
-        [.. EvidencePattern.Matches(prompt ?? string.Empty)
+    public static IReadOnlyList<string> EvidenceIdsFromPrompt(string? prompt)
+    {
+        var evidence = EvidencePattern.Matches(prompt ?? string.Empty)
             .Select(match => match.Groups[1].Value)
-            .Distinct(StringComparer.Ordinal)];
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (evidence.Length > 0)
+        {
+            return evidence;
+        }
+        var currentPrefix = CurrentEvidencePrefixPattern.Match(
+            prompt ?? string.Empty);
+        return currentPrefix.Success
+            ? [$"{currentPrefix.Groups[1].Value}001"]
+            : [];
+    }
 
     /// <summary>
-    /// Builds a strict <c>outcome-qa-v2</c> block purely from what the host injected. When the host
+    /// Builds a strict outcome-QA block purely from what the host injected. When the host
     /// injected nothing, the block is deliberately unusable so the turn fails closed.
     /// </summary>
     public static string QaBlockFromPrompt(
@@ -103,7 +118,7 @@ internal static class DeliveryReadinessFixtures
         return
             $"{DeliveryReadinessPolicy.QaBeginMarker}{Environment.NewLine}" +
             $$"""
-            {"Version":"outcome-qa-v2","AcceptancePlanHash":"{{planHash}}","Verdict":"{{verdictOverride ?? derived}}","Criteria":[{{criteria}}],"ResidualRisks":[{{riskItems}}]}
+            {"AcceptancePlanHash":"{{planHash}}","Verdict":"{{verdictOverride ?? derived}}","Criteria":[{{criteria}}],"ResidualRisks":[{{riskItems}}],"PlanGaps":[]}
             """ +
             $"{Environment.NewLine}{DeliveryReadinessPolicy.QaEndMarker}";
     }
@@ -151,7 +166,17 @@ internal static class DeliveryReadinessFixtures
                 identity.OutcomeContractHash,
                 identity.Fingerprint,
                 [],
-                KnownEvidenceIds: null,
+                KnownEvidence:
+                [
+                    new DeliveryEvidenceItem(
+                        "EV-S010-001",
+                        OutcomeEvidenceKind.Observation,
+                        "reviewed-preview",
+                        "The host observed the expected result.",
+                        SupportsVerification: true,
+                        ExitCode: null,
+                        ResultDigest: string.Empty)
+                ],
                 [],
                 [],
                 DateTimeOffset.UtcNow,
@@ -199,7 +224,6 @@ internal static class DeliveryReadinessFixtures
     private static DeliveryQaDocument QaDocument() =>
         new()
         {
-            Version = DeliveryReadinessPolicy.QaVersion,
             AcceptancePlanHash = PlanHash(),
             Verdict = OutcomeQaVerdict.PASS,
             Criteria =
@@ -208,12 +232,13 @@ internal static class DeliveryReadinessFixtures
                 {
                     CriterionId = "AC-001",
                     Outcome = DeliveryCriterionOutcome.Verified,
-                    EvidenceIds = ["EV-S010-000"],
+                    EvidenceIds = ["EV-S010-001"],
                     Rationale = "The host-observed check produced the expected result.",
                     Remediation = null,
                     ResponsibleRoles = []
                 }
             ],
-            ResidualRisks = []
+            ResidualRisks = [],
+            PlanGaps = []
         };
 }

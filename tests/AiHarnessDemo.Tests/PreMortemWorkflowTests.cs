@@ -81,7 +81,6 @@ public sealed class PreMortemWorkflowTests
         var engine = new WorkflowEngine(
             databaseFactory,
             new AgentCatalog(paths, databaseFactory),
-            new FlowPlanner(),
             new WrongFamilyModelRouter(),
             new BootstrapTaskProfileFactory(),
             TestRoutingSupport.Recorder(databaseFactory),
@@ -122,7 +121,7 @@ public sealed class PreMortemWorkflowTests
     }
 
     [Fact]
-    public async Task MigratedLegacyRun_UsesSnapshottedScepticAcrossAllRounds()
+    public async Task SnapshottedRun_UsesCapturedScepticAcrossAllRounds()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -176,9 +175,11 @@ public sealed class PreMortemWorkflowTests
             Title = "Implement feature",
             OriginalRequest = "Implement feature",
             ConsolidatedRequest = "Implement a focused product feature.",
+            Kind = FlowKind.Advisory,
             Status = FlowStatus.Queued,
             RepositoryPath = root,
             RepositoryKnowledge = "Test repository.",
+            Outcome = OutcomeType.None,
             ModelSelectionStrategy = ModelSelectionStrategy.MaximumQuality
         };
         await using (var database = await databaseFactory.CreateDbContextAsync())
@@ -208,9 +209,14 @@ public sealed class PreMortemWorkflowTests
         Assert.True(catalogStatus.Ready, catalogStatus.LastError);
         var snapshots =
             new FlowAgentSnapshotService(databaseFactory, catalog);
-        Assert.Equal(
-            1,
-            await snapshots.MigrateLegacyNonterminalAsync());
+        await using (var database =
+                     await databaseFactory.CreateDbContextAsync())
+        {
+            var stored = await database.Flows.SingleAsync(
+                item => item.Id == flow.Id);
+            snapshots.CaptureForNewFlow(database, stored);
+            await database.SaveChangesAsync();
+        }
         _ = await catalog.ToggleAsync(
             WorkflowEngine.PreMortemRole,
             enabled: false);
@@ -219,11 +225,9 @@ public sealed class PreMortemWorkflowTests
         using var handoffGate = new HandoffGateEngine();
         handoffGate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
         handoffGate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
-        handoffGate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
         var engine = new WorkflowEngine(
             databaseFactory,
             catalog,
-            new FlowPlanner(),
             router,
             new BootstrapTaskProfileFactory(),
             TestRoutingSupport.Recorder(databaseFactory),
@@ -362,7 +366,7 @@ public sealed class PreMortemWorkflowTests
                 "pre-mortem-sceptic" => $$"""
                     {{PreMortemRules.FindingsStatus}}
                     {{PreMortemRules.FindingsBeginSentinel}}
-                    {"Version":"pre-mortem-findings-v1","Findings":[{"FailureMode":"The handoff fails after six months because its compatibility boundary is incomplete.","Evidence":"src\\contract.cs and the evaluated output show no compatibility guarantee.","MissedSignal":"The public boundary has no stated compatibility behavior.","Prevention":"State and verify the compatibility behavior before the next handoff."}]}
+                    {"Findings":[{"FailureMode":"The handoff fails after six months because its compatibility boundary is incomplete.","Evidence":"src\\contract.cs and the evaluated output show no compatibility guarantee.","MissedSignal":"The public boundary has no stated compatibility behavior.","Prevention":"State and verify the compatibility behavior before the next handoff."}]}
                     {{PreMortemRules.FindingsEndSentinel}}
                     """,
                 _ => """
@@ -381,6 +385,18 @@ public sealed class PreMortemWorkflowTests
                     Continue the planned flow.
                     """
             };
+            if (context.IsOutcomeOwner)
+            {
+                output +=
+                    Environment.NewLine +
+                    FlowOutcomeParser.BeginSentinel +
+                    Environment.NewLine +
+                    """
+                    {"Goal":"Assess the feature.","Summary":"The assessment is complete.","ImplementationDetails":["The requested pre-mortem findings were incorporated."],"Artifacts":[]}
+                    """ +
+                    Environment.NewLine +
+                    FlowOutcomeParser.EndSentinel;
+            }
             return Task.FromResult(new AgentExecutionResult(
                 output,
                 "Fake runner evidence.",
@@ -403,12 +419,9 @@ public sealed class PreMortemWorkflowTests
             ## Next owner
             Software Engineer.
 
-            TEAM_TASK_PROFILES_V1_BEGIN
-            {"Version":"task-profile-v1","Profiles":[{"Role":"software-engineer","Complexity":7,"ReasoningDepth":8,"ContextDemand":7,"ToolIntensity":8,"TaskTypeTags":["Implementation"],"Risk":"Critical","RiskReason":"The implementation changes a compatibility boundary.","Confidence":0.9,"Rationales":["Code and focused validation are required."]},{"Role":"quality-engineer","Complexity":6,"ReasoningDepth":7,"ContextDemand":7,"ToolIntensity":7,"TaskTypeTags":["Quality"],"Risk":"High","RiskReason":"Independent validation is required.","Confidence":0.9,"Rationales":["Acceptance evidence must be checked."]},{"Role":"release-engineer","Complexity":4,"ReasoningDepth":4,"ContextDemand":6,"ToolIntensity":6,"TaskTypeTags":["Release"],"Risk":"High","RiskReason":"Packaging changes repository state.","Confidence":0.8,"Rationales":["Verified work must be packaged."]}]}
-            TEAM_TASK_PROFILES_V1_END
-            PRE_MORTEM_PLAN_V1_BEGIN
-            {"Version":"pre-mortem-plan-v1","AfterRoles":["software-engineer"]}
-            PRE_MORTEM_PLAN_V1_END
+            TEAM_PLAN_BEGIN
+            {"Disposition":"Planned","Steps":[{"Id":"assess","AgentId":"software-engineer","Order":10,"Stage":"BeforeReview","Assignment":"Assess the requested feature and prepare the outcome.","Justification":"The captured engineer owns the assessment.","DependsOn":[],"Duties":["Analyze","PrepareOutcome"],"OutcomeOwner":true,"TaskProfile":{"Complexity":7,"ReasoningDepth":8,"ContextDemand":7,"ToolIntensity":8,"TaskTypeTags":["Implementation"],"Risk":"Critical","RiskReason":"The assessment covers a compatibility boundary.","Confidence":0.9,"Rationales":["Focused validation is required."]}}],"PreMortemCheckpoints":["assess"],"AcceptanceCriteria":null,"MissingQualification":null}
+            TEAM_PLAN_END
             """;
     }
 

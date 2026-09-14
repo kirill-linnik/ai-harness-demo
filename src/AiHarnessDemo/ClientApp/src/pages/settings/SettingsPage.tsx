@@ -179,14 +179,6 @@ export function SettingsPage() {
                 <strong>{workflow.maxAttempts} attempts</strong>
               </div>
               <div className="runtime-line">
-                <small>Outcome verification</small>
-                <strong>
-                  {workflow.outcomeVerificationEnabled
-                    ? `${workflow.outcomeVerificationMaxRounds} QA rounds`
-                    : "Disabled"}
-                </strong>
-              </div>
-              <div className="runtime-line">
                 <small>Workspaces</small>
                 <strong title={workflow.workspaceRoot ?? ""}>{lastPathPart(workflow.workspaceRoot ?? "")}</strong>
               </div>

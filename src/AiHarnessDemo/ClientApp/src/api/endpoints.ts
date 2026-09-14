@@ -14,18 +14,13 @@ import type {
   DirectReviewResponse,
   DemoMutationRequest,
   DemoRuntimeStatus,
-  FeedbackRequest,
-  FeedbackResponse,
   FlowDetailDto,
-  FlowDecisionRequest,
-  FlowDecisionResponse,
   FlowReviewResultResponse,
   FlowSummaryDto,
   HistoryItemDto,
   IntakeRequest,
   IntakeResponse,
   LearningDto,
-  OutcomeResolutionRequest,
   PreviewDto,
   QualificationResolutionRequest,
   QualificationResolutionResponse,
@@ -86,18 +81,6 @@ export const api = {
       `/api/flows/${flowId}/qualification-resolution`,
       { method: "POST", body }
     ),
-  sendFeedback: (flowId: string, body: FeedbackRequest) =>
-    request<FeedbackResponse>(`/api/flows/${flowId}/feedback`, { method: "POST", body }),
-  decideFlow: (flowId: string, body: FlowDecisionRequest) =>
-    request<FlowDecisionResponse>(`/api/flows/${flowId}/decision`, {
-      method: "POST",
-      body
-    }),
-  resolveOutcome: (flowId: string, body: OutcomeResolutionRequest) =>
-    request<FlowDetailDto>(`/api/flows/${flowId}/outcome-resolution`, {
-      method: "POST",
-      body
-    }),
   abandonFlow: (flowId: string) =>
     request<AbandonFlowResponse>(`/api/flows/${flowId}/abandon`, {
       method: "POST"

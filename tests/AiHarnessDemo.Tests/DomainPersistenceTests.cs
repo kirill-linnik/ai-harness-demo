@@ -26,7 +26,7 @@ public sealed class DomainPersistenceTests
         Assert.True(await TableExistsAsync(connection, "FlowPlanDocuments"));
         Assert.True(await TableExistsAsync(connection, "DemoInstances"));
         Assert.Equal(
-            IntakeV2Parser.MaximumJsonCharacters,
+            IntakeParser.MaximumJsonCharacters,
             database.Model.FindEntityType(typeof(FlowEvent))!
                 .FindProperty(nameof(FlowEvent.DataJson))!
                 .GetMaxLength());
@@ -53,137 +53,6 @@ public sealed class DomainPersistenceTests
     }
 
     [Fact]
-    public async Task CurrentSchemaUpgrade_IsIdempotentAndPreservesLegacyHistory()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        await using (var create = connection.CreateCommand())
-        {
-            create.CommandText = """
-                CREATE TABLE Flows (
-                    Id TEXT NOT NULL CONSTRAINT PK_Flows PRIMARY KEY,
-                    Title TEXT NOT NULL,
-                    OriginalRequest TEXT NOT NULL,
-                    ConsolidatedRequest TEXT NOT NULL,
-                    Status TEXT NOT NULL,
-                    Iteration INTEGER NOT NULL,
-                    RepositoryPath TEXT NOT NULL,
-                    RepositoryKnowledge TEXT NOT NULL,
-                    Outcome TEXT NOT NULL,
-                    ModelSelectionStrategy TEXT NOT NULL,
-                    ExecutionMode TEXT NOT NULL,
-                    WorkspacePath TEXT NOT NULL,
-                    BranchName TEXT NOT NULL,
-                    OutcomeUrl TEXT NOT NULL,
-                    OutcomeLabel TEXT NOT NULL,
-                    FailureReason TEXT NOT NULL,
-                    OutcomeVerificationJson TEXT NOT NULL,
-                    CreatedAt INTEGER NOT NULL,
-                    UpdatedAt INTEGER NOT NULL,
-                    CompletedAt INTEGER NULL
-                );
-                CREATE TABLE Agents (
-                    Id TEXT NOT NULL CONSTRAINT PK_Agents PRIMARY KEY,
-                    Name TEXT NOT NULL,
-                    Description TEXT NOT NULL,
-                    Role TEXT NOT NULL,
-                    SourcePath TEXT NOT NULL,
-                    Accent TEXT NOT NULL,
-                    Enabled INTEGER NOT NULL,
-                    SortOrder INTEGER NOT NULL,
-                    UpdatedAt INTEGER NOT NULL
-                );
-                CREATE TABLE FlowMessages (
-                    Id TEXT NOT NULL CONSTRAINT PK_FlowMessages PRIMARY KEY,
-                    FlowRunId TEXT NOT NULL,
-                    Role TEXT NOT NULL,
-                    Content TEXT NOT NULL,
-                    IsQuestion INTEGER NOT NULL,
-                    CreatedAt INTEGER NOT NULL
-                );
-                CREATE TABLE FlowEvents (
-                    Id TEXT NOT NULL CONSTRAINT PK_FlowEvents PRIMARY KEY,
-                    FlowRunId TEXT NOT NULL,
-                    FlowStepId TEXT NULL,
-                    Type TEXT NOT NULL,
-                    Message TEXT NOT NULL,
-                    CreatedAt INTEGER NOT NULL
-                );
-                CREATE TABLE GateRecords (
-                    Id TEXT NOT NULL CONSTRAINT PK_GateRecords PRIMARY KEY,
-                    FlowRunId TEXT NOT NULL,
-                    FlowStepId TEXT NOT NULL,
-                    ActionType TEXT NOT NULL,
-                    Decision TEXT NOT NULL,
-                    TrustLevelAtDecision TEXT NOT NULL,
-                    Summary TEXT NOT NULL,
-                    Evidence TEXT NOT NULL,
-                    Reason TEXT NOT NULL,
-                    DecidedAt INTEGER NOT NULL,
-                    Resolved INTEGER NOT NULL,
-                    Approved INTEGER NULL,
-                    ResolvedBy TEXT NULL,
-                    ResolutionNote TEXT NULL,
-                    ResolvedAt INTEGER NULL
-                );
-                INSERT INTO Flows VALUES (
-                    '11111111-1111-1111-1111-111111111111',
-                    'Legacy flow', 'Keep history', 'Keep history',
-                    'Approved', 2, 'C:\repo', 'knowledge', 'PullRequest',
-                    'MaximumQuality', 'LiveCopilot', 'C:\workspace', 'legacy',
-                    'https://example.test/pr/1', 'PR 1', '', '', 1, 2, 3);
-                INSERT INTO Agents VALUES (
-                    'architect', 'Architect', 'Designs', 'architect',
-                    '.github\agents\architect.agent.md', 'violet', 1, 1, 4);
-                INSERT INTO FlowMessages VALUES (
-                    '22222222-2222-2222-2222-222222222222',
-                    '11111111-1111-1111-1111-111111111111',
-                    'Customer', 'Original message', 0, 5);
-                INSERT INTO FlowEvents VALUES (
-                    '33333333-3333-3333-3333-333333333333',
-                    '11111111-1111-1111-1111-111111111111',
-                    NULL, 'flow.completed', 'Completed', 6);
-                INSERT INTO GateRecords VALUES (
-                    '44444444-4444-4444-4444-444444444444',
-                    '11111111-1111-1111-1111-111111111111',
-                    '55555555-5555-5555-5555-555555555555',
-                    'Release', 'AutoApproved', 'Auto', 'Release', '', '', 7,
-                    1, 1, 'operator', 'approved', 8);
-                """;
-            await create.ExecuteNonQueryAsync();
-        }
-
-        await using var database = CreateDatabase(connection);
-        await DatabaseInitializer.EnsureFlowRunSchemaAsync(database);
-        await DatabaseInitializer.EnsureSliceOneSchemaAsync(database);
-        await DatabaseInitializer.EnsureDemoRuntimeSchemaAsync(database);
-        await DatabaseInitializer.EnsureFlowRunSchemaAsync(database);
-        await DatabaseInitializer.EnsureSliceOneSchemaAsync(database);
-        await DatabaseInitializer.EnsureDemoRuntimeSchemaAsync(database);
-
-        database.ChangeTracker.Clear();
-        var flow = await database.Flows
-            .AsNoTracking()
-            .Include(item => item.Messages)
-            .Include(item => item.Events)
-            .Include(item => item.GateRecords)
-            .SingleAsync();
-        var agent = await database.Agents.AsNoTracking().SingleAsync();
-
-        Assert.Equal(FlowKind.Delivery, flow.Kind);
-        Assert.Equal("legacy-v1", flow.ContractVersion);
-        Assert.Equal("https://example.test/pr/1", flow.OutcomeUrl);
-        Assert.Equal("Original message", Assert.Single(flow.Messages).Content);
-        Assert.Equal("flow.completed", Assert.Single(flow.Events).Type);
-        Assert.Equal(HandoffActionType.Release, Assert.Single(flow.GateRecords).ActionType);
-        Assert.Null(flow.GateRecords[0].ReviewDecision);
-        Assert.Equal(AgentDefinitionStatus.Valid, agent.DefinitionStatus);
-        Assert.True(agent.Switchable);
-        Assert.Empty(await database.FlowAgentSnapshots.ToListAsync());
-        Assert.True(await TableExistsAsync(connection, "DemoInstances"));
-    }
-
-    [Fact]
     public async Task NewEnumsAndEntities_RoundTripAsNamedValues()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -196,7 +65,6 @@ public sealed class DomainPersistenceTests
             Title = "Advisory",
             OriginalRequest = "Assess",
             Kind = FlowKind.Advisory,
-            ContractVersion = "studio-v2",
             Status = FlowStatus.Blocked,
             Outcome = OutcomeType.None,
             CurrentBlockerCode = "qualification"
@@ -225,7 +93,7 @@ public sealed class DomainPersistenceTests
             IsOutcomeOwner = true,
             PermissionProfile = ExecutionPermissionProfile.Publish,
             EffectivePermissionJson = """{"publish":true}""",
-            WorkflowRevision = "workflow-v2"
+            WorkflowRevision = "workflow-revision"
         };
         child.AgentSnapshots.Add(new FlowAgentSnapshot
         {
@@ -243,9 +111,8 @@ public sealed class DomainPersistenceTests
         child.PlanDocuments.Add(new FlowPlanDocument
         {
             Iteration = 1,
-            Version = "plan-v2",
             Disposition = "Ready",
-            RawJson = """{"Version":"plan-v2"}"""
+            RawJson = """{"Disposition":"Planned"}"""
         });
         child.Events.Add(new FlowEvent
         {
@@ -311,7 +178,9 @@ public sealed class DomainPersistenceTests
             ReviewDecision.RefinementRequested,
             Assert.Single(loaded.GateRecords).ReviewDecision);
         Assert.Equal("engineer", Assert.Single(loaded.AgentSnapshots).AgentId);
-        Assert.Equal("plan-v2", Assert.Single(loaded.PlanDocuments).Version);
+        Assert.Equal(
+            """{"Disposition":"Planned"}""",
+            Assert.Single(loaded.PlanDocuments).RawJson);
         Assert.Equal("implement", Assert.Single(loaded.TaskProfiles).PlanStepKey);
         Assert.Equal(
             AgentDefinitionStatus.Invalid,
@@ -344,7 +213,6 @@ public sealed class DomainPersistenceTests
             Title = "Classify intake",
             OriginalRequest = "Assess the request",
             Kind = FlowKind.Delivery,
-            ContractVersion = "studio-v2"
         };
         var step = new FlowStep
         {
@@ -377,10 +245,7 @@ public sealed class DomainPersistenceTests
                 ImmutableArray.Create(PlanDuty.Analyze),
                 DurableReviewDecision: null,
                 DurableApproval: false,
-                IsOnlyPlannedPublishStep: false,
-                ContractVersion: "studio-v2",
-                LegacyPublicationAuthorized: false,
-                IsGovernedOutcomeVerification: false),
+                IsOnlyPlannedPublishStep: false),
             new WorkflowPermissionRestrictions(
                 ExecutionPermissionProfile.ReadOnlySource,
                 ExecutionPermissionProfile.WorkspaceWrite,

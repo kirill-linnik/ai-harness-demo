@@ -4,10 +4,7 @@ import { flowPollIntervalMs } from "../lib/pollInterval";
 import type {
   AnalyzeRepositoryRequest,
   DirectReviewRequest,
-  FeedbackRequest,
-  FlowDecisionRequest,
   IntakeRequest,
-  OutcomeResolutionRequest,
   QualificationResolutionRequest,
   SaveSettingsRequest,
   ToggleAgentRequest
@@ -224,19 +221,6 @@ export function useRecoverFlowMutation() {
   });
 }
 
-export function useSendFeedbackMutation() {
-  const queryClient = useQueryClient();
-  const invalidateProjection = useInvalidateProjection();
-  return useMutation({
-    mutationFn: ({ flowId, body }: { flowId: string; body: FeedbackRequest }) =>
-      api.sendFeedback(flowId, body),
-    onSuccess: response => {
-      queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
-      return invalidateProjection(response.flow.id);
-    }
-  });
-}
-
 export function useReviewFlowMutation() {
   const invalidateProjection = useInvalidateProjection();
   return useMutation({
@@ -258,37 +242,6 @@ export function useResolveQualificationMutation() {
     }) => api.resolveQualification(flowId, body),
     onSuccess: result =>
       invalidateProjection(result.parentFlowId, result.successorFlowId)
-  });
-}
-
-export function useDecideFlowMutation() {
-  const queryClient = useQueryClient();
-  const invalidateProjection = useInvalidateProjection();
-  return useMutation({
-    mutationFn: ({ flowId, body }: { flowId: string; body: FlowDecisionRequest }) =>
-      api.decideFlow(flowId, body),
-    onSuccess: result => {
-      queryClient.setQueryData(queryKeys.flow(result.flow.id), result.flow);
-      return invalidateProjection(result.flow.id);
-    }
-  });
-}
-
-export function useResolveOutcomeMutation() {
-  const queryClient = useQueryClient();
-  const invalidateProjection = useInvalidateProjection();
-  return useMutation({
-    mutationFn: ({
-      flowId,
-      body
-    }: {
-      flowId: string;
-      body: OutcomeResolutionRequest;
-    }) => api.resolveOutcome(flowId, body),
-    onSuccess: flow => {
-      queryClient.setQueryData(queryKeys.flow(flow.id), flow);
-      return invalidateProjection(flow.id);
-    }
   });
 }
 

@@ -5,18 +5,16 @@ using AiHarnessDemo.Core.Domain;
 
 namespace AiHarnessDemo.Core.Orchestration;
 
-public enum IntakeV2Status
+public enum IntakeStatus
 {
     NeedsClarification,
     AwaitingConfirmation,
     Confirmed
 }
 
-public sealed class IntakeV2Document
+public sealed class IntakeDocument
 {
-    public string Version { get; init; } = string.Empty;
-
-    public IntakeV2Status? Status { get; init; }
+    public IntakeStatus? Status { get; init; }
 
     public FlowKind? FlowKind { get; init; }
 
@@ -24,10 +22,10 @@ public sealed class IntakeV2Document
 
     public string CustomerReply { get; init; } = string.Empty;
 
-    public IntakeV2Brief? Brief { get; init; }
+    public IntakeBrief? Brief { get; init; }
 }
 
-public sealed class IntakeV2Brief
+public sealed class IntakeBrief
 {
     public string Goal { get; init; } = string.Empty;
 
@@ -40,14 +38,14 @@ public sealed class IntakeV2Brief
     public IReadOnlyList<string>? Assumptions { get; init; }
 }
 
-public sealed record ParsedIntakeV2(
-    IntakeV2Document Document,
+public sealed record ParsedIntake(
+    IntakeDocument Document,
     string RawJson,
     string NormalizedBriefJson);
 
-public sealed class IntakeV2ContractException(IReadOnlyList<string> errors)
+public sealed class IntakeContractException(IReadOnlyList<string> errors)
     : InvalidOperationException(
-        "Intake v2 contract validation failed: " + string.Join("; ", errors))
+        "Intake contract validation failed: " + string.Join("; ", errors))
 {
     public IReadOnlyList<string> Errors { get; } = errors;
 }
@@ -66,11 +64,10 @@ public sealed class IntakeAttemptException(
     public string RetryMessage { get; } = retryMessage;
 }
 
-public static class IntakeV2Parser
+public static class IntakeParser
 {
-    public const string Version = "intake-v2";
-    public const string BeginSentinel = "INTAKE_V2_BEGIN";
-    public const string EndSentinel = "INTAKE_V2_END";
+    public const string BeginSentinel = "INTAKE_BEGIN";
+    public const string EndSentinel = "INTAKE_END";
     public const int MaximumTaskTitleCharacters = 120;
     public const int MaximumCustomerReplyCharacters = 4_000;
     public const int MaximumGoalCharacters = 4_000;
@@ -88,12 +85,12 @@ public static class IntakeV2Parser
 
     private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
 
-    public static ParsedIntakeV2 Parse(string output)
+    public static ParsedIntake Parse(string output)
     {
         ArgumentNullException.ThrowIfNull(output);
         if (output.Length > MaximumDocumentCharacters)
         {
-            throw new IntakeV2ContractException(
+            throw new IntakeContractException(
                 [$"output must contain at most {MaximumDocumentCharacters} characters"]);
         }
 
@@ -106,13 +103,13 @@ public static class IntakeV2Parser
         if (begins.Count == 0 || ends.Count == 0 ||
             ends[0] <= begins[0])
         {
-            throw new IntakeV2ContractException(
+            throw new IntakeContractException(
                 [$"output must contain exact {BeginSentinel}/{EndSentinel} sentinels"]);
         }
         if (begins.Count != 1 || ends.Count != 1)
         {
-            throw new IntakeV2ContractException(
-                ["intake v2 sentinels must occur exactly once"]);
+            throw new IntakeContractException(
+                ["intake sentinels must occur exactly once"]);
         }
         var begin = begins[0];
         var end = ends[0];
@@ -120,45 +117,41 @@ public static class IntakeV2Parser
         return ParseJson(output[(begin + BeginSentinel.Length)..end].Trim());
     }
 
-    public static ParsedIntakeV2 ParseJson(string json)
+    public static ParsedIntake ParseJson(string json)
     {
         ArgumentNullException.ThrowIfNull(json);
         if (string.IsNullOrWhiteSpace(json))
         {
-            throw new IntakeV2ContractException(["intake v2 JSON is empty"]);
+            throw new IntakeContractException(["intake JSON is empty"]);
         }
         if (json.Length > MaximumJsonCharacters)
         {
-            throw new IntakeV2ContractException(
-                [$"intake v2 JSON must contain at most {MaximumJsonCharacters} characters"]);
+            throw new IntakeContractException(
+                [$"intake JSON must contain at most {MaximumJsonCharacters} characters"]);
         }
 
-        IntakeV2Document document;
+        IntakeDocument document;
         try
         {
             using var jsonDocument = JsonDocument.Parse(json);
             var shapeErrors = ValidateShape(jsonDocument.RootElement);
             if (shapeErrors.Count > 0)
             {
-                throw new IntakeV2ContractException(shapeErrors);
+                throw new IntakeContractException(shapeErrors);
             }
-            document = JsonSerializer.Deserialize<IntakeV2Document>(
+            document = JsonSerializer.Deserialize<IntakeDocument>(
                            json,
                            JsonOptions)
-                       ?? throw new IntakeV2ContractException(
-                           ["intake v2 document is null"]);
+                       ?? throw new IntakeContractException(
+                           ["intake document is null"]);
         }
         catch (JsonException exception)
         {
-            throw new IntakeV2ContractException(
-                [$"sentinel content is not strict intake-v2 JSON: {exception.Message}"]);
+            throw new IntakeContractException(
+                [$"sentinel content is not strict intake JSON: {exception.Message}"]);
         }
 
         var errors = new List<string>();
-        if (!string.Equals(document.Version, Version, StringComparison.Ordinal))
-        {
-            errors.Add($"Version must be exactly '{Version}'");
-        }
         if (document.Status is null || !Enum.IsDefined(document.Status.Value))
         {
             errors.Add("Status must be NeedsClarification, AwaitingConfirmation, or Confirmed");
@@ -177,7 +170,7 @@ public static class IntakeV2Parser
             errors);
 
         if (document.Status is
-                IntakeV2Status.AwaitingConfirmation or IntakeV2Status.Confirmed &&
+                IntakeStatus.AwaitingConfirmation or IntakeStatus.Confirmed &&
             document.FlowKind is null)
         {
             errors.Add("FlowKind is required for AwaitingConfirmation and Confirmed");
@@ -193,7 +186,7 @@ public static class IntakeV2Parser
         else
         {
             var requiresBrief = document.Status is
-                IntakeV2Status.AwaitingConfirmation or IntakeV2Status.Confirmed;
+                IntakeStatus.AwaitingConfirmation or IntakeStatus.Confirmed;
             ValidateText(
                 document.Brief.Goal,
                 MaximumGoalCharacters,
@@ -217,39 +210,38 @@ public static class IntakeV2Parser
 
         if (errors.Count > 0)
         {
-            throw new IntakeV2ContractException(errors);
+            throw new IntakeContractException(errors);
         }
 
         var normalized = Normalize(document);
-        return new ParsedIntakeV2(
+        return new ParsedIntake(
             normalized,
             json,
             SerializeBrief(normalized.Brief!));
     }
 
-    public static string Serialize(IntakeV2Document document)
+    public static string Serialize(IntakeDocument document)
     {
         var json = JsonSerializer.Serialize(document, JsonOptions);
         if (json.Length > MaximumJsonCharacters)
         {
-            throw new IntakeV2ContractException(
-                [$"normalized intake v2 JSON must contain at most {MaximumJsonCharacters} characters"]);
+            throw new IntakeContractException(
+                [$"normalized intake JSON must contain at most {MaximumJsonCharacters} characters"]);
         }
         return json;
     }
 
-    public static string SerializeBrief(IntakeV2Brief brief) =>
+    public static string SerializeBrief(IntakeBrief brief) =>
         JsonSerializer.Serialize(brief, JsonOptions);
 
-    private static IntakeV2Document Normalize(IntakeV2Document document) =>
+    private static IntakeDocument Normalize(IntakeDocument document) =>
         new()
         {
-            Version = document.Version,
             Status = document.Status,
             FlowKind = document.FlowKind,
             TaskTitle = NormalizeText(document.TaskTitle),
             CustomerReply = NormalizeText(document.CustomerReply),
-            Brief = new IntakeV2Brief
+            Brief = new IntakeBrief
             {
                 Goal = NormalizeText(document.Brief!.Goal),
                 Details = NormalizeList(document.Brief.Details!),
@@ -325,14 +317,13 @@ public static class IntakeV2Parser
         var errors = new List<string>();
         if (root.ValueKind != JsonValueKind.Object)
         {
-            return ["intake v2 JSON must be an object"];
+            return ["intake JSON must be an object"];
         }
         RejectDuplicateProperties(root, "intake", errors);
         RequireProperties(
             root,
             "intake",
             [
-                "Version",
                 "Status",
                 "FlowKind",
                 "TaskTitle",

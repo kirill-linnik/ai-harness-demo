@@ -23,8 +23,6 @@ internal sealed class RepositoryKnowledgeContractException(
 
 internal sealed class RepositoryKnowledgeDocument
 {
-    public string Version { get; init; } = string.Empty;
-
     public string Project { get; init; } = string.Empty;
 
     public IReadOnlyList<RepositoryKnowledgeFinding?>? ProductAndScope { get; init; }
@@ -60,8 +58,6 @@ internal sealed class RepositoryKnowledgeRepository
 
 internal sealed class RepositoryKnowledgeRecapDocument
 {
-    public string Version { get; init; } = string.Empty;
-
     public bool? Changed { get; init; }
 
     public string Reason { get; init; } = string.Empty;
@@ -78,14 +74,12 @@ public sealed class RepositoryKnowledgeSynthesizer(
     ProcessRunner processRunner,
     ILogger<RepositoryKnowledgeSynthesizer> logger)
 {
-    internal const string Version = "repository-knowledge-v1";
-    internal const string BeginSentinel = "REPOSITORY_KNOWLEDGE_V1_BEGIN";
-    internal const string EndSentinel = "REPOSITORY_KNOWLEDGE_V1_END";
-    internal const string RecapVersion = "repository-knowledge-recap-v1";
+    internal const string BeginSentinel = "REPOSITORY_KNOWLEDGE_BEGIN";
+    internal const string EndSentinel = "REPOSITORY_KNOWLEDGE_END";
     internal const string RecapBeginSentinel =
-        "REPOSITORY_KNOWLEDGE_RECAP_V1_BEGIN";
+        "REPOSITORY_KNOWLEDGE_RECAP_BEGIN";
     internal const string RecapEndSentinel =
-        "REPOSITORY_KNOWLEDGE_RECAP_V1_END";
+        "REPOSITORY_KNOWLEDGE_RECAP_END";
     internal const string RepositoryEvidenceBasis = "RepositoryEvidence";
     internal const string UserProvidedBasis = "UserProvided";
     internal const string UnresolvedBasis = "Unresolved";
@@ -319,7 +313,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
             property names and no Markdown fences:
 
             {{BeginSentinel}}
-            {"Version":"{{Version}}","Project":"{{projectName}}","ProductAndScope":[{"Summary":"what the product does and for whom","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"Repositories":[{"Path":"exact repository path","Purpose":"its responsibility and relationship to the project","Evidence":["relative/path"]}],"ArchitectureAndDataFlow":[{"Summary":"major component or flow","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"TechnologyAndWorkflow":[{"Summary":"verified stack, build, run, or test fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"ConstraintsAndConventions":[{"Summary":"stable rule future work must preserve","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"RisksAndUnknowns":[{"Summary":"conflict, stale claim, risk, or unresolved unknown","Basis":"{{UnresolvedBasis}}","Evidence":["relative/path"]}]}
+            {"Project":"{{projectName}}","ProductAndScope":[{"Summary":"what the product does and for whom","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"Repositories":[{"Path":"exact repository path","Purpose":"its responsibility and relationship to the project","Evidence":["relative/path"]}],"ArchitectureAndDataFlow":[{"Summary":"major component or flow","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"TechnologyAndWorkflow":[{"Summary":"verified stack, build, run, or test fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"ConstraintsAndConventions":[{"Summary":"stable rule future work must preserve","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"RisksAndUnknowns":[{"Summary":"conflict, stale claim, risk, or unresolved unknown","Basis":"{{UnresolvedBasis}}","Evidence":["relative/path"]}]}
             {{EndSentinel}}
 
             Keep each array to at most 12 high-value entries and the rendered knowledge comfortably under
@@ -386,7 +380,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
         catch (JsonException exception)
         {
             throw new RepositoryKnowledgeContractException(
-                [$"sentinel content is not strict {Version} JSON: {exception.Message}"]);
+                [$"sentinel content is not strict repository-knowledge JSON: {exception.Message}"]);
         }
 
         var normalized = ValidateAndNormalize(
@@ -407,13 +401,6 @@ public sealed class RepositoryKnowledgeSynthesizer(
     {
         var document = ParseRecapDocument(output);
         var errors = new List<string>();
-        if (!string.Equals(
-                document.Version,
-                RecapVersion,
-                StringComparison.Ordinal))
-        {
-            errors.Add($"Version must be exactly '{RecapVersion}'");
-        }
         if (document.Changed is null)
         {
             errors.Add("Changed is required");
@@ -506,11 +493,11 @@ public sealed class RepositoryKnowledgeSynthesizer(
 
             Emit exactly one strict JSON object between these standalone sentinels:
             {{RecapBeginSentinel}}
-            {"Version":"{{RecapVersion}}","Changed":false,"Reason":"why the accepted change does or does not alter durable repository knowledge","Knowledge":null}
+            {"Changed":false,"Reason":"why the accepted change does or does not alter durable repository knowledge","Knowledge":null}
             {{RecapEndSentinel}}
 
             For Changed=true, Knowledge must use this exact shape:
-            {"Version":"{{Version}}","Project":"the existing project name","ProductAndScope":[{"Summary":"durable fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"Repositories":[{"Path":"exact detected repository path","Purpose":"responsibility and relationship","Evidence":["relative/path"]}],"ArchitectureAndDataFlow":[{"Summary":"durable fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"TechnologyAndWorkflow":[{"Summary":"durable fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"ConstraintsAndConventions":[{"Summary":"durable fact","Basis":"{{UserProvidedBasis}}","Evidence":[]}],"RisksAndUnknowns":[{"Summary":"material risk or unknown","Basis":"{{UnresolvedBasis}}","Evidence":["relative/path"]}]}
+            {"Project":"the existing project name","ProductAndScope":[{"Summary":"durable fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"Repositories":[{"Path":"exact detected repository path","Purpose":"responsibility and relationship","Evidence":["relative/path"]}],"ArchitectureAndDataFlow":[{"Summary":"durable fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"TechnologyAndWorkflow":[{"Summary":"durable fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"ConstraintsAndConventions":[{"Summary":"durable fact","Basis":"{{UserProvidedBasis}}","Evidence":[]}],"RisksAndUnknowns":[{"Summary":"material risk or unknown","Basis":"{{UnresolvedBasis}}","Evidence":["relative/path"]}]}
             """;
     }
 
@@ -521,11 +508,6 @@ public sealed class RepositoryKnowledgeSynthesizer(
         string? expectedProjectName)
     {
         var errors = new List<string>();
-        if (!string.Equals(document.Version, Version, StringComparison.Ordinal))
-        {
-            errors.Add($"Version must be exactly '{Version}'");
-        }
-
         var expectedProject = string.IsNullOrWhiteSpace(expectedProjectName)
             ? Path.GetFileName(
                 Path.TrimEndingDirectorySeparator(
@@ -608,7 +590,6 @@ public sealed class RepositoryKnowledgeSynthesizer(
 
         return new RepositoryKnowledgeDocument
         {
-            Version = Version,
             Project = project,
             ProductAndScope = product,
             Repositories = repositories,
@@ -646,7 +627,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
             using var jsonDocument = JsonDocument.Parse(json);
             var shapeErrors = ValidateObjectProperties(
                 jsonDocument.RootElement,
-                ["Version", "Changed", "Reason", "Knowledge"],
+                ["Changed", "Reason", "Knowledge"],
                 "recap");
             if (jsonDocument.RootElement.ValueKind ==
                     JsonValueKind.Object &&
@@ -671,7 +652,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
         catch (JsonException exception)
         {
             throw new RepositoryKnowledgeContractException(
-                [$"sentinel content is not strict {RecapVersion} JSON: {exception.Message}"]);
+                [$"sentinel content is not strict repository-knowledge recap JSON: {exception.Message}"]);
         }
     }
 
@@ -746,7 +727,6 @@ public sealed class RepositoryKnowledgeSynthesizer(
         var errors = ValidateObjectProperties(
             root,
             [
-                "Version",
                 "Project",
                 "ProductAndScope",
                 "Repositories",
@@ -1369,7 +1349,7 @@ public sealed class RepositoryKnowledgeSynthesizer(
             Return exactly one strict JSON object with this complete canonical shape, exact property
             names, and no Markdown fences:
             {{BeginSentinel}}
-            {"Version":"{{Version}}","Project":"{{projectName}}","ProductAndScope":[{"Summary":"durable product fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"Repositories":[{"Path":"exact detected repository path","Purpose":"repository responsibility","Evidence":["relative/path"]}],"ArchitectureAndDataFlow":[{"Summary":"durable architecture fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"TechnologyAndWorkflow":[{"Summary":"durable workflow fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"ConstraintsAndConventions":[{"Summary":"durable constraint","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"RisksAndUnknowns":[{"Summary":"material risk or unknown","Basis":"{{UnresolvedBasis}}","Evidence":["relative/path"]}]}
+            {"Project":"{{projectName}}","ProductAndScope":[{"Summary":"durable product fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"Repositories":[{"Path":"exact detected repository path","Purpose":"repository responsibility","Evidence":["relative/path"]}],"ArchitectureAndDataFlow":[{"Summary":"durable architecture fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"TechnologyAndWorkflow":[{"Summary":"durable workflow fact","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"ConstraintsAndConventions":[{"Summary":"durable constraint","Basis":"{{RepositoryEvidenceBasis}}","Evidence":["relative/path"]}],"RisksAndUnknowns":[{"Summary":"material risk or unknown","Basis":"{{UnresolvedBasis}}","Evidence":["relative/path"]}]}
             {{EndSentinel}}
 
             RepositoryEvidence entries require at least one exact existing project-relative path.

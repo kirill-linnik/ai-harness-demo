@@ -45,7 +45,7 @@ public sealed class ApiProjectionTests
     }
 
     [Fact]
-    public async Task DemoApi_RegistersTheCompleteSliceNineSurface()
+    public async Task DemoApi_RegistersCanonicalReviewSurfaceWithoutCompatibilityRoutes()
     {
         var builder = WebApplication.CreateBuilder();
         var serviceTypes = new[]
@@ -62,7 +62,6 @@ public sealed class ApiProjectionTests
             typeof(FlowQueue),
             typeof(ReviewCoordinator),
             typeof(QualificationResolutionCoordinator),
-            typeof(FeedbackCoordinator),
             typeof(WorkflowEngine),
             typeof(IFlowRecoveryController),
             typeof(FlowAbandonmentService),
@@ -127,6 +126,11 @@ public sealed class ApiProjectionTests
                     string.Equals(route.Pattern, pattern, StringComparison.Ordinal) &&
                     route.Methods.Contains(method, StringComparer.Ordinal));
         }
+        Assert.DoesNotContain(
+            routes,
+            route => route.Pattern is
+                "/api/flows/{flowId:guid}/feedback" or
+                "/api/flows/{flowId:guid}/decision");
     }
 
     [Fact]
@@ -138,14 +142,13 @@ public sealed class ApiProjectionTests
             OriginalRequest = "Assess checkout resilience.",
             ConsolidatedRequest = "{}",
             Kind = FlowKind.Advisory,
-            ContractVersion = "studio-v2",
             Status = FlowStatus.WaitingForFeedback,
             Iteration = 2,
             AgentCatalogRevision = "sha256:catalog",
             OutcomeOwnerPlanStepKey = "prepare-recommendation",
             OutcomeContractJson =
                 """
-                {"Version":"flow-outcome-v1","Goal":"Harden checkout retries.","Summary":"Use durable idempotency.","ImplementationDetails":["Persist a request key before payment."],"Artifacts":[{"Path":"recommendations/checkout.md","MediaType":"text/markdown","Content":"# Checkout\nUse idempotency."}]}
+                {"Goal":"Harden checkout retries.","Summary":"Use durable idempotency.","ImplementationDetails":["Persist a request key before payment."],"Artifacts":[{"Path":"recommendations/checkout.md","MediaType":"text/markdown","Content":"# Checkout\nUse idempotency."}]}
                 """
         };
         var analysis = new FlowStep
@@ -216,7 +219,6 @@ public sealed class ApiProjectionTests
             Title = "Implement checkout resilience",
             OriginalRequest = "Implement the accepted recommendation.",
             Kind = FlowKind.Delivery,
-            ContractVersion = "studio-v2",
             ParentFlowRunId = flow.Id,
             ParentIteration = flow.Iteration,
             LinkKind = FlowLinkKind.AdvisoryPromotion,
@@ -270,7 +272,6 @@ public sealed class ApiProjectionTests
             Title = "Deliver checkout resilience",
             OriginalRequest = "Implement checkout resilience.",
             Kind = FlowKind.Delivery,
-            ContractVersion = "studio-v2",
             Status = FlowStatus.Running,
             PublicationPlanStepKey = "publish-approved-result"
         };
@@ -448,8 +449,6 @@ public sealed class ApiProjectionTests
                 factory,
                 new PreviewArtifactCatalog(),
                 null!,
-                null!,
-                new FlowQueue(),
                 verifier,
                 CancellationToken.None);
             Assert.IsAssignableFrom<IValueHttpResult>(metadata);
@@ -467,8 +466,6 @@ public sealed class ApiProjectionTests
                 context,
                 factory,
                 new PreviewArtifactCatalog(),
-                null!,
-                new FlowQueue(),
                 verifier,
                 CancellationToken.None);
             await artifact.ExecuteAsync(context);
@@ -536,8 +533,6 @@ public sealed class ApiProjectionTests
                     factory,
                     new PreviewArtifactCatalog(),
                     null!,
-                    null!,
-                    new FlowQueue(),
                     verifier,
                     CancellationToken.None));
             await Assert.ThrowsAsync<CandidateValidationException>(() =>
@@ -548,8 +543,6 @@ public sealed class ApiProjectionTests
                     context,
                     factory,
                     new PreviewArtifactCatalog(),
-                    null!,
-                    new FlowQueue(),
                     verifier,
                     CancellationToken.None));
             Assert.Equal(0, context.Response.Body.Length);
@@ -572,8 +565,6 @@ public sealed class ApiProjectionTests
                     factory,
                     new PreviewArtifactCatalog(),
                     null!,
-                    null!,
-                    new FlowQueue(),
                     verifier,
                     CancellationToken.None));
             await Assert.ThrowsAsync<CandidateValidationException>(() =>
@@ -584,8 +575,6 @@ public sealed class ApiProjectionTests
                     context,
                     factory,
                     new PreviewArtifactCatalog(),
-                    null!,
-                    new FlowQueue(),
                     verifier,
                     CancellationToken.None));
             Assert.Equal(0, context.Response.Body.Length);
@@ -600,8 +589,6 @@ public sealed class ApiProjectionTests
                     context,
                     factory,
                     new PreviewArtifactCatalog(),
-                    null!,
-                    new FlowQueue(),
                     verifier,
                     CancellationToken.None));
             Assert.Equal(0, context.Response.Body.Length);
@@ -666,13 +653,6 @@ public sealed class ApiProjectionTests
                 CancellationToken.None));
             verifier.NoPreviewArtifacts = false;
 
-            var legacy = CreatePreviewFlow(root, includeSeal: true);
-            legacy.ContractVersion = "legacy-v1";
-            Assert.Null(await DemoApi.ResolveReviewedPreviewUrlAsync(
-                legacy,
-                catalog,
-                verifier,
-                CancellationToken.None));
         }
         finally
         {
@@ -795,7 +775,6 @@ public sealed class ApiProjectionTests
             Title = "Reviewed Delivery preview",
             OriginalRequest = "Prepare the reviewed preview.",
             ConsolidatedRequest = "Prepare the reviewed preview.",
-            ContractVersion = "studio-v2",
             Kind = FlowKind.Delivery,
             Status = FlowStatus.WaitingForFeedback,
             Iteration = 1,
@@ -803,7 +782,7 @@ public sealed class ApiProjectionTests
             RepositoryPath = workspacePath,
             OutcomeOwnerPlanStepKey = "outcome",
             OutcomeContractJson =
-                """{"Version":"flow-outcome-v1","Goal":"Preview","Summary":"Ready","ImplementationDetails":["Serve reviewed bytes."],"Artifacts":[]}"""
+                """{"Goal":"Preview","Summary":"Ready","ImplementationDetails":["Serve reviewed bytes."],"Artifacts":[]}"""
         };
         var owner = new FlowStep
         {
@@ -847,7 +826,6 @@ public sealed class ApiProjectionTests
             Message = "Sealed the current Delivery preview.",
             DataJson = ReviewedCandidateLedger.Serialize(
                 new ReviewedCandidateIdentity(
-                    ReviewedCandidateIdentity.CurrentVersion,
                     flow.Id,
                     flow.Iteration,
                     owner.Id,
@@ -917,9 +895,6 @@ public sealed class ApiProjectionTests
                     .ToLowerInvariant();
             var manifest =
                 new AiHarnessDemo.Core.Verification.CandidateManifest(
-                    AiHarnessDemo.Core.Verification
-                        .OutcomeVerificationRules
-                        .CandidateManifestVersion,
                     flow.Iteration,
                     identity.AcceptancePlanHash,
                     identity.Repositories.Select(item =>

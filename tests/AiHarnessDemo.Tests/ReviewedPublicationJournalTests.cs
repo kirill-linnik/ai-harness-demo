@@ -96,7 +96,6 @@ public sealed class ReviewedPublicationJournalTests
             Id = scenario.Flow.Id,
             Title = scenario.Flow.Title,
             OriginalRequest = scenario.Flow.OriginalRequest,
-            ContractVersion = "studio-v2",
             Kind = FlowKind.Delivery,
             Outcome = OutcomeType.PullRequest,
             OutcomeOwnerPlanStepKey = scenario.Flow.OutcomeOwnerPlanStepKey,
@@ -586,8 +585,6 @@ public sealed class ReviewedPublicationJournalTests
         using var scenario = await ReviewedPublicationScenario.CreateAsync(
             OutcomeType.PullRequest,
             [("first", RemoteRepository), ("second", "example/second")]);
-        var first = scenario.Identity.Repositories
-            .Single(item => item.RelativePath == "first");
         await scenario.SeedRecordAsync(
             "first",
             ReviewedPublicationStage.Completed,
@@ -601,8 +598,13 @@ public sealed class ReviewedPublicationJournalTests
         Assert.Equal(1, scenario.Runner.CountOf("gh", "create"));
         Assert.DoesNotContain(
             scenario.Runner.Invocations,
-            invocation => invocation.Arguments.Contains(
-                $"{first.Head}:refs/heads/{scenario.Flow.BranchName}"));
+            invocation =>
+                invocation.Executable == "git" &&
+                string.Equals(
+                    invocation.WorkingDirectory,
+                    scenario.Repositories[0].Path,
+                    StringComparison.OrdinalIgnoreCase) &&
+                invocation.Arguments.Contains("push"));
         var records = await scenario.ReadRecordsAsync();
         Assert.Equal(2, records.Count);
         Assert.All(
@@ -703,98 +705,6 @@ public sealed class ReviewedPublicationJournalTests
         Assert.Single(
             await scenario.ReadPublicationEventsAsync(
                 VerifiedCandidatePublisher.ReviewedPublicationCompletedEventType));
-    }
-
-    [Fact]
-    public async Task LegacyCompletedPublicationEvents_RebuildTheJournalWithoutRemoteWork()
-    {
-        using var scenario = await ReviewedPublicationScenario.CreateAsync(
-            OutcomeType.PullRequest);
-        var head = scenario.Identity.Repositories[0].Head;
-        var tree = scenario.Identity.Repositories[0].Tree;
-        await scenario.AddLegacyPublicationEventsAsync(
-            scenario.Repositories[0].Path,
-            RemoteRepository,
-            "https://github.com/example/repository/pull/9",
-            head,
-            tree);
-
-        var report = await scenario.PublishAsync();
-
-        Assert.Contains("https://github.com/example/repository/pull/9", report);
-        Assert.Empty(scenario.Runner.Invocations);
-        var record = Assert.Single(await scenario.ReadRecordsAsync());
-        Assert.Equal(ReviewedPublicationStage.Completed, record.Stage);
-        Assert.Equal(
-            "https://github.com/example/repository/pull/9",
-            record.PullRequestUrl);
-    }
-
-    [Fact]
-    public async Task ReviewedPublicationSchema_IsAdditiveAndIdempotentOnOlderDatabases()
-    {
-        var root = Path.Combine(
-            Path.GetTempPath(),
-            "reviewed-publication-schema",
-            Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
-        try
-        {
-            var options = new DbContextOptionsBuilder<HarnessDbContext>()
-                .UseSqlite(
-                    $"Data Source={Path.Combine(root, "schema.db")};Pooling=False")
-                .Options;
-            IDbContextFactory<HarnessDbContext> factory =
-                new ScenarioDbContextFactory(options);
-            var flowId = Guid.NewGuid();
-            await using (var database = await factory.CreateDbContextAsync())
-            {
-                await database.Database.EnsureCreatedAsync();
-                // Reproduce a database created before the durable publication journal existed.
-                await database.Database.ExecuteSqlRawAsync(
-                    "DROP TABLE ReviewedPublicationRecords;");
-                database.Flows.Add(new FlowRun
-                {
-                    Id = flowId,
-                    Title = "Legacy flow",
-                    OriginalRequest = "Keep history."
-                });
-                await database.SaveChangesAsync();
-            }
-
-            await using (var database = await factory.CreateDbContextAsync())
-            {
-                await DatabaseInitializer.EnsureReviewedPublicationSchemaAsync(
-                    database);
-                await DatabaseInitializer.EnsureReviewedPublicationSchemaAsync(
-                    database);
-                database.ReviewedPublicationRecords.Add(
-                    BuildSchemaProbeRecord(flowId));
-                await database.SaveChangesAsync();
-            }
-
-            await using (var database = await factory.CreateDbContextAsync())
-            {
-                var record = await database.ReviewedPublicationRecords
-                    .AsNoTracking()
-                    .SingleAsync();
-                Assert.Equal(flowId, record.FlowRunId);
-                Assert.Equal(
-                    ReviewedPublicationStage.BranchPublished,
-                    record.Stage);
-                Assert.Equal("first", record.RelativePath);
-                Assert.Single(await database.Flows.AsNoTracking().ToListAsync());
-
-                database.ReviewedPublicationRecords.Add(
-                    BuildSchemaProbeRecord(flowId));
-                await Assert.ThrowsAsync<DbUpdateException>(
-                    () => database.SaveChangesAsync());
-            }
-        }
-        finally
-        {
-            GitWorkspace.DeleteBestEffort(root);
-        }
     }
 
     private static ReviewedPublicationRecord BuildSchemaProbeRecord(Guid flowId) =>
@@ -906,7 +816,6 @@ public sealed class ReviewedPublicationJournalTests
                 Title = "Publish the reviewed candidate",
                 OriginalRequest = "Publish the reviewed candidate.",
                 ConsolidatedRequest = "Publish the reviewed candidate.",
-                ContractVersion = "studio-v2",
                 Kind = FlowKind.Delivery,
                 Status = FlowStatus.Queued,
                 RepositoryPath = workspacePath,
@@ -916,7 +825,7 @@ public sealed class ReviewedPublicationJournalTests
                 OutcomeOwnerPlanStepKey = "outcome",
                 PublicationPlanStepKey = "publish",
                 OutcomeContractJson =
-                    """{"Version":"flow-outcome-v1","Goal":"Publish.","Summary":"Reviewed.","ImplementationDetails":["Exact bytes."],"Artifacts":[]}"""
+                    """{"Goal":"Publish.","Summary":"Reviewed.","ImplementationDetails":["Exact bytes."],"Artifacts":[]}"""
             };
             flow.Events.Add(new FlowEvent
             {
@@ -961,7 +870,7 @@ public sealed class ReviewedPublicationJournalTests
                     ExecutionPermissionProfile.Publish,
                 EffectivePermissionJson = JsonSerializer.Serialize(
                     PublicationPermission()),
-                WorkflowRevision = "publication-workflow-v1",
+                WorkflowRevision = "publication-workflow",
                 RemotePublicationAllowed = true,
                 Status = StepStatus.Running,
                 DependsOnStepId = outcomeOwner.Id
@@ -1175,11 +1084,8 @@ public sealed class ReviewedPublicationJournalTests
                     ImmutableArray.Create(PlanDuty.Publish),
                     DurableReviewDecision:
                         ReviewDecision.Accepted,
-                    DurableApproval: true,
-                    IsOnlyPlannedPublishStep: true,
-                    ContractVersion: "studio-v2",
-                    LegacyPublicationAuthorized: false,
-                    IsGovernedOutcomeVerification: false),
+                        DurableApproval: true,
+                        IsOnlyPlannedPublishStep: true),
                 new WorkflowPermissionRestrictions(
                     ExecutionPermissionProfile.ReadOnlySource,
                     ExecutionPermissionProfile.WorkspaceWrite,
@@ -1213,65 +1119,6 @@ public sealed class ReviewedPublicationJournalTests
             });
             await database.SaveChangesAsync();
         }
-
-        public async Task AddLegacyPublicationEventsAsync(
-            string relativePath,
-            string remoteRepository,
-            string pullRequestUrl,
-            string head,
-            string tree)
-        {
-            await using var database = await Factory.CreateDbContextAsync();
-            database.FlowEvents.Add(new FlowEvent
-            {
-                FlowRunId = Flow.Id,
-                FlowStepId = PublicationRootId,
-                Type = VerifiedCandidatePublisher
-                    .ReviewedPublicationRepositoryEventType,
-                Message = "Legacy repository publication.",
-                DataJson = SerializeLegacyEvent(
-                    Identity.Fingerprint,
-                    relativePath,
-                    remoteRepository,
-                    pullRequestUrl,
-                    head,
-                    tree)
-            });
-            database.FlowEvents.Add(new FlowEvent
-            {
-                FlowRunId = Flow.Id,
-                FlowStepId = PublicationRootId,
-                Type = VerifiedCandidatePublisher
-                    .ReviewedPublicationCompletedEventType,
-                Message = "Legacy publication completion.",
-                DataJson = SerializeLegacyEvent(
-                    Identity.Fingerprint,
-                    string.Empty,
-                    string.Empty,
-                    string.Empty,
-                    string.Empty,
-                    string.Empty)
-            });
-            await database.SaveChangesAsync();
-        }
-
-        private static string SerializeLegacyEvent(
-            string fingerprint,
-            string relativePath,
-            string remoteRepository,
-            string pullRequestUrl,
-            string head,
-            string tree) =>
-            JsonSerializer.Serialize(new
-            {
-                Version = "reviewed-candidate-publication-v1",
-                CandidateFingerprint = fingerprint,
-                RelativePath = relativePath,
-                RemoteRepository = remoteRepository,
-                PullRequestUrl = pullRequestUrl,
-                Head = head,
-                Tree = tree
-            });
 
         private static HandoffGateRecord BuildCustomerReviewGate(
             Guid flowId,

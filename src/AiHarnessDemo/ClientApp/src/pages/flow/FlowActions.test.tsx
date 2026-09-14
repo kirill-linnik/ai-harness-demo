@@ -20,7 +20,6 @@ function flow(overrides: Partial<FlowDetailDto> = {}): FlowDetailDto {
     originalRequest: "Assess checkout resilience.",
     consolidatedRequest: "{}",
     kind: "Advisory",
-    contractVersion: "studio-v2",
     parentFlowRunId: null,
     parentIteration: null,
     linkKind: null,
@@ -66,26 +65,6 @@ function flow(overrides: Partial<FlowDetailDto> = {}): FlowDetailDto {
       publicationStatus: "NotApplicable"
     },
     publicationStatus: "NotApplicable",
-    outcomeVerification: {
-      status: "LegacyUnverified",
-      legacyUnverified: true,
-      currentRound: 0,
-      maxRounds: 0,
-      planHashPrefix: "",
-      candidateFingerprintPrefix: "",
-      candidateFingerprint: "",
-      releaseGateId: null,
-      criteria: [],
-      evidence: [],
-      latestResults: [],
-      failedCriterionIds: [],
-      pendingOwnerRoles: [],
-      stale: false,
-      previewRequired: false,
-      releaseReady: false,
-      verifiedAt: null,
-      humanResolutionGate: null
-    },
     ...overrides
   };
 }

@@ -106,8 +106,8 @@ public sealed class FlowAbandonmentTests
             databaseFactory,
             new FakeExecutionController(),
             new FakeProcessCleaner(),
-            new FlowSessionCleaner(
-                new CopilotSessionJournal(),
+            new OwnedStagedSessionCleaner(
+                copilotHome,
                 new AgentManifestStager()),
             new FakeWorkspaceManager(),
             new FlowLifecycleCoordinator(),
@@ -216,61 +216,6 @@ public sealed class FlowAbandonmentTests
     }
 
     [Fact]
-    public async Task AbandonAsync_RejectsCustomerApprovedPublication()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        var databaseFactory = new AbandonDbContextFactory(options);
-        await using (var database = await databaseFactory.CreateDbContextAsync())
-        {
-            await database.Database.EnsureCreatedAsync();
-            var flow = new FlowRun
-            {
-                Title = "Published",
-                OriginalRequest = "Published",
-                Status = FlowStatus.Queued
-            };
-            var releaseStep = new FlowStep
-            {
-                FlowRunId = flow.Id,
-                AgentId = "release-engineer",
-                AgentName = "Release Engineer",
-                AgentRole = "release-engineer",
-                Status = StepStatus.Pending
-            };
-            flow.Steps.Add(releaseStep);
-            database.Flows.Add(flow);
-            database.GateRecords.Add(new AiHarnessDemo.Core.Gating.HandoffGateRecord
-            {
-                FlowRunId = flow.Id,
-                FlowStepId = releaseStep.Id,
-                ActionType = AiHarnessDemo.Core.Gating.HandoffActionType.Release,
-                Decision = AiHarnessDemo.Core.Gating.HandoffGateDecision.AwaitingHumanApproval,
-                TrustLevelAtDecision = AiHarnessDemo.Core.Gating.HandoffTrustLevel.Gated,
-                Resolved = true,
-                Approved = true
-            });
-            await database.SaveChangesAsync();
-        }
-        var service = new FlowAbandonmentService(
-            databaseFactory,
-            new FakeExecutionController(),
-            new FakeProcessCleaner(),
-            new FakeSessionCleaner(),
-            new FakeWorkspaceManager(),
-            new FlowLifecycleCoordinator(),
-            NullLogger<FlowAbandonmentService>.Instance);
-
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            service.AbandonAsync(databaseFactory.CreateDbContext().Flows.Single().Id));
-
-        Assert.Contains("approval is already recorded", exception.Message);
-    }
-
-    [Fact]
     public async Task AbandonAsync_RejectsAcceptedStudioDeliveryBeforePublication()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -287,7 +232,6 @@ public sealed class FlowAbandonmentTests
             {
                 Title = "Accepted Delivery",
                 OriginalRequest = "Publish after acceptance.",
-                ContractVersion = "studio-v2",
                 Kind = FlowKind.Delivery,
                 Status = FlowStatus.Queued,
                 OutcomeOwnerPlanStepKey = "outcome",
@@ -476,6 +420,34 @@ public sealed class FlowAbandonmentTests
             IReadOnlyCollection<FlowStep> steps,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(3);
+    }
+
+    private sealed class OwnedStagedSessionCleaner(
+        string copilotHome,
+        AgentManifestStager stager) : IFlowSessionCleaner
+    {
+        public Task<int> DeleteAsync(
+            FlowRun flow,
+            IReadOnlyCollection<FlowStep> steps,
+            CancellationToken cancellationToken = default)
+        {
+            var sessionIds = steps
+                .Select(step => step.CopilotSessionId)
+                .OfType<Guid>()
+                .Concat(steps.Select(step =>
+                    AgentSessionIdentity.Create(
+                        flow.Id,
+                        step.Iteration,
+                        step.AgentId,
+                        step.PlanStepKey)))
+                .Distinct()
+                .ToArray();
+            foreach (var sessionId in sessionIds)
+            {
+                stager.CleanupSessionRoot(copilotHome, sessionId);
+            }
+            return Task.FromResult(sessionIds.Length);
+        }
     }
 
     private sealed class FakeWorkspaceManager : IWorkspaceManager

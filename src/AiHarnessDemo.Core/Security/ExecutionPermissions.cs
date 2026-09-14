@@ -10,10 +10,7 @@ public sealed record PermissionResolutionRequest(
     ImmutableArray<PlanDuty> PlanDuties,
     ReviewDecision? DurableReviewDecision,
     bool DurableApproval,
-    bool IsOnlyPlannedPublishStep,
-    string ContractVersion,
-    bool LegacyPublicationAuthorized,
-    bool IsGovernedOutcomeVerification);
+    bool IsOnlyPlannedPublishStep);
 
 public sealed record WorkflowPermissionRestrictions(
     ExecutionPermissionProfile AdvisoryMaximum,

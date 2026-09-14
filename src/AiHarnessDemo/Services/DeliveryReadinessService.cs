@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Verification;
@@ -29,53 +30,30 @@ public sealed record DeliveryReadinessBinding(
 }
 
 /// <summary>
-/// Durable envelope for one recorded <c>outcome-qa-v2</c> contract. The raw JSON is preserved so a
+/// Durable envelope for one recorded verification contract. The raw JSON is preserved so a
 /// restart re-derives readiness from the exact bytes the host validated.
 /// </summary>
 public sealed record DeliveryQaLedgerEntry(
-    string Version,
     int Iteration,
     Guid StepId,
     string Role,
     string ContractHash,
-    string QaJson)
-{
-    public const string CurrentVersion = "delivery-readiness-qa-v1";
-}
+    string QaJson);
 
 /// <summary>Durable envelope for the planned, hashed acceptance criteria of one iteration.</summary>
 public sealed record DeliveryAcceptancePlanLedgerEntry(
-    string Version,
     int Iteration,
     Guid StepId,
     string PlanHash,
-    string PlanJson)
-{
-    public const string CurrentVersion = "delivery-acceptance-plan-v1";
-}
-
-/// <summary>
-/// One host-issued evidence identifier. The host mints these from its own execution records before
-/// the verification turn is dispatched, so a verification result can only cite evidence the host
-/// itself observed.
-/// </summary>
-public sealed record DeliveryEvidenceItem(
-    string EvidenceId,
-    string Kind,
-    string Locator,
-    string Summary);
+    string PlanJson);
 
 /// <summary>Durable envelope for the host-owned evidence registry of one plan step.</summary>
 public sealed record DeliveryEvidenceLedgerEntry(
-    string Version,
     int Iteration,
     Guid StepId,
     int Sequence,
     string Role,
-    IReadOnlyList<DeliveryEvidenceItem> Items)
-{
-    public const string CurrentVersion = "delivery-readiness-evidence-v1";
-}
+    IReadOnlyList<DeliveryEvidenceItem> Items);
 
 /// <summary>
 /// Derives, persists, and re-reads the host-owned Delivery readiness assessment. The service owns
@@ -91,23 +69,26 @@ public sealed class DeliveryReadinessService
     public const string SupersededEventType = "delivery.readiness-superseded";
     public const string WaiverGrantedEventType = "delivery.readiness-waiver-granted";
     public const string DeniedEventType = "delivery.readiness-authorization-denied";
-    public const string ReconciledEventType = "delivery.readiness-reconciled";
 
     private static readonly JsonSerializerOptions LedgerOptions = new()
     {
         PropertyNameCaseInsensitive = false,
+        UnmappedMemberHandling =
+            System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow,
         Converters =
         {
             new ExactEnumConverter<OutcomeEvidenceKind>()
         }
     };
+    private static readonly Regex TestCommandPattern = new(
+        @"(?im)(?:^|[;&|]\s*)(?:dotnet\s+test\b|node\s+--test\b|npm\s+(?:run\s+)?test(?:\s|$)|pnpm\s+(?:run\s+)?test(?:\s|$)|yarn\s+(?:run\s+)?test(?:\s|$)|pytest\b|(?:npx\s+)?(?:vitest|jest)\b|(?:npx\s+)?playwright\s+test\b)",
+        RegexOptions.CultureInvariant);
+    private static readonly Regex SourceInspectionCommandPattern = new(
+        @"(?im)(?:^|[;&|]\s*)(?:git\s+(?:--no-pager\s+)?(?:diff|show|status|log)\b|Get-Content\b|Select-String\b|rg\b)",
+        RegexOptions.CultureInvariant);
 
     public static bool AppliesTo(FlowRun flow) =>
-        flow is
-        {
-            ContractVersion: "studio-v2",
-            Kind: FlowKind.Delivery
-        };
+        flow.Kind == FlowKind.Delivery;
 
     public static string SerializeAcceptancePlan(
         DeliveryAcceptancePlan plan,
@@ -117,7 +98,6 @@ public sealed class DeliveryReadinessService
         var hash = DeliveryReadinessPolicy.HashAcceptancePlan(plan);
         return JsonSerializer.Serialize(
             new DeliveryAcceptancePlanLedgerEntry(
-                DeliveryAcceptancePlanLedgerEntry.CurrentVersion,
                 iteration,
                 stepId,
                 hash,
@@ -132,7 +112,6 @@ public sealed class DeliveryReadinessService
         string role) =>
         JsonSerializer.Serialize(
             new DeliveryQaLedgerEntry(
-                DeliveryQaLedgerEntry.CurrentVersion,
                 iteration,
                 stepId,
                 role,
@@ -158,11 +137,7 @@ public sealed class DeliveryReadinessService
         var entries = ReadLedger<DeliveryAcceptancePlanLedgerEntry>(
             events,
             AcceptancePlanEventType,
-            entry => entry.Iteration == iteration &&
-                     string.Equals(
-                         entry.Version,
-                         DeliveryAcceptancePlanLedgerEntry.CurrentVersion,
-                         StringComparison.Ordinal));
+            entry => entry.Iteration == iteration);
         if (entries.Count == 0)
         {
             return (
@@ -199,7 +174,7 @@ public sealed class DeliveryReadinessService
         }
     }
 
-    /// <summary>Reads the newest recorded <c>outcome-qa-v2</c> contract of the current iteration.</summary>
+    /// <summary>Reads the newest recorded verification contract of the current iteration.</summary>
     public static (DeliveryQaLedgerEntry? Entry, IReadOnlyList<string> Errors) TryReadQa(
         FlowRun flow)
     {
@@ -207,20 +182,16 @@ public sealed class DeliveryReadinessService
         var entries = ReadLedger<DeliveryQaLedgerEntry>(
             flow.Events,
             QaEventType,
-            entry => entry.Iteration == flow.Iteration &&
-                     string.Equals(
-                         entry.Version,
-                         DeliveryQaLedgerEntry.CurrentVersion,
-                         StringComparison.Ordinal));
+            entry => entry.Iteration == flow.Iteration);
         return entries.Count == 0
-            ? (null, ["the current Delivery iteration has no strict outcome-qa-v2 result"])
+            ? (null, ["the current Delivery iteration has no strict verification result"])
             : (entries[^1], []);
     }
 
     /// <summary>
-    /// Mints the deterministic host-issued evidence identifiers for one completed or about-to-run
-    /// plan step. Identifier <c>EV-Snnn-000</c> is the step's own host execution record; the
-    /// remaining identifiers are the host-observed tool calls in their recorded order.
+    /// Mints deterministic host-issued evidence identifiers for one plan step. Identifier
+    /// <c>EV-Snnn-000</c> is context only and cannot verify a criterion; remaining identifiers bind
+    /// successful or failed tool observations in their recorded order.
     /// </summary>
     public static DeliveryEvidenceLedgerEntry BuildEvidence(
         FlowStep step,
@@ -231,30 +202,33 @@ public sealed class DeliveryReadinessService
         {
             new(
                 EvidenceId(step.Sequence, 0),
-                "Observation",
+                OutcomeEvidenceKind.Observation,
                 string.IsNullOrWhiteSpace(step.PlanStepKey)
                     ? step.AgentRole
                     : step.PlanStepKey,
-                $"Host execution record for plan step '{step.PlanStepKey}' run by {step.AgentRole}.")
+                $"Host execution record for plan step '{step.PlanStepKey}' run by {step.AgentRole}.",
+                SupportsVerification: false,
+                ExitCode: null,
+                ResultDigest: string.Empty)
         };
         var index = 0;
-        foreach (var call in (toolCalls ?? [.. step.ToolCalls]).OrderBy(call => call.Id))
+        foreach (var call in toolCalls ?? [.. step.ToolCalls.OrderBy(call => call.Id)])
         {
             index++;
             items.Add(new DeliveryEvidenceItem(
                 EvidenceId(step.Sequence, index),
-                string.Equals(call.ToolType, "Shell", StringComparison.OrdinalIgnoreCase)
-                    ? "Command"
-                    : "Observation",
+                ClassifyEvidenceKind(call),
                 Clip(
                     string.IsNullOrWhiteSpace(call.NormalizedCommand)
                         ? call.ToolName
                         : call.NormalizedCommand,
                     400),
-                Clip(call.ResultSummary, 400)));
+                Clip(call.ResultSummary, 400),
+                call.Succeeded && call.ExitCode is null or 0,
+                call.ExitCode,
+                call.ResultDigest));
         }
         return new DeliveryEvidenceLedgerEntry(
-            DeliveryEvidenceLedgerEntry.CurrentVersion,
             step.Iteration,
             step.Id,
             step.Sequence,
@@ -272,14 +246,11 @@ public sealed class DeliveryReadinessService
         [.. ReadLedger<DeliveryEvidenceLedgerEntry>(
                 events,
                 EvidenceEventType,
-                entry => entry.Iteration == iteration &&
-                         string.Equals(
-                             entry.Version,
-                             DeliveryEvidenceLedgerEntry.CurrentVersion,
-                             StringComparison.Ordinal))
+                entry => entry.Iteration == iteration)
+            .GroupBy(entry => entry.StepId)
+            .Select(group => group.Last())
             .OrderBy(entry => entry.Sequence)
-            .SelectMany(entry => entry.Items)
-            .DistinctBy(item => item.EvidenceId, StringComparer.Ordinal)];
+            .SelectMany(entry => entry.Items)];
 
     /// <summary>
     /// The identifiers a verification result may cite. The set is always authoritative, so an empty
@@ -289,6 +260,38 @@ public sealed class DeliveryReadinessService
         IEnumerable<FlowEvent> events,
         int iteration) =>
         [.. ReadEvidence(events, iteration).Select(item => item.EvidenceId)];
+
+    private static OutcomeEvidenceKind ClassifyEvidenceKind(AgentToolCall call)
+    {
+        if (string.Equals(
+                call.ToolType,
+                "Command",
+                StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(
+                call.ToolType,
+                "Shell",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var command = $"{call.NormalizedCommand} {call.NormalizedArguments}";
+            if (TestCommandPattern.IsMatch(command))
+            {
+                return OutcomeEvidenceKind.Test;
+            }
+            return SourceInspectionCommandPattern.IsMatch(command)
+                ? OutcomeEvidenceKind.SourceInspection
+                : OutcomeEvidenceKind.Command;
+        }
+
+        return string.Equals(
+                   call.ToolType,
+                   "Read",
+                   StringComparison.OrdinalIgnoreCase) ||
+               call.ToolName is "view" or "grep" or "glob"
+            ? OutcomeEvidenceKind.SourceInspection
+            : call.ToolName is "create" or "edit" or "apply_patch"
+                ? OutcomeEvidenceKind.Artifact
+                : OutcomeEvidenceKind.Observation;
+    }
 
     private static string EvidenceId(int sequence, int index) =>
         $"EV-S{Math.Max(sequence, 0):000}-{index:000}";
@@ -316,7 +319,7 @@ public sealed class DeliveryReadinessService
         if (!AppliesTo(flow))
         {
             throw new InvalidOperationException(
-                "Delivery readiness applies only to studio-v2 Delivery flows.");
+                "Delivery readiness applies only to Delivery flows.");
         }
 
         var diagnostics = new List<string>();
@@ -335,7 +338,7 @@ public sealed class DeliveryReadinessService
                     qaEntry.QaJson,
                     plan,
                     planHash,
-                    KnownEvidenceIds(flow));
+                    ReadEvidence(flow.Events, flow.Iteration));
                 qa = parsed.Document;
                 qaHash = parsed.ContractHash;
             }
@@ -345,6 +348,12 @@ public sealed class DeliveryReadinessService
             }
         }
         var existing = await LoadCurrentAsync(database, flow.Id, cancellationToken);
+        var maximumRevision = await database.DeliveryReadinessSnapshots
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Iteration == flow.Iteration)
+            .Select(item => (int?)item.Revision)
+            .MaxAsync(cancellationToken) ?? 0;
         var grantedRiskIds = await LoadApplicableWaiverRiskIdsAsync(
             database,
             flow.Id,
@@ -356,7 +365,7 @@ public sealed class DeliveryReadinessService
         var candidate = new DeliveryReadinessDerivationInput(
             flow.Id,
             flow.Iteration,
-            (existing?.Record.Revision ?? 0) + 1,
+            (existing?.Record.Revision ?? maximumRevision) + 1,
             plan,
             planHash,
             qa,
@@ -367,7 +376,7 @@ public sealed class DeliveryReadinessService
             identity.OutcomeContractHash,
             identity.Fingerprint,
             grantedRiskIds,
-            KnownEvidenceIds(flow),
+            ReadEvidence(flow.Events, flow.Iteration),
             PreMortemStepIds(flow),
             diagnostics,
             now,
@@ -401,7 +410,6 @@ public sealed class DeliveryReadinessService
                     $"Superseded readiness revision {existing.Record.Revision} ({existing.Record.State}).",
                 DataJson = JsonSerializer.Serialize(new
                 {
-                    Version = "delivery-readiness-superseded-v1",
                     SnapshotId = existing.Record.Id,
                     existing.Record.Revision,
                     State = existing.Record.State.ToString(),
@@ -418,7 +426,6 @@ public sealed class DeliveryReadinessService
             Iteration = flow.Iteration,
             Revision = contract.Revision,
             State = contract.State,
-            Reconciliation = DeliveryReadinessReconciliation.Current,
             CandidateFingerprint = identity.Fingerprint,
             AcceptancePlanHash = string.IsNullOrEmpty(planHash)
                 ? OutcomeVerificationRules.ComputeSha256(
@@ -458,7 +465,6 @@ public sealed class DeliveryReadinessService
                 $"Derived host-owned Delivery readiness '{contract.State}' at revision {contract.Revision}.",
             DataJson = JsonSerializer.Serialize(new
             {
-                Version = DeliveryReadinessSnapshot.CurrentVersion,
                 SnapshotId = record.Id,
                 record.Revision,
                 State = record.State.ToString(),
@@ -524,7 +530,6 @@ public sealed class DeliveryReadinessService
             Message = reason,
             DataJson = JsonSerializer.Serialize(new
             {
-                Version = "delivery-readiness-superseded-v1",
                 SnapshotId = binding.Record.Id,
                 binding.Record.Revision,
                 State = binding.Record.State.ToString(),
@@ -557,7 +562,7 @@ public sealed class DeliveryReadinessService
         if (candidate is null || candidate.ReadinessSnapshotId != record.Id)
         {
             throw new DeliveryReadinessConflictException(
-                DeliveryReadinessConflicts.ReconciliationRequired,
+                DeliveryReadinessConflicts.BindingInvalid,
                 "The active readiness assessment is not bound to a current reviewed candidate.",
                 record.State,
                 record.Revision,
@@ -573,7 +578,7 @@ public sealed class DeliveryReadinessService
                 StringComparison.Ordinal))
         {
             throw new DeliveryReadinessConflictException(
-                DeliveryReadinessConflicts.ReconciliationRequired,
+                DeliveryReadinessConflicts.BindingInvalid,
                 "The active readiness row does not match its canonical contract.",
                 record.State,
                 record.Revision,
@@ -607,7 +612,7 @@ public sealed class DeliveryReadinessService
     {
         var binding = await LoadCurrentAsync(database, flowId, cancellationToken)
                       ?? throw new DeliveryReadinessConflictException(
-                          DeliveryReadinessConflicts.ReconciliationRequired,
+                          DeliveryReadinessConflicts.BindingInvalid,
                           "This Delivery flow has no current host-derived readiness assessment.");
         if (expectedCandidateId is { } candidateId &&
             candidateId != binding.Candidate.Id)
@@ -760,7 +765,6 @@ public sealed class DeliveryReadinessService
                 $"Customer waived {requested.Count} disclosed waiver-required risk(s) for readiness revision {binding.Revision}.",
             DataJson = JsonSerializer.Serialize(new
             {
-                Version = "delivery-readiness-waiver-v1",
                 SnapshotId = binding.Record.Id,
                 ReviewedCandidateId = binding.Candidate.Id,
                 binding.Record.ContractHash,
@@ -792,7 +796,6 @@ public sealed class DeliveryReadinessService
             Message = message,
             DataJson = JsonSerializer.Serialize(new
             {
-                Version = "delivery-readiness-denied-v1",
                 Code = code,
                 State = binding?.State.ToString(),
                 Revision = binding?.Revision,
@@ -801,163 +804,7 @@ public sealed class DeliveryReadinessService
             })
         };
 
-    /// <summary>
-    /// Fail-closed reconciliation for databases written before readiness existed. It never invents
-    /// criteria, evidence, or waivers, and never unpublishes or rewrites history.
-    /// </summary>
-    public async Task<int> ReconcileLegacyFlowsAsync(
-        HarnessDbContext database,
-        HandoffGateEngine gateEngine,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(database);
-        ArgumentNullException.ThrowIfNull(gateEngine);
-        var flows = await database.Flows
-            .AsSplitQuery()
-            .Include(item => item.Steps)
-            .Include(item => item.GateRecords)
-            .Include(item => item.Events)
-            .Where(item =>
-                item.ContractVersion == "studio-v2" &&
-                item.Kind == FlowKind.Delivery)
-            .ToListAsync(cancellationToken);
-        var reconciled = 0;
-        foreach (var flow in flows)
-        {
-            if (await database.DeliveryReadinessSnapshots.AnyAsync(
-                    item => item.FlowRunId == flow.Id,
-                    cancellationToken))
-            {
-                continue;
-            }
-            if (flow.Status is FlowStatus.Abandoned or FlowStatus.Abandoning)
-            {
-                continue;
-            }
-            var hasReviewHistory = flow.GateRecords.Any(gate =>
-                gate.ActionType == HandoffActionType.CustomerReview);
-            if (!hasReviewHistory && flow.Status is not FlowStatus.Approved)
-            {
-                // The flow never reached review, so the new contracts apply from its next
-                // readiness assessment with no legacy row required.
-                continue;
-            }
-
-            var now = DateTimeOffset.UtcNow;
-            foreach (var unresolved in flow.GateRecords.Where(gate =>
-                         !gate.Resolved &&
-                         gate.ActionType == HandoffActionType.CustomerReview))
-            {
-                var superseded = gateEngine.PrepareSupersession(
-                    unresolved,
-                    "harness",
-                    "Superseded because this review predates host-derived readiness verification.",
-                    now);
-                unresolved.Resolved = superseded.Resolved;
-                unresolved.Approved = superseded.Approved;
-                unresolved.ResolvedBy = superseded.ResolvedBy;
-                unresolved.ResolutionNote = superseded.ResolutionNote;
-                unresolved.ResolvedAt = superseded.ResolvedAt;
-                gateEngine.RestoreHistory([superseded]);
-            }
-
-            var record = new DeliveryReadinessSnapshotRecord
-            {
-                FlowRunId = flow.Id,
-                Iteration = flow.Iteration,
-                Revision = 1,
-                State = DeliveryReadinessState.Blocked,
-                Reconciliation = DeliveryReadinessReconciliation.LegacyUnverified,
-                CandidateFingerprint = OutcomeVerificationRules.ComputeSha256(
-                    $"legacy-unverified:{flow.Id:D}:{flow.Iteration}"),
-                AcceptancePlanHash = OutcomeVerificationRules.ComputeSha256(
-                    $"legacy-unverified-plan:{flow.Id:D}:{flow.Iteration}"),
-                OutcomeContractHash = OutcomeVerificationRules.ComputeSha256(
-                    flow.OutcomeContractJson ?? string.Empty),
-                QaContractHash = string.Empty,
-                OutcomeOwnerStepId = Guid.Empty,
-                QaStepId = Guid.Empty,
-                ContractJson = "{}",
-                ContractHash = OutcomeVerificationRules.ComputeSha256(
-                    $"legacy-unverified-readiness:{flow.Id:D}:{flow.Iteration}"),
-                Active = true,
-                CreatedAt = now
-            };
-            var legacyContract = new DeliveryReadinessSnapshot(
-                DeliveryReadinessSnapshot.CurrentVersion,
-                record.Id,
-                flow.Id,
-                flow.Iteration,
-                1,
-                DeliveryReadinessState.Blocked,
-                DeliveryReadinessReconciliation.LegacyUnverified,
-                record.CandidateFingerprint,
-                record.AcceptancePlanHash,
-                record.OutcomeContractHash,
-                string.Empty,
-                Guid.Empty,
-                Guid.Empty,
-                [],
-                [],
-                [],
-                [],
-                [
-                    "this Delivery result predates host-derived readiness verification and was " +
-                    "never proven against typed acceptance criteria"
-                ],
-                now);
-            record.ContractJson = DeliveryReadinessPolicy.SerializeSnapshot(legacyContract);
-            record.ContractHash = DeliveryReadinessPolicy.HashSnapshot(legacyContract);
-            var candidateRecord = new ReviewedCandidateRecord
-            {
-                FlowRunId = flow.Id,
-                Iteration = flow.Iteration,
-                CandidateFingerprint = record.CandidateFingerprint,
-                OutcomeOwnerStepId = Guid.Empty,
-                OutcomeContractHash = record.OutcomeContractHash,
-                AcceptancePlanHash = record.AcceptancePlanHash,
-                ReadinessSnapshotId = record.Id,
-                ReadinessContractHash = record.ContractHash,
-                IdentityJson = "{}",
-                Active = true,
-                CreatedAt = now
-            };
-            database.DeliveryReadinessSnapshots.Add(record);
-            database.ReviewedCandidateRecords.Add(candidateRecord);
-            database.FlowEvents.Add(new FlowEvent
-            {
-                FlowRunId = flow.Id,
-                Type = ReconciledEventType,
-                Message = flow.Status == FlowStatus.Approved
-                    ? "Published without host-derived readiness verification; publication authority is withheld until reconciliation."
-                    : "Fail-closed reconciliation: this flow needs a new host-derived readiness assessment before review.",
-                DataJson = JsonSerializer.Serialize(new
-                {
-                    Version = "delivery-readiness-reconciliation-v1",
-                    SnapshotId = record.Id,
-                    Reconciliation = record.Reconciliation.ToString(),
-                    PreviousStatus = flow.Status.ToString(),
-                    record.ContractHash
-                })
-            });
-            reconciled++;
-        }
-        if (reconciled > 0)
-        {
-            await database.SaveChangesAsync(cancellationToken);
-        }
-        return reconciled;
-    }
-
-    /// <summary>
-    /// Loads the waiver receipts that apply to one readiness assessment.
-    ///
-    /// Receipts are written against the pre-waiver assessment, and granting a waiver deliberately
-    /// re-derives a new revision with a new contract hash. Filtering by that new hash would orphan
-    /// every receipt, so the durable binding used here is the pair that actually survives the
-    /// re-derivation: the sealed candidate fingerprint and the exact QA contract the receipts were
-    /// granted against. New QA facts change that pair and therefore invalidate prior consent.
-    /// </summary>
+    /// <summary>Loads waivers bound to the exact candidate and QA result.</summary>
     private static async Task<IReadOnlyList<ReadinessWaiverRecord>> LoadWaiversAsync(
         HarnessDbContext database,
         Guid flowId,
@@ -1037,11 +884,4 @@ public sealed class DeliveryReadinessService
                 step.InvocationKind == ExecutionInvocationKind.PreMortem)
             .Select(step => step.Id)];
 
-    /// <summary>
-    /// Evidence identifiers the host itself issued for this iteration, read from the durable
-    /// registry. The set is always authoritative, so a fabricated identifier becomes a contract
-    /// error and an empty registry fails closed instead of authorizing anything.
-    /// </summary>
-    private static IReadOnlyList<string> KnownEvidenceIds(FlowRun flow) =>
-        KnownEvidenceIds(flow.Events, flow.Iteration);
 }

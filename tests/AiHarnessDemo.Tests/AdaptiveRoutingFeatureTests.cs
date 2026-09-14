@@ -90,9 +90,9 @@ public sealed class TaskProfileTests
         var profiles = TaskProfileRules.ParseTeamLeadOutput(
             """
             HANDOFF_STATUS: COMPLETE
-            TEAM_TASK_PROFILES_V1_BEGIN
-            {"Version":"task-profile-v1","Profiles":[{"Role":"software-engineer","Complexity":7,"ReasoningDepth":8,"ContextDemand":6,"ToolIntensity":9,"TaskTypeTags":["Implementation"],"Risk":"High","RiskReason":"The implementation changes a public contract.","Confidence":0.9,"Rationales":["Code and focused validation are required."]}]}
-            TEAM_TASK_PROFILES_V1_END
+            TEAM_TASK_PROFILES_BEGIN
+            {"Profiles":[{"Role":"software-engineer","Complexity":7,"ReasoningDepth":8,"ContextDemand":6,"ToolIntensity":9,"TaskTypeTags":["Implementation"],"Risk":"High","RiskReason":"The implementation changes a public contract.","Confidence":0.9,"Rationales":["Code and focused validation are required."]}]}
+            TEAM_TASK_PROFILES_END
             """,
             ["software-engineer"],
             flowId,
@@ -111,9 +111,9 @@ public sealed class TaskProfileTests
         var exception = Assert.Throws<TaskProfileValidationException>(() =>
             TaskProfileRules.ParseTeamLeadOutput(
                 """
-                TEAM_TASK_PROFILES_V1_BEGIN
-                {"Version":"task-profile-v1","Profiles":[{"Role":"quality-engineer","Complexity":11,"ReasoningDepth":5,"ContextDemand":5,"ToolIntensity":5,"TaskTypeTags":["Quality"],"Risk":"Low","RiskReason":"Validation task.","Confidence":0.5,"Rationales":["Validate."]}]}
-                TEAM_TASK_PROFILES_V1_END
+                TEAM_TASK_PROFILES_BEGIN
+                {"Profiles":[{"Role":"quality-engineer","Complexity":11,"ReasoningDepth":5,"ContextDemand":5,"ToolIntensity":5,"TaskTypeTags":["Quality"],"Risk":"Low","RiskReason":"Validation task.","Confidence":0.5,"Rationales":["Validate."]}]}
+                TEAM_TASK_PROFILES_END
                 """,
                 ["software-engineer"],
                 Guid.NewGuid(),
@@ -145,9 +145,9 @@ public sealed class PreMortemContractTests
     {
         var roles = PreMortemRules.ParsePlan(
             """
-            PRE_MORTEM_PLAN_V1_BEGIN
-            {"Version":"pre-mortem-plan-v1","AfterRoles":["architect","software-engineer"]}
-            PRE_MORTEM_PLAN_V1_END
+            PRE_MORTEM_PLAN_BEGIN
+            {"AfterRoles":["architect","software-engineer"]}
+            PRE_MORTEM_PLAN_END
             """,
             ["architect", "software-engineer", "quality-engineer"],
             scepticAvailable: true);
@@ -163,9 +163,9 @@ public sealed class PreMortemContractTests
         var exception = Assert.Throws<PreMortemValidationException>(() =>
             PreMortemRules.ParsePlan(
                 """
-                PRE_MORTEM_PLAN_V1_BEGIN
-                {"Version":"pre-mortem-plan-v1","AfterRoles":["software-engineer"]}
-                PRE_MORTEM_PLAN_V1_END
+                PRE_MORTEM_PLAN_BEGIN
+                {"AfterRoles":["software-engineer"]}
+                PRE_MORTEM_PLAN_END
                 """,
                 ["software-engineer"],
                 scepticAvailable: false));
@@ -181,9 +181,9 @@ public sealed class PreMortemContractTests
         var clear = PreMortemRules.ParseReview(
             """
             PRE_MORTEM_STATUS: CLEAR
-            PRE_MORTEM_FINDINGS_V1_BEGIN
-            {"Version":"pre-mortem-findings-v1","Findings":[]}
-            PRE_MORTEM_FINDINGS_V1_END
+            PRE_MORTEM_FINDINGS_BEGIN
+            {"Findings":[]}
+            PRE_MORTEM_FINDINGS_END
             """);
         var sixFindings = string.Join(
             ",",
@@ -194,9 +194,9 @@ public sealed class PreMortemContractTests
             PreMortemRules.ParseReview(
                 $$"""
                  PRE_MORTEM_STATUS: FINDINGS
-                 PRE_MORTEM_FINDINGS_V1_BEGIN
-                 {"Version":"pre-mortem-findings-v1","Findings":[{{sixFindings}}]}
-                 PRE_MORTEM_FINDINGS_V1_END
+                 PRE_MORTEM_FINDINGS_BEGIN
+                 {"Findings":[{{sixFindings}}]}
+                 PRE_MORTEM_FINDINGS_END
                  """));
 
         Assert.False(clear.HasFindings);
@@ -216,9 +216,9 @@ public sealed class PreMortemContractTests
                 $$"""{"FailureMode":"failure {{index}} {{padding}}","Evidence":"evidence {{index}} {{padding}}","MissedSignal":"signal {{index}} {{padding}}","Prevention":"prevention {{index}} {{padding}}"}"""));
         var review = $$"""
             PRE_MORTEM_STATUS: FINDINGS
-            PRE_MORTEM_FINDINGS_V1_BEGIN
-            {"Version":"pre-mortem-findings-v1","Findings":[{{findings}}]}
-            PRE_MORTEM_FINDINGS_V1_END
+            PRE_MORTEM_FINDINGS_BEGIN
+            {"Findings":[{{findings}}]}
+            PRE_MORTEM_FINDINGS_END
             """;
 
         Assert.InRange(review.Length, 8_001, PreMortemRules.MaximumReviewOutputCharacters);
@@ -234,15 +234,15 @@ public sealed class PreMortemContractTests
                 $$"""{"FailureMode":"failure {{index}}","Evidence":"proof {{index}}","MissedSignal":"signal {{index}}","Prevention":"prevention {{index}}"}"""));
         var review = $$"""
             PRE_MORTEM_STATUS: FINDINGS
-            PRE_MORTEM_FINDINGS_V1_BEGIN
-            {"Version":"pre-mortem-findings-v1","Findings":[{{findings}}]}
-            PRE_MORTEM_FINDINGS_V1_END
+            PRE_MORTEM_FINDINGS_BEGIN
+            {"Findings":[{{findings}}]}
+            PRE_MORTEM_FINDINGS_END
             """;
 
         _ = PreMortemRules.ParseReview(review);
         var assignment = WorkflowEngine.BuildPreMortemRevisionAssignment(
             review,
-            "software-engineer");
+            """["Implement"]""");
 
         Assert.Contains("\"FailureMode\":\"failure 1\"", assignment);
         Assert.Contains("\"FailureMode\":\"failure 5\"", assignment);
@@ -254,10 +254,10 @@ public sealed class PreMortemContractTests
     {
         var designer = WorkflowEngine.BuildPreMortemRevisionAssignment(
             "PRE_MORTEM_STATUS: FINDINGS",
-            "product-designer");
+            """["Design"]""");
         var engineer = WorkflowEngine.BuildPreMortemRevisionAssignment(
             "PRE_MORTEM_STATUS: FINDINGS",
-            "software-engineer");
+            """["Implement"]""");
 
         Assert.Contains("Do not implement downstream product corrections", designer);
         Assert.Contains("make the focused corrections owned by this role", engineer);
@@ -273,9 +273,7 @@ public sealed class PreMortemContractTests
              {TeamPlanParser.EndSentinel}, {FlowOutcomeParser.BeginSentinel}, and
              {FlowOutcomeParser.EndSentinel}.
              """,
-            "product-designer",
-            """["Design","PrepareOutcome"]""",
-            "studio-v2");
+            """["Design","PrepareOutcome"]""");
 
         Assert.DoesNotContain(TeamPlanParser.BeginSentinel, assignment);
         Assert.DoesNotContain(TeamPlanParser.EndSentinel, assignment);
@@ -337,184 +335,6 @@ public sealed class PreMortemContractTests
         Assert.Equal(
             expected,
             WorkflowEngine.ShouldRunPreMortemRound(round, maximumRounds));
-    }
-}
-
-public sealed class FeedbackRoutingAttributionTests
-{
-    [Fact]
-    public void ReworkTargets_AreStrictlyValidatedAndRemovedFromCustomerReply()
-    {
-        const string output = """
-            The implementation needs another pass.
-            REWORK_TARGET_ROLES: software-engineer, quality-engineer
-            """;
-        var valid = FeedbackCoordinator.TryParseReworkTargets(
-            output,
-            new HashSet<string>(["software-engineer", "quality-engineer"], StringComparer.Ordinal),
-            out var targets);
-
-        Assert.True(valid);
-        Assert.Equal(["software-engineer", "quality-engineer"], targets);
-        Assert.Equal(
-            "The implementation needs another pass.",
-            FeedbackCoordinator.StripReworkTargetMarker(output));
-    }
-
-    [Fact]
-    public void ReworkTargets_RejectUnknownOrMissingAttribution()
-    {
-        var eligible = new HashSet<string>(["software-engineer"], StringComparer.Ordinal);
-
-        Assert.False(FeedbackCoordinator.TryParseReworkTargets(
-            "REWORK_TARGET_ROLES: architect",
-            eligible,
-            out var unknown));
-        Assert.Empty(unknown);
-        Assert.False(FeedbackCoordinator.TryParseReworkTargets(
-            "No structured attribution.",
-            eligible,
-            out var missing));
-        Assert.Empty(missing);
-    }
-}
-
-public sealed class RoutingPersistenceTests
-{
-    [Fact]
-    public async Task Settings_DefaultStrategyAndSchemaUpgradeAreStable()
-    {
-        Assert.Equal(
-            ModelSelectionStrategy.MaximumQuality,
-            new HarnessSettings().ModelSelectionStrategy);
-
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        await using (var create = connection.CreateCommand())
-        {
-            create.CommandText = """
-                CREATE TABLE Settings (
-                    Id INTEGER NOT NULL PRIMARY KEY,
-                    RepositoryPath TEXT NOT NULL,
-                    RepositoryKnowledge TEXT NOT NULL,
-                    Outcome TEXT NOT NULL,
-                    MaxHandoffRetries INTEGER NOT NULL,
-                    ExecutionMode TEXT NOT NULL,
-                    UpdatedAt INTEGER NOT NULL
-                );
-                INSERT INTO Settings VALUES
-                    (1, '', '', 'PullRequest', 2, 'LiveCopilot', 0);
-                """;
-            await create.ExecuteNonQueryAsync();
-        }
-
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        await using var database = new HarnessDbContext(options);
-
-        await DatabaseInitializer.EnsureSettingsSchemaAsync(database);
-        var settings = await database.Settings.SingleAsync();
-
-        Assert.Equal(ModelSelectionStrategy.MaximumQuality, settings.ModelSelectionStrategy);
-    }
-
-    [Fact]
-    public async Task RoutingSchema_AllowsOneFreshProfilePerStepForTheSameRole()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        await using var database = new HarnessDbContext(options);
-        await database.Database.EnsureCreatedAsync();
-        await database.Database.ExecuteSqlRawAsync(
-            """
-            DROP INDEX IF EXISTS IX_TaskProfiles_Flow_Iteration_Role;
-            CREATE UNIQUE INDEX IX_TaskProfiles_Flow_Iteration_Role
-                ON TaskProfiles (FlowRunId, Iteration, Role);
-            """);
-
-        await DatabaseInitializer.EnsureRoutingSchemaAsync(database);
-
-        var flow = new FlowRun
-        {
-            Title = "Profile routing",
-            OriginalRequest = "Route changing intake tasks."
-        };
-        var firstStep = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            AgentId = "account-manager",
-            AgentName = "Account Manager",
-            AgentRole = "account-manager"
-        };
-        var secondStep = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            AgentId = "account-manager",
-            AgentName = "Account Manager",
-            AgentRole = "account-manager"
-        };
-        database.Flows.Add(flow);
-        database.FlowSteps.AddRange(firstStep, secondStep);
-        var factory = new BootstrapTaskProfileFactory();
-        database.TaskProfiles.AddRange(
-            factory.Create(
-                "account-manager",
-                "Clarify a small text change.",
-                flow.Id,
-                1,
-                firstStep.Id),
-            factory.Create(
-                "account-manager",
-                "Clarify a production authentication migration.",
-                flow.Id,
-                1,
-                secondStep.Id));
-
-        await database.SaveChangesAsync();
-
-        Assert.Equal(
-            2,
-            await database.TaskProfiles.CountAsync(item =>
-                item.FlowRunId == flow.Id &&
-                item.Role == "account-manager"));
-    }
-
-    [Fact]
-    public async Task RoutingSchema_AddsPreMortemCheckpointToExistingProfiles()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                CREATE TABLE TaskProfiles (
-                    Id TEXT NOT NULL CONSTRAINT PK_TaskProfiles PRIMARY KEY,
-                    FlowRunId TEXT NOT NULL,
-                    Iteration INTEGER NOT NULL,
-                    FlowStepId TEXT NULL,
-                    Role TEXT NOT NULL
-                );
-                """;
-            await command.ExecuteNonQueryAsync();
-        }
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        await using var database = new HarnessDbContext(options);
-
-        await DatabaseInitializer.EnsureRoutingSchemaAsync(database);
-        await using var probe = connection.CreateCommand();
-        probe.CommandText =
-            "SELECT COUNT(*) FROM pragma_table_info('TaskProfiles') " +
-            "WHERE name IN ('PreMortemAfter', 'PlanStepKey', 'AgentId');";
-
-        Assert.Equal(3L, Convert.ToInt64(await probe.ExecuteScalarAsync()));
     }
 }
 
@@ -661,220 +481,5 @@ public sealed class RoutingObservationTests
         public Task<HarnessDbContext> CreateDbContextAsync(
             CancellationToken cancellationToken = default) =>
             Task.FromResult(CreateDbContext());
-    }
-}
-
-public sealed class ApprovalGatedReleaseTests
-{
-    [Fact]
-    public async Task LegacyUnverifiedApproval_IsRejectedWithoutPublication()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        var databaseFactory = new ApprovalDbContextFactory(options);
-        var flow = await SeedWaitingFlowAsync(databaseFactory);
-        var queue = new FlowQueue();
-        using var gate = new HandoffGateEngine();
-        gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
-        await RestoreGateAsync(databaseFactory, gate);
-        var coordinator = CreateCoordinator(databaseFactory, gate, queue);
-        Guid gateId;
-        await using (var gateDatabase = await databaseFactory.CreateDbContextAsync())
-        {
-            gateId = await gateDatabase.GateRecords.Select(item => item.Id).SingleAsync();
-        }
-
-        var updated = await coordinator.DecideAsync(
-            flow.Id,
-            approve: true,
-            gateId,
-            candidateFingerprint: string.Empty,
-            feedback: string.Empty,
-            CancellationToken.None);
-
-        Assert.Equal(ReleaseDecisionOutcome.Conflict, updated.Outcome);
-        Assert.Equal(FlowStatus.WaitingForFeedback, updated.Flow.Status);
-        Assert.Null(updated.Flow.CompletedAt);
-        Assert.Equal($"#/preview/{flow.Id}", updated.Flow.OutcomeUrl);
-        Assert.DoesNotContain(
-            updated.Flow.Steps,
-            step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
-        Assert.False(queue.Reader.TryRead(out _));
-        await using var database = await databaseFactory.CreateDbContextAsync();
-        var resolvedGate = await database.GateRecords.SingleAsync();
-        Assert.False(resolvedGate.Resolved);
-        Assert.Null(resolvedGate.Approved);
-    }
-
-    [Fact]
-    public async Task Rejection_QueuesReworkWithoutPublication()
-    {
-        await using var connection = new SqliteConnection("Data Source=:memory:");
-        await connection.OpenAsync();
-        var options = new DbContextOptionsBuilder<HarnessDbContext>()
-            .UseSqlite(connection)
-            .Options;
-        var databaseFactory = new ApprovalDbContextFactory(options);
-        var flow = await SeedWaitingFlowAsync(databaseFactory);
-        await using (var database = await databaseFactory.CreateDbContextAsync())
-        {
-            database.FlowMessages.Add(new FlowMessage
-            {
-                FlowRunId = flow.Id,
-                Role = ConversationRole.Customer,
-                Content = "Increase text contrast."
-            });
-            await database.SaveChangesAsync();
-        }
-        var queue = new FlowQueue();
-        using var gate = new HandoffGateEngine();
-        gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
-        await RestoreGateAsync(databaseFactory, gate);
-        var coordinator = CreateCoordinator(databaseFactory, gate, queue);
-        Guid gateId;
-        await using (var gateDatabase = await databaseFactory.CreateDbContextAsync())
-        {
-            gateId = await gateDatabase.GateRecords.Select(item => item.Id).SingleAsync();
-        }
-
-        var updated = await coordinator.DecideAsync(
-            flow.Id,
-            approve: false,
-            gateId,
-            candidateFingerprint: string.Empty,
-            feedback: string.Empty,
-            CancellationToken.None);
-
-        Assert.Equal(ReleaseDecisionOutcome.Rejected, updated.Outcome);
-        Assert.Equal(FlowStatus.Queued, updated.Flow.Status);
-        Assert.Equal(2, updated.Flow.Iteration);
-        Assert.DoesNotContain(
-            updated.Flow.Steps,
-            step => step.Label == WorkflowEngine.ApprovedPublicationLabel);
-        Assert.True(queue.Reader.TryRead(out var queuedFlowId));
-        Assert.Equal(flow.Id, queuedFlowId);
-    }
-
-    [Fact]
-    public void PullRequestReference_IsParsedFromPublishedReleaseOutput()
-    {
-        var reference = PublishedOutcomeVerifier.ParsePullRequest(
-            "Published https://github.com/devclub/site/pull/38 after approval.");
-
-        Assert.NotNull(reference);
-        Assert.Equal("devclub/site", reference.Repository);
-        Assert.Equal(38, reference.Number);
-        Assert.Null(PublishedOutcomeVerifier.ParsePullRequest("Local candidate only."));
-        Assert.Equal(
-            "devclub/site",
-            PublishedOutcomeVerifier.NormalizeGitHubRepository(
-                "git@github.com:devclub/site.git"));
-        Assert.Equal(
-            "devclub/site.gitops",
-            PublishedOutcomeVerifier.NormalizeGitHubRepository(
-                "git@github.com:devclub/site.gitops.git"));
-        Assert.Null(PublishedOutcomeVerifier.NormalizeSingleGitHubRemote(
-            "https://github.com/devclub/site.git\n" +
-            "https://github.com/other/site.git"));
-        using var ownHead = System.Text.Json.JsonDocument.Parse(
-            """{"headRepository":{"nameWithOwner":"devclub/site"},"headRepositoryOwner":{"login":"devclub"}}""");
-        using var forkHead = System.Text.Json.JsonDocument.Parse(
-            """{"headRepository":{"nameWithOwner":"someone/site"},"headRepositoryOwner":{"login":"someone"}}""");
-        Assert.True(PublishedOutcomeVerifier.IsExpectedHeadRepository(
-            ownHead.RootElement,
-            "devclub/site"));
-        Assert.False(PublishedOutcomeVerifier.IsExpectedHeadRepository(
-            forkHead.RootElement,
-            "devclub/site"));
-    }
-
-    private static FeedbackCoordinator CreateCoordinator(
-        IDbContextFactory<HarnessDbContext> databaseFactory,
-        HandoffGateEngine gate,
-        FlowQueue queue) =>
-        new(
-            databaseFactory,
-            new FixedModelRouter(),
-            new BootstrapTaskProfileFactory(),
-            TestRoutingSupport.Recorder(databaseFactory),
-            new NeverApprovalAgentRunner(),
-            gate,
-            queue,
-            new FlowLifecycleCoordinator());
-
-    private static async Task<FlowRun> SeedWaitingFlowAsync(
-        IDbContextFactory<HarnessDbContext> databaseFactory)
-    {
-        await using var database = await databaseFactory.CreateDbContextAsync();
-        await database.Database.EnsureCreatedAsync();
-        var flow = new FlowRun
-        {
-            Title = "Approval gated release",
-            OriginalRequest = "Prepare a release.",
-            ConsolidatedRequest = "Prepare a release.",
-            Status = FlowStatus.WaitingForFeedback,
-            Outcome = OutcomeType.PullRequest,
-            RepositoryPath = @"C:\code\demo"
-        };
-        flow.OutcomeUrl = $"#/preview/{flow.Id}";
-        var release = new FlowStep
-        {
-            FlowRunId = flow.Id,
-            Iteration = 1,
-            Sequence = 70,
-            AgentId = "release-engineer",
-            AgentName = "Release Engineer",
-            AgentRole = "release-engineer",
-            Label = WorkflowEngine.ReleaseCandidateLabel,
-            Status = StepStatus.Completed,
-            Attempt = 1,
-            OutputSummary = "Local candidate prepared."
-        };
-        flow.Steps.Add(release);
-        database.Flows.Add(flow);
-        database.GateRecords.Add(new HandoffGateRecord
-        {
-            FlowRunId = flow.Id,
-            FlowStepId = release.Id,
-            ActionType = HandoffActionType.Release,
-            Decision = HandoffGateDecision.AwaitingHumanApproval,
-            TrustLevelAtDecision = HandoffTrustLevel.Gated,
-            Summary = "Candidate ready.",
-            Evidence = "Validated.",
-            Reason = "Customer approval required."
-        });
-        await database.SaveChangesAsync();
-        return flow;
-    }
-
-    private static async Task RestoreGateAsync(
-        IDbContextFactory<HarnessDbContext> databaseFactory,
-        HandoffGateEngine gate)
-    {
-        await using var database = await databaseFactory.CreateDbContextAsync();
-        gate.RestoreHistory(await database.GateRecords.AsNoTracking().ToListAsync());
-    }
-
-    private sealed class ApprovalDbContextFactory(
-        DbContextOptions<HarnessDbContext> options)
-        : IDbContextFactory<HarnessDbContext>
-    {
-        public HarnessDbContext CreateDbContext() => new(options);
-
-        public Task<HarnessDbContext> CreateDbContextAsync(
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult(CreateDbContext());
-    }
-
-    private sealed class NeverApprovalAgentRunner : IAgentRunner
-    {
-        public Task<AgentExecutionResult> ExecuteAsync(
-            AgentExecutionContext context,
-            CancellationToken cancellationToken = default) =>
-            throw new InvalidOperationException(
-                "Approval scheduling must not execute an agent inline.");
     }
 }

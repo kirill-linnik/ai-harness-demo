@@ -3,7 +3,7 @@ using AiHarnessDemo.Core.Verification;
 namespace AiHarnessDemo.Core.Domain;
 
 /// <summary>
-/// One immutable, host-derived readiness assessment for a studio-v2 Delivery iteration. Exactly one
+/// One immutable, host-derived readiness assessment for a Studio Delivery iteration. Exactly one
 /// row per flow may be <see cref="Active"/>; superseding a row is the only way to change readiness,
 /// so an authorization can always prove which assessment it used.
 /// </summary>
@@ -19,9 +19,6 @@ public sealed class DeliveryReadinessSnapshotRecord
 
     public DeliveryReadinessState State { get; set; }
 
-    public DeliveryReadinessReconciliation Reconciliation { get; set; } =
-        DeliveryReadinessReconciliation.Current;
-
     public required string CandidateFingerprint { get; set; }
 
     public required string AcceptancePlanHash { get; set; }
@@ -34,7 +31,7 @@ public sealed class DeliveryReadinessSnapshotRecord
 
     public Guid QaStepId { get; set; }
 
-    /// <summary>Canonical <c>delivery-readiness-v1</c> JSON. It is never rewritten in place.</summary>
+    /// <summary>Canonical readiness JSON. It is never rewritten in place.</summary>
     public required string ContractJson { get; set; }
 
     /// <summary>SHA-256 of <see cref="ContractJson"/>; the immutable binding token for review,

@@ -12,9 +12,7 @@ public sealed record WorkflowRuntimeStatus(
     string? CurrentFileError,
     int? MaxConcurrentAgents,
     int? MaxAttempts,
-    string? WorkspaceRoot,
-    bool? OutcomeVerificationEnabled,
-    int? OutcomeVerificationMaxRounds)
+    string? WorkspaceRoot)
 {
     public bool Ready => CurrentFileValid;
 
@@ -93,9 +91,7 @@ public sealed class WorkflowDefinitionProvider(
                 _currentFileError,
                 _effective?.Config.Agent.MaxConcurrentAgents,
                 _effective?.Config.Agent.MaxAttempts,
-                _effective?.Config.Workspace.ResolvedRoot,
-                _effective?.Config.OutcomeVerification.Enabled,
-                _effective?.Config.OutcomeVerification.MaxRounds);
+                _effective?.Config.Workspace.ResolvedRoot);
         }
     }
 

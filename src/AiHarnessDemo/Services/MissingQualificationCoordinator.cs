@@ -89,7 +89,7 @@ public sealed class MissingQualificationCoordinator(
                         cancellationToken);
                 }
                 catch (Exception exception) when (
-                    exception is IntakeV2ContractException or
+                    exception is IntakeContractException or
                         InvalidOperationException)
                 {
                     explanationFailure = Clip(
@@ -176,7 +176,7 @@ public sealed class MissingQualificationCoordinator(
                 step.PushbackReason = string.Empty;
             }
             catch (Exception exception) when (
-                exception is IntakeV2ContractException or
+                exception is IntakeContractException or
                     InvalidOperationException)
             {
                 customerMessage = SafeFallbackMessage;
@@ -397,12 +397,10 @@ public sealed class MissingQualificationCoordinator(
                 DataJson = explanationFailure is null
                     ? JsonSerializer.Serialize(new
                     {
-                        Version = "qualification-explanation-v1",
                         UsedFallback = false
                     })
                     : JsonSerializer.Serialize(new
                     {
-                        Version = "qualification-explanation-v1",
                         UsedFallback = true,
                         Error = explanationFailure
                     })
@@ -457,7 +455,6 @@ public sealed class MissingQualificationCoordinator(
     {
         var json = JsonSerializer.Serialize(new
         {
-            Version = "missing-qualification-v1",
             Code = BlockerCode,
             qualification.Summary,
             Missing = qualification.Missing ?? [],
@@ -499,7 +496,6 @@ public sealed class MissingQualificationCoordinator(
                 exception);
         }
         if (persisted is null ||
-            persisted.Version != "missing-qualification-v1" ||
             persisted.Code != BlockerCode ||
             string.IsNullOrWhiteSpace(persisted.Summary) ||
             persisted.Missing is null ||
@@ -528,7 +524,7 @@ public sealed class MissingQualificationCoordinator(
         operator wording below. Do not claim the request failed and do not promise an automatic
         retry.
 
-        Return exactly one intake-v2 document. Set Status to NeedsClarification, FlowKind to null,
+        Return exactly one intake document. Set Status to NeedsClarification, FlowKind to null,
         TaskTitle to "{{taskTitle}}", CustomerReply to only the safe explanation, and Brief to
         empty Goal/Details/SuccessCriteria/Constraints/Assumptions values.
 
@@ -540,12 +536,12 @@ public sealed class MissingQualificationCoordinator(
         string output,
         MissingQualification qualification)
     {
-        var parsed = IntakeV2Parser.Parse(output);
-        if (parsed.Document.Status != IntakeV2Status.NeedsClarification ||
+        var parsed = IntakeParser.Parse(output);
+        if (parsed.Document.Status != IntakeStatus.NeedsClarification ||
             parsed.Document.FlowKind is not null)
         {
             throw new InvalidOperationException(
-                "The Account Manager blocker response must be a NeedsClarification intake-v2 document.");
+                "The Account Manager blocker response must be a NeedsClarification intake document.");
         }
         var message = parsed.Document.CustomerReply.Trim();
         if (string.Equals(
@@ -597,8 +593,6 @@ public sealed class MissingQualificationCoordinator(
 
     private sealed class PersistedBlocker
     {
-        public string Version { get; init; } = string.Empty;
-
         public string Code { get; init; } = string.Empty;
 
         public string Summary { get; init; } = string.Empty;

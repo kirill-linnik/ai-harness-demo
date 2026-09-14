@@ -43,7 +43,6 @@ builder.Services.AddSingleton<INewWorkAdmissionService>(
 builder.Services.AddSingleton<RepositoryKnowledgeSynthesizer>();
 builder.Services.AddSingleton<RepositoryAnalyzer>();
 builder.Services.AddSingleton<IntakeCoordinator>();
-builder.Services.AddSingleton<FlowPlanner>();
 builder.Services.AddSingleton<TeamPlanValidator>();
 builder.Services.AddSingleton<BootstrapTaskProfileFactory>();
 builder.Services.AddSingleton<ModelCatalogDiscovery>();
@@ -80,7 +79,6 @@ builder.Services.AddSingleton<IDemoRuntimeRevoker>(
     services => services.GetRequiredService<DemoRuntimeManager>());
 builder.Services.AddHostedService<DemoRuntimeShutdownService>();
 builder.Services.AddSingleton<DemoReverseProxy>();
-builder.Services.AddSingleton<OutcomeVerificationContextBuilder>();
 builder.Services.AddSingleton<IVerifiedCandidatePublisher, VerifiedCandidatePublisher>();
 builder.Services.AddSingleton<IWorkspaceProcessCleaner, WorkspaceProcessCleaner>();
 builder.Services.AddSingleton<IFlowSessionCleaner, FlowSessionCleaner>();
@@ -96,8 +94,6 @@ builder.Services.AddSingleton(_ =>
     var gate = new HandoffGateEngine();
     gate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
     gate.SetTrustLevel(HandoffActionType.RequestRevision, HandoffTrustLevel.Auto);
-    gate.SetTrustLevel(HandoffActionType.Release, HandoffTrustLevel.Gated);
-    gate.SetTrustLevel(HandoffActionType.OutcomeResolution, HandoffTrustLevel.Gated);
     gate.SetTrustLevel(HandoffActionType.CustomerReview, HandoffTrustLevel.Gated);
     gate.SetTrustLevel(HandoffActionType.CustomerWaiver, HandoffTrustLevel.Gated);
     return gate;
@@ -109,7 +105,6 @@ builder.Services.AddSingleton<IAgentRunner>(
 builder.Services.AddSingleton<CopilotSessionJournal>();
 builder.Services.AddSingleton<FlowQueue>();
 builder.Services.AddSingleton<WorkflowEngine>();
-builder.Services.AddSingleton<FeedbackCoordinator>();
 builder.Services.AddSingleton<ReviewCoordinator>();
 builder.Services.AddSingleton<FlowWorker>();
 builder.Services.AddSingleton<IFlowExecutionController>(

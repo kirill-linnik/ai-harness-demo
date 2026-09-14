@@ -264,55 +264,21 @@ public sealed class FlowAbandonmentService(
 
     internal static bool HasEffectiveApprovedRelease(FlowRun flow)
     {
-        if (string.Equals(
-                flow.ContractVersion,
-                "studio-v2",
-                StringComparison.Ordinal) &&
-            flow.Kind == FlowKind.Delivery)
-        {
-            var currentStepIds = flow.Steps
-                .Where(step => step.Iteration == flow.Iteration)
-                .Select(step => step.Id)
-                .ToHashSet();
-            return flow.GateRecords.Any(gate =>
-                gate.ActionType == HandoffActionType.CustomerReview &&
-                gate.Resolved &&
-                gate.Approved == true &&
-                gate.ReviewDecision == ReviewDecision.Accepted &&
-                currentStepIds.Contains(gate.FlowStepId));
-        }
-
-        var approvedReleaseGates = flow.GateRecords
-            .Where(item =>
-                item.ActionType ==
-                AiHarnessDemo.Core.Gating.HandoffActionType.Release &&
-                item.Resolved &&
-                item.Approved == true)
-            .ToArray();
-        if (string.IsNullOrWhiteSpace(flow.OutcomeVerificationJson))
-        {
-            return approvedReleaseGates.Length > 0;
-        }
-        var state = OutcomeVerificationRules.DeserializeAggregate(
-            flow.OutcomeVerificationJson);
-        if (state.Status != OutcomeVerificationStatus.Passed ||
-            state.Stale ||
-            string.IsNullOrWhiteSpace(state.VerifiedCandidateFingerprint))
+        if (flow.Kind != FlowKind.Delivery)
         {
             return false;
         }
-        var currentQaStepIds = state.Rounds
-            .Where(round =>
-                !round.Stale &&
-                round.Result?.Verdict == OutcomeQaVerdict.PASS &&
-                string.Equals(
-                    round.CandidateFingerprint,
-                    state.VerifiedCandidateFingerprint,
-                    StringComparison.Ordinal))
-            .Select(round => round.QaStepId)
+
+        var currentStepIds = flow.Steps
+            .Where(step => step.Iteration == flow.Iteration)
+            .Select(step => step.Id)
             .ToHashSet();
-        return approvedReleaseGates.Any(gate =>
-            currentQaStepIds.Contains(gate.FlowStepId));
+        return flow.GateRecords.Any(gate =>
+            gate.ActionType == HandoffActionType.CustomerReview &&
+            gate.Resolved &&
+            gate.Approved == true &&
+            gate.ReviewDecision == ReviewDecision.Accepted &&
+            currentStepIds.Contains(gate.FlowStepId));
     }
 
     public async Task ResumePendingAsync(CancellationToken cancellationToken = default)

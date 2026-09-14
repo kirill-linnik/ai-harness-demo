@@ -7,8 +7,6 @@ namespace AiHarnessDemo.Core.Orchestration;
 
 public sealed class AdvisoryPromotionSeed
 {
-    public string Version { get; init; } = string.Empty;
-
     public string Goal { get; init; } = string.Empty;
 
     public IReadOnlyList<string>? ImplementationDetails { get; init; }
@@ -28,7 +26,6 @@ public sealed class AdvisoryPromotionSeedContractException(
 /// </summary>
 public static class AdvisoryPromotionSeedParser
 {
-    public const string Version = "advisory-promotion-seed-v1";
     public const int MaximumSemanticCharacters =
         FlowOutcomeParser.MaximumGoalCharacters +
         FlowOutcomeParser.MaximumImplementationDetails *
@@ -76,10 +73,6 @@ public static class AdvisoryPromotionSeedParser
         }
 
         var errors = new List<string>();
-        if (!string.Equals(seed.Version, Version, StringComparison.Ordinal))
-        {
-            errors.Add($"Version must be exactly '{Version}'");
-        }
         ValidateText(
             seed.Goal,
             FlowOutcomeParser.MaximumGoalCharacters,
@@ -111,7 +104,6 @@ public static class AdvisoryPromotionSeedParser
 
         return new AdvisoryPromotionSeed
         {
-            Version = Version,
             Goal = NormalizeText(seed.Goal),
             ImplementationDetails = seed.ImplementationDetails!
                 .Select(NormalizeText)
@@ -127,7 +119,6 @@ public static class AdvisoryPromotionSeedParser
         var json = JsonSerializer.Serialize(
             new AdvisoryPromotionSeed
             {
-                Version = Version,
                 Goal = NormalizeText(goal),
                 ImplementationDetails = implementationDetails
                     .Select(NormalizeText)
@@ -192,7 +183,6 @@ public static class AdvisoryPromotionSeedParser
 
         var allowed = new HashSet<string>(StringComparer.Ordinal)
         {
-            "Version",
             "Goal",
             "ImplementationDetails"
         };
@@ -214,11 +204,6 @@ public static class AdvisoryPromotionSeedParser
             {
                 errors.Add($"seed property '{required}' is required");
             }
-        }
-        if (element.TryGetProperty("Version", out var version) &&
-            version.ValueKind != JsonValueKind.String)
-        {
-            errors.Add("Version must be a string");
         }
         if (element.TryGetProperty("Goal", out var goal) &&
             goal.ValueKind != JsonValueKind.String)

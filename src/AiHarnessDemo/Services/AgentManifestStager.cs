@@ -26,7 +26,6 @@ public sealed record StagedPrompt(
 public sealed class AgentManifestStager
 {
     internal const int MaximumStagedPromptBytes = 16 * 1024 * 1024;
-    private const string PromptManifestVersion = "host-prompt-v1";
     private const string PromptFileName = "prompt.utf8.txt";
     private const string PromptManifestFileName = "manifest.json";
     private static readonly UTF8Encoding Utf8WithoutBom =
@@ -340,7 +339,6 @@ public sealed class AgentManifestStager
                 promptBytes,
                 cancellationToken);
             var manifest = new PromptManifest(
-                PromptManifestVersion,
                 sessionId,
                 flowId,
                 flowStepId,
@@ -489,11 +487,7 @@ public sealed class AgentManifestStager
                 exception);
         }
 
-        if (!string.Equals(
-                manifest.Version,
-                PromptManifestVersion,
-                StringComparison.Ordinal) ||
-            manifest.SessionId != sessionId ||
+        if (manifest.SessionId != sessionId ||
             manifest.FlowId != flowId ||
             manifest.FlowStepId != flowStepId ||
             manifest.Attempt != attempt ||
@@ -821,7 +815,6 @@ public sealed class AgentManifestStager
         JsonSerializer.Serialize(value.ReplaceLineEndings(" "));
 
     private sealed record PromptManifest(
-        string Version,
         Guid SessionId,
         Guid FlowId,
         Guid FlowStepId,

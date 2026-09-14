@@ -143,7 +143,6 @@ public sealed class CustomerDemoManifestParserTests
         var manifest = CustomerDemoManifestParser.Parse(
             Encoding.UTF8.GetBytes(ValidJson()));
 
-        Assert.Equal(CustomerDemoManifest.CurrentVersion, manifest.Version);
         Assert.Equal("eu", manifest.ArtifactId);
         Assert.Equal(
             ["run", "preview", "--", "--host", "127.0.0.1", "--port", "{port}"],
@@ -152,25 +151,28 @@ public sealed class CustomerDemoManifestParserTests
 
     [Theory]
     [InlineData(
-        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5,"Unknown":true}""",
+        """{"ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5,"Unknown":true}""",
         "Unknown")]
     [InlineData(
-        """{"version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
-        "version")]
+        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
+        "Version")]
     [InlineData(
-        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"shell","WorkingDirectory":"","Arguments":["serve","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
+        """{"artifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
+        "artifactId")]
+    [InlineData(
+        """{"ArtifactId":"eu","LaunchProfile":"shell","WorkingDirectory":"","Arguments":["serve","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
         "not approved")]
     [InlineData(
-        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","--","--host","0.0.0.0","--port","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
+        """{"ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","--","--host","0.0.0.0","--port","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
         "127.0.0.1")]
     [InlineData(
-        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"../outside","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
+        """{"ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"../outside","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
         "traversal")]
     [InlineData(
-        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
+        """{"ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
         "exactly one")]
     [InlineData(
-        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","{port}","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
+        """{"ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","{port}","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""",
         "exactly one")]
     public void StrictContract_RejectsUnsafeOrAmbiguousInput(
         string json,
@@ -186,7 +188,7 @@ public sealed class CustomerDemoManifestParserTests
     public void StrictContract_RejectsDuplicateProperties()
     {
         var json =
-            """{"Version":"customer-demo-v1","Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""";
+            """{"ArtifactId":"eu","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","{port}"],"HealthPath":"/","StartupTimeoutSeconds":5}""";
 
         var error = Assert.Throws<CustomerDemoContractException>(() =>
             CustomerDemoManifestParser.Parse(Encoding.UTF8.GetBytes(json)));
@@ -295,7 +297,7 @@ public sealed class CustomerDemoManifestParserTests
     }
 
     private static string ValidJson() =>
-        """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","--","--host","127.0.0.1","--port","{port}"],"HealthPath":"/health","StartupTimeoutSeconds":5}""";
+        """{"ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","--","--host","127.0.0.1","--port","{port}"],"HealthPath":"/health","StartupTimeoutSeconds":5}""";
 }
 
 public sealed class SealedDemoManifestServiceTests
@@ -309,20 +311,19 @@ public sealed class SealedDemoManifestServiceTests
         var artifactRoot = Path.Combine(root, ".customer-preview", "eu");
         Directory.CreateDirectory(artifactRoot);
         var bytes = Encoding.UTF8.GetBytes(
-            """{"Version":"customer-demo-v1","ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","--","--host","127.0.0.1","--port","{port}"],"HealthPath":"/health","StartupTimeoutSeconds":5}""");
+            """{"ArtifactId":"eu","LaunchProfile":"npm","WorkingDirectory":"","Arguments":["run","preview","--","--host","127.0.0.1","--port","{port}"],"HealthPath":"/health","StartupTimeoutSeconds":5}""");
         var path = Path.Combine(artifactRoot, SealedDemoManifestService.ManifestFileName);
         await File.WriteAllBytesAsync(path, bytes);
         var digest =
             "sha256:" +
             Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
         var ownerId = Guid.NewGuid();
-        var outcomeJson = """{"Version":"flow-outcome-v1"}""";
+        var outcomeJson = """{}""";
         var flow = new FlowRun
         {
             Title = "Sealed demo",
             OriginalRequest = "Run it",
             ConsolidatedRequest = "Run it",
-            ContractVersion = "studio-v2",
             Kind = FlowKind.Delivery,
             WorkspacePath = root,
             OutcomeOwnerPlanStepKey = "package",
@@ -330,7 +331,6 @@ public sealed class SealedDemoManifestServiceTests
         };
         var candidateFingerprint = Sha('c');
         var identity = new ReviewedCandidateIdentity(
-            ReviewedCandidateIdentity.CurrentVersion,
             flow.Id,
             flow.Iteration,
             ownerId,
@@ -360,7 +360,6 @@ public sealed class SealedDemoManifestServiceTests
         });
         var snapshot = new OutcomeCandidateSnapshot(
             new CandidateManifest(
-                "candidate-manifest-v1",
                 flow.Iteration,
                 Sha('a'),
                 [],
@@ -1377,7 +1376,6 @@ public sealed class DemoRuntimeManagerTests
                 Title = "Live demo",
                 OriginalRequest = "Run two demos",
                 ConsolidatedRequest = "Run two demos",
-                ContractVersion = "studio-v2",
                 Kind = FlowKind.Delivery,
                 WorkspacePath = root,
                 Status = FlowStatus.WaitingForFeedback
@@ -1467,7 +1465,6 @@ public sealed class DemoRuntimeManagerTests
                     "Synthetic invalid manifest.");
             }
             var manifest = new CustomerDemoManifest(
-                CustomerDemoManifest.CurrentVersion,
                 artifactId,
                 "dotnet",
                 string.Empty,

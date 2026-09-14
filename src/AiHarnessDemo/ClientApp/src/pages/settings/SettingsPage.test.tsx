@@ -49,9 +49,7 @@ const bootstrap: BootstrapDto = {
     lastError: null,
     maxConcurrentAgents: 1,
     maxAttempts: 1,
-    workspaceRoot: "E:\\projects\\demo\\data\\worktrees",
-    outcomeVerificationEnabled: true,
-    outcomeVerificationMaxRounds: 3
+    workspaceRoot: "E:\\projects\\demo\\data\\worktrees"
   },
   agentCatalog: {
     ready: true,
@@ -120,29 +118,6 @@ describe("SettingsPage model strategy", () => {
     expect(screen.getByRole("button", { name: "Commit" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Pull request" })).toBeInTheDocument();
     expect(screen.queryByText("None")).not.toBeInTheDocument();
-  });
-
-  it("shows the repository-owned outcome verification round policy read-only", () => {
-    const queryClient = new QueryClient();
-    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
-
-    render(
-      <QueryClientProvider client={queryClient}>
-        <ToastProvider>
-          <MemoryRouter>
-            <SettingsPage />
-          </MemoryRouter>
-        </ToastProvider>
-      </QueryClientProvider>
-    );
-
-    expect(screen.getByText("3 QA rounds")).toBeInTheDocument();
-    expect(
-      screen.getByText((_, element) =>
-        element?.tagName === "SMALL" &&
-        Boolean(element.textContent?.includes("Outcome verification is repository policy"))
-      )
-    ).toHaveTextContent("WORKFLOW.md");
   });
 
   it("hydrates a persisted strategy after an asynchronous bootstrap load", async () => {
