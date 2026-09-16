@@ -114,6 +114,43 @@ describe("StepDetail", () => {
     expect(screen.getByText("Agent is reasoning, acting, and observing...")).toBeInTheDocument();
   });
 
+  it("renders the formatted assignment as sections and lists without hiding literal brief text", () => {
+    const executionPrompt = String.raw`## Assignment
+
+### Goal
+
+Give both sites a fresh look.
+
+### Details
+
+- Redesign the visual style.
+- Keep \<main\> \& \*\*literal\*\* text.
+
+### Success criteria
+
+- Both sites use the new design.
+
+### Constraints
+
+- Preserve C:\\work\\logo\_v2.svg.
+
+### Assumptions
+
+None specified.`;
+    render(<StepDetail step={{ ...step, executionPrompt }} gate={undefined} />);
+
+    const prompt = within(screen.getByRole("region", { name: "Prompt sent to Copilot CLI" }));
+    for (const name of ["Goal", "Details", "Success criteria", "Constraints", "Assumptions"]) {
+      expect(prompt.getByRole("heading", { name, level: 3 })).toBeInTheDocument();
+    }
+    expect(prompt.getAllByRole("list")).toHaveLength(3);
+    expect(prompt.getAllByRole("listitem")).toHaveLength(4);
+    expect(prompt.getByText("Give both sites a fresh look.")).toBeInTheDocument();
+    expect(prompt.getByText("Keep <main> & **literal** text.")).toBeInTheDocument();
+    expect(prompt.getByText(String.raw`Preserve C:\work\logo_v2.svg.`)).toBeInTheDocument();
+    expect(prompt.getByText("None specified.")).toBeInTheDocument();
+  });
+
   it("does not present an older input summary as the exact execution prompt", () => {
     render(<StepDetail step={{ ...step, executionPrompt: "" }} gate={undefined} />);
 

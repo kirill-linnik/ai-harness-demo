@@ -1463,7 +1463,8 @@ public sealed class WorkflowEngine(
 
             Flow kind: {{flow.Kind}}
             Confirmed brief:
-            {{flow.ConsolidatedRequest}}
+
+            {{AssignmentBriefFormatter.Format(flow.ConsolidatedRequest)}}
 
             Exact enabled optional snapshot roster (Id, Name, Description):
             {{rosterJson}}
@@ -6931,13 +6932,14 @@ public sealed class WorkflowEngine(
 
     internal static string BuildStepTask(string customerTask, string inputSummary)
     {
+        var brief = AssignmentBriefFormatter.Format(customerTask);
         if (string.IsNullOrWhiteSpace(inputSummary))
         {
-            return customerTask;
+            return brief;
         }
 
         return
-            $"{customerTask}{Environment.NewLine}{Environment.NewLine}" +
+            $"{brief}{Environment.NewLine}{Environment.NewLine}" +
             $"## Role-specific assignment{Environment.NewLine}{inputSummary}";
     }
 
@@ -7134,7 +7136,7 @@ public sealed class WorkflowEngine(
         assignment +
         $"{Environment.NewLine}{Environment.NewLine}" +
         $"## Original customer outcome{Environment.NewLine}" +
-        ClipText(customerTask, 700);
+        ClipText(AssignmentBriefFormatter.Format(customerTask), 700);
 
     internal static bool HasHandoffRetryAvailable(
         int observedPushbacks,

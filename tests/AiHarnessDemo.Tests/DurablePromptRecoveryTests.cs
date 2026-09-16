@@ -12,11 +12,14 @@ namespace AiHarnessDemo.Tests;
 
 public sealed class DurablePromptRecoveryTests
 {
-    [Fact]
-    public async Task InterruptedAttempt_UsesExactPromptAndRevisionAfterWorkflowReload()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("## Assignment\n\n{\"Goal\":\"Original brief.\",\"Details\":[],\"SuccessCriteria\":[],\"Constraints\":[],\"Assumptions\":[]}")]
+    public async Task InterruptedAttempt_UsesExactPromptAndRevisionAfterWorkflowReload(
+        string? capturedPrompt)
     {
         await using var fixture =
-            await DurablePromptFixture.CreateAsync();
+            await DurablePromptFixture.CreateAsync(executionPrompt: capturedPrompt);
         var originalPrompt = fixture.OriginalPrompt;
         var originalRevision = fixture.OriginalRevision;
         var current = await fixture.ReloadWorkflowAsync(
@@ -50,6 +53,67 @@ public sealed class DurablePromptRecoveryTests
         var stored = await fixture.LoadStepAsync();
         Assert.Equal(originalPrompt, stored.ExecutionPrompt);
         Assert.Equal(originalRevision, stored.WorkflowRevision);
+    }
+
+    [Fact]
+    public async Task FreshAttempt_PersistsAndStagesReadableBriefWithoutRewritingStoredJson()
+    {
+        const string brief =
+            """{"Goal":"Refresh both sites.","Details":["Use the same design."],"SuccessCriteria":["Both sites look modern."],"Constraints":["Keep the logo unchanged."],"Assumptions":[]}""";
+        await using var fixture =
+            await DurablePromptFixture.CreateAsync(executionPrompt: string.Empty);
+        await using (var database = await fixture.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(item => item.Id == fixture.FlowId);
+            flow.ConsolidatedRequest = brief;
+            await database.SaveChangesAsync();
+        }
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "## Assignment\n\n{{ task }}\n\n## Role contract\n\n{{ agent.instructions }}");
+        var context = fixture.Context with
+        {
+            Task = WorkflowEngine.BuildStepTask(brief, "Implement the approved design.")
+        };
+
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            context,
+            workflow,
+            "Preserve the agreed scope.",
+            fixture.WorkspacePath,
+            stagedPromotion: null,
+            new WorkflowPromptRenderer(),
+            fixture.Factory,
+            CancellationToken.None);
+        var stager = new AgentManifestStager();
+        var stagedAgent = await stager.StageAsync(
+            fixture.CopilotHome,
+            DurablePromptFixture.Manifest(),
+            fixture.SessionId);
+        var stagedPrompt = await stager.StagePromptAsync(
+            stagedAgent,
+            instructions.Prompt,
+            fixture.SessionId,
+            fixture.FlowId,
+            fixture.StepId,
+            attempt: 1);
+
+        Assert.Contains("### Goal\n\nRefresh both sites.", instructions.Prompt, StringComparison.Ordinal);
+        Assert.Contains(
+            "### Constraints\n\n- Keep the logo unchanged.",
+            instructions.Prompt,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(brief, instructions.Prompt, StringComparison.Ordinal);
+        Assert.Equal(instructions.Prompt, await File.ReadAllTextAsync(stagedPrompt.Path));
+        var stored = await fixture.LoadStepAsync();
+        Assert.Equal(instructions.Prompt, stored.ExecutionPrompt);
+        Assert.Equal(workflow.Revision, stored.WorkflowRevision);
+        await using var persisted = await fixture.Factory.CreateDbContextAsync();
+        Assert.Equal(
+            brief,
+            await persisted.Flows
+                .Where(flow => flow.Id == fixture.FlowId)
+                .Select(flow => flow.ConsolidatedRequest)
+                .SingleAsync());
     }
 
     [Fact]

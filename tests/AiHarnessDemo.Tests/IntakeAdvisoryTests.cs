@@ -377,6 +377,10 @@ public sealed class IntakeAdvisoryTests
                 assignment,
                 StringComparison.Ordinal);
             Assert.Contains(
+                AssignmentBriefFormatter.Format(teamLeadFlow.ConsolidatedRequest),
+                stagedTeamLeadText,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain(
                 teamLeadFlow.ConsolidatedRequest,
                 stagedTeamLeadText,
                 StringComparison.Ordinal);

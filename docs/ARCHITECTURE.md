@@ -74,6 +74,12 @@ The Account Manager uses its captured definition to clarify the request and prod
 `intake` brief. The customer must explicitly confirm that brief and choose Advisory or Delivery
 before execution can be queued.
 
+The confirmed brief remains structured JSON in durable state. Planning, worker, and pre-mortem
+prompts present it as Markdown headings and lists for the goal, details, success criteria,
+constraints, and assumptions. The host persists that rendered prompt before sending it to Copilot
+CLI, so the prompt viewer shows the same content the agent receives. Previously captured prompts
+remain unchanged, including when an interrupted attempt resumes.
+
 The catalog has three special definitions:
 
 | Agent | Rule |
