@@ -195,7 +195,7 @@ public sealed class AssignmentBriefFormatterTests
     }
 
     [Fact]
-    public void PreMortemAssignment_FormatsBeforeApplyingItsExistingContextLimit()
+    public void PreMortemAssignment_PreservesTheCompleteReadableCustomerContext()
     {
         var brief = IntakeParser.SerializeBrief(new IntakeBrief
         {
@@ -220,8 +220,8 @@ public sealed class AssignmentBriefFormatterTests
             "### Goal\n\nPreserve the goal while reviewing.\n\n### Details\n\n- ",
             context,
             StringComparison.Ordinal);
-        Assert.Equal(700 + "...".Length, context.Length);
-        Assert.EndsWith("...", context, StringComparison.Ordinal);
+        Assert.Equal(AssignmentBriefFormatter.Format(brief), context);
+        Assert.Contains(new string('x', 1_000), context, StringComparison.Ordinal);
     }
 
     [Fact]

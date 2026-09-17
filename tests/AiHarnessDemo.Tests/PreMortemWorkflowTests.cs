@@ -120,8 +120,11 @@ public sealed class PreMortemWorkflowTests
         }
     }
 
-    [Fact]
-    public async Task SnapshottedRun_UsesCapturedScepticAcrossAllRounds()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SnapshottedRun_UsesCapturedScepticAcrossAllRounds(
+        bool correctInvalidReview)
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -174,7 +177,9 @@ public sealed class PreMortemWorkflowTests
         {
             Title = "Implement feature",
             OriginalRequest = "Implement feature",
-            ConsolidatedRequest = "Implement a focused product feature.",
+            ConsolidatedRequest =
+                "Implement a focused product feature. " +
+                new string('x', 900) + " Complete customer requirement.",
             Kind = FlowKind.Advisory,
             Status = FlowStatus.Queued,
             RepositoryPath = root,
@@ -220,7 +225,7 @@ public sealed class PreMortemWorkflowTests
         _ = await catalog.ToggleAsync(
             WorkflowEngine.PreMortemRole,
             enabled: false);
-        var runner = new PreMortemAgentRunner();
+        var runner = new PreMortemAgentRunner(correctInvalidReview);
         var router = new FamilyAwareModelRouter(databaseFactory);
         using var handoffGate = new HandoffGateEngine();
         handoffGate.SetTrustLevel(HandoffActionType.Advance, HandoffTrustLevel.Auto);
@@ -265,16 +270,17 @@ public sealed class PreMortemWorkflowTests
 
             Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
             Assert.Equal(3, softwareSteps.Count);
-            Assert.Equal(2, reviews.Count);
+            var expectedReviews = correctInvalidReview ? 3 : 2;
+            Assert.Equal(expectedReviews, reviews.Count);
             Assert.All(softwareSteps, step => Assert.Equal("claude-sonnet-5", step.Model));
             Assert.All(reviews, step => Assert.Equal("gpt-5.6-sol", step.Model));
             Assert.Equal(3, softwareRuns.Count);
             Assert.Single(softwareRuns.Select(item => item.CopilotSessionId).Distinct());
             Assert.False(softwareRuns[0].ResumeSession);
             Assert.All(softwareRuns.Skip(1), context => Assert.True(context.ResumeSession));
-            Assert.Equal(2, reviewRuns.Count);
+            Assert.Equal(expectedReviews, reviewRuns.Count);
             Assert.Equal(
-                2,
+                expectedReviews,
                 reviewRuns.Select(item => item.CopilotSessionId).Distinct().Count());
             Assert.All(reviewRuns, context => Assert.False(context.ResumeSession));
             Assert.All(
@@ -287,7 +293,28 @@ public sealed class PreMortemWorkflowTests
                 softwareRuns[1].Task);
             Assert.Contains(
                 "Adjusted deliverable 2",
-                reviewRuns[1].Task);
+                reviewRuns[^1].Task);
+            Assert.Contains(
+                softwareSteps[0].OutputSummary,
+                reviewRuns[0].Task,
+                StringComparison.Ordinal);
+            Assert.All(reviewRuns, context =>
+                Assert.Contains("Complete customer requirement.", context.Task, StringComparison.Ordinal));
+            if (correctInvalidReview)
+            {
+                Assert.Equal(1, reviewRuns[0].Attempt);
+                Assert.Equal(1, reviewRuns[1].Attempt);
+                Assert.Contains(
+                    "Previous review to correct:",
+                    reviewRuns[1].Task,
+                    StringComparison.Ordinal);
+                Assert.Contains(
+                    reviews[0].OutputSummary,
+                    reviewRuns[1].Task,
+                    StringComparison.Ordinal);
+                Assert.Single(stored.Events, item =>
+                    item.Type == "agent.contract-correction-scheduled");
+            }
             Assert.Contains(
                 stored.Events,
                 item => item.Type == "premortem.round-limit-exhausted");
@@ -295,7 +322,7 @@ public sealed class PreMortemWorkflowTests
                 2,
                 stored.Events.Count(item => item.Type == "premortem.findings"));
             Assert.Equal(
-                2,
+                expectedReviews,
                 stored.Events.Count(item =>
                     item.Type == "premortem.model-family-separated"));
             Assert.DoesNotContain(
@@ -309,7 +336,7 @@ public sealed class PreMortemWorkflowTests
         }
     }
 
-    private sealed class PreMortemAgentRunner : IAgentRunner
+    private sealed class PreMortemAgentRunner(bool correctInvalidReview = false) : IAgentRunner
     {
         public List<AgentExecutionContext> Contexts { get; } = [];
 
@@ -385,6 +412,17 @@ public sealed class PreMortemWorkflowTests
                     Continue the planned flow.
                     """
             };
+            if (context.AgentRole == "software-engineer" && context.Attempt == 1)
+            {
+                output += Environment.NewLine + new string('x', 8_500) +
+                          Environment.NewLine + "Complete handoff tail.";
+            }
+            if (correctInvalidReview &&
+                context.AgentRole == WorkflowEngine.PreMortemRole &&
+                Contexts.Count(item => item.AgentRole == WorkflowEngine.PreMortemRole) == 1)
+            {
+                output = "Investigation complete." + Environment.NewLine + output;
+            }
             if (context.IsOutcomeOwner)
             {
                 output +=

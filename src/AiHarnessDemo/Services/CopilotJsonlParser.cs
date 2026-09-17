@@ -403,7 +403,9 @@ public static partial class CopilotJsonlParser
         }
 
         var root = document.RootElement;
-        if (!root.TryGetProperty("type", out var typeElement))
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("type", out var typeElement) ||
+            typeElement.ValueKind != JsonValueKind.String)
         {
             document.Dispose();
             return false;

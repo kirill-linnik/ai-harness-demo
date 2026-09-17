@@ -19,6 +19,34 @@ public sealed partial class PreviewArtifactCatalog(
     [GeneratedRegex(@"^[A-Za-z0-9_-]+$")]
     private static partial Regex ArtifactIdPattern();
 
+    internal static string VerificationBasePath(Guid flowId) =>
+        $"/api/verification-previews/{flowId:D}";
+
+    internal static string VerificationBaseUrl(Guid flowId, string serverAddress)
+    {
+        var address = serverAddress
+            .Replace("://*:", "://localhost:", StringComparison.Ordinal)
+            .Replace("://+:", "://localhost:", StringComparison.Ordinal);
+        if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) ||
+            uri.Scheme is not ("http" or "https") ||
+            uri.Port == 0)
+        {
+            throw new InvalidOperationException(
+                "The Studio server has no usable HTTP address for verification previews.");
+        }
+        var builder = new UriBuilder(uri)
+        {
+            Path = VerificationBasePath(flowId),
+            Query = string.Empty,
+            Fragment = string.Empty
+        };
+        if (builder.Host is "0.0.0.0" or "[::]" or "::")
+        {
+            builder.Host = "localhost";
+        }
+        return builder.Uri.AbsoluteUri;
+    }
+
     public IReadOnlyList<PreviewArtifact> Discover(FlowRun flow)
     {
         if (string.IsNullOrWhiteSpace(flow.WorkspacePath))

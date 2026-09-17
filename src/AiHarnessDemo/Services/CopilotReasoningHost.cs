@@ -59,7 +59,7 @@ public sealed partial class CopilotReasoningHost(
         DeliveryReadinessPolicy.MaximumSnapshotBytes +
         32_768;
     private const int ProductManagerLedgerCharacters = 6_000;
-    internal const int MaximumStudioDependencyContextCharacters = 3_200;
+    internal const int MaximumStudioDependencyContextCharacters = 262_144;
     internal const string RepositoryKnowledgeBegin =
         "REPOSITORY_KNOWLEDGE_BEGIN";
     internal const string RepositoryKnowledgeEnd =
@@ -70,10 +70,6 @@ public sealed partial class CopilotReasoningHost(
         "STUDIO_PLAN_CONTEXT_END";
     private const string PromptCompactionMarker =
         "\n...[prompt context compacted]...\n";
-    private const int MinimumDirectDependencyOutputCharacters = 64;
-    private const int MaximumDirectDependencyOutputCharacters = 900;
-    private const int MinimumAncestorOutputCharacters = 64;
-    private const int MaximumAncestorOutputCharacters = 400;
     private const string AccountManagerTools = "view,grep,glob";
     private const string PreMortemTools = "view,grep,glob,web_fetch";
     private const string HostControlledPublicationTools = "view,grep,glob";
@@ -273,16 +269,25 @@ public sealed partial class CopilotReasoningHost(
             request.Progress?.Invoke(new AgentRunProgress(
                 AgentRunPhase.BuildingPrompt,
                 "Rendering WORKFLOW.md with role-focused task context."));
+            var preparedContext = await AgentPromptContext.PrepareAsync(
+                context,
+                manifest.Instructions,
+                recoveredInstructions?.WorkflowRevision ?? workflow.Revision,
+                agentAccess,
+                manifestStager,
+                databaseFactory,
+                cancellationToken);
             var instructions = recoveredInstructions ??
                 await RenderAndPersistExecutionInstructionsAsync(
-                    context,
+                    preparedContext.Context,
                     workflow,
-                    manifest.Instructions,
+                    preparedContext.AgentInstructions,
                     request.WorkingDirectory,
                     stagedPromotion,
                     promptRenderer,
                     databaseFactory,
-                    cancellationToken);
+                    cancellationToken,
+                    preparedContext);
             var renderedPrompt = instructions.Prompt;
             var inlinePrompt = renderedPrompt;
             request.Progress?.Invoke(new AgentRunProgress(
@@ -382,6 +387,18 @@ public sealed partial class CopilotReasoningHost(
                 workflow.Config.Copilot,
                 context.ModelSelectionStrategy,
                 context.ExpectedAcceptedTimeSeconds);
+            using var handoffWatchdog = new CopilotHandoffWatchdog(
+                output => IsRecoverableCompletedOutput(
+                    context.AgentRole,
+                    output,
+                    context.IsPreMortemRevision,
+                    context.InvocationKind,
+                    context.IsOutcomeOwner,
+                    context.PlanStepKey,
+                    context.FlowKind),
+                cancellationToken);
+            var reportProgress = CopilotJsonlParser.CreateProgressReporter(
+                request.Progress, copilotSessionHome);
 
             ProcessResult result;
             try
@@ -410,13 +427,32 @@ public sealed partial class CopilotReasoningHost(
                     arguments,
                     request.WorkingDirectory,
                     timeouts.TurnTimeout,
-                    cancellationToken,
-                    CopilotJsonlParser.CreateProgressReporter(
-                        request.Progress,
-                        copilotSessionHome),
+                    handoffWatchdog.Token,
+                    line =>
+                    {
+                        handoffWatchdog.Observe(line);
+                        reportProgress(line);
+                    },
                     timeouts.StallTimeout,
                     environmentVariables);
                 retainStagedContextForRecovery = false;
+            }
+            catch (OperationCanceledException) when (
+                handoffWatchdog.Expired && !cancellationToken.IsCancellationRequested)
+            {
+                var recovered = await RecoverInterruptedProcessAsync(
+                    context,
+                    request,
+                    copilotSessionHome,
+                    "Copilot CLI did not shut down after its final handoff.",
+                    $"The CLI exceeded the {CopilotHandoffWatchdog.ShutdownGracePeriod.TotalSeconds:0}-second " +
+                    "shutdown grace period after a completed handoff.",
+                    AgentRunFailureKind.Stalled);
+                retainStagedContextForRecovery =
+                    !recovered.Success &&
+                    (recovered.CanResumeSession ||
+                     recovered.ProcessTerminationUnconfirmed);
+                return recovered;
             }
             catch (ProcessStalledException exception)
             {
@@ -1204,8 +1240,15 @@ public sealed partial class CopilotReasoningHost(
         ValidatePersistedExecutionInstructions(
             step.ExecutionPrompt,
             step.WorkflowRevision);
-        if (step.ExecutionPrompt.Length >
-            ResolveMaximumRenderedPromptCharacters(context))
+        var boundedContext = await database.FlowEvents.AnyAsync(
+            item => item.FlowRunId == context.FlowId &&
+                item.FlowStepId == step.Id &&
+                item.Type == AgentPromptContext.SnapshotEventType,
+            cancellationToken);
+        if (boundedContext
+                ? Encoding.UTF8.GetByteCount(step.ExecutionPrompt) >
+                    AgentPromptContext.MaximumWorkingPromptBytes
+                : step.ExecutionPrompt.Length > ResolveMaximumRenderedPromptCharacters(context))
         {
             throw new InvalidOperationException(
                 "The persisted execution prompt exceeds the durable attempt's prompt limit; recovery failed closed.");
@@ -1226,7 +1269,8 @@ public sealed partial class CopilotReasoningHost(
             StagedPromotionSeed? stagedPromotion,
             WorkflowPromptRenderer promptRenderer,
             IDbContextFactory<HarnessDbContext> databaseFactory,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            PreparedAgentPromptContext? preparedContext = null)
     {
         if (context.RecoverInterruptedSession)
         {
@@ -1251,6 +1295,11 @@ public sealed partial class CopilotReasoningHost(
                     context,
                     agentInstructions,
                     workingDirectory));
+        if (preparedContext is not null)
+        {
+            AgentPromptContext.ValidateRenderedPrompt(
+                renderedPrompt, preparedContext.DocumentPaths);
+        }
 
         if (context.FlowStepId == Guid.Empty)
         {
@@ -1275,6 +1324,33 @@ public sealed partial class CopilotReasoningHost(
 
         step.ExecutionPrompt = renderedPrompt;
         step.WorkflowRevision = workflow.Revision;
+        if (preparedContext?.SnapshotJson is { } snapshotJson)
+        {
+            var existing = await database.FlowEvents.SingleOrDefaultAsync(
+                item => item.FlowRunId == context.FlowId &&
+                    item.FlowStepId == step.Id &&
+                    item.Type == AgentPromptContext.SnapshotEventType,
+                cancellationToken);
+            if (existing is not null &&
+                !string.Equals(existing.DataJson, snapshotJson, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "The durable attempt already has different context documents; its inputs cannot be rebound.");
+            }
+            if (existing is null)
+            {
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = context.FlowId,
+                    FlowStepId = step.Id,
+                    Type = AgentPromptContext.SnapshotEventType,
+                    Message =
+                        $"Bound a {Encoding.UTF8.GetByteCount(renderedPrompt)}-byte working prompt " +
+                        $"with {preparedContext.DocumentPaths.Count} complete read-only context document(s).",
+                    DataJson = snapshotJson
+                });
+            }
+        }
         await database.SaveChangesAsync(cancellationToken);
         return new DurableExecutionInstructions(
             renderedPrompt,
@@ -1388,6 +1464,10 @@ public sealed partial class CopilotReasoningHost(
     internal static int ResolveMaximumRenderedPromptCharacters(
         AgentExecutionContext context)
     {
+        if (context.UsesBoundedWorkingPrompt)
+        {
+            return AgentPromptContext.MaximumWorkingPromptBytes;
+        }
         var baseMaximum = context.RequiresDeliveryReadinessQa
             ? MaximumDeliveryVerificationPromptCharacters
             : context.InvocationKind switch
@@ -1399,11 +1479,20 @@ public sealed partial class CopilotReasoningHost(
         var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
             context.RepositoryKnowledge,
             context.SourceProjectPath);
-        return checked(baseMaximum + repositoryKnowledgeBlock.Length);
+        var dependencyCharacters =
+            context.InvocationKind == ExecutionInvocationKind.Worker &&
+            context.StudioDependencyOutputs is { Count: > 0 }
+                ? FormatStudioDependencyContext(
+                    context.StudioDependencyOutputs,
+                    context.SourceProjectPath).Length
+                : 0;
+        return checked(
+            baseMaximum + repositoryKnowledgeBlock.Length + dependencyCharacters);
     }
 
     private static bool IsStructuredLargePrompt(
         AgentExecutionContext context) =>
+        context.UsesBoundedWorkingPrompt ||
         context.RequiresDeliveryReadinessQa ||
         context.InvocationKind == ExecutionInvocationKind.Planning;
 
@@ -1708,6 +1797,13 @@ public sealed partial class CopilotReasoningHost(
         if (!string.IsNullOrWhiteSpace(dependencyContext))
         {
             roleContext.Add(dependencyContext);
+            roleContext.Add(
+                "The dependency handoffs above contain complete supplied material or host-owned " +
+                "references to it. Read referenced handoffs in full; never treat an excerpt as " +
+                "the complete input. A named design or specification may be delivered inline rather than " +
+                "as a workspace file. If its complete content is supplied and this assignment " +
+                "permits workspace writes, materialize it as needed instead of requesting the " +
+                "same material again merely because the named file is absent.");
         }
         if (context.InvocationKind is
                 ExecutionInvocationKind.Worker or
@@ -1726,7 +1822,11 @@ public sealed partial class CopilotReasoningHost(
                     ? "This step has no valid earlier dependency or ancestor. Do not emit HANDOFF_STATUS: PUSHBACK; complete the assigned work from the confirmed brief."
                     : "PUSHBACK_OWNER_STEP_ID may name only one of these exact current-iteration plan-step IDs: " +
                       string.Join(", ", pushbackOwners) +
-                      ". Never name a prior-iteration or inferred step."));
+                      ". Never name a prior-iteration or inferred step.") +
+                " Push back only when a required upstream input or deliverable is missing or " +
+                "unusable and the named owner must supply it. Explain exactly what is missing " +
+                "and the smallest correction that unblocks this assignment. Do not push back " +
+                "for optional improvements, non-blocking disclosures, or response formatting.");
         }
         if (context.InvocationKind == ExecutionInvocationKind.Worker &&
             context.RequiresDeliveryReadinessQa)
@@ -1735,11 +1835,12 @@ public sealed partial class CopilotReasoningHost(
                 "## Quality verdict handoff" +
                 Environment.NewLine +
                 Environment.NewLine +
-                "HANDOFF_STATUS: COMPLETE is allowed only when every required check is release-ready. " +
-                "If any required check fails and the pushback boundary lists an owner, return " +
-                "HANDOFF_STATUS: PUSHBACK with one exact allowed PUSHBACK_OWNER_STEP_ID and a bounded " +
-                "PUSHBACK_REASON. Never pair COMPLETE with FAIL, NOT release-ready, or an informal " +
-                "Next owner instruction.");
+                "HANDOFF_STATUS: COMPLETE means the assigned verification is complete, not that " +
+                "the candidate is approved. Report actual Failed or Blocked criteria and their " +
+                "remediation in the strict OUTCOME_QA document; the host derives readiness. " +
+                "A non-blocking disclosure is not a reason to reject a completed assignment. " +
+                "Reserve PUSHBACK for a missing or unusable required upstream deliverable, " +
+                "using the exact owner and actionable missing-input description above.");
         }
         if (stagedPromotion is not null)
         {
@@ -1781,7 +1882,7 @@ public sealed partial class CopilotReasoningHost(
         return new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["agent.name"] = context.AgentName,
-            ["agent.instructions"] = Clip(agentInstructions, 3_000),
+            ["agent.instructions"] = agentInstructions,
             ["task"] = BoundTaskContext(
                 context,
                 usesCompactPreMortemContext),
@@ -1902,128 +2003,40 @@ public sealed partial class CopilotReasoningHost(
                 "Studio direct dependency context must contain one nonempty effective output per plan-step key.");
         }
 
-        var budgets = direct
-            .Select(item => Math.Min(
-                item.Output.Length,
-                MinimumDirectDependencyOutputCharacters))
-            .ToArray();
-        if (StudioDependencySectionLength(direct, budgets) >
-            maximumCharacters)
-        {
-            throw new InvalidOperationException(
-                "Studio direct dependency identifiers exceed the bounded context envelope.");
-        }
-
-        var targets = direct
-            .Select(item => Math.Min(
-                item.Output.Length,
-                MaximumDirectDependencyOutputCharacters))
-            .ToArray();
-        while (true)
-        {
-            var advanced = false;
-            for (var index = 0; index < budgets.Length; index++)
-            {
-                if (budgets[index] >= targets[index])
-                {
-                    continue;
-                }
-                budgets[index]++;
-                if (StudioDependencySectionLength(direct, budgets) >
-                    maximumCharacters)
-                {
-                    budgets[index]--;
-                    continue;
-                }
-                advanced = true;
-            }
-            if (!advanced)
-            {
-                break;
-            }
-        }
-
         var entries = direct
-            .Select((item, index) =>
-                RenderStudioDependencyEntry(item, budgets[index]))
+            .Select(RenderStudioDependencyEntry)
             .ToList();
-        var allDirectComplete = direct
-            .Select((item, index) => budgets[index] >= item.Output.Length)
-            .All(value => value);
-        if (allDirectComplete)
+        foreach (var ancestor in normalized
+                     .Where(item =>
+                         item.Kind == StudioDependencyKind.Ancestor &&
+                         !string.IsNullOrWhiteSpace(item.Output))
+                     .OrderBy(item => item.Distance)
+                     .ThenBy(item => item.Sequence)
+                     .ThenBy(item => item.PlanStepKey, StringComparer.Ordinal))
         {
-            foreach (var ancestor in normalized
-                         .Where(item =>
-                             item.Kind == StudioDependencyKind.Ancestor &&
-                             !string.IsNullOrWhiteSpace(item.Output))
-                         .OrderBy(item => item.Distance)
-                         .ThenBy(item => item.Sequence)
-                         .ThenBy(item => item.PlanStepKey, StringComparer.Ordinal))
-            {
-                var minimumBudget = Math.Min(
-                    ancestor.Output.Length,
-                    MinimumAncestorOutputCharacters);
-                var maximumBudget = Math.Min(
-                    ancestor.Output.Length,
-                    MaximumAncestorOutputCharacters);
-                var selectedBudget = -1;
-                for (var budget = maximumBudget;
-                     budget >= minimumBudget;
-                     budget--)
-                {
-                    var candidateEntries = entries
-                        .Append(RenderStudioDependencyEntry(ancestor, budget))
-                        .ToList();
-                    if (RenderStudioDependencySection(candidateEntries).Length <=
-                        maximumCharacters)
-                    {
-                        selectedBudget = budget;
-                        break;
-                    }
-                }
-                if (selectedBudget < 0)
-                {
-                    continue;
-                }
-                entries.Add(
-                    RenderStudioDependencyEntry(
-                        ancestor,
-                        selectedBudget));
-            }
+            entries.Add(RenderStudioDependencyEntry(ancestor));
         }
 
         var result = RenderStudioDependencySection(entries);
         if (result.Length > maximumCharacters)
         {
             throw new InvalidOperationException(
-                "Studio dependency context exceeded its hard bound.");
+                $"The complete Studio dependency handoffs require {result.Length} characters, " +
+                $"exceeding the {maximumCharacters}-character bound. Split the assignment or " +
+                "provide smaller complete upstream deliverables; required input will not be truncated.");
         }
         return result;
     }
 
-    private static int StudioDependencySectionLength(
-        IReadOnlyList<StudioDependencyOutput> items,
-        IReadOnlyList<int> budgets) =>
-        RenderStudioDependencySection(
-                items.Select((item, index) =>
-                    RenderStudioDependencyEntry(item, budgets[index]))
-                    .ToList())
-            .Length;
-
     private static string RenderStudioDependencyEntry(
-        StudioDependencyOutput item,
-        int outputBudget)
+        StudioDependencyOutput item)
     {
         var relationship = item.Kind == StudioDependencyKind.Direct
             ? "DIRECT DEPENDENCY"
             : $"ANCESTOR (distance {item.Distance})";
-        var output = item.Output.Length <= outputBudget
-            ? item.Output
-            : item.Output[..outputBudget] +
-              $"\n...[dependency output clipped: kept {outputBudget} of {item.Output.Length} characters]...";
         return
             $"### {relationship} `{item.PlanStepKey}` (effective attempt {item.Attempt})\n" +
-            output;
+            item.Output;
     }
 
     private static string RenderStudioDependencySection(

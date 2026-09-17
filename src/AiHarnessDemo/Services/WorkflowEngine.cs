@@ -10,6 +10,8 @@ using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Core.Security;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Core.Workflow;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.EntityFrameworkCore;
 
 namespace AiHarnessDemo.Services;
@@ -38,7 +40,8 @@ public sealed class WorkflowEngine(
     IReviewedCandidateService? reviewedCandidateService = null,
     LinkedFlowCoordinator? linkedFlowCoordinator = null,
     AgentManifestStager? manifestStager = null,
-    DeliveryReadinessService? deliveryReadinessService = null)
+    DeliveryReadinessService? deliveryReadinessService = null,
+    IServer? server = null)
 {
     internal const string ApprovedPublicationLabel = "Publish customer-approved outcome";
     internal const string PreMortemRole = "pre-mortem-sceptic";
@@ -2163,6 +2166,10 @@ public sealed class WorkflowEngine(
                     flow,
                     step,
                     cancellationToken);
+                if (isStudioContractCorrection)
+                {
+                    RestrictResponseCorrectionPermission(step);
+                }
                 var persistedSessionId = step.CopilotSessionId;
                 var interruptedDurableAttempt =
                     step.Phase ==
@@ -2175,7 +2182,9 @@ public sealed class WorkflowEngine(
                         "The interrupted durable attempt has no recoverable Copilot session; an explicit retry attempt is required.");
                 }
                 var priorSession = persistedSessionId is null &&
-                                   !IsPreMortemStep(step)
+                                   !IsPreMortemStep(step) &&
+                                   !(isStudioContractCorrection &&
+                                     IsDeliveryVerificationStep(step))
                     ? await database.FlowSteps
                         .AsNoTracking()
                         .Where(item =>
@@ -2201,7 +2210,9 @@ public sealed class WorkflowEngine(
                     AgentSessionIdentity.Create(
                         flow.Id,
                         flow.Iteration,
-                        IsPreMortemStep(step)
+                        isStudioContractCorrection
+                            ? $"{step.AgentId}:response-correction:{step.Id:N}"
+                        : IsPreMortemStep(step)
                             ? $"{step.AgentId}:{step.PreMortemOriginStepId:D}:{step.Attempt}"
                             : step.RetryOfStepId is not null &&
                               step.Attempt > 1
@@ -2391,7 +2402,16 @@ public sealed class WorkflowEngine(
                     FlowKind: flow.Kind,
                     RequiresDeliveryReadinessQa:
                         DeliveryReadinessService.AppliesTo(flow) &&
-                        IsDeliveryVerificationStep(step));
+                        IsDeliveryVerificationStep(step),
+                    ContextDocuments: readinessAssignment is null
+                        ? null
+                        :
+                        [
+                            new AgentContextDocument(
+                                "evidence.jsonl",
+                                DeliveryReadinessService.SerializeEvidenceDocument(
+                                    readinessAssignment.Evidence))
+                        ]);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -2411,6 +2431,7 @@ public sealed class WorkflowEngine(
         }
 
         AgentExecutionResult? attemptedResult = null;
+        var correctionScheduled = false;
         try
         {
             logger.LogInformation(
@@ -2430,6 +2451,20 @@ public sealed class WorkflowEngine(
             var contractError = GetStudioContractCorrectionReason(
                 executionContext,
                 attemptedResult.Output);
+            if (contractError is null && executionContext.RequiresDeliveryReadinessQa)
+            {
+                await using var database =
+                    await databaseFactory.CreateDbContextAsync(cancellationToken);
+                var flow = await database.Flows
+                    .Include(item => item.Events)
+                    .SingleAsync(item => item.Id == flowId, cancellationToken);
+                var step = await database.FlowSteps
+                    .SingleAsync(item => item.Id == stepId, cancellationToken);
+                contractError = GetDeliveryQaCorrectionReason(
+                    flow,
+                    step,
+                    attemptedResult);
+            }
             if (contractError is not null)
             {
                 if (isStudioContractCorrection)
@@ -2448,6 +2483,7 @@ public sealed class WorkflowEngine(
                         stopwatch.ElapsedMilliseconds,
                         cancellationToken);
                 stopwatch.Stop();
+                correctionScheduled = true;
                 return await ExecuteStepAsync(
                     flowId,
                     correctionStepId,
@@ -2479,22 +2515,29 @@ public sealed class WorkflowEngine(
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             stopwatch.Stop();
-            await MarkStepInterruptedAsync(
-                flowId,
-                stepId,
-                stopwatch.ElapsedMilliseconds,
-                CancellationToken.None);
+            if (!correctionScheduled)
+            {
+                await MarkStepInterruptedAsync(
+                    flowId,
+                    stepId,
+                    stopwatch.ElapsedMilliseconds,
+                    CancellationToken.None);
+            }
             throw;
         }
         catch (Exception exception)
         {
             stopwatch.Stop();
-            await MarkStepFailedAsync(
-                stepId,
-                exception,
-                stopwatch.ElapsedMilliseconds,
-                cancellationToken,
-                attemptedResult?.Output);
+            if (!correctionScheduled)
+            {
+                await MarkStepFailedAsync(
+                    stepId,
+                    exception,
+                    stopwatch.ElapsedMilliseconds,
+                    cancellationToken,
+                    attemptedResult?.Output,
+                    attemptedResult);
+            }
             throw;
         }
     }
@@ -2503,6 +2546,18 @@ public sealed class WorkflowEngine(
         AgentExecutionContext context,
         string output)
     {
+        if (context.InvocationKind == ExecutionInvocationKind.PreMortem)
+        {
+            try
+            {
+                _ = PreMortemRules.ParseReview(output);
+                return null;
+            }
+            catch (InvalidOperationException exception)
+            {
+                return exception.Message;
+            }
+        }
         if (context.InvocationKind is not (
                 ExecutionInvocationKind.Worker or
                 ExecutionInvocationKind.Publication))
@@ -2556,9 +2611,61 @@ public sealed class WorkflowEngine(
                ReadPlanDuties(step.PlanDutiesJson).Contains(PlanDuty.Verify);
     }
 
+    internal static string? GetDeliveryQaCorrectionReason(
+        FlowRun flow,
+        FlowStep step,
+        AgentExecutionResult result)
+    {
+        if (!DeliveryReadinessService.AppliesTo(flow) ||
+            !IsDeliveryVerificationStep(step) ||
+            AgentHandoffInspector.ParseDynamic(result.Output).IsPushback)
+        {
+            return null;
+        }
+        var (plan, planHash, planErrors) =
+            DeliveryReadinessService.TryReadAcceptancePlan(flow);
+        if (plan is null)
+        {
+            throw new InvalidOperationException(
+                "A Delivery verification turn has no valid acceptance plan: " +
+                string.Join("; ", planErrors));
+        }
+        var issued = DeliveryReadinessService.ReadStepEvidence(
+            flow.Events,
+            step.Iteration,
+            step.Id);
+        var observed = DeliveryReadinessService.BuildEvidence(
+            step,
+            ToObservedToolCalls(step.Id, result),
+            issued?.Sequence);
+        var currentIds = observed.Items
+            .Select(item => item.EvidenceId)
+            .ToHashSet(StringComparer.Ordinal);
+        var evidence = DeliveryReadinessService.ReadEvidence(
+                flow.Events,
+                flow.Iteration)
+            .Where(item => !currentIds.Contains(item.EvidenceId))
+            .Concat(observed.Items)
+            .ToArray();
+        try
+        {
+            _ = DeliveryReadinessPolicy.ParseQaOutput(
+                result.Output,
+                plan,
+                planHash,
+                evidence);
+            return null;
+        }
+        catch (DeliveryReadinessContractException exception)
+        {
+            return exception.Message;
+        }
+    }
+
     /// <summary>
     /// Validates and durably records the strict verification contract emitted by a Delivery
-    /// verification turn. Contract errors fail the step instead of being interpreted charitably.
+    /// verification turn. Only a fully validated contract is accepted; invalid responses are
+    /// routed through the bounded correction turn before reaching this commit boundary.
     /// </summary>
     private static async Task RecordDeliveryQaContractAsync(
         HarnessDbContext database,
@@ -2646,7 +2753,8 @@ public sealed class WorkflowEngine(
         string contractError,
         DateTimeOffset completedAt,
         long durationMilliseconds,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool recoveringFailedAttempt = false)
     {
         await using var database =
             await databaseFactory.CreateDbContextAsync(cancellationToken);
@@ -2658,7 +2766,10 @@ public sealed class WorkflowEngine(
             .Include(item => item.TaskProfiles)
             .SingleAsync(item => item.Id == flowId, cancellationToken);
         var source = flow.Steps.Single(item => item.Id == stepId);
-        if (source.Status != StepStatus.Running)
+        if (source.Status != StepStatus.Running &&
+            !(recoveringFailedAttempt &&
+              source.Status == StepStatus.Failed &&
+              flow.Status == FlowStatus.Failed))
         {
             throw new InvalidOperationException(
                 "A Studio response-contract correction can be scheduled only for its running source attempt.");
@@ -2669,24 +2780,29 @@ public sealed class WorkflowEngine(
                      item.Sequence > source.Sequence))
         {
             later.Sequence += 10;
+            if (recoveringFailedAttempt && later.Status == StepStatus.Skipped)
+            {
+                ResetSkippedStep(later);
+            }
         }
 
-        foreach (var toolCall in result.ToolCalls)
+        var observedToolCalls = ToObservedToolCalls(source.Id, result);
+        if (!await database.AgentToolCalls.AnyAsync(
+                item => item.FlowStepId == source.Id,
+                cancellationToken))
         {
-            database.AgentToolCalls.Add(new AgentToolCall
-            {
-                FlowStepId = source.Id,
-                ToolName = toolCall.ToolName,
-                ArgumentsSummary = toolCall.ArgumentsSummary,
-                Succeeded = toolCall.Succeeded,
-                ToolType = toolCall.ToolType,
-                NormalizedCommand = toolCall.NormalizedCommand,
-                NormalizedArguments = toolCall.NormalizedArguments,
-                WorkingDirectory = toolCall.WorkingDirectory,
-                ExitCode = toolCall.ExitCode,
-                ResultDigest = toolCall.ResultDigest,
-                ResultSummary = toolCall.ResultSummary
-            });
+            database.AgentToolCalls.AddRange(observedToolCalls);
+        }
+        if (DeliveryReadinessService.AppliesTo(flow) &&
+            source.PlanStage == PlanStage.BeforeReview &&
+            source.InvocationKind == ExecutionInvocationKind.Worker)
+        {
+            await RecordDeliveryEvidenceAsync(
+                database,
+                flow,
+                source,
+                observedToolCalls,
+                cancellationToken);
         }
         source.Status = StepStatus.Completed;
         source.Phase = AgentRunPhase.Succeeded;
@@ -2717,13 +2833,15 @@ public sealed class WorkflowEngine(
             WorkflowRevision = source.WorkflowRevision,
             Status = StepStatus.Pending,
             Phase = AgentRunPhase.PreparingWorkspace,
-            Attempt = flow.Steps
-                .Where(item =>
-                    item.Iteration == source.Iteration &&
-                    item.AgentId == source.AgentId)
-                .Select(item => item.Attempt)
-                .DefaultIfEmpty()
-                .Max() + 1,
+            Attempt = IsPreMortemStep(source)
+                ? source.Attempt
+                : flow.Steps
+                    .Where(item =>
+                        item.Iteration == source.Iteration &&
+                        item.AgentId == source.AgentId)
+                    .Select(item => item.Attempt)
+                    .DefaultIfEmpty()
+                    .Max() + 1,
             InputSummary = BuildStudioContractCorrectionAssignment(
                 source,
                 contractError),
@@ -2738,6 +2856,25 @@ public sealed class WorkflowEngine(
         };
         flow.Steps.Add(correction);
         database.Entry(correction).State = EntityState.Added;
+        PreserveOrTightenRetryPermission(flow, source, correction);
+        if (!string.IsNullOrWhiteSpace(correction.EffectivePermissionJson))
+        {
+            RestrictResponseCorrectionPermission(correction);
+        }
+        foreach (var dependent in flow.Steps.Where(item =>
+                     item.Id != correction.Id &&
+                     item.Status == StepStatus.Pending &&
+                     item.DependsOnStepId == source.Id))
+        {
+            dependent.DependsOnStepId = correction.Id;
+        }
+        foreach (var review in flow.Steps.Where(item =>
+                     IsPreMortemStep(item) &&
+                     item.Status == StepStatus.Pending &&
+                     item.PreMortemTargetStepId == source.Id))
+        {
+            review.PreMortemTargetStepId = correction.Id;
+        }
         var sourceProfile = flow.TaskProfiles.SingleOrDefault(
             item => item.FlowStepId == source.Id);
         if (sourceProfile is not null)
@@ -2759,6 +2896,21 @@ public sealed class WorkflowEngine(
                 Error = ClipText(contractError, 2_000)
             })
         });
+        if (recoveringFailedAttempt)
+        {
+            _lifecycle.Transition(flow, FlowStatus.Queued);
+            flow.FailureReason = string.Empty;
+            flow.CompletedAt = null;
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = correction.Id,
+                Type = "flow.contract-correction-queued",
+                Message =
+                    $"Recovered {source.AgentName}'s completed execution and its host-observed " +
+                    "evidence. Only the invalid response will be corrected; completed work will not be rerun."
+            });
+        }
         flow.UpdatedAt = completedAt;
         await database.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
@@ -2769,6 +2921,20 @@ public sealed class WorkflowEngine(
         FlowStep source,
         string contractError)
     {
+        if (IsPreMortemStep(source))
+        {
+            return
+                "Correct only the format of your completed pre-mortem review. Do not repeat " +
+                "research or modify the workspace. Preserve the evidence-backed findings and " +
+                "return the complete review, not a delta. The first non-empty line must be " +
+                "exactly PRE_MORTEM_STATUS: CLEAR or PRE_MORTEM_STATUS: FINDINGS. For FINDINGS, " +
+                "include exactly one valid PRE_MORTEM_FINDINGS_BEGIN/END JSON envelope. Do not " +
+                "emit a HANDOFF_STATUS marker, introductory commentary, or Markdown fences. " +
+                "Keep the response under 9,000 characters and each finding field under 800. " +
+                $"Validation error: {ClipText(contractError, 2_000)}" +
+                $"{Environment.NewLine}{Environment.NewLine}" +
+                $"Previous review to correct:{Environment.NewLine}{source.OutputSummary}";
+        }
         var assignment =
             "Your previous Studio response contract was invalid. Do not rerun tools or modify " +
             "the workspace; rewrite the complete response from your existing evidence. Start with " +
@@ -2782,12 +2948,79 @@ public sealed class WorkflowEngine(
                 " Return exactly one complete flow-outcome document with 1-24 concise, " +
                 "consolidated ImplementationDetails between the exact standalone sentinels.";
         }
+        if (IsDeliveryVerificationStep(source))
+        {
+            assignment +=
+                " Also replace the complete OUTCOME_QA document. The host has now recorded the " +
+                "actual tool observations from your previous turn with their exact identifiers, " +
+                "kinds, and success values in the verification context. Do not count or invent " +
+                "identifiers. Select the observations that actually prove each criterion and " +
+                "whose kind is allowed by its unchanged acceptance plan. Never cite a failed " +
+                "call as successful evidence. If the evidence is insufficient, report the honest " +
+                "Failed or Blocked result with remediation rather than claiming PASS." +
+                $"{Environment.NewLine}{Environment.NewLine}" +
+                $"Previous response to correct:{Environment.NewLine}" +
+                BoundFailedOutput(source.OutputSummary);
+        }
         if (source.PreMortemReviewStepId is not null)
         {
             assignment +=
                 " Preserve exactly one PRE_MORTEM_DISPOSITION marker required by this revision.";
         }
         return assignment;
+    }
+
+    private static void RestrictResponseCorrectionPermission(FlowStep step)
+    {
+        var permission = JsonSerializer.Deserialize<EffectiveExecutionPermission>(
+                step.EffectivePermissionJson)
+            ?? throw new InvalidOperationException(
+                "A response correction requires its persisted permission ceiling.");
+        step.EffectivePermissionJson = JsonSerializer.Serialize(
+            PermissionProfileResolver.ForResponseCorrection(permission));
+    }
+
+    internal static async Task<FlowStep> ResolveTaskPermissionSourceAsync(
+        HarnessDbContext database,
+        FlowStep step,
+        CancellationToken cancellationToken)
+    {
+        var source = step;
+        var visited = new HashSet<Guid>();
+        while (source.Label.StartsWith(
+                   StudioContractCorrectionLabelPrefix,
+                   StringComparison.Ordinal))
+        {
+            if (!visited.Add(source.Id))
+            {
+                throw new InvalidOperationException(
+                    "The response-correction permission lineage contains a cycle.");
+            }
+            var binding = await database.FlowEvents.AsNoTracking()
+                .SingleAsync(item =>
+                    item.FlowRunId == step.FlowRunId &&
+                    item.FlowStepId == source.Id &&
+                    item.Type == "agent.contract-correction-scheduled",
+                    cancellationToken);
+            using var document = JsonDocument.Parse(
+                binding.DataJson ?? throw new InvalidOperationException(
+                    "The response-correction permission binding is missing."));
+            if (!document.RootElement.TryGetProperty("SourceStepId", out var sourceValue) ||
+                !sourceValue.TryGetGuid(out var sourceId))
+            {
+                throw new InvalidOperationException(
+                    "The response correction has no durable task-permission source.");
+            }
+            source = await database.FlowSteps.AsNoTracking()
+                .SingleAsync(item =>
+                    item.Id == sourceId &&
+                    item.FlowRunId == step.FlowRunId &&
+                    item.Iteration == step.Iteration &&
+                    item.AgentId == step.AgentId &&
+                    item.PlanStepKey == step.PlanStepKey,
+                    cancellationToken);
+        }
+        return source;
     }
 
     private static async Task<IReadOnlyList<StudioDependencyOutput>>
@@ -3059,7 +3292,10 @@ public sealed class WorkflowEngine(
         var review = await database.FlowSteps.SingleAsync(
             item => item.Id == reviewStepId,
             cancellationToken);
-        if (!IsPreMortemStep(review))
+        if (!IsPreMortemStep(review) ||
+            review.Label.StartsWith(
+                StudioContractCorrectionLabelPrefix,
+                StringComparison.Ordinal))
         {
             return;
         }
@@ -3313,7 +3549,6 @@ public sealed class WorkflowEngine(
             review = await database.FlowSteps
                 .AsNoTracking()
                 .SingleAsync(item => item.Id == reviewStepId, cancellationToken);
-            result = PreMortemRules.ParseReview(review.OutputSummary);
             alreadyResolved = await database.FlowEvents.AnyAsync(
                                   item =>
                                       item.FlowStepId == reviewStepId &&
@@ -3322,12 +3557,21 @@ public sealed class WorkflowEngine(
                                   cancellationToken) ||
                               await database.FlowSteps.AnyAsync(
                                   item => item.PreMortemReviewStepId == reviewStepId,
+                                  cancellationToken) ||
+                              await database.FlowSteps.AnyAsync(
+                                  item =>
+                                      item.FlowRunId == review.FlowRunId &&
+                                      item.Iteration == review.Iteration &&
+                                      item.RetryOfStepId == (review.RetryOfStepId ?? review.Id) &&
+                                      item.Sequence > review.Sequence &&
+                                      item.Label.StartsWith(StudioContractCorrectionLabelPrefix),
                                   cancellationToken);
         }
         if (alreadyResolved)
         {
             return;
         }
+        result = PreMortemRules.ParseReview(review.OutputSummary);
         if (!result.HasFindings)
         {
             await AddEventAsync(
@@ -3367,6 +3611,8 @@ public sealed class WorkflowEngine(
         var target = await database.FlowSteps
             .AsNoTracking()
             .SingleAsync(item => item.Id == targetStepId, cancellationToken);
+        var permissionSource = await ResolveTaskPermissionSourceAsync(
+            database, target, cancellationToken);
         var laterSteps = await database.FlowSteps
             .Where(item =>
                 item.FlowRunId == flow.Id &&
@@ -3400,8 +3646,8 @@ public sealed class WorkflowEngine(
             PlanStage = target.PlanStage,
             InvocationKind = target.InvocationKind,
             IsOutcomeOwner = target.IsOutcomeOwner,
-            PermissionProfile = target.PermissionProfile,
-            EffectivePermissionJson = target.EffectivePermissionJson,
+            PermissionProfile = permissionSource.PermissionProfile,
+            EffectivePermissionJson = permissionSource.EffectivePermissionJson,
             WorkflowRevision = target.WorkflowRevision,
             RemotePublicationAllowed = target.RemotePublicationAllowed,
             Status = StepStatus.Pending,
@@ -3416,7 +3662,7 @@ public sealed class WorkflowEngine(
         var permissionTightened =
             PreserveOrTightenRetryPermission(
                 flow,
-                target,
+                permissionSource,
                 revision);
         database.FlowSteps.Add(revision);
         var targetProfile = await database.TaskProfiles
@@ -3637,6 +3883,16 @@ public sealed class WorkflowEngine(
             recoveredResult.ToolCalls);
         try
         {
+            if (await TryScheduleRecoveredQaCorrectionAsync(
+                    flowId,
+                    stepId,
+                    result,
+                    completedAt ?? DateTimeOffset.UtcNow,
+                    recoveringFailedAttempt: false,
+                    cancellationToken))
+            {
+                return;
+            }
             await CompleteStepAsync(
                 flowId,
                 stepId,
@@ -3657,9 +3913,51 @@ public sealed class WorkflowEngine(
                 exception,
                 durationMilliseconds: null,
                 cancellationToken,
-                result.Output);
+                result.Output,
+                result);
             throw;
         }
+    }
+
+    private async Task<bool> TryScheduleRecoveredQaCorrectionAsync(
+        Guid flowId,
+        Guid stepId,
+        AgentExecutionResult result,
+        DateTimeOffset completedAt,
+        bool recoveringFailedAttempt,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var flow = await database.Flows
+            .Include(item => item.Events)
+            .SingleAsync(item => item.Id == flowId, cancellationToken);
+        var step = await database.FlowSteps
+            .SingleAsync(item => item.Id == stepId, cancellationToken);
+        if (step.Label.StartsWith(
+                StudioContractCorrectionLabelPrefix,
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+        var error = GetDeliveryQaCorrectionReason(flow, step, result);
+        if (error is null)
+        {
+            return false;
+        }
+        await ScheduleStudioContractCorrectionAsync(
+            flowId,
+            stepId,
+            result,
+            error,
+            completedAt,
+            step.DurationMilliseconds > 0
+                ? step.DurationMilliseconds
+                : Math.Max(1, (long)(completedAt -
+                    (step.StartedAt ?? completedAt)).TotalMilliseconds),
+            cancellationToken,
+            recoveringFailedAttempt);
+        return true;
     }
 
     private async Task<FlowStep> CompleteStepAsync(
@@ -3925,23 +4223,13 @@ public sealed class WorkflowEngine(
         var flow = await database.Flows.SingleAsync(
             item => item.Id == flowId,
             cancellationToken);
-        var observedToolCalls = result.ToolCalls
-            .Select(toolCall => new AgentToolCall
-            {
-                FlowStepId = stepId,
-                ToolName = toolCall.ToolName,
-                ArgumentsSummary = toolCall.ArgumentsSummary,
-                Succeeded = toolCall.Succeeded,
-                ToolType = toolCall.ToolType,
-                NormalizedCommand = toolCall.NormalizedCommand,
-                NormalizedArguments = toolCall.NormalizedArguments,
-                WorkingDirectory = toolCall.WorkingDirectory,
-                ExitCode = toolCall.ExitCode,
-                ResultDigest = toolCall.ResultDigest,
-                ResultSummary = toolCall.ResultSummary
-            })
-            .ToArray();
-        database.AgentToolCalls.AddRange(observedToolCalls);
+        var observedToolCalls = ToObservedToolCalls(stepId, result);
+        if (!await database.AgentToolCalls.AnyAsync(
+                item => item.FlowStepId == stepId,
+                cancellationToken))
+        {
+            database.AgentToolCalls.AddRange(observedToolCalls);
+        }
         if (step.InvocationKind == ExecutionInvocationKind.Intake)
         {
             ValidateStudioIntakeCompletion(flow, step, result.Output);
@@ -4444,12 +4732,40 @@ public sealed class WorkflowEngine(
         Exception exception,
         long? durationMilliseconds,
         CancellationToken cancellationToken,
-        string? diagnosticOutput = null)
+        string? diagnosticOutput = null,
+        AgentExecutionResult? executionResult = null)
     {
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var step = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
+        if (executionResult is not null)
+        {
+            var observedToolCalls = ToObservedToolCalls(stepId, executionResult);
+            if (!await database.AgentToolCalls.AnyAsync(
+                    item => item.FlowStepId == stepId,
+                    cancellationToken))
+            {
+                database.AgentToolCalls.AddRange(observedToolCalls);
+            }
+            var flow = await database.Flows.SingleAsync(
+                item => item.Id == step.FlowRunId,
+                cancellationToken);
+            if (DeliveryReadinessService.AppliesTo(flow) &&
+                step.PlanStage == PlanStage.BeforeReview &&
+                step.InvocationKind == ExecutionInvocationKind.Worker)
+            {
+                await RecordDeliveryEvidenceAsync(
+                    database,
+                    flow,
+                    step,
+                    observedToolCalls,
+                    cancellationToken);
+            }
+            step.ExecutionAttempts = Math.Max(
+                step.ExecutionAttempts,
+                executionResult.ExecutionAttempts);
+        }
         var completedAt = DateTimeOffset.UtcNow;
         step.Status = StepStatus.Failed;
         step.Phase = exception is AgentRunException
@@ -5274,6 +5590,16 @@ public sealed class WorkflowEngine(
         var recoveredExecution = ToRecoveredExecutionResult(
             recoveredResult,
             snapshot.SessionId);
+        if (await TryScheduleRecoveredQaCorrectionAsync(
+                candidate.FlowId,
+                candidate.StepId,
+                recoveredExecution,
+                snapshot.CompletedAt ?? DateTimeOffset.UtcNow,
+                recoveringFailedAttempt: true,
+                cancellationToken))
+        {
+            return true;
+        }
         var governedPublicationOutput = await PrepareGovernedPublicationIfNeededAsync(
             candidate.FlowId,
             candidate.StepId,
@@ -5466,6 +5792,37 @@ public sealed class WorkflowEngine(
                     throw new InvalidOperationException(
                         $"Copilot session {snapshot.SessionId:D} is still active and could not be stopped safely.");
                 }
+            }
+
+            if (isVerification &&
+                snapshot is
+                {
+                    State: CopilotSessionJournalState.Completed,
+                    Result: { Success: true } completedVerification
+                } &&
+                CopilotReasoningHost.IsRecoveryCurrent(
+                    failedStep.StartedAt,
+                    snapshot.CompletedAt) &&
+                await TryScheduleRecoveredQaCorrectionAsync(
+                    flow.Id,
+                    failedStep.Id,
+                    ToRecoveredExecutionResult(
+                        completedVerification,
+                        snapshot.SessionId),
+                    snapshot.CompletedAt ?? DateTimeOffset.UtcNow,
+                    recoveringFailedAttempt: true,
+                    cancellationToken))
+            {
+                database.ChangeTracker.Clear();
+                return await database.Flows
+                    .AsSplitQuery()
+                    .Include(item => item.Steps)
+                    .ThenInclude(step => step.ToolCalls)
+                    .Include(item => item.Messages)
+                    .Include(item => item.Events)
+                    .Include(item => item.GateRecords)
+                    .Include(item => item.AgentSnapshots)
+                    .SingleAsync(item => item.Id == flowId, cancellationToken);
             }
 
             if (snapshot is
@@ -6548,7 +6905,7 @@ public sealed class WorkflowEngine(
                 "Resume your prior work, correct the missing handoff or implementation detail, " +
                 $"and explicitly unblock {blockedStep.AgentName}.{Environment.NewLine}{Environment.NewLine}" +
                 $"Blocked agent output:{Environment.NewLine}" +
-                ClipText(blockedStep.OutputSummary, 2_000)
+                blockedStep.OutputSummary
         };
         var retryStep = new FlowStep
         {
@@ -6599,7 +6956,7 @@ public sealed class WorkflowEngine(
         retryStep.InputSummary =
             $"{revision.AgentName} responded to your pushback. Resume your role and re-attempt " +
             $"the blocked work using this corrected handoff:{Environment.NewLine}{Environment.NewLine}" +
-            ClipText(revision.OutputSummary, 3_000);
+            revision.OutputSummary;
         await database.SaveChangesAsync(cancellationToken);
     }
 
@@ -6646,7 +7003,7 @@ public sealed class WorkflowEngine(
         retryStep.InputSummary =
             $"{revisionStep.AgentName} responded to your pushback. Resume your role and re-attempt " +
             $"the blocked work using this corrected handoff:{Environment.NewLine}{Environment.NewLine}" +
-            ClipText(revisionStep.OutputSummary, 3_000);
+            revisionStep.OutputSummary;
         await database.SaveChangesAsync(cancellationToken);
     }
 
@@ -6859,15 +7216,21 @@ public sealed class WorkflowEngine(
                 $"owners={string.Join('/', criterion.OwnerRoles ?? [])}; " +
                 $"evidenceKinds={string.Join('/', (criterion.EvidenceKinds ?? []).Select(kind => kind.ToString()))}): " +
                 $"{criterion.Requirement} | verification: {criterion.Verification}"));
-        var evidence = readiness.Evidence.Count == 0
-            ? "- (none: the host issued no evidence identifiers, so no criterion can be verified)"
-            : string.Join(
-                Environment.NewLine,
-                readiness.Evidence.Select(item =>
-                    $"- {item.EvidenceId} [{item.Kind}; supportsVerification=" +
-                    $"{item.SupportsVerification.ToString().ToLowerInvariant()}; " +
-                    $"exitCode={item.ExitCode?.ToString() ?? "n/a"}] " +
-                    $"{item.Locator}: {item.Summary}"));
+        var evidence = BuildDeliveryEvidenceContext(readiness.Evidence);
+        var preview = readiness.VerificationPreviewUrl is null
+            ? string.Empty
+            : $"""
+              Active verification preview metadata: {readiness.VerificationPreviewUrl}
+              For ordinary verification, not response-only correction, read this endpoint to
+              discover every generated variant. Open each returned openUrl
+              on the same Studio origin; it uses the actual customer-preview sandbox, CSP, and
+              bootstrap. Allow only this local preview origin while blocking external network
+              access. Exercise the iframe content at representative desktop and mobile sizes.
+              These unreviewed URLs are available only while this verification task is running.
+              Ordinary customer-preview URLs require the later reviewed seal; do not use them
+              before review or treat a direct-file check as proof of the harness security layer.
+              This endpoint grants no customer approval or publication authority.
+              """;
         return $"""
             You additionally own the Delivery verification duty for this iteration.
 
@@ -6881,10 +7244,67 @@ public sealed class WorkflowEngine(
             {evidence}
 
             Current verification step evidence prefix: {readiness.CurrentStepEvidencePrefix}
-            Tool calls from this turn receive that prefix followed by a one-based, three-digit call
-            index. You may cite such an ID only when you actually made that successful call; the host
-            records and validates the call after execution.
+            Tool calls from this turn receive that prefix followed by a one-based, three-digit
+            index in host-observed completion order, including context reads and failed calls.
+            Do not infer an ID from a command label, shell session number, or a count of only the
+            important checks. The host validates every citation against the actual observations.
+            If references are invalid, the host preserves your work and supplies the recorded
+            identifiers for one response-only correction, without rerunning successful checks.
+
+            {preview}
             """;
+    }
+
+    internal static string BuildDeliveryEvidenceContext(
+        IReadOnlyList<DeliveryEvidenceItem> evidence)
+    {
+        if (evidence.Count == 0)
+        {
+            return "- (none: the host issued no evidence identifiers, so no criterion can be verified)";
+        }
+        var index = string.Join(
+            Environment.NewLine,
+            evidence.GroupBy(item => new
+            {
+                item.Kind,
+                item.SupportsVerification,
+                item.ExitCode
+            }).Select(group =>
+                $"[{group.Key.Kind}; supportsVerification=" +
+                $"{group.Key.SupportsVerification.ToString().ToLowerInvariant()}; " +
+                $"exitCode={group.Key.ExitCode?.ToString() ?? "n/a"}]" +
+                Environment.NewLine +
+                string.Join(
+                    Environment.NewLine,
+                    group.Chunk(12).Select(chunk =>
+                        string.Join(", ", chunk.Select(item => item.EvidenceId))))));
+        const int detailBudget = 16_000;
+        var details = new List<string>();
+        var used = 0;
+        foreach (var item in evidence.Reverse())
+        {
+            if (item.EvidenceId.EndsWith("-000", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var detail =
+                $"- {item.EvidenceId} [{item.Kind}; supportsVerification=" +
+                $"{item.SupportsVerification.ToString().ToLowerInvariant()}; " +
+                $"exitCode={item.ExitCode?.ToString() ?? "n/a"}] " +
+                $"{ClipText(item.Locator, 160)}: {ClipText(item.Summary, 240)}";
+            if (used + detail.Length + Environment.NewLine.Length > detailBudget)
+            {
+                break;
+            }
+            details.Add(detail);
+            used += detail.Length + Environment.NewLine.Length;
+        }
+        return
+            "Complete identifier index (kind and success are authoritative):" +
+            Environment.NewLine + index +
+            Environment.NewLine + Environment.NewLine +
+            "Recent observation details (newest first; summaries are abbreviated, not new evidence):" +
+            Environment.NewLine + string.Join(Environment.NewLine, details);
     }
 
     internal static string DeliveryQaResponseContract(string acceptancePlanHash) => $$"""
@@ -6948,7 +7368,12 @@ public sealed class WorkflowEngine(
         "Independently reconstruct what failed, what the result missed, and the precise prevention. " +
         "Research the isolated workspace and authoritative sources as needed. Report no more than " +
         "five findings, and report CLEAR when no evidence-backed failure case remains. Keep the " +
-        "entire response under 9,000 characters and each finding field under 800 characters." +
+        "entire response under 9,000 characters and each finding field under 800 characters. " +
+        "Evaluate the correctness and completeness of this role's handoff, not whether its " +
+        "acknowledged downstream corrections have already been implemented. An honest failed or " +
+        "blocked QA assessment is a valid handoff to refinement, not an approval. Do not repeat " +
+        "acknowledged failures as new findings or turn optional improvements into requirements " +
+        "outside the confirmed customer brief." +
         $"{Environment.NewLine}{Environment.NewLine}" +
         $"Evaluated agent: {target.AgentName} ({target.AgentRole})" +
         $"{Environment.NewLine}Evaluated model: " +
@@ -6957,7 +7382,7 @@ public sealed class WorkflowEngine(
         $"Evaluated result:{Environment.NewLine}" +
         (string.IsNullOrWhiteSpace(target.OutputSummary)
             ? "The completed result will be attached immediately before this review runs."
-            : ClipText(target.OutputSummary, 8_000));
+            : target.OutputSummary);
 
     internal static string BuildPreMortemRevisionAssignment(
         string reviewOutput,
@@ -6986,7 +7411,8 @@ public sealed class WorkflowEngine(
         return
         "The Pre-mortem Sceptic found evidence that this result could fail within six months. " +
         "Resume your original work and investigate every finding. Accept, reject, or narrow each " +
-        "item based on facts. " +
+        "item based on facts. This is a task revision, not a response-only format correction; " +
+        "use this attempt's recorded task permissions. " +
         (ownsImplementation
             ? "If a finding is justified, make the focused corrections owned by this role. "
             : "Do not implement downstream product corrections in this turn; revise this role's " +
@@ -7136,7 +7562,7 @@ public sealed class WorkflowEngine(
         assignment +
         $"{Environment.NewLine}{Environment.NewLine}" +
         $"## Original customer outcome{Environment.NewLine}" +
-        ClipText(AssignmentBriefFormatter.Format(customerTask), 700);
+        AssignmentBriefFormatter.Format(customerTask);
 
     internal static bool HasHandoffRetryAvailable(
         int observedPushbacks,
@@ -7575,7 +8001,8 @@ public sealed class WorkflowEngine(
         string PlanHash,
         DeliveryAcceptancePlan Plan,
         IReadOnlyList<DeliveryEvidenceItem> Evidence,
-        string CurrentStepEvidencePrefix);
+        string CurrentStepEvidencePrefix,
+        string? VerificationPreviewUrl = null);
 
     /// <summary>
     /// Durably records the host-issued evidence identifiers for one plan step. It is idempotent, so
@@ -7588,17 +8015,40 @@ public sealed class WorkflowEngine(
         IReadOnlyList<AgentToolCall> toolCalls,
         CancellationToken cancellationToken)
     {
-        var entry = DeliveryReadinessService.BuildEvidence(step, toolCalls);
-        var data = DeliveryReadinessService.SerializeEvidence(entry);
-        if (await database.FlowEvents.AnyAsync(
-                item =>
-                    item.FlowRunId == flow.Id &&
-                    item.FlowStepId == step.Id &&
-                    item.Type == DeliveryReadinessService.EvidenceEventType &&
-                    item.DataJson == data,
-                cancellationToken))
+        var events = await database.FlowEvents
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.FlowStepId == step.Id &&
+                item.Type == DeliveryReadinessService.EvidenceEventType)
+            .ToListAsync(cancellationToken);
+        var issued = DeliveryReadinessService.ReadStepEvidence(
+            events,
+            step.Iteration,
+            step.Id);
+        if (issued is not null && toolCalls.Count == 0)
         {
             return;
+        }
+        var entry = DeliveryReadinessService.BuildEvidence(
+            step,
+            toolCalls,
+            issued?.Sequence);
+        var data = DeliveryReadinessService.SerializeEvidence(entry);
+        if (issued is not null)
+        {
+            if (string.Equals(
+                    DeliveryReadinessService.SerializeEvidence(issued),
+                    data,
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+            if (issued.Items.Count > 1)
+            {
+                throw new InvalidOperationException(
+                    "Host-issued evidence is immutable. The recorded observations for this " +
+                    "attempt cannot be replaced or reordered.");
+            }
         }
         database.FlowEvents.Add(new FlowEvent
         {
@@ -7611,12 +8061,30 @@ public sealed class WorkflowEngine(
         });
     }
 
+    private static AgentToolCall[] ToObservedToolCalls(
+        Guid stepId,
+        AgentExecutionResult result) =>
+        [.. result.ToolCalls.Select(toolCall => new AgentToolCall
+        {
+            FlowStepId = stepId,
+            ToolName = toolCall.ToolName,
+            ArgumentsSummary = toolCall.ArgumentsSummary,
+            Succeeded = toolCall.Succeeded,
+            ToolType = toolCall.ToolType,
+            NormalizedCommand = toolCall.NormalizedCommand,
+            NormalizedArguments = toolCall.NormalizedArguments,
+            WorkingDirectory = toolCall.WorkingDirectory,
+            ExitCode = toolCall.ExitCode,
+            ResultDigest = toolCall.ResultDigest,
+            ResultSummary = toolCall.ResultSummary
+        })];
+
     /// <summary>
     /// Prepares the verification turn: pre-issues the step's own evidence identifier before
     /// dispatch and loads the durable acceptance plan and evidence registry that the prompt must
     /// carry. A Delivery verification turn is never dispatched without a planned criterion set.
     /// </summary>
-    private static async Task<DeliveryVerificationAssignment?>
+    private async Task<DeliveryVerificationAssignment?>
         PrepareDeliveryVerificationAssignmentAsync(
             HarnessDbContext database,
             FlowRun flow,
@@ -7634,11 +8102,21 @@ public sealed class WorkflowEngine(
                 item.FlowRunId == flow.Id &&
                 item.Iteration == flow.Iteration &&
                 item.PlanStage == PlanStage.BeforeReview &&
+                item.InvocationKind == ExecutionInvocationKind.Worker &&
                 item.Status == StepStatus.Completed)
             .OrderBy(item => item.Sequence)
             .ToListAsync(cancellationToken);
         foreach (var completedStep in completedSteps)
         {
+            if (await database.FlowEvents.AnyAsync(
+                    item =>
+                        item.FlowRunId == flow.Id &&
+                        item.FlowStepId == completedStep.Id &&
+                        item.Type == DeliveryReadinessService.EvidenceEventType,
+                    cancellationToken))
+            {
+                continue;
+            }
             var toolCalls = await database.AgentToolCalls
                 .AsNoTracking()
                 .Where(item => item.FlowStepId == completedStep.Id)
@@ -7672,7 +8150,21 @@ public sealed class WorkflowEngine(
             planHash,
             plan,
             DeliveryReadinessService.ReadEvidence(events, flow.Iteration),
-            $"EV-S{Math.Max(step.Sequence, 0):000}-");
+            $"EV-S{Math.Max(
+                DeliveryReadinessService.ReadStepEvidence(
+                    events,
+                    step.Iteration,
+                    step.Id)?.Sequence ?? step.Sequence, 0):000}-",
+            server is null
+                ? null
+                : PreviewArtifactCatalog.VerificationBaseUrl(
+                    flow.Id,
+                    server.Features.Get<IServerAddressesFeature>()?.Addresses
+                        .OrderBy(address =>
+                            !address.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                        .FirstOrDefault()
+                    ?? throw new InvalidOperationException(
+                        "Studio must be listening before dispatching Delivery verification.")));
     }
 
     /// <summary>

@@ -266,6 +266,23 @@ public sealed class PermissionProfileResolver
                right.GovernedGitMetadataIsolation;
     }
 
+    public static EffectiveExecutionPermission ForResponseCorrection(
+        EffectiveExecutionPermission permission)
+    {
+        ValidateShape(permission);
+        return permission with
+        {
+            AllowedTools = permission.AllowedTools
+                .Where(tool => tool is "view" or "grep" or "glob")
+                .ToImmutableArray(),
+            DeniedTools = permission.DeniedTools
+                .Concat(["write", "shell"])
+                .Distinct(StringComparer.Ordinal)
+                .ToImmutableArray(),
+            DisallowTemporaryDirectory = true
+        };
+    }
+
     public static void ValidatePersisted(
         EffectiveExecutionPermission permission,
         ExecutionPermissionProfile recordedProfile,

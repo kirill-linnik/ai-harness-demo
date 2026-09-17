@@ -56,6 +56,12 @@ public static class DemoApi
         api.MapGet("/learnings", GetLearningsAsync);
         api.MapGet("/previews/{flowId:guid}", GetPreviewAsync);
         api.MapGet(
+            "/verification-previews/{flowId:guid}",
+            GetVerificationPreviewAsync);
+        api.MapGet(
+            "/verification-previews/{flowId:guid}/artifacts/{artifactId}/{**path}",
+            GetVerificationPreviewArtifactAsync);
+        api.MapGet(
             "/previews/{flowId:guid}/artifacts/{artifactId}/demo",
             GetDemoStatusAsync);
         api.MapPost(
@@ -914,6 +920,98 @@ public static class DemoApi
             flow,
             reviewedCandidateService,
             cancellationToken);
+        return await ServePreviewArtifactAsync(
+            flow,
+            artifactId,
+            path,
+            httpContext,
+            artifactCatalog,
+            reviewedSnapshot,
+            cancellationToken);
+    }
+
+    internal static async Task<IResult> GetVerificationPreviewAsync(
+        Guid flowId,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        PreviewArtifactCatalog artifactCatalog,
+        CancellationToken cancellationToken)
+    {
+        var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
+        var verifier = RequireActiveDeliveryVerifier(flow);
+        var basePath = PreviewArtifactCatalog.VerificationBasePath(flowId);
+        return Results.Ok(new
+        {
+            flowId,
+            flowStepId = verifier.Id,
+            reviewed = false,
+            artifacts = artifactCatalog.Discover(flow).Select(artifact => new
+            {
+                id = artifact.Id,
+                label = artifact.Label,
+                url = $"{basePath}/artifacts/{Uri.EscapeDataString(artifact.Id)}/index.html",
+                openUrl = $"{basePath}/artifacts/{Uri.EscapeDataString(artifact.Id)}/view"
+            }).ToArray()
+        });
+    }
+
+    internal static async Task<IResult> GetVerificationPreviewArtifactAsync(
+        Guid flowId,
+        string artifactId,
+        string? path,
+        HttpContext httpContext,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        PreviewArtifactCatalog artifactCatalog,
+        CancellationToken cancellationToken)
+    {
+        var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
+        _ = RequireActiveDeliveryVerifier(flow);
+        if (string.Equals(path, "view", StringComparison.Ordinal))
+        {
+            _ = artifactCatalog.ResolveFile(flow, artifactId, "index.html");
+            return CreateIsolatedPreviewView(
+                $"{PreviewArtifactCatalog.VerificationBasePath(flowId)}/artifacts/{Uri.EscapeDataString(artifactId)}/index.html",
+                httpContext,
+                "Unreviewed verification preview");
+        }
+        return await ServePreviewArtifactAsync(
+            flow,
+            artifactId,
+            path,
+            httpContext,
+            artifactCatalog,
+            reviewedSnapshot: null,
+            cancellationToken);
+    }
+
+    private static FlowStep RequireActiveDeliveryVerifier(FlowRun flow)
+    {
+        var verifier = flow.Steps.SingleOrDefault(step =>
+            step.Iteration == flow.Iteration &&
+            step.Status == StepStatus.Running &&
+            step.InvocationKind == ExecutionInvocationKind.Worker &&
+            step.PlanStage == PlanStage.BeforeReview &&
+            step.IsOutcomeOwner &&
+            step.PlanStepKey == flow.OutcomeOwnerPlanStepKey &&
+            WorkflowEngine.IsDeliveryVerificationStep(step));
+        if (flow.Kind != FlowKind.Delivery ||
+            flow.Status != FlowStatus.Running ||
+            verifier is null)
+        {
+            throw new InvalidOperationException(
+                "An unreviewed verification preview is available only while the current Delivery verifier is running.");
+        }
+        return verifier;
+    }
+
+    private static async Task<IResult> ServePreviewArtifactAsync(
+        FlowRun flow,
+        string artifactId,
+        string? path,
+        HttpContext httpContext,
+        PreviewArtifactCatalog artifactCatalog,
+        OutcomeCandidateSnapshot? reviewedSnapshot,
+        CancellationToken cancellationToken)
+    {
         var filePath = artifactCatalog.ResolveFile(flow, artifactId, path);
         var contentTypes = new FileExtensionContentTypeProvider();
         if (!contentTypes.TryGetContentType(filePath, out var contentType))
@@ -1148,18 +1246,25 @@ public static class DemoApi
     internal static IResult GetIsolatedPreviewView(
         Guid flowId,
         string artifactId,
-        HttpContext httpContext)
+        HttpContext httpContext) =>
+        CreateIsolatedPreviewView(
+            $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(artifactId)}/index.html",
+            httpContext,
+            "Customer preview");
+
+    private static IResult CreateIsolatedPreviewView(
+        string artifactUrl,
+        HttpContext httpContext,
+        string title)
     {
         ApplyIsolatedPreviewViewSecurityHeaders(httpContext.Response);
-        var artifactUrl =
-            $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(artifactId)}/index.html";
         var document = $$"""
             <!doctype html>
             <html lang="en">
             <head>
               <meta charset="utf-8">
               <meta name="viewport" content="width=device-width, initial-scale=1">
-              <title>Customer preview</title>
+              <title>{{title}}</title>
               <style>
                 html,body,iframe{box-sizing:border-box;width:100%;height:100%;margin:0;border:0;background:#fff}
               </style>

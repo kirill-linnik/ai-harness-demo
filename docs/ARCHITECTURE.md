@@ -129,7 +129,17 @@ strict QA document and the customer-facing `flow outcome`.
 `WorkflowEngine` materializes only pre-review workers before customer review, orders them
 deterministically, and executes one pending attempt at a time. A dependency must point backward in
 the accepted plan. Before a worker runs, the host resolves the latest successful attempt for each
-declared dependency and provides bounded dependency results in the prompt. There is no parallel
+declared dependency and supplies its complete deliverable, including design tokens or specification
+content delivered inline. Fresh host working prompts are capped at 32 KiB of UTF-8, leaving room for
+reasoning, tool results, and the CLI's own context. Sections above 4 KiB and large combined handoffs
+become host-owned, searchable context documents rather than excerpts. Agents read required handoffs
+in bounded sections and query the full evidence registry by identifier or command.
+
+The prompt and its complete context-document snapshot are saved atomically through `HarnessDbContext`.
+Document hashes, paths, attempt identity, and workflow revision remain bound to that attempt.
+Recovery recreates missing staged files from the database and rejects changed files or snapshots;
+files are never a success fallback. The document set has a separate 16 MiB storage bound. This is a
+working-set policy, not a claim to know an unreported model context-window size. There is no parallel
 fan-out or integration join inside a flow.
 
 Optional pre-mortem checkpoints are inserted after their target steps. They run read-only and their
@@ -171,7 +181,11 @@ Delivery readiness is derived by the host from the current iteration:
 1. The Team Lead declares ordered acceptance criteria. The host records and hashes that plan.
 2. The host records evidence identifiers from completed steps and observed tool calls. A verified
    criterion must cite a successful observation whose kind is allowed by that criterion; a generic
-   step-completion record is context only.
+   step-completion record is context only. Issued identifiers retain their original observation
+   order and prefix across retries, sequence changes, and restarts; random database row IDs never
+   reorder an existing evidence registry. Verification context carries the complete kind/success
+   index plus bounded recent observation details, with the complete evidence rows in a searchable
+   `evidence.jsonl` context document rather than repeated inline transcripts.
 3. The final outcome owner returns one result for every criterion and classifies residual risks.
    It may cite only host-issued evidence identifiers and must report any confirmed requirement that
    the acceptance plan omitted as a plan gap.
@@ -198,6 +212,13 @@ For browser-visible work, `.customer-preview\<variant>` is part of the sealed ca
 served only after length and digest checks. Its reviewed representation is network-disabled. A
 separately requested loopback live demo is convenience only and contributes no readiness evidence
 or publication authority.
+
+Before sealing, the active Delivery verifier receives an absolute verification-preview metadata
+URL on Studio's actual listening address. Its unreviewed artifact views share the customer-preview
+renderer, sandbox, CSP, and bootstrap, so QA can exercise the real isolation policy before review
+exists. These separate endpoints require the current iteration's running `BeforeReview` verification
+owner, preserve workspace path containment, and close when that task stops. They neither create a
+reviewed seal nor open customer approval or publication.
 
 ### Customer review and publication
 
@@ -233,15 +254,48 @@ within the configured correction limit, schedules:
 Retries preserve or tighten the original permission document. Exhausting the correction limit
 fails the flow instead of bypassing the handoff.
 
+Pushback is reserved for missing or unusable required upstream inputs. A completed verification can
+report honest failed or blocked criteria; non-blocking disclosures and host response-validation
+errors are not upstream pushback.
+
+The full QA contract is validated before handoff acceptance, not just its sentinel markers.
+An invalid plan hash, evidence reference, evidence kind, success claim, or JSON shape triggers one
+durable response-only correction. The host retains the original output, execution count, and tool
+observations even when a contract is rejected. The correction receives the exact recorded evidence
+and is restricted to read/search tools, with shell and write denied. It cannot rerun implementation,
+weaken acceptance criteria, or authorize release from an invalid response. Both attempts and the
+correction event remain visible. QA correction starts a fresh CLI context using the retained
+response and evidence, rather than resuming an already bloated conversation. Its own interrupted
+attempt still resumes exactly. An interrupted completed QA session follows this same bounded
+path during restart reconciliation.
+
+Pre-mortem response envelopes receive the same bounded, read-only format correction rather than
+failing an otherwise completed investigation. Their correction uses a distinct persisted CLI
+session without consuming another critique round. Pre-mortem and pushback-retry assignments carry
+the complete customer brief and evaluated or corrected handoff through the bounded context
+documents; they do not truncate either source. A later substantive revision uses the originating
+task's persisted permission ceiling, not a response correction's temporary read-only restriction.
+
 The SQLite ledger and `CopilotSessionJournal` support restart reconciliation. Completed journal
 results are applied once; interrupted resumable attempts retain their flow, workspace, semantic
 step, Copilot session identity, workflow revision, and permission ceiling. Open customer reviews
 remain waiting, accepted Delivery publication can be rematerialized from durable authorization,
 and missing-qualification blockers are not retried automatically.
 
+A contract-valid final handoff followed by its matching closed assistant turn starts a separate
+60-second CLI shutdown grace period. Further assistant or tool work disarms that watchdog; open
+turns, pending tools, partial responses, and session errors cannot trigger it. If the CLI remains
+alive, the host terminates its process tree and uses the existing journal-recovery path instead of
+waiting out the whole task timeout. The journal must still confirm a current completed result
+after process termination, and normal handoff and QA validation still apply. This is visible
+recovery, not acceptance of a response while its worker remains active.
+
 The flow page's **Recover stalled execution** action is limited to queued, running, or reworking
 work. It stops only the tracked worker, reconciles persisted state, and queues the flow once.
-Failed work requires the explicit **Recover failed task** action. Queue and execution claims prevent
+Failed work requires the explicit **Recover failed task** action. When its completed CLI journal
+contains a rejected QA response, recovery restores the observed evidence and queues only response
+correction in the preserved workspace, without repeating completed upstream steps. The UI labels
+host execution failures separately from actual agent pushback. Queue and execution claims prevent
 two workers from running the same flow concurrently.
 
 ## Permission ceilings

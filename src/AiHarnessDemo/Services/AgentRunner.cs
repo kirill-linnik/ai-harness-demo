@@ -25,6 +25,8 @@ public sealed record AdvisoryPromotionContext(
     string CanonicalSeedJson,
     string SeedHash);
 
+public sealed record AgentContextDocument(string Name, string Content);
+
 public sealed record AgentExecutionContext(
     Guid FlowId,
     int Iteration,
@@ -64,7 +66,9 @@ public sealed record AgentExecutionContext(
     bool IsOutcomeOwner = false,
     string PlanStepKey = "",
     FlowKind? FlowKind = null,
-    bool RequiresDeliveryReadinessQa = false);
+    bool RequiresDeliveryReadinessQa = false,
+    IReadOnlyList<AgentContextDocument>? ContextDocuments = null,
+    bool UsesBoundedWorkingPrompt = false);
 
 public sealed record AgentExecutionResult(
     string Output,

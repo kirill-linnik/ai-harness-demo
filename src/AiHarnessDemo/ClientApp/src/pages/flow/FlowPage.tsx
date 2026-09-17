@@ -22,13 +22,17 @@ import { RecoverFlowButton } from "./RecoverFlowButton";
 const failedTaskRecoveryEvents = new Set([
   "flow.manual-restart",
   "flow.finalization-retry-queued",
-  "flow.completed-output-recovered"
+  "flow.completed-output-recovered",
+  "flow.contract-correction-queued"
 ]);
 
 function latestManualRetry(flow: FlowDetailDto) {
   return [...flow.steps]
     .reverse()
-    .find(step => step.label.startsWith("Manual restart of "));
+    .find(step =>
+      step.label.startsWith("Manual restart of ") ||
+      step.label.startsWith("Correct invalid response from ")
+    );
 }
 
 function recoveryCommitted(

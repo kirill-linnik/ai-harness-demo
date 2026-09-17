@@ -682,6 +682,8 @@ public sealed class ReviewCoordinator(
 
             if (action == ReadinessResolutionAction.Continue)
             {
+                var permissionSource = await WorkflowEngine.ResolveTaskPermissionSourceAsync(
+                    database, reviewedStep, cancellationToken);
                 var continuation = new FlowStep
                 {
                     FlowRunId = flow.Id,
@@ -700,8 +702,8 @@ public sealed class ReviewCoordinator(
                     PlanStage = reviewedStep.PlanStage,
                     InvocationKind = reviewedStep.InvocationKind,
                     IsOutcomeOwner = true,
-                    PermissionProfile = reviewedStep.PermissionProfile,
-                    EffectivePermissionJson = reviewedStep.EffectivePermissionJson,
+                    PermissionProfile = permissionSource.PermissionProfile,
+                    EffectivePermissionJson = permissionSource.EffectivePermissionJson,
                     WorkflowRevision = reviewedStep.WorkflowRevision,
                     RemotePublicationAllowed = false,
                     Status = StepStatus.Pending,
@@ -714,7 +716,7 @@ public sealed class ReviewCoordinator(
                         .DefaultIfEmpty()
                         .Max() + 1,
                     InputSummary =
-                        $"{reviewedStep.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+                        $"{permissionSource.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
                         "Customer requested another attempt after the blocked readiness result. " +
                         "Re-check the current candidate, address the blocker if it is now resolvable, " +
                         "and return a complete replacement verification and outcome.",

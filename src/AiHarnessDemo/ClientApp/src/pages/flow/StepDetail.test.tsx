@@ -160,4 +160,16 @@ None specified.`;
     ).toBeInTheDocument();
     expect(within(prompt).queryByText("The change crosses technical boundaries.")).not.toBeInTheDocument();
   });
+
+  it.each(["Failed", "Pushback"] as const)("labels a %s outcome without blaming the wrong source", status => {
+    render(
+      <StepDetail
+        step={{ ...step, status, pushbackReason: "The evidence reference needs correction." }}
+        gate={undefined}
+      />
+    );
+
+    expect(screen.getByText(status === "Pushback" ? "Pushback:" : "Execution failure:")).toBeInTheDocument();
+    expect(screen.queryByText(status === "Pushback" ? "Execution failure:" : "Pushback:")).not.toBeInTheDocument();
+  });
 });

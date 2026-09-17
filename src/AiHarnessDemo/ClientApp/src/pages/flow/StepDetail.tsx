@@ -164,7 +164,8 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
       )}
       {step.pushbackReason && (
         <div className="pushback-callout">
-          <strong>Pushback:</strong> {step.pushbackReason}
+          <strong>{step.status === "Pushback" ? "Pushback:" : "Execution failure:"}</strong>{" "}
+          {step.pushbackReason}
         </div>
       )}
       {step.toolCalls.length > 0 && (

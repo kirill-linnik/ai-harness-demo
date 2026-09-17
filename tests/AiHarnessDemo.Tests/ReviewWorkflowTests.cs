@@ -1156,6 +1156,112 @@ public sealed class ReviewWorkflowTests
         Assert.Empty(await database.DeliveryReadinessSnapshots
             .Where(item => item.FlowRunId == harness.FlowId)
             .ToListAsync());
+        Assert.Equal(2, harness.Runner.Contexts.Count(context => context.RequiresDeliveryReadinessQa));
+        Assert.Single(flow.Events, item => item.Type == "agent.contract-correction-scheduled");
+    }
+
+    [Theory]
+    [InlineData("unknown")]
+    [InlineData("unsuccessful")]
+    [InlineData("kind")]
+    [InlineData("hash")]
+    [InlineData("casing")]
+    public async Task DeliveryReadiness_InvalidCitationsAreCorrectedWithoutRepeatingImplementation(
+        string defect)
+    {
+        await using var harness = await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        var verificationTurns = 0;
+        harness.Runner.VerificationToolCallsOverride = context =>
+            context.Task.Contains("previous Studio response contract was invalid", StringComparison.Ordinal)
+                ? []
+                :
+                [
+                    new ToolCallRecord(
+                        "observe", "Failed browser check.", false, ToolType: "Observation",
+                        ExitCode: 1, ResultSummary: "The first check failed."),
+                    new ToolCallRecord(
+                        "view", "Read source.", true, ToolType: "Read",
+                        ResultSummary: "Source inspection is not a browser observation."),
+                    new ToolCallRecord(
+                        "observe", "Successful browser check.", true, ToolType: "Observation",
+                        ResultDigest: OutcomeVerificationRules.ComputeSha256("verified candidate"),
+                        ResultSummary: "The corrected browser check passed.")
+                ];
+        harness.Runner.QaBlockOverride = context =>
+        {
+            verificationTurns++;
+            if (verificationTurns > 1)
+            {
+                return DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext);
+            }
+            var prefix = System.Text.RegularExpressions.Regex.Match(
+                context.OutcomeContext,
+                @"Current verification step evidence prefix: (EV-S[0-9]+-)").Groups[1].Value;
+            var evidenceId = prefix + (defect switch
+            {
+                "unknown" => "999",
+                "unsuccessful" => "001",
+                "kind" => "002",
+                _ => "003"
+            });
+            var block = DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                evidenceOverride: [evidenceId],
+                planHashOverride: defect == "hash"
+                    ? OutcomeVerificationRules.ComputeSha256("wrong plan")
+                    : null);
+            return defect == "casing"
+                ? block.Replace("\"Verified\"", "\"verified\"", StringComparison.Ordinal)
+                : block;
+        };
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.Equal(2, verificationTurns);
+        var verificationContexts = harness.Runner.Contexts
+            .Where(context => context.RequiresDeliveryReadinessQa).ToArray();
+        Assert.False(verificationContexts[1].ResumeSession);
+        Assert.NotEqual(
+            verificationContexts[0].CopilotSessionId,
+            verificationContexts[1].CopilotSessionId);
+        Assert.Single(harness.Runner.Contexts, context => context.PlanStepKey == "implement");
+        Assert.DoesNotContain(flow.Events, item => item.Type is "flow.failed" or "handoff.pushback");
+        var correctionEvent = Assert.Single(
+            flow.Events, item => item.Type == "agent.contract-correction-scheduled");
+        var correction = Assert.Single(flow.Steps, step => step.Id == correctionEvent.FlowStepId);
+        var original = Assert.Single(flow.Steps, step => step.Id == correction.RetryOfStepId);
+        Assert.Equal(StepStatus.Completed, original.Status);
+        Assert.Equal(StepStatus.Completed, correction.Status);
+        Assert.Equal(original.WorkflowRevision, correction.WorkflowRevision);
+        var originalPermission =
+            System.Text.Json.JsonSerializer.Deserialize<AiHarnessDemo.Core.Security.EffectiveExecutionPermission>(
+                original.EffectivePermissionJson)!;
+        var correctionPermission =
+            System.Text.Json.JsonSerializer.Deserialize<AiHarnessDemo.Core.Security.EffectiveExecutionPermission>(
+                correction.EffectivePermissionJson)!;
+        Assert.All(correctionPermission.AllowedTools, tool => Assert.Contains(tool, originalPermission.AllowedTools));
+        Assert.Contains("write", correctionPermission.DeniedTools);
+        Assert.Contains("shell", correctionPermission.DeniedTools);
+        Assert.DoesNotContain("powershell", correctionPermission.AllowedTools);
+        Assert.DoesNotContain("bash", correctionPermission.AllowedTools);
+        Assert.Equal(1, original.ExecutionAttempts);
+        Assert.Contains("Previous response to correct:", correction.InputSummary);
+        Assert.Single(flow.GateRecords, gate => gate.ActionType == HandoffActionType.CustomerReview);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        Assert.Equal(3, await database.AgentToolCalls.CountAsync(call => call.FlowStepId == original.Id));
+        var issued = DeliveryReadinessService.ReadStepEvidence(flow.Events, flow.Iteration, original.Id)!;
+        Assert.False(issued.Items[1].SupportsVerification);
+        Assert.Equal(OutcomeEvidenceKind.SourceInspection, issued.Items[2].Kind);
+        Assert.Equal("The corrected browser check passed.", issued.Items[3].Summary);
+        Assert.Single(
+            flow.Events,
+            item => item.FlowStepId == original.Id &&
+                item.Type == DeliveryReadinessService.EvidenceEventType &&
+                item.DataJson == DeliveryReadinessService.SerializeEvidence(issued));
     }
 
     private static ReadinessWaiverRequest Waiver(
@@ -2348,6 +2454,9 @@ public sealed class ReviewWorkflowTests
         /// <summary>Optional strict outcome-QA block for a scripted readiness case.</summary>
         public Func<AgentExecutionContext, string>? QaBlockOverride { get; set; }
 
+        public Func<AgentExecutionContext, IReadOnlyList<ToolCallRecord>>?
+            VerificationToolCallsOverride { get; set; }
+
         public Task<AgentExecutionResult> ExecuteAsync(
             AgentExecutionContext context,
             CancellationToken cancellationToken = default)
@@ -2443,6 +2552,10 @@ public sealed class ReviewWorkflowTests
                                 "The customer-visible behavior was observed.")
                     ]
                     : [];
+            if (context.RequiresDeliveryReadinessQa && VerificationToolCallsOverride is not null)
+            {
+                toolCalls = VerificationToolCallsOverride(context);
+            }
             return Task.FromResult(new AgentExecutionResult(
                 output,
                 "Fixture evidence.",

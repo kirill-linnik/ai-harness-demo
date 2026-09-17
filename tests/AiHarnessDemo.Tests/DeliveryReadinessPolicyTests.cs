@@ -216,6 +216,59 @@ public sealed class DeliveryReadinessPolicyTests
             evidence.Items[1].Kind);
     }
 
+    [Fact]
+    public void HostEvidence_IdentifiesAnActuallyViewedImageAsAnObservation()
+    {
+        var step = new FlowStep
+        {
+            Sequence = 100,
+            AgentId = "verifier",
+            AgentName = "Verifier",
+            AgentRole = "verifier"
+        };
+        var image = new AgentToolCall
+        {
+            FlowStepId = step.Id,
+            ToolName = "view",
+            ArgumentsSummary = @"C:\workspace\preview.png",
+            NormalizedArguments = """{"path":"C:\\workspace\\preview.png"}""",
+            ToolType = "Read",
+            Succeeded = true,
+            ResultSummary = "Viewed image file successfully."
+        };
+
+        var observed = DeliveryReadinessService.BuildEvidence(step, [image]).Items[1];
+        Assert.Equal(OutcomeEvidenceKind.Observation, observed.Kind);
+        Assert.True(observed.SupportsVerification);
+        Assert.Contains("preview.png", observed.Locator);
+
+        image.ResultSummary = "The source file contains the text preview.png.";
+        var source = DeliveryReadinessService.BuildEvidence(step, [image]).Items[1];
+        Assert.Equal(OutcomeEvidenceKind.SourceInspection, source.Kind);
+    }
+
+    [Fact]
+    public void EvidencePrompt_KeepsTheCompleteTypedIndexWithoutRepeatingLargeTranscripts()
+    {
+        var evidence = Enumerable.Range(1, 1_200)
+            .Select(index => new DeliveryEvidenceItem(
+                $"EV-S{index / 100 + 10:000}-{index % 100 + 1:000}",
+                index % 2 == 0 ? OutcomeEvidenceKind.Observation : OutcomeEvidenceKind.Command,
+                new string('c', 400),
+                new string('r', 400),
+                SupportsVerification: index % 3 != 0,
+                ExitCode: index % 3 == 0 ? 1 : 0,
+                ResultDigest: OutcomeVerificationRules.ComputeSha256(index.ToString())))
+            .ToArray();
+
+        var prompt = WorkflowEngine.BuildDeliveryEvidenceContext(evidence);
+
+        Assert.True(prompt.Length < 64_000, $"Evidence context was {prompt.Length} characters.");
+        Assert.All(evidence, item => Assert.Contains(item.EvidenceId, prompt));
+        Assert.Contains("supportsVerification=false; exitCode=1", prompt);
+        Assert.Contains("Observation; supportsVerification=true; exitCode=0", prompt);
+    }
+
     private static string QaOutput(
         string planHash,
         string evidenceId,

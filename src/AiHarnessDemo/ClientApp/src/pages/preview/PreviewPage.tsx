@@ -312,22 +312,27 @@ export function PreviewPage() {
                 </p>
               </div>
               {selectedArtifact.demoCapability === "OfflineOnly" ? (
-                <div className="pushback-callout">
-                  <strong>Offline preview only</strong>
-                  <p>
-                    No valid sealed customer demo manifest is available for this reviewed candidate.
-                  </p>
-                  {preview.review.available && !preview.review.resolved ? (
-                    <a className="button" href={`#/factory/${preview.flowId}`}>
-                      <RefreshIcon /> Rebuild and verify preview
-                    </a>
+                <div className={selectedArtifact.demoFailureDetail ? "pushback-callout" : undefined}>
+                  <strong>
+                    {selectedArtifact.demoFailureDetail
+                      ? "Live demo unavailable"
+                      : "Interactive offline preview · Live server not configured"}
+                  </strong>
+                  {selectedArtifact.demoFailureDetail ? (
+                    <>
+                      <p role="alert">{selectedArtifact.demoFailureDetail}</p>
+                      {preview.review.available && !preview.review.resolved ? (
+                        <a className="button" href={`#/factory/${preview.flowId}`}>
+                          <RefreshIcon /> Rebuild and verify preview
+                        </a>
+                      ) : (
+                        <span className="muted">
+                          Rebuild is unavailable because there is no current safe review or refinement action.
+                        </span>
+                      )}
+                    </>
                   ) : (
-                    <span className="muted">
-                      Rebuild is unavailable because there is no current safe review or refinement action.
-                    </span>
-                  )}
-                  {selectedArtifact.demoFailureDetail && (
-                    <p role="alert">{selectedArtifact.demoFailureDetail}</p>
+                    <p className="muted">This preview works without a live application server.</p>
                   )}
                 </div>
               ) : selectedArtifact.demoState === "Running" && selectedArtifact.demoUrl ? (

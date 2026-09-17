@@ -10,6 +10,8 @@ public sealed record StagedAgentManifest(string Root, string AgentId);
 
 public sealed record StagedPromotionSeed(string Path, string SeedHash);
 
+public sealed record StagedContextDocument(string Path, string Sha256, long ByteCount);
+
 public sealed record StagedPrompt(
     string AgentRoot,
     string BundleRoot,
@@ -231,6 +233,51 @@ public sealed class AgentManifestStager
                 "The staged promotion seed cannot be cleaned through a reparse point.");
             File.Delete(stagedSeed.Path);
         }
+    }
+
+    public async Task<StagedContextDocument> StageContextDocumentAsync(
+        StagedAgentManifest manifest,
+        Guid flowId,
+        Guid stepId,
+        int attempt,
+        string name,
+        string content,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(content);
+        if (flowId == Guid.Empty || stepId == Guid.Empty || attempt < 1 ||
+            string.IsNullOrWhiteSpace(name) || name.Length > 100 ||
+            name.StartsWith('.') ||
+            name.Any(character =>
+                !char.IsAsciiLetterOrDigit(character) && character is not ('-' or '.')))
+        {
+            throw new InvalidOperationException(
+                "A context document requires an attempt identity and a safe host-issued filename.");
+        }
+        var bytes = Utf8WithoutBom.GetBytes(content);
+        if (bytes.Length > MaximumStagedPromptBytes)
+        {
+            throw new InvalidOperationException("The context document exceeds its staging limit.");
+        }
+        var directory = Path.Combine(
+            manifest.Root,
+            "host-context",
+            "inputs",
+            flowId.ToString("N"),
+            stepId.ToString("N"),
+            $"attempt-{attempt}");
+        EnsureContained(manifest.Root, directory);
+        EnsureNoDirectoryReparsePoints(manifest.Root, directory);
+        Directory.CreateDirectory(directory);
+        EnsureNoDirectoryReparsePoints(manifest.Root, directory);
+        var path = Path.Combine(directory, name);
+        await WriteOrValidateOwnedFileAsync(
+            path,
+            bytes,
+            "The host-owned execution context document",
+            cancellationToken);
+        return new StagedContextDocument(path, ComputeSha256(bytes), bytes.LongLength);
     }
 
     public async Task<StagedPrompt> StagePromptAsync(

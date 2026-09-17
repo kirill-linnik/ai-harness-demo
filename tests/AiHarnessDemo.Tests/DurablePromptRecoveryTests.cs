@@ -1,4 +1,5 @@
 using AiHarnessDemo.Core.Domain;
+using System.Text;
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Core.Workflow;
@@ -12,6 +13,93 @@ namespace AiHarnessDemo.Tests;
 
 public sealed class DurablePromptRecoveryTests
 {
+    [Fact]
+    public async Task LargeContext_IsPagedDurablyWithinA32KiBWorkingPromptAndRestoredExactly()
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(executionPrompt: string.Empty);
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}\n{{ role.context }}\n{{ outcome.context }}\n{{ outcome.contract }}\n{{ response.contract }}");
+        var design = "DESIGN-START\n" + new string('d', 23_139) + "\nSPEC-CORE: preserve the logo.";
+        var evidence = string.Join(
+            "\n",
+            Enumerable.Range(1, 1_200).Select(index =>
+                $"EV-{index:0000}: " + new string('e', 400)));
+        var original = fixture.Context with
+        {
+            Task = "Implement the complete supplied design.",
+            StudioDependencyOutputs =
+            [
+                new StudioDependencyOutput(
+                    "design", "product-designer", StudioDependencyKind.Direct, 1, 1, 10, design)
+            ],
+            OutcomeContext = "Verify the exact acceptance plan.\n" + evidence,
+            ContextDocuments = [new AgentContextDocument("evidence.jsonl", evidence)],
+            RequiresDeliveryReadinessQa = true
+        };
+        var stager = new AgentManifestStager();
+        var manifest = await stager.StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+        var prepared = await AgentPromptContext.PrepareAsync(
+            original, "Use the supplied handoff.", workflow.Revision, manifest, stager,
+            fixture.Factory, CancellationToken.None);
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath,
+            null, new WorkflowPromptRenderer(), fixture.Factory, CancellationToken.None, prepared);
+
+        Assert.True(Encoding.UTF8.GetByteCount(instructions.Prompt) <= AgentPromptContext.MaximumWorkingPromptBytes);
+        Assert.DoesNotContain(new string('d', 900), instructions.Prompt);
+        Assert.DoesNotContain(new string('e', 400), instructions.Prompt);
+        var handoffPath = Assert.Single(prepared.DocumentPaths, path => path.EndsWith("handoff-01.md"));
+        var evidencePath = Assert.Single(prepared.DocumentPaths, path => path.EndsWith("evidence.jsonl"));
+        Assert.Equal(design, await File.ReadAllTextAsync(handoffPath));
+        Assert.Equal(evidence, await File.ReadAllTextAsync(evidencePath));
+        Assert.Contains(handoffPath, instructions.Prompt);
+        Assert.Contains(evidencePath, instructions.Prompt);
+        await using (var database = await fixture.Factory.CreateDbContextAsync())
+        {
+            var snapshot = Assert.Single(await database.FlowEvents
+                .Where(item => item.Type == AgentPromptContext.SnapshotEventType).ToListAsync());
+            Assert.Contains("SPEC-CORE", snapshot.DataJson);
+            Assert.Contains("EV-1200", snapshot.DataJson);
+        }
+        foreach (var path in prepared.DocumentPaths)
+        {
+            File.Delete(path);
+        }
+        await fixture.ReloadWorkflowAsync("CHANGED {{ task }}");
+        var recoveredContext = original with
+        {
+            RecoverInterruptedSession = true,
+            Task = "This newer task must not replace the durable instructions.",
+            StudioDependencyOutputs = [],
+            ContextDocuments = []
+        };
+        var recoveredInstructions = await CopilotReasoningHost.LoadPersistedExecutionInstructionsAsync(
+            recoveredContext, fixture.Factory, CancellationToken.None);
+        var restored = await AgentPromptContext.PrepareAsync(
+            recoveredContext, "Changed instructions.", recoveredInstructions.WorkflowRevision,
+            manifest, stager, fixture.Factory, CancellationToken.None);
+
+        Assert.Equal(instructions.Prompt, recoveredInstructions.Prompt);
+        Assert.Equal(workflow.Revision, recoveredInstructions.WorkflowRevision);
+        Assert.Equal(prepared.SnapshotJson, restored.SnapshotJson);
+        Assert.Equal(design, await File.ReadAllTextAsync(handoffPath));
+        Assert.Equal(evidence, await File.ReadAllTextAsync(evidencePath));
+        await File.WriteAllTextAsync(handoffPath, "Changed outside the host.");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => AgentPromptContext.PrepareAsync(
+            recoveredContext, "Changed instructions.", recoveredInstructions.WorkflowRevision,
+            manifest, stager, fixture.Factory, CancellationToken.None));
+    }
+
+    [Fact]
+    public void WorkingPromptBudget_CountsUtf8BytesAndRejectsMissingReferences()
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            AgentPromptContext.ValidateRenderedPrompt(new string('\u0416', 20_000), []));
+        Assert.Throws<InvalidOperationException>(() =>
+            AgentPromptContext.ValidateRenderedPrompt("Required handoff omitted.", [@"C:\context\handoff.md"]));
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("## Assignment\n\n{\"Goal\":\"Original brief.\",\"Details\":[],\"SuccessCriteria\":[],\"Constraints\":[],\"Assumptions\":[]}")]

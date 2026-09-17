@@ -361,7 +361,10 @@ describe("FlowPage manual restart", () => {
     );
   });
 
-  it("restarts a failed task and selects the scheduled retry", async () => {
+  it.each([
+    "Manual restart of Software Engineer",
+    "Correct invalid response from Software Engineer"
+  ])("recovers a failed task and selects %s", async label => {
     const failed = failedFlow();
     const restarted: FlowDetailDto = {
       ...failed,
@@ -373,7 +376,7 @@ describe("FlowPage manual restart", () => {
         step({
           id: "22222222-2222-2222-2222-222222222222",
           sequence: 50,
-          label: "Manual restart of Software Engineer",
+          label,
           status: "Pending",
           phase: "CanceledByReconciliation",
           attempt: 2,
@@ -411,18 +414,21 @@ describe("FlowPage manual restart", () => {
     await waitFor(() => expect(restartFlow).toHaveBeenCalledWith(flowId));
     await waitFor(() =>
       expect(
-        screen.getAllByText("Manual restart of Software Engineer").length
+        screen.getAllByText(label).length
       ).toBeGreaterThan(0)
     );
     expect(screen.queryByText("Flow stopped")).not.toBeInTheDocument();
   });
 
-  it("reports committed recovery when the restart response is ambiguous", async () => {
+  it.each([
+    ["Manual restart of Software Engineer", "flow.manual-restart"],
+    ["Correct invalid response from Software Engineer", "flow.contract-correction-queued"]
+  ])("recognizes committed %s when the restart response is ambiguous", async (label, eventType) => {
     const failed = failedFlow();
     const retry = step({
       id: "22222222-2222-2222-2222-222222222222",
       sequence: 50,
-      label: "Manual restart of Software Engineer",
+      label,
       status: "Running",
       phase: "StreamingTurn",
       attempt: 2,
@@ -439,7 +445,7 @@ describe("FlowPage manual restart", () => {
         {
           id: "44444444-4444-4444-8444-444444444444",
           flowStepId: failed.steps[0].id,
-          type: "flow.manual-restart",
+          type: eventType,
           message: "Manual restart requested.",
           dataJson: null,
           createdAt: timestamp
@@ -481,7 +487,7 @@ describe("FlowPage manual restart", () => {
       )
     ).toBeInTheDocument();
     expect(screen.queryByText("Only a failed flow can be restarted.")).not.toBeInTheDocument();
-    expect(screen.getAllByText("Manual restart of Software Engineer").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(label).length).toBeGreaterThan(0);
   });
 
   it("renders repeated dynamic agents as a persisted sequential plan with lineage and review", async () => {

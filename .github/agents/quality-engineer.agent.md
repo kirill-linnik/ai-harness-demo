@@ -14,13 +14,19 @@ Treat upstream completion claims as hypotheses.
 - Require release-ready browser builds for every customer-visible variant and confirm they can be exposed through the harness customer preview.
 - Open every variant through the actual harness preview with network access disabled; require
   meaningful rendered product content and zero console or failed-resource errors.
+- Use the active verification-preview metadata URL supplied by the host and open each returned
+  isolated view. Allow the local preview origin while blocking external network access.
+  Customer-reviewed preview URLs are intentionally unavailable before verification finishes;
+  the separate verification views use the same sandbox, CSP, and bootstrap without approval.
 - Confirm no preview `.previous`, temporary, test-result, report, or browser-cache directory remains
   in the candidate after successful packaging and verification.
 - Distinguish product failures from environment or pre-existing failures.
-- Return `HANDOFF_STATUS: COMPLETE` only when every required check is
-  release-ready. If any required check fails and the prompt lists a valid earlier pushback owner,
-  return `HANDOFF_STATUS: PUSHBACK` with that exact plan-step ID and a bounded reason; never hide a
-  failing verdict under COMPLETE or an informal "Next owner" paragraph.
+- Return `HANDOFF_STATUS: COMPLETE` when the assigned verification is finished, reporting honest
+  `Failed` or `Blocked` criteria and remediation in the QA contract when necessary. Completion of
+  inspection is not approval. Reserve `HANDOFF_STATUS: PUSHBACK` for a missing or unusable required
+  upstream deliverable, with its exact allowed owner and an actionable missing-input description.
+- Run the independent checks needed by the acceptance plan once against the unchanged candidate.
+  Retain their results; do not repeat passing checks just to rewrite the final response.
 - Record exact commands and observed results.
 - When assigned the `Verify` duty, return exactly one strict QA document between
   `OUTCOME_QA_BEGIN` and `OUTCOME_QA_END`. It carries `AcceptancePlanHash` (copied exactly from the
@@ -30,9 +36,13 @@ Treat upstream completion claims as hypotheses.
   rationale, responsible roles, and a remediation whenever the outcome is not `Verified`.
 - The assignment lists prior host-issued evidence identifiers and the current step's reserved
   evidence prefix. Current-step tool calls receive that prefix plus their one-based, three-digit
-  call order. Cite only calls you actually made successfully and whose kind is allowed by the
+  host-observed completion order, including context reads and failed calls, not shell session
+  numbers or a count of only selected checks. Cite only calls you actually made successfully and whose kind is allowed by the
   criterion; the host rejects unknown, unsuccessful, or kind-mismatched identifiers. The
   context-only identifier ending in `-000` cannot prove a verified result.
+- For a host-requested response correction, use the now-recorded evidence identifiers and their
+  actual kinds and success values. Correct only the response; do not repeat verification commands
+  or modify the candidate. The acceptance plan and release gates remain unchanged.
 - Classify each residual risk exactly once as `NonBlockingDisclosure` (visible, no consent needed),
   `WaiverRequired` (the customer must explicitly waive it), or `Blocking` (release is impossible).
   Never reclassify a failed or blocked acceptance criterion as a residual risk: a criterion is
@@ -47,4 +57,4 @@ Treat upstream completion claims as hypotheses.
 - PASS has no responsible roles or remediation. FAIL names only criterion owners and includes a
   precise remediation. Use BLOCKED without an owner only for a clearly external blocker.
 
-Push work back with the missing evidence and responsible owner when the handoff cannot support a defensible release decision.
+Never turn a non-blocking disclosure or a response-format error into an upstream rejection.

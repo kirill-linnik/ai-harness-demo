@@ -195,13 +195,15 @@ public sealed class DeliveryReadinessService
     /// </summary>
     public static DeliveryEvidenceLedgerEntry BuildEvidence(
         FlowStep step,
-        IReadOnlyList<AgentToolCall>? toolCalls = null)
+        IReadOnlyList<AgentToolCall>? toolCalls = null,
+        int? issuedSequence = null)
     {
         ArgumentNullException.ThrowIfNull(step);
+        var sequence = issuedSequence ?? step.Sequence;
         var items = new List<DeliveryEvidenceItem>
         {
             new(
-                EvidenceId(step.Sequence, 0),
+                EvidenceId(sequence, 0),
                 OutcomeEvidenceKind.Observation,
                 string.IsNullOrWhiteSpace(step.PlanStepKey)
                     ? step.AgentRole
@@ -216,11 +218,11 @@ public sealed class DeliveryReadinessService
         {
             index++;
             items.Add(new DeliveryEvidenceItem(
-                EvidenceId(step.Sequence, index),
+                EvidenceId(sequence, index),
                 ClassifyEvidenceKind(call),
                 Clip(
                     string.IsNullOrWhiteSpace(call.NormalizedCommand)
-                        ? call.ToolName
+                        ? $"{call.ToolName} {call.NormalizedArguments}".Trim()
                         : call.NormalizedCommand,
                     400),
                 Clip(call.ResultSummary, 400),
@@ -231,13 +233,30 @@ public sealed class DeliveryReadinessService
         return new DeliveryEvidenceLedgerEntry(
             step.Iteration,
             step.Id,
-            step.Sequence,
+            sequence,
             step.AgentRole,
             items);
     }
 
     public static string SerializeEvidence(DeliveryEvidenceLedgerEntry entry) =>
         JsonSerializer.Serialize(entry, LedgerOptions);
+
+    internal static string SerializeEvidenceDocument(
+        IReadOnlyList<DeliveryEvidenceItem> evidence) =>
+        string.Join(
+            Environment.NewLine,
+            evidence.Select(item => JsonSerializer.Serialize(item, LedgerOptions)));
+
+    internal static DeliveryEvidenceLedgerEntry? ReadStepEvidence(
+        IEnumerable<FlowEvent> events,
+        int iteration,
+        Guid stepId) =>
+        ReadLedger<DeliveryEvidenceLedgerEntry>(
+            events,
+            EvidenceEventType,
+            entry => entry.Iteration == iteration && entry.StepId == stepId)
+            .OrderBy(entry => entry.Items.Count)
+            .LastOrDefault();
 
     /// <summary>The complete host-owned evidence registry for one iteration.</summary>
     public static IReadOnlyList<DeliveryEvidenceItem> ReadEvidence(
@@ -248,7 +267,7 @@ public sealed class DeliveryReadinessService
                 EvidenceEventType,
                 entry => entry.Iteration == iteration)
             .GroupBy(entry => entry.StepId)
-            .Select(group => group.Last())
+            .Select(group => group.OrderBy(entry => entry.Items.Count).Last())
             .OrderBy(entry => entry.Sequence)
             .SelectMany(entry => entry.Items)];
 
@@ -263,6 +282,14 @@ public sealed class DeliveryReadinessService
 
     private static OutcomeEvidenceKind ClassifyEvidenceKind(AgentToolCall call)
     {
+        if (call.ToolName is "view" or "view_image" &&
+            string.Equals(
+                call.ResultSummary,
+                "Viewed image file successfully.",
+                StringComparison.Ordinal))
+        {
+            return OutcomeEvidenceKind.Observation;
+        }
         if (string.Equals(
                 call.ToolType,
                 "Command",

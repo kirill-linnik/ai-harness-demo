@@ -1169,7 +1169,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public void StudioDependencyContext_IsDeterministicBoundedAndNeverDropsDirectKeys()
+    public void StudioDependencyContext_PreservesCompleteDirectAndAncestorDeliverables()
     {
         var direct = Enumerable.Range(1, 8)
             .Select(index => new StudioDependencyOutput(
@@ -1206,11 +1206,10 @@ public sealed class DynamicPlanningTests
                     bounded,
                     $"`{dependency.PlanStepKey}`"));
         }
+        Assert.All(direct, dependency =>
+            Assert.Contains(dependency.Output, bounded, StringComparison.Ordinal));
+        Assert.DoesNotContain("dependency output clipped", bounded, StringComparison.Ordinal);
         Assert.Contains(
-            "dependency output clipped",
-            bounded,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain(
             "ancestor-should-not-fit",
             bounded,
             StringComparison.Ordinal);
@@ -1238,13 +1237,15 @@ public sealed class DynamicPlanningTests
         Assert.Contains("`direct-a`", shortContext, StringComparison.Ordinal);
         Assert.Contains("`ancestor-a`", shortContext, StringComparison.Ordinal);
 
+        var maximum = 16_000 + bounded.Length;
         var resumed = CopilotReasoningHost.RestartContinuationPrompt(
             new string('p', 20_000) +
             Environment.NewLine +
             bounded +
             Environment.NewLine +
-            new string('s', 20_000));
-        Assert.True(resumed.Length <= 16_000);
+            new string('s', 20_000),
+            maximum);
+        Assert.True(resumed.Length <= maximum);
         Assert.Contains(
             CopilotReasoningHost.StudioPlanContextBegin,
             resumed,
@@ -1261,6 +1262,46 @@ public sealed class DynamicPlanningTests
                 resumed,
                 StringComparison.Ordinal);
         }
+    }
+
+    [Fact]
+    public void StudioDependencyContext_TransfersTheDesignBeyondTheOld900CharacterCutoff()
+    {
+        var design =
+            "HANDOFF_STATUS: COMPLETE\nDesign rationale:\n" +
+            new string('r', 23_000) +
+            "\nSPEC-CORE: accent #0E6E8C; responsive navigation and complete error states.";
+        var context = StudioWorkerContext("software-engineer", isOutcomeOwner: false) with
+        {
+            StudioDependencyOutputs =
+            [
+                new StudioDependencyOutput(
+                    "define-design-direction",
+                    "product-designer",
+                    StudioDependencyKind.Direct,
+                    1,
+                    1,
+                    20,
+                    design)
+            ]
+        };
+        var values = CopilotReasoningHost.BuildPromptValues(
+            context,
+            "Implement the complete supplied design.",
+            context.WorkspacePath);
+        var prompt = CopilotReasoningHost.BoundRenderedPrompt(
+            context,
+            values["task"] + "\n" + values["role.context"] +
+            "\n" + values["response.contract"]);
+
+        Assert.Contains(design, prompt, StringComparison.Ordinal);
+        Assert.Contains(values["response.contract"], prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("dependency output clipped", prompt, StringComparison.Ordinal);
+        Assert.Throws<InvalidOperationException>(() =>
+            CopilotReasoningHost.FormatStudioDependencyContext(
+                context.StudioDependencyOutputs,
+                string.Empty,
+                maximumCharacters: 3_200));
     }
 
     [Theory]
@@ -1312,7 +1353,7 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
-    public void StudioQualityPrompt_RequiresPushbackForFailedChecks()
+    public void StudioQualityPrompt_SeparatesCompletedVerificationFromReadiness()
     {
         var context = new AgentExecutionContext(
             Guid.NewGuid(),
@@ -1352,9 +1393,12 @@ public sealed class DynamicPlanningTests
             context.WorkspacePath);
 
         Assert.Contains(
-            "HANDOFF_STATUS: COMPLETE is allowed only when every required check is release-ready",
+            "HANDOFF_STATUS: COMPLETE means the assigned verification is complete",
             values["role.context"],
             StringComparison.Ordinal);
+        Assert.Contains("strict OUTCOME_QA document", values["role.context"]);
+        Assert.Contains("missing or unusable required upstream deliverable", values["role.context"]);
+        Assert.DoesNotContain("COMPLETE is allowed only", values["role.context"]);
         Assert.Contains(
             "PUSHBACK_OWNER_STEP_ID",
             values["role.context"],

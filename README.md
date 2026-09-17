@@ -26,6 +26,9 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
   convenience but never counts as readiness evidence.
 - **Durable orchestration** — plans, attempts, sessions, permissions, events, reviews, links,
   learnings, readiness, and publication state survive restart and remain visible in the dashboard.
+- **Bounded agent context** — working prompts stay within 32 KiB of UTF-8; complete larger
+  handoffs and evidence remain available through durable, searchable context documents. Invalid
+  QA responses receive a read-only correction without discarding completed work.
 
 ## How a flow runs
 
@@ -39,8 +42,9 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
    pre-mortem checks can challenge work, and bounded pushback can return work to an earlier
    dependency.
 6. For Delivery, the final `BeforeReview` outcome owner is the sole `Verify` step and also owns
-   `PrepareOutcome`. The host validates its criterion results, seals the candidate, and derives
-   Delivery readiness.
+   `PrepareOutcome`. During that task, dedicated verification-preview URLs expose unreviewed
+   artifacts through the real sandbox and network policy. The host then validates criterion
+   results, seals the candidate, and derives Delivery readiness.
 7. Customers can refine either flow kind, accept an Advisory, promote it to a fresh Delivery, or
    accept a ready Delivery. Only accepted Delivery work materializes the planned `AfterApproval`
    Publish step.

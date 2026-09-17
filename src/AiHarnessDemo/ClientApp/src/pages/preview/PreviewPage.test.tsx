@@ -298,26 +298,62 @@ describe("PreviewPage", () => {
     expect(screen.getByRole("heading", { name: "Reviewed preview" })).toBeInTheDocument();
   });
 
-  it("labels artifacts offline-only and routes rebuild through the current review", async () => {
-    renderPage({
-      ...preview,
-      review: {
-        gateId: "99999999-9999-4999-8999-999999999999",
-        available: true,
-        resolved: false,
-        approved: null,
-        decision: null,
-        publicationStatus: "AwaitingApproval"
-      }
-    });
+  it.each([true, false])(
+    "describes offline previews without a warning or rebuild prompt when review availability is %s",
+    async reviewAvailable => {
+      renderPage({
+        ...preview,
+        review: {
+          ...preview.review,
+          available: reviewAvailable
+        }
+      });
 
-    expect(await screen.findByText("Offline preview only")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Rebuild and verify preview" })).toHaveAttribute(
-      "href",
-      `#/factory/${flowId}`
-    );
-    expect(screen.getByText(/never affect Delivery readiness/i)).toBeInTheDocument();
-  });
+      const message = await screen.findByText(
+        "Interactive offline preview · Live server not configured"
+      );
+      expect(message.closest(".pushback-callout")).toBeNull();
+      expect(screen.getByText("This preview works without a live application server."))
+        .toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: "Rebuild and verify preview" })).not.toBeInTheDocument();
+      expect(screen.queryByText(/Rebuild is unavailable/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/No valid sealed customer demo manifest/)).not.toBeInTheDocument();
+      expect(screen.getByText(/never affect Delivery readiness/i)).toBeInTheDocument();
+    }
+  );
+
+  it.each([true, false])(
+    "preserves actual demo failures and gates repair on review availability %s",
+    async reviewAvailable => {
+      renderPage({
+        ...preview,
+        artifacts: [{
+          ...preview.artifacts[0],
+          demoState: "Failed",
+          demoFailureDetail: "The sealed live-demo manifest is invalid."
+        }],
+        review: {
+          ...preview.review,
+          available: reviewAvailable
+        }
+      });
+
+      const message = await screen.findByText("Live demo unavailable");
+      expect(message.closest(".pushback-callout")).not.toBeNull();
+      expect(screen.getByRole("alert")).toHaveTextContent("The sealed live-demo manifest is invalid.");
+      expect(screen.queryByText("Interactive offline preview · Live server not configured"))
+        .not.toBeInTheDocument();
+      if (reviewAvailable) {
+        expect(screen.getByRole("link", { name: "Rebuild and verify preview" })).toHaveAttribute(
+          "href",
+          `#/factory/${flowId}`
+        );
+      } else {
+        expect(screen.queryByRole("link", { name: "Rebuild and verify preview" })).not.toBeInTheDocument();
+        expect(screen.getByText(/Rebuild is unavailable/)).toBeInTheDocument();
+      }
+    }
+  );
 
   it("starts a sealed demo and opens its stable harness URL", async () => {
     const candidateFingerprint = "sha256:candidate";

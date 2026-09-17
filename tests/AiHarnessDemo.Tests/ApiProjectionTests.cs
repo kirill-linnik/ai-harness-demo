@@ -410,6 +410,181 @@ public sealed class ApiProjectionTests
         }
     }
 
+    [Theory]
+    [InlineData("http://localhost:5283", "http://localhost:5283")]
+    [InlineData("http://127.0.0.1:5107", "http://127.0.0.1:5107")]
+    [InlineData("http://0.0.0.0:5107", "http://localhost:5107")]
+    [InlineData("http://[::]:5107", "http://localhost:5107")]
+    [InlineData("http://*:5107", "http://localhost:5107")]
+    public void VerificationPreview_UsesTheListeningServerAddress(
+        string address,
+        string expectedOrigin)
+    {
+        var flowId = Guid.NewGuid();
+
+        Assert.Equal(
+            $"{expectedOrigin}/api/verification-previews/{flowId:D}",
+            PreviewArtifactCatalog.VerificationBaseUrl(flowId, address));
+        Assert.Throws<InvalidOperationException>(() =>
+            PreviewArtifactCatalog.VerificationBaseUrl(flowId, "http://localhost:0"));
+    }
+
+    [Fact]
+    public async Task VerificationPreview_ServesTheRealSandboxWithoutOpeningCustomerReview()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"studio-verification-preview-{Guid.NewGuid():N}");
+        var browserRoot = Path.Combine(root, ".customer-preview", "eu", "browser");
+        Directory.CreateDirectory(browserRoot);
+        await File.WriteAllTextAsync(
+            Path.Combine(browserRoot, "index.html"),
+            "<h1>unreviewed preview</h1>");
+        await using var connection =
+            new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var factory = new PreviewDbContextFactory(
+            new DbContextOptionsBuilder<HarnessDbContext>().UseSqlite(connection).Options);
+        var flow = CreatePreviewFlow(root, includeSeal: false);
+        flow.Status = FlowStatus.Running;
+        flow.GateRecords.Clear();
+        var owner = Assert.Single(flow.Steps);
+        owner.Status = StepStatus.Running;
+        owner.PlanDutiesJson = """["Verify","PrepareOutcome"]""";
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+            database.Flows.Add(flow);
+            await database.SaveChangesAsync();
+        }
+        using var services = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var context = NewContext(
+            $"/api/verification-previews/{flow.Id:D}/artifacts/eu/index.html");
+        context.RequestServices = services;
+
+        try
+        {
+            var metadata = Assert.IsAssignableFrom<IValueHttpResult>(
+                await DemoApi.GetVerificationPreviewAsync(
+                    flow.Id, factory, new PreviewArtifactCatalog(), CancellationToken.None));
+            using var metadataJson = JsonDocument.Parse(JsonSerializer.Serialize(metadata.Value));
+            Assert.False(metadataJson.RootElement.GetProperty("reviewed").GetBoolean());
+            Assert.Equal(
+                owner.Id,
+                metadataJson.RootElement.GetProperty("flowStepId").GetGuid());
+            Assert.Equal(
+                $"/api/verification-previews/{flow.Id:D}/artifacts/eu/view",
+                metadataJson.RootElement.GetProperty("artifacts")[0]
+                    .GetProperty("openUrl").GetString());
+
+            var result = await DemoApi.GetVerificationPreviewArtifactAsync(
+                flow.Id, "eu", "index.html", context, factory,
+                new PreviewArtifactCatalog(), CancellationToken.None);
+            await result.ExecuteAsync(context);
+            context.Response.Body.Position = 0;
+            var body = await new StreamReader(context.Response.Body, leaveOpen: true)
+                .ReadToEndAsync();
+            Assert.Contains("unreviewed preview", body, StringComparison.Ordinal);
+            Assert.Contains("data-ai-harness-preview-bootstrap", body, StringComparison.Ordinal);
+            Assert.Contains(
+                "connect-src 'none';",
+                context.Response.Headers.ContentSecurityPolicy.ToString(),
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "sandbox allow-scripts;",
+                context.Response.Headers.ContentSecurityPolicy.ToString(),
+                StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                "allow-same-origin",
+                context.Response.Headers.ContentSecurityPolicy.ToString(),
+                StringComparison.Ordinal);
+
+            var reviewedContext = NewContext("/api/previews");
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                DemoApi.GetPreviewArtifactAsync(
+                    flow.Id, "eu", "index.html", reviewedContext, factory,
+                    new PreviewArtifactCatalog(), new PreviewReviewedCandidateService(),
+                    CancellationToken.None));
+            Assert.Equal(0, reviewedContext.Response.Body.Length);
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+                DemoApi.GetVerificationPreviewArtifactAsync(
+                    flow.Id, "eu", "..\\..\\..\\outside.html", reviewedContext, factory,
+                    new PreviewArtifactCatalog(), CancellationToken.None));
+
+            await using var database = await factory.CreateDbContextAsync();
+            var stored = await database.Flows
+                .Include(item => item.GateRecords)
+                .Include(item => item.Events)
+                .Include(item => item.Steps)
+                .SingleAsync(item => item.Id == flow.Id);
+            Assert.Equal(FlowStatus.Running, stored.Status);
+            Assert.Empty(stored.GateRecords);
+            Assert.DoesNotContain(stored.Events, item =>
+                item.Type == ReviewedCandidateLedger.EventType);
+            Assert.Single(stored.Steps).Status = StepStatus.Completed;
+            await database.SaveChangesAsync();
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                DemoApi.GetVerificationPreviewAsync(
+                    flow.Id, factory, new PreviewArtifactCatalog(), CancellationToken.None));
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                DemoApi.GetVerificationPreviewArtifactAsync(
+                    flow.Id, "eu", "index.html", reviewedContext, factory,
+                    new PreviewArtifactCatalog(), CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(FlowStatus.Queued, "running")]
+    [InlineData(FlowStatus.WaitingForFeedback, "running")]
+    [InlineData(FlowStatus.Approved, "running")]
+    [InlineData(FlowStatus.Failed, "running")]
+    [InlineData(FlowStatus.Running, "pending")]
+    [InlineData(FlowStatus.Running, "wrong-duty")]
+    [InlineData(FlowStatus.Running, "wrong-owner")]
+    [InlineData(FlowStatus.Running, "previous-iteration")]
+    [InlineData(FlowStatus.Running, "advisory")]
+    public async Task VerificationPreview_RejectsAnythingExceptTheActiveDeliveryVerifier(
+        FlowStatus status,
+        string scenario)
+    {
+        await using var connection =
+            new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var factory = new PreviewDbContextFactory(
+            new DbContextOptionsBuilder<HarnessDbContext>().UseSqlite(connection).Options);
+        var flow = CreatePreviewFlow(string.Empty, includeSeal: false);
+        flow.Status = status;
+        flow.GateRecords.Clear();
+        var owner = Assert.Single(flow.Steps);
+        owner.Status = scenario == "pending" ? StepStatus.Pending : StepStatus.Running;
+        owner.PlanDutiesJson = scenario == "wrong-duty"
+            ? """["PrepareOutcome"]"""
+            : """["Verify","PrepareOutcome"]""";
+        owner.IsOutcomeOwner = scenario != "wrong-owner";
+        owner.Iteration = scenario == "previous-iteration" ? 0 : flow.Iteration;
+        flow.Kind = scenario == "advisory" ? FlowKind.Advisory : FlowKind.Delivery;
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+            database.Flows.Add(flow);
+            await database.SaveChangesAsync();
+        }
+        var context = NewContext("/api/verification-previews");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            DemoApi.GetVerificationPreviewAsync(
+                flow.Id, factory, new PreviewArtifactCatalog(), CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            DemoApi.GetVerificationPreviewArtifactAsync(
+                flow.Id, "eu", "index.html", context, factory,
+                new PreviewArtifactCatalog(), CancellationToken.None));
+        Assert.Equal(0, context.Response.Body.Length);
+    }
+
     [Fact]
     public async Task StudioDeliveryPreviewEndpoints_ServeOnlyTheCurrentReviewedSeal()
     {
