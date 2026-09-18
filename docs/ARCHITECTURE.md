@@ -201,7 +201,7 @@ The customer-visible states are:
 | --- | --- |
 | `ReadyToApprove` | Opens ordinary customer review. The customer may accept or request refinement. |
 | `NeedsCustomerWaiver` | Opens a separate informed-consent step for specifically disclosed risks. Recording all required waivers re-derives readiness before ordinary review opens. |
-| `NeedsRefinement` | Acceptance is unavailable; the customer can request another iteration. |
+| `NeedsRefinement` | Acceptance is unavailable. The harness replans and retries on its own while `studio.flow_kinds.delivery.max_auto_refinement_iterations` allows it and each iteration keeps closing criteria; it asks the customer for another iteration only once that budget is spent or progress stalls. |
 | `Blocked` | Acceptance is unavailable; the customer can continue, replan, or abandon as permitted by the host. |
 
 A failed, blocked, missing, or malformed criterion cannot be waived. Review, waiver, publication,

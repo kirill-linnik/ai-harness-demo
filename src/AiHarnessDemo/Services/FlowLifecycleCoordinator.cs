@@ -186,6 +186,45 @@ public sealed class FlowLifecycleCoordinator
         return true;
     }
 
+    /// <summary>
+    /// The host-owned counterpart to <see cref="ResolveReadinessState"/>. It lets the harness
+    /// schedule its own refinement iteration directly from the verification turn that produced a
+    /// <see cref="DeliveryReadinessState.NeedsRefinement"/> assessment, so a recoverable Delivery
+    /// failure never has to park on the customer. It is deliberately narrow: only a
+    /// <c>NeedsRefinement</c> binding qualifies, and it can only reach
+    /// <see cref="FlowStatus.Reworking"/>.
+    /// </summary>
+    public bool ScheduleAutoRefinement(
+        FlowRun flow,
+        DeliveryReadinessState state,
+        string candidateFingerprint,
+        string boundCandidateFingerprint)
+    {
+        RequireDeliveryBinding(
+            flow,
+            state,
+            DeliveryReadinessState.NeedsRefinement,
+            candidateFingerprint,
+            boundCandidateFingerprint,
+            FlowStatus.Reworking);
+        if (flow.Status is not (FlowStatus.Running or FlowStatus.Reworking
+            or FlowStatus.WaitingForFeedback))
+        {
+            throw new FlowLifecycleException(
+                flow.Id,
+                flow.Status,
+                FlowStatus.Reworking,
+                "only a running, reworking, or waiting flow can schedule host-owned refinement");
+        }
+        if (flow.Status == FlowStatus.Reworking)
+        {
+            return false;
+        }
+        flow.Status = FlowStatus.Reworking;
+        flow.UpdatedAt = DateTimeOffset.UtcNow;
+        return true;
+    }
+
     private static void RequireDeliveryBinding(
         FlowRun flow,
         DeliveryReadinessState state,

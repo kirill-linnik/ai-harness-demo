@@ -41,6 +41,7 @@ public sealed class WorkflowEngine(
     LinkedFlowCoordinator? linkedFlowCoordinator = null,
     AgentManifestStager? manifestStager = null,
     DeliveryReadinessService? deliveryReadinessService = null,
+    FlowQueue? flowQueue = null,
     IServer? server = null)
 {
     internal const string ApprovedPublicationLabel = "Publish customer-approved outcome";
@@ -51,6 +52,12 @@ public sealed class WorkflowEngine(
     internal const int MaximumFailedOutputCharacters = 32_000;
     internal const string RepositoryKnowledgeUnchangedEventType =
         "repository.knowledge-unchanged";
+    internal const string AutoRefinementScheduledEventType =
+        "delivery.auto-refinement-scheduled";
+    internal const string AutoRefinementAppliedEventType =
+        "delivery.auto-refinement-applied";
+    internal const string AutoRefinementExhaustedEventType =
+        "delivery.auto-refinement-exhausted";
     internal const string RepositoryKnowledgeRefreshSkippedEventType =
         "repository.knowledge-refresh-skipped";
     private const string ManualRestartLabelPrefix = "Manual restart of ";
@@ -7925,6 +7932,16 @@ public sealed class WorkflowEngine(
         else
         {
             var blocked = readiness.State == DeliveryReadinessState.Blocked;
+            if (!blocked &&
+                await TryScheduleAutoRefinementAsync(
+                    database,
+                    flow,
+                    owner,
+                    readiness,
+                    cancellationToken))
+            {
+                return;
+            }
             _lifecycle.Transition(
                 flow,
                 blocked ? FlowStatus.Blocked : FlowStatus.WaitingForFeedback);
@@ -7979,6 +7996,197 @@ public sealed class WorkflowEngine(
             });
         }
         await database.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Host-owned remediation for a recoverable Delivery failure. When the derived readiness is
+    /// <see cref="DeliveryReadinessState.NeedsRefinement"/>, the verification turn has already
+    /// named every unmet criterion, its remediation, and its owning role, so the harness can seed
+    /// and schedule the next iteration itself instead of stopping to ask the customer to retype
+    /// what the Quality Engineer just wrote.
+    /// </summary>
+    /// <remarks>
+    /// The loop is deliberately bounded, unlike the unbounded re-dispatch it is modelled on. It
+    /// stops and escalates to the customer when the configured iteration budget is spent, when the
+    /// feature is disabled, when nothing actionable was reported, or when an iteration failed to
+    /// make progress. Progress means the unmet set became a proper subset of the previous unmet
+    /// set: at least one criterion closed and no new one opened.
+    /// </remarks>
+    private async Task<bool> TryScheduleAutoRefinementAsync(
+        HarnessDbContext database,
+        FlowRun flow,
+        FlowStep owner,
+        DeliveryReadinessBinding readiness,
+        CancellationToken cancellationToken)
+    {
+        var budget = workflowProvider.GetEffective()
+            .Config.Studio.FlowKinds.Delivery.MaxAutoRefinementIterations;
+        var unmet = readiness.Contract.Criteria
+            .Where(item => item.Outcome is
+                DeliveryCriterionOutcome.Failed or DeliveryCriterionOutcome.Blocked)
+            .OrderBy(item => item.CriterionId, StringComparer.Ordinal)
+            .ToList();
+        var unmetIds = unmet
+            .Select(item => item.CriterionId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var priorAttempts = await database.FlowEvents
+            .Where(item =>
+                item.FlowRunId == flow.Id &&
+                item.Type == AutoRefinementScheduledEventType)
+            .OrderBy(item => item.CreatedAt)
+            .ToListAsync(cancellationToken);
+        var attemptNumber = priorAttempts.Count + 1;
+        var previousUnmetIds = ReadRecordedUnmetCriteria(priorAttempts.LastOrDefault());
+
+        var escalation = budget <= 0
+            ? "Host-owned refinement is disabled by studio.flow_kinds.delivery.max_auto_refinement_iterations."
+            : flowQueue is null
+                ? "No flow queue is available, so the harness cannot schedule its own iteration."
+                : unmet.Count == 0
+                    ? "The assessment reports no failed or blocked criterion the harness could act on."
+                    : unmet.Any(item => string.IsNullOrWhiteSpace(item.Remediation))
+                        ? "At least one unmet criterion carries no remediation, so the harness has nothing concrete to dispatch."
+                        : attemptNumber > budget
+                            ? $"The host-owned refinement budget of {budget} iteration(s) is spent."
+                            : previousUnmetIds is not null &&
+                              !unmetIds.IsProperSubsetOf(previousUnmetIds)
+                                ? "The previous host-owned iteration closed no criterion, or opened a new one, so retrying is unlikely to converge."
+                                : null;
+
+        if (escalation is not null)
+        {
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = owner.Id,
+                Type = AutoRefinementExhaustedEventType,
+                Message =
+                    $"Harness stopped host-owned refinement and escalated to the customer: {escalation}",
+                DataJson = JsonSerializer.Serialize(new
+                {
+                    Reason = escalation,
+                    AttemptNumber = attemptNumber,
+                    Budget = budget,
+                    UnmetCriteria = unmetIds.OrderBy(id => id, StringComparer.Ordinal).ToArray(),
+                    PreviousUnmetCriteria = previousUnmetIds?
+                        .OrderBy(id => id, StringComparer.Ordinal).ToArray(),
+                    readiness.Revision,
+                    readiness.ContractHash
+                })
+            });
+            return false;
+        }
+
+        var requestedChanges = unmet
+            .Select(item =>
+            {
+                var owners = item.ResponsibleRoles is { Count: > 0 }
+                    ? string.Join(", ", item.ResponsibleRoles)
+                    : "the planned owner";
+                return
+                    $"{item.CriterionId} ({owners}): {item.Remediation!.Trim()} " +
+                    $"Failing requirement: {item.Requirement.Trim()}";
+            })
+            .ToArray();
+        var refinement = ReviewCoordinator.NormalizeRefinement(new DirectReviewRefinement
+        {
+            Goal =
+                $"Close every acceptance criterion the Quality Engineer could not verify in " +
+                $"iteration {flow.Iteration}, without regressing any criterion already verified.",
+            RequestedChanges = requestedChanges
+        });
+
+        await _readiness.SupersedeCurrentAsync(
+            database,
+            flow.Id,
+            owner.Id,
+            $"Superseded because the harness scheduled host-owned refinement attempt {attemptNumber} of {budget}.",
+            cancellationToken);
+        database.FlowEvents.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = owner.Id,
+            Type = AutoRefinementScheduledEventType,
+            Message =
+                $"Harness scheduled host-owned refinement attempt {attemptNumber} of {budget} to close {unmet.Count} unmet criterion(s) without customer input.",
+            DataJson = JsonSerializer.Serialize(new
+            {
+                AttemptNumber = attemptNumber,
+                Budget = budget,
+                UnmetCriteria = unmetIds.OrderBy(id => id, StringComparer.Ordinal).ToArray(),
+                PreviousUnmetCriteria = previousUnmetIds?
+                    .OrderBy(id => id, StringComparer.Ordinal).ToArray(),
+                readiness.Revision,
+                readiness.ContractHash,
+                ReviewedCandidateId = readiness.Candidate.Id
+            })
+        });
+
+        _lifecycle.ScheduleAutoRefinement(
+            flow,
+            readiness.State,
+            readiness.Record.CandidateFingerprint,
+            readiness.Candidate.CandidateFingerprint);
+        ReviewCoordinator.ApplyRefinement(
+            flow,
+            owner,
+            refinement,
+            DateTimeOffset.UtcNow,
+            database,
+            _lifecycle,
+            new ReviewCoordinator.RefinementOrigin(
+                $"Harness-scheduled refinement for iteration {flow.Iteration} " +
+                $"(attempt {attemptNumber} of {budget}), derived from the verification result:",
+                ConversationRole.Harness,
+                AutoRefinementAppliedEventType,
+                $"Harness applied host-owned refinement attempt {attemptNumber} of {budget}; iteration {flow.Iteration + 1} will be replanned without customer input."));
+
+        flow.CurrentBlockerCode = null;
+        flow.CurrentBlockerSummary = null;
+        flow.CurrentBlockerDataJson = null;
+        flow.CustomerBlockerMessage = null;
+        flow.OutcomeLabel = string.Empty;
+        flow.OutcomeUrl = string.Empty;
+        flow.UpdatedAt = DateTimeOffset.UtcNow;
+        await database.SaveChangesAsync(cancellationToken);
+
+        if (flowQueue is null || !flowQueue.Queue(flow.Id))
+        {
+            throw new InvalidOperationException(
+                "The host-owned refinement iteration was recorded, but the flow could not be queued.");
+        }
+        return true;    }
+
+    /// <summary>
+    /// Reads the unmet-criterion set recorded by the previous host-owned refinement attempt. A
+    /// missing or unreadable payload returns <see langword="null"/>, which the caller treats as
+    /// "no prior attempt to compare against" rather than as progress.
+    /// </summary>
+    private static HashSet<string>? ReadRecordedUnmetCriteria(FlowEvent? previousAttempt)
+    {
+        if (string.IsNullOrWhiteSpace(previousAttempt?.DataJson))
+        {
+            return null;
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(previousAttempt.DataJson);
+            if (!document.RootElement.TryGetProperty("UnmetCriteria", out var recorded) ||
+                recorded.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+            return recorded
+                .EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetString()!)
+                .ToHashSet(StringComparer.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static void ApplyGateResolution(

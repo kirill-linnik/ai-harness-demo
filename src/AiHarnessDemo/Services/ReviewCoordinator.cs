@@ -1243,7 +1243,7 @@ public sealed class ReviewCoordinator(
                 RequestedChanges = refinement.RequestedChanges
             }));
 
-    private static DirectReviewRefinement NormalizeRefinement(
+    internal static DirectReviewRefinement NormalizeRefinement(
         DirectReviewRefinement? refinement)
     {
         if (refinement?.RequestedChanges is null)
@@ -1303,21 +1303,42 @@ public sealed class ReviewCoordinator(
         return normalized;
     }
 
-    private static void ApplyRefinement(
+    /// <summary>
+    /// Describes who asked for a refinement iteration so the durable seed, conversation message,
+    /// and event stream stay honest about its origin. The customer path keeps the original
+    /// wording; the harness path records host-owned auto-remediation instead.
+    /// </summary>
+    internal sealed record RefinementOrigin(
+        string SeedHeading,
+        ConversationRole MessageRole,
+        string EventType,
+        string EventMessage)
+    {
+        internal static RefinementOrigin Customer(int reviewedIteration) =>
+            new(
+                $"Customer refinement for iteration {reviewedIteration}:",
+                ConversationRole.Customer,
+                "flow.review-refinement-requested",
+                $"Customer requested refinement; iteration {reviewedIteration + 1} will be replanned from the retained snapshot.");
+    }
+
+    internal static void ApplyRefinement(
         FlowRun flow,
         FlowStep reviewedStep,
         DirectReviewRefinement refinement,
         DateTimeOffset now,
         HarnessDbContext database,
-        FlowLifecycleCoordinator lifecycle)
+        FlowLifecycleCoordinator lifecycle,
+        RefinementOrigin? origin = null)
     {
         var reviewedIteration = flow.Iteration;
+        var resolvedOrigin = origin ?? RefinementOrigin.Customer(reviewedIteration);
         var requestedChanges = refinement.RequestedChanges
             ?? throw new InvalidOperationException(
                 "Normalized requested changes are missing.");
         var seedLines = new List<string>
         {
-            $"Customer refinement for iteration {reviewedIteration}:"
+            resolvedOrigin.SeedHeading
         };
         if (!string.IsNullOrWhiteSpace(refinement.Goal))
         {
@@ -1332,16 +1353,15 @@ public sealed class ReviewCoordinator(
         database.FlowMessages.Add(new FlowMessage
         {
             FlowRunId = flow.Id,
-            Role = ConversationRole.Customer,
+            Role = resolvedOrigin.MessageRole,
             Content = seed
         });
         database.FlowEvents.Add(new FlowEvent
         {
             FlowRunId = flow.Id,
             FlowStepId = reviewedStep.Id,
-            Type = "flow.review-refinement-requested",
-            Message =
-                $"Customer requested refinement; iteration {reviewedIteration + 1} will be replanned from the retained snapshot.",
+            Type = resolvedOrigin.EventType,
+            Message = resolvedOrigin.EventMessage,
             DataJson = JsonSerializer.Serialize(new
             {
                 Goal = refinement.Goal,

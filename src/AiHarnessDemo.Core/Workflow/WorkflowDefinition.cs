@@ -82,6 +82,13 @@ public sealed class StudioDeliveryFlowConfig
 
     public ExecutionPermissionProfile PostApprovalMaximumPermission { get; set; } =
         ExecutionPermissionProfile.Publish;
+
+    /// <summary>
+    /// How many consecutive host-scheduled refinement iterations a Delivery flow may take on its
+    /// own after a <c>NeedsRefinement</c> assessment before the harness stops and asks the
+    /// customer. Zero restores the previous always-ask behavior.
+    /// </summary>
+    public int MaxAutoRefinementIterations { get; set; } = 3;
 }
 
 public sealed class StudioAdvisoryConfig
@@ -273,7 +280,8 @@ public sealed class WorkflowLoader
                 "required_duties", "maximum_permission");
             ValidateMapping(flowKinds, "delivery", "studio.flow_kinds.delivery",
                 "required_duties", "pre_review_maximum_permission",
-                "post_approval_maximum_permission");
+                "post_approval_maximum_permission",
+                "max_auto_refinement_iterations");
         }
         ValidateMapping(studio, "advisory", "studio.advisory",
             "artifact_directory", "max_artifact_count", "max_total_artifact_bytes");
@@ -557,6 +565,11 @@ public sealed class WorkflowLoader
         {
             throw new WorkflowConfigurationException(
                 "studio.flow_kinds.delivery.post_approval_maximum_permission cannot exceed Publish.");
+        }
+        if (studio.FlowKinds.Delivery.MaxAutoRefinementIterations is < 0 or > 10)
+        {
+            throw new WorkflowConfigurationException(
+                "studio.flow_kinds.delivery.max_auto_refinement_iterations must be from 0 through 10.");
         }
         var advisoryArtifactSegments = studio.Advisory.ArtifactDirectory?
             .Split(['\\', '/'], StringSplitOptions.None) ?? [];

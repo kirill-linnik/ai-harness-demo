@@ -46,6 +46,7 @@ studio:
         - Publish
       pre_review_maximum_permission: WorkspaceWrite
       post_approval_maximum_permission: Publish
+      max_auto_refinement_iterations: 3
   advisory:
     artifact_directory: .studio\advisory
     max_artifact_count: 8
@@ -141,9 +142,18 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
 - An ordinary `CustomerReview` exists only for `ReadyToApprove`. `NeedsCustomerWaiver` opens the
   separate `CustomerWaiver` gate, which is informed consent to named disclosed risks and is never
   acceptance. Failed, blocked, or missing criteria are never waivable.
-- `NeedsRefinement` and `Blocked` are resolved through the typed readiness-resolution path:
-  `NeedsRefinement` accepts only `RequestRefinement`, and `Blocked` accepts only `Continue`,
-  `Replan`, or `Abandon`. None of them can accept a result or waive a risk.
+- `NeedsRefinement` is first resolved by the harness itself. While
+  `studio.flow_kinds.delivery.max_auto_refinement_iterations` is not exhausted, the host seeds the
+  next iteration from the unmet criteria's own remediation and owning roles and replans without
+  customer input, because the verification turn already named the concrete work. The host stops and
+  escalates to the customer when the budget is spent, when an unmet criterion carries no
+  remediation, or when an iteration made no progress, where progress means the unmet set became a
+  proper subset of the previous one. Each host-owned attempt supersedes the readiness it acted on
+  and is recorded durably, so the loop is always bounded and always visible.
+- A customer-resolved `NeedsRefinement` and a `Blocked` assessment use the typed
+  readiness-resolution path: `NeedsRefinement` accepts only `RequestRefinement`, and `Blocked`
+  accepts only `Continue`, `Replan`, or `Abandon`. None of them can accept a result or waive a
+  risk. `Blocked` is never resolved by the harness on its own.
 - Review acceptance, publication authorization, remote verification, and final approval each re-read
   the same durable readiness, candidate, waiver, and review identifiers before acting.
 - Browser-visible deliveries always include a self-contained `.customer-preview\<variant>` reviewed

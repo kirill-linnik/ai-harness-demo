@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using AiHarnessDemo.Api;
 using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Core.Domain;
@@ -938,8 +938,26 @@ public sealed class ReviewWorkflowTests
 
         await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
 
+        // The harness now spends its own refinement budget before it ever asks the customer, so a
+        // permanently failing criterion first produces a host-owned iteration, not a question.
+        var afterFirstPass = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Reworking, afterFirstPass.Status);
+        Assert.Equal(2, afterFirstPass.Iteration);
+        Assert.Contains(
+            afterFirstPass.Events,
+            item => item.Type == "delivery.auto-refinement-scheduled");
+        Assert.DoesNotContain(
+            afterFirstPass.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+
+        // The second pass closes nothing, so the no-progress guard escalates instead of looping.
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
         var flow = await harness.LoadFlowAsync();
         Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.Contains(
+            flow.Events,
+            item => item.Type == "delivery.auto-refinement-exhausted");
         Assert.DoesNotContain(
             flow.GateRecords,
             gate => gate.ActionType == HandoffActionType.CustomerReview);
@@ -978,6 +996,128 @@ public sealed class ReviewWorkflowTests
             DeliveryReadinessConflicts.CandidateStale,
             conflict.Code);
         Assert.NotEqual(FlowStatus.Approved, (await harness.LoadFlowAsync()).Status);
+    }
+
+    [Fact]
+    public async Task NeedsRefinement_HarnessClosesTheGapItselfWithoutAskingTheCustomer()
+    {
+        // The verification turn already names the remediation and its owner, so a recoverable
+        // Delivery failure must produce another iteration, not a question for the customer.
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        var qaCalls = 0;
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                outcome: ++qaCalls == 1
+                    ? DeliveryCriterionOutcome.Failed
+                    : DeliveryCriterionOutcome.Verified);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var reworking = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Reworking, reworking.Status);
+        Assert.Equal(2, reworking.Iteration);
+        Assert.DoesNotContain(
+            reworking.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        var scheduled = Assert.Single(
+            reworking.Events,
+            item => item.Type == "delivery.auto-refinement-scheduled");
+        Assert.Contains("AC-001", scheduled.DataJson!, StringComparison.Ordinal);
+
+        // The seed is attributed to the harness and carries the QA turn's own remediation text,
+        // so nobody has to retype what the Quality Engineer already wrote.
+        var seed = Assert.Single(
+            reworking.Messages,
+            message => message.Role == ConversationRole.Harness);
+        Assert.Contains(
+            "Correct the failing behavior and re-verify.",
+            seed.Content,
+            StringComparison.Ordinal);
+        Assert.Contains("external-delivery", seed.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            reworking.Events,
+            item => item.Type == "flow.review-refinement-requested");
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var converged = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, converged.Status);
+        Assert.Equal(2, converged.Iteration);
+        var review = Assert.Single(
+            converged.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        Assert.False(review.Resolved);
+        Assert.DoesNotContain(
+            converged.Events,
+            item => item.Type == "delivery.auto-refinement-exhausted");
+
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var readiness = Assert.Single(
+            await database.DeliveryReadinessSnapshots
+                .Where(item => item.FlowRunId == harness.FlowId && item.Active)
+                .ToListAsync());
+        Assert.Equal(DeliveryReadinessState.ReadyToApprove, readiness.State);
+    }
+
+    [Fact]
+    public async Task NeedsRefinement_StopsWhenTheRefinementBudgetIsSpent()
+    {
+        // The loop is bounded: unlike the unbounded re-dispatch it is modelled on, a budget of one
+        // buys exactly one host-owned attempt before the customer is asked.
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery,
+            maxAutoRefinementIterations: 1);
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                outcome: DeliveryCriterionOutcome.Failed);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        Assert.Equal(
+            FlowStatus.Reworking,
+            (await harness.LoadFlowAsync()).Status);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.Single(
+            flow.Events,
+            item => item.Type == "delivery.auto-refinement-scheduled");
+        var exhausted = Assert.Single(
+            flow.Events,
+            item => item.Type == "delivery.auto-refinement-exhausted");
+        Assert.Contains("budget of 1", exhausted.Message, StringComparison.Ordinal);
+        Assert.Equal("delivery.readiness-needs-refinement", flow.CurrentBlockerCode);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+    }
+
+    [Fact]
+    public async Task NeedsRefinement_WithoutABudgetKeepsTheCustomerGateUnchanged()
+    {
+        // Setting the budget to zero restores the previous always-ask behavior exactly.
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery,
+            maxAutoRefinementIterations: 0);
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                outcome: DeliveryCriterionOutcome.Failed);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.Equal(1, flow.Iteration);
+        Assert.Equal("delivery.readiness-needs-refinement", flow.CurrentBlockerCode);
+        Assert.DoesNotContain(
+            flow.Events,
+            item => item.Type == "delivery.auto-refinement-scheduled");
+        Assert.Contains(
+            flow.Events,
+            item => item.Type == "delivery.auto-refinement-exhausted");
     }
 
     [Fact]
@@ -1586,8 +1726,11 @@ public sealed class ReviewWorkflowTests
     public async Task NeedsRefinement_ResolvesThroughTheTypedRefinementPathIntoANewIteration()
     {
         // Finding 3: NeedsRefinement is not a dead end, and its resolution never accepts anything.
-        await using var harness =
-            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        // The budget is disabled here so the flow parks on the customer immediately; in production
+        // this same path is reached once host-owned refinement is spent.
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery,
+            maxAutoRefinementIterations: 0);
         harness.Runner.QaBlockOverride = context =>
             DeliveryReadinessFixtures.QaBlockFromPrompt(
                 context.OutcomeContext,
@@ -1995,7 +2138,8 @@ public sealed class ReviewWorkflowTests
 
         public static async Task<ReviewHarness> CreateAsync(
             FlowKind kind,
-            RecordingPublicationVerifier? publicationVerifier = null)
+            RecordingPublicationVerifier? publicationVerifier = null,
+            int maxAutoRefinementIterations = 3)
         {
             var root = Path.Combine(
                 AppContext.BaseDirectory,
@@ -2033,6 +2177,7 @@ public sealed class ReviewWorkflowTests
                         - Publish
                       pre_review_maximum_permission: WorkspaceWrite
                       post_approval_maximum_permission: Publish
+                      max_auto_refinement_iterations: {{MAX_AUTO_REFINEMENT}}
                   advisory:
                     artifact_directory: .studio\advisory
                     max_artifact_count: 8
@@ -2049,7 +2194,11 @@ public sealed class ReviewWorkflowTests
                 ---
 
                 Test {{ agent.name }} on {{ task }}.
-                """);
+                """.Replace(
+                    "{{MAX_AUTO_REFINEMENT}}",
+                    maxAutoRefinementIterations.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture),
+                    StringComparison.Ordinal));
 
             var plan = kind == FlowKind.Advisory
                 ? AdvisoryPlan()
@@ -2153,7 +2302,8 @@ public sealed class ReviewWorkflowTests
                 candidatePublisher: candidatePublisher,
                 flowAgentSnapshotService: snapshotService,
                 teamPlanValidator: new TeamPlanValidator(),
-                reviewedCandidateService: reviewedCandidates);
+                reviewedCandidateService: reviewedCandidates,
+                flowQueue: flowQueue);
             var reviews = new ReviewCoordinator(
                 factory,
                 gate,

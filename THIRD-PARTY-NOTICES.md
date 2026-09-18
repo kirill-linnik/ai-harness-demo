@@ -9,7 +9,7 @@ invariants from [OpenAI Symphony](https://github.com/openai/symphony), including
 - one authoritative orchestration authority;
 - bounded concurrent dispatch and restart reconciliation;
 - explicit run-attempt phases and failure classes;
-- exponential retry with jitter;
+- exponential retry backoff, extended here with jitter;
 - isolated, reusable per-work-item workspaces;
 - workspace path containment and sanitized keys;
 - lifecycle hooks;
