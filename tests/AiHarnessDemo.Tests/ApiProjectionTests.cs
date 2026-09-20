@@ -836,6 +836,48 @@ public sealed class ApiProjectionTests
     }
 
     [Fact]
+    public async Task StudioDeliveryProjection_DoesNotBlockOnRestartVerification()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"studio-reviewed-preview-timeout-{Guid.NewGuid():N}");
+        var browserRoot = Path.Combine(
+            root,
+            ".customer-preview",
+            "eu",
+            "browser");
+        Directory.CreateDirectory(browserRoot);
+        await File.WriteAllTextAsync(
+            Path.Combine(browserRoot, "index.html"),
+            "<h1>reviewed preview</h1>");
+        var verifier = new PreviewReviewedCandidateService
+        {
+            SynchronousVerificationDelay = TimeSpan.FromMilliseconds(100)
+        };
+
+        try
+        {
+            var flow = CreatePreviewFlow(root, includeSeal: true);
+            var url = await DemoApi.ResolveReviewedPreviewUrlAsync(
+                flow,
+                new PreviewArtifactCatalog(),
+                verifier,
+                CancellationToken.None,
+                TimeSpan.FromMilliseconds(10));
+
+            Assert.Null(url);
+            await Task.Delay(
+                verifier.SynchronousVerificationDelay +
+                TimeSpan.FromMilliseconds(20));
+            Assert.Equal(1, verifier.VerifyCalls);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ApiExceptionHandler_MapsLifecycleAndAdmissionFailuresToProblemDetails()
     {
         var handler = new ApiExceptionHandler(
@@ -1036,6 +1078,10 @@ public sealed class ApiProjectionTests
 
         public bool NoPreviewArtifacts { get; set; }
 
+        public TimeSpan VerificationDelay { get; set; }
+
+        public TimeSpan SynchronousVerificationDelay { get; set; }
+
         public Task<ReviewedCandidateIdentity> SealAsync(
             FlowRun flow,
             Guid outcomeOwnerStepId,
@@ -1044,13 +1090,21 @@ public sealed class ApiProjectionTests
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task<AiHarnessDemo.Core.Verification.OutcomeCandidateSnapshot>
+        public async Task<AiHarnessDemo.Core.Verification.OutcomeCandidateSnapshot>
             VerifyAsync(
                 FlowRun flow,
                 ReviewedCandidateIdentity identity,
                 CancellationToken cancellationToken = default)
         {
             VerifyCalls++;
+            if (SynchronousVerificationDelay > TimeSpan.Zero)
+            {
+                Thread.Sleep(SynchronousVerificationDelay);
+            }
+            if (VerificationDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(VerificationDelay, cancellationToken);
+            }
             if (FailVerification)
             {
                 throw new CandidateValidationException(
@@ -1094,13 +1148,12 @@ public sealed class ApiProjectionTests
             {
                 File.WriteAllText(path, "changed after verification");
             }
-            return Task.FromResult(
-                new AiHarnessDemo.Core.Verification
-                    .OutcomeCandidateSnapshot(
-                        manifest,
-                        identity.Fingerprint,
-                        identity.OutcomeOwnerStepId,
-                        identity.SealedAt));
+            return new AiHarnessDemo.Core.Verification
+                .OutcomeCandidateSnapshot(
+                    manifest,
+                    identity.Fingerprint,
+                    identity.OutcomeOwnerStepId,
+                    identity.SealedAt);
         }
     }
 

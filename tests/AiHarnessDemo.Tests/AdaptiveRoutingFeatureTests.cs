@@ -13,6 +13,36 @@ namespace AiHarnessDemo.Tests;
 public sealed class ModelCatalogDiscoveryTests
 {
     [Fact]
+    public async Task ReadResponseAsync_TimesOutOneSlowAcpRequestWithMethodContext()
+    {
+        var exception = await Assert.ThrowsAsync<TimeoutException>(
+            () => ModelCatalogDiscovery.ReadResponseAsync(
+                new DelayedTextReader(TimeSpan.FromSeconds(1)),
+                7,
+                "session/new",
+                TimeSpan.FromMilliseconds(10),
+                CancellationToken.None));
+
+        Assert.Contains("session/new", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("within", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadResponseAsync_PreservesCallerCancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ModelCatalogDiscovery.ReadResponseAsync(
+                new DelayedTextReader(TimeSpan.FromSeconds(1)),
+                7,
+                "session/new",
+                TimeSpan.FromSeconds(1),
+                cancellation.Token));
+    }
+
+    [Fact]
     public void ParseConfigOptions_UsesEachModelsAdvertisedEfforts()
     {
         var catalog = ModelCatalogDiscovery.ParseConfigOptions(
@@ -78,6 +108,16 @@ public sealed class ModelCatalogDiscoveryTests
         var candidate = Assert.Single(catalog.Candidates);
         Assert.Equal("default", candidate.Effort);
         Assert.Equal(.33, candidate.PremiumMultiplier);
+    }
+
+    private sealed class DelayedTextReader(TimeSpan delay) : TextReader
+    {
+        public override async ValueTask<string?> ReadLineAsync(
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(delay, cancellationToken);
+            return null;
+        }
     }
 }
 

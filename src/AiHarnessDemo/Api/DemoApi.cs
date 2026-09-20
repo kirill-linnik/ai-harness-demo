@@ -16,6 +16,9 @@ namespace AiHarnessDemo.Api;
 
 public static class DemoApi
 {
+    private static readonly TimeSpan ReviewedPreviewProjectionTimeout =
+        TimeSpan.FromSeconds(1);
+
     public static IEndpointRouteBuilder MapDemoApi(this IEndpointRouteBuilder endpoints)
     {
         var api = endpoints.MapGroup("/api");
@@ -446,7 +449,8 @@ public static class DemoApi
         FlowRun flow,
         PreviewArtifactCatalog artifactCatalog,
         IReviewedCandidateService reviewedCandidateService,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? verificationTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(flow);
         ArgumentNullException.ThrowIfNull(artifactCatalog);
@@ -472,10 +476,16 @@ public static class DemoApi
 
         try
         {
-            var reviewed = await EnsureDeliveryPreviewCurrentAsync(
-                flow,
-                reviewedCandidateService,
-                cancellationToken);
+            var verification = Task.Run(
+                () => EnsureDeliveryPreviewCurrentAsync(
+                    flow,
+                    reviewedCandidateService,
+                    CancellationToken.None),
+                CancellationToken.None);
+            var reviewed = await verification
+                .WaitAsync(
+                    verificationTimeout ?? ReviewedPreviewProjectionTimeout,
+                    cancellationToken);
             return reviewed is not null &&
                    artifactCatalog.DiscoverVerified(
                            flow,
@@ -497,6 +507,10 @@ public static class DemoApi
             return null;
         }
         catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+        catch (TimeoutException)
         {
             return null;
         }

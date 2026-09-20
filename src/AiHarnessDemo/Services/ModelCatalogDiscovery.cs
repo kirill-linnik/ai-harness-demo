@@ -41,7 +41,8 @@ public sealed class ModelCatalogDiscovery(
     TimeProvider timeProvider,
     ILogger<ModelCatalogDiscovery> logger)
 {
-    private static readonly TimeSpan DiscoveryTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan DiscoveryTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
     private readonly SemaphoreSlim _discoveryLock = new(1, 1);
     private readonly Lock _statusLock = new();
     private ModelCatalogRuntimeStatus _status = new(
@@ -459,9 +460,36 @@ public sealed class ModelCatalogDiscovery(
             process,
             new { jsonrpc = "2.0", id, method, @params = parameters },
             cancellationToken);
+        return await ReadResponseAsync(
+            process.StandardOutput,
+            id,
+            method,
+            RequestTimeout,
+            cancellationToken);
+    }
+
+    internal static async Task<string> ReadResponseAsync(
+        TextReader reader,
+        int id,
+        string method,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        using var requestTimeout =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestTimeout.CancelAfter(timeout);
         while (true)
         {
-            var line = await process.StandardOutput.ReadLineAsync(cancellationToken);
+            string? line;
+            try
+            {
+                line = await reader.ReadLineAsync(requestTimeout.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"Copilot ACP {method} did not respond within {timeout.TotalSeconds:0} seconds.");
+            }
             if (line is null)
             {
                 throw new InvalidOperationException(

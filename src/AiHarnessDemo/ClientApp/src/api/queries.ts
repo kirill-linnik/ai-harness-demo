@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./endpoints";
-import { flowPollIntervalMs } from "../lib/pollInterval";
+import { flowDetailPollIntervalMs } from "../lib/pollInterval";
 import type {
   AnalyzeRepositoryRequest,
   DirectReviewRequest,
@@ -68,7 +68,12 @@ export function useFlowQuery(flowId: string | undefined) {
     queryFn: () => api.flow(flowId!),
     enabled: Boolean(flowId),
     staleTime: 0,
-    refetchInterval: query => flowPollIntervalMs(query.state.data?.status),
+    refetchInterval: query =>
+      flowDetailPollIntervalMs(
+        query.state.data?.status,
+        query.state.data?.kind,
+        query.state.data?.reviewedPreviewUrl
+      ),
     refetchIntervalInBackground: true
   });
 }
