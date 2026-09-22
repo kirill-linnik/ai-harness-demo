@@ -16,9 +16,6 @@ namespace AiHarnessDemo.Api;
 
 public static class DemoApi
 {
-    private static readonly TimeSpan ReviewedPreviewProjectionTimeout =
-        TimeSpan.FromSeconds(1);
-
     public static IEndpointRouteBuilder MapDemoApi(this IEndpointRouteBuilder endpoints)
     {
         var api = endpoints.MapGroup("/api");
@@ -359,16 +356,13 @@ public static class DemoApi
         Guid flowId,
         IDbContextFactory<HarnessDbContext> databaseFactory,
         PreviewArtifactCatalog artifactCatalog,
-        IReviewedCandidateService reviewedCandidateService,
         DeliveryReadinessService readinessService,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
-        var reviewedPreviewUrl = await ResolveReviewedPreviewUrlAsync(
+        var reviewedPreviewUrl = ResolveReviewedPreviewUrl(
             flow,
-            artifactCatalog,
-            reviewedCandidateService,
-            cancellationToken);
+            artifactCatalog);
         return Results.Ok(flow.ToDetailDto(
             reviewedPreviewUrl,
             await LoadReadinessDtoAsync(
@@ -445,16 +439,18 @@ public static class DemoApi
         });
     }
 
-    internal static async Task<string?> ResolveReviewedPreviewUrlAsync(
+    /// <summary>
+    /// Projects navigation to a durably sealed reviewed preview without re-hashing the full
+    /// candidate on every flow-detail request. The preview endpoints still verify the candidate
+    /// byte-for-byte before returning metadata or content, so this link grants no readiness or
+    /// publication authority.
+    /// </summary>
+    internal static string? ResolveReviewedPreviewUrl(
         FlowRun flow,
-        PreviewArtifactCatalog artifactCatalog,
-        IReviewedCandidateService reviewedCandidateService,
-        CancellationToken cancellationToken,
-        TimeSpan? verificationTimeout = null)
+        PreviewArtifactCatalog artifactCatalog)
     {
         ArgumentNullException.ThrowIfNull(flow);
         ArgumentNullException.ThrowIfNull(artifactCatalog);
-        ArgumentNullException.ThrowIfNull(reviewedCandidateService);
         if (flow.Kind != FlowKind.Delivery ||
             flow.Status != FlowStatus.WaitingForFeedback)
         {
@@ -476,21 +472,9 @@ public static class DemoApi
 
         try
         {
-            var verification = Task.Run(
-                () => EnsureDeliveryPreviewCurrentAsync(
-                    flow,
-                    reviewedCandidateService,
-                    CancellationToken.None),
-                CancellationToken.None);
-            var reviewed = await verification
-                .WaitAsync(
-                    verificationTimeout ?? ReviewedPreviewProjectionTimeout,
-                    cancellationToken);
-            return reviewed is not null &&
-                   artifactCatalog.DiscoverVerified(
-                           flow,
-                           reviewed.Manifest.PreviewArtifacts)
-                       .Count > 0
+            var reviewed = ReviewedCandidateLedger.Read(flow);
+            return reviewed.PreviewFileCount > 0 &&
+                   artifactCatalog.Discover(flow).Count > 0
                 ? $"#/preview/{flow.Id:D}"
                 : null;
         }
@@ -507,10 +491,6 @@ public static class DemoApi
             return null;
         }
         catch (UnauthorizedAccessException)
-        {
-            return null;
-        }
-        catch (TimeoutException)
         {
             return null;
         }

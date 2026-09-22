@@ -216,6 +216,11 @@ binding, port placeholder, health path, or startup timeout. Its reviewed represe
 network-disabled. A separately requested loopback live demo is convenience only and contributes no
 readiness evidence or publication authority.
 
+The flow-detail projection shows **Open reviewed preview** from the current durable seal and the
+presence of its workspace-root artifact, without waiting for a full candidate re-hash after host
+restart. Following that link does not trust the projection: the preview metadata and file endpoints
+still revalidate the complete sealed candidate byte-for-byte before serving customer content.
+
 Before sealing, the active Delivery verifier receives an absolute verification-preview metadata
 URL on Studio's actual listening address. Its unreviewed artifact views share the customer-preview
 renderer, sandbox, CSP, and bootstrap, so QA can exercise the real isolation policy before review

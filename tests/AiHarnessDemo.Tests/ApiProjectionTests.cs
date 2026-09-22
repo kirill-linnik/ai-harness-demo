@@ -775,7 +775,7 @@ public sealed class ApiProjectionTests
     }
 
     [Fact]
-    public async Task StudioDeliveryProjection_ExposesOnlyCurrentReviewedBrowserPreview()
+    public async Task StudioDeliveryProjection_ExposesDurablySealedBrowserPreviewNavigation()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -790,43 +790,34 @@ public sealed class ApiProjectionTests
             Path.Combine(browserRoot, "index.html"),
             "<h1>reviewed preview</h1>");
         var catalog = new PreviewArtifactCatalog();
-        var verifier = new PreviewReviewedCandidateService();
 
         try
         {
             var reviewed = CreatePreviewFlow(root, includeSeal: true);
-            var url = await DemoApi.ResolveReviewedPreviewUrlAsync(
+            var url = DemoApi.ResolveReviewedPreviewUrl(
                 reviewed,
-                catalog,
-                verifier,
-                CancellationToken.None);
+                catalog);
 
             Assert.Equal($"#/preview/{reviewed.Id:D}", url);
-            Assert.Equal(1, verifier.VerifyCalls);
 
             reviewed.Status = FlowStatus.Approved;
-            Assert.Null(await DemoApi.ResolveReviewedPreviewUrlAsync(
+            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(
                 reviewed,
-                catalog,
-                verifier,
-                CancellationToken.None));
-            Assert.Equal(1, verifier.VerifyCalls);
+                catalog));
 
             var missingSeal = CreatePreviewFlow(root, includeSeal: false);
-            Assert.Null(await DemoApi.ResolveReviewedPreviewUrlAsync(
+            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(
                 missingSeal,
-                catalog,
-                verifier,
-                CancellationToken.None));
+                catalog));
 
-            var noBrowser = CreatePreviewFlow(root, includeSeal: true);
-            verifier.NoPreviewArtifacts = true;
-            Assert.Null(await DemoApi.ResolveReviewedPreviewUrlAsync(
+            var missingArtifactRoot = Path.Combine(root, "missing-artifact");
+            Directory.CreateDirectory(missingArtifactRoot);
+            var noBrowser = CreatePreviewFlow(
+                missingArtifactRoot,
+                includeSeal: true);
+            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(
                 noBrowser,
-                catalog,
-                verifier,
-                CancellationToken.None));
-            verifier.NoPreviewArtifacts = false;
+                catalog));
 
         }
         finally
@@ -836,7 +827,7 @@ public sealed class ApiProjectionTests
     }
 
     [Fact]
-    public async Task StudioDeliveryProjection_DoesNotBlockOnRestartVerification()
+    public async Task StudioDeliveryProjection_DoesNotWaitForRestartVerification()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -850,26 +841,14 @@ public sealed class ApiProjectionTests
         await File.WriteAllTextAsync(
             Path.Combine(browserRoot, "index.html"),
             "<h1>reviewed preview</h1>");
-        var verifier = new PreviewReviewedCandidateService
-        {
-            SynchronousVerificationDelay = TimeSpan.FromMilliseconds(100)
-        };
-
         try
         {
             var flow = CreatePreviewFlow(root, includeSeal: true);
-            var url = await DemoApi.ResolveReviewedPreviewUrlAsync(
+            var url = DemoApi.ResolveReviewedPreviewUrl(
                 flow,
-                new PreviewArtifactCatalog(),
-                verifier,
-                CancellationToken.None,
-                TimeSpan.FromMilliseconds(10));
+                new PreviewArtifactCatalog());
 
-            Assert.Null(url);
-            await Task.Delay(
-                verifier.SynchronousVerificationDelay +
-                TimeSpan.FromMilliseconds(20));
-            Assert.Equal(1, verifier.VerifyCalls);
+            Assert.Equal($"#/preview/{flow.Id:D}", url);
         }
         finally
         {
