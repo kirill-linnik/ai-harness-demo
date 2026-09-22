@@ -22,8 +22,9 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
   results, residual risks, waivers, and the exact sealed candidate are bound together before review,
   approval, or publication.
 - **Reviewable outcomes** — customers can inspect Advisory artifacts or an immutable,
-  network-disabled Delivery preview. An optional loopback-only live demo is available for
-  convenience but never counts as readiness evidence.
+  network-disabled Delivery preview. Browser previews are sealed only from workspace-root
+  `.customer-preview\<variant>` artifacts and remain available after restart. An optional
+  loopback-only live demo is available for convenience but never counts as readiness evidence.
 - **Durable orchestration** — plans, attempts, sessions, permissions, events, reviews, links,
   learnings, readiness, and publication state survive restart and remain visible in the dashboard.
 - **Bounded agent context** — working prompts stay within 32 KiB of UTF-8; complete larger

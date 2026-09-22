@@ -581,7 +581,7 @@ public static partial class CopilotJsonlParser
                 continue;
             }
             return RedactSensitiveText(
-                HostObservedToolLocator.Normalize(
+                HostObservedToolLocator.NormalizeCommand(
                     property.Value.GetString() ?? string.Empty));
         }
         return string.Empty;

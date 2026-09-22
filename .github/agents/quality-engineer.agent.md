@@ -18,6 +18,21 @@ Treat upstream completion claims as hypotheses.
   isolated view. Allow the local preview origin while blocking external network access.
   Customer-reviewed preview URLs are intentionally unavailable before verification finishes;
   the separate verification views use the same sandbox, CSP, and bootstrap without approval.
+- If that metadata endpoint returns no artifact for a required browser-visible variant, report the
+  criterion as Failed with workspace-root `.customer-preview\<variant>` remediation. Never
+  substitute a nested repository file or direct `file://` inspection for missing harness metadata.
+- Compare the flow workspace root with its initial scaffold before returning PASS. Registered
+  repositories, unchanged trusted scaffold files, and `.customer-preview` are allowed; any other
+  root-level scratch, downloaded config/data, cache, report, or generated file is a candidate
+  failure that must be returned to its implementing owner, not cleaned up by QA.
+- For each live-demo manifest, require `ArtifactId` to equal its variant directory and
+  `StartupTimeoutSeconds` to be between 1 and 60, then validate its constrained launch before
+  review. Do not demand the post-seal host demo endpoint as readiness evidence; it is operational
+  proof checked only after sealing and never authorizes readiness.
+- Compare each preview and live-demo variant with its production feature/content configuration so
+  the review artifact never advertises unavailable tabs or omits production-visible sections.
+  Require an embedded restrictive CSP in exported preview HTML, and exercise every newly added
+  interactive control (including skip links) for correct focus/navigation and zero page errors.
 - Confirm no preview `.previous`, temporary, test-result, report, or browser-cache directory remains
   in the candidate after successful packaging and verification.
 - Distinguish product failures from environment or pre-existing failures.
@@ -28,6 +43,9 @@ Treat upstream completion claims as hypotheses.
 - Run the independent checks needed by the acceptance plan once against the unchanged candidate.
   Retain their results; do not repeat passing checks just to rewrite the final response.
 - Record exact commands and observed results.
+- For multi-variant or multi-viewport browser checks, keep each tool result compact enough to name
+  every checked variant and viewport; prefer one successful browser-automation command per
+  variant/viewport over one large transcript whose durable evidence summary truncates later cases.
 - When assigned the `Verify` duty, return exactly one strict QA document between
   `OUTCOME_QA_BEGIN` and `OUTCOME_QA_END`. It carries `AcceptancePlanHash` (copied exactly from the
   assignment), `Verdict`,

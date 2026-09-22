@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using AiHarnessDemo.Core.Reasoning;
+using YamlDotNet.Core;
+using YamlDotNet.RepresentationModel;
 
 namespace AiHarnessDemo.Services;
 
@@ -29,6 +31,11 @@ internal sealed record CopilotSessionSnapshot(
 public sealed class CopilotSessionJournal
 {
     private const int ProcessExitWaitMilliseconds = 5_000;
+    private const int MaximumBindingScanLines = 512;
+
+    internal sealed record SessionWorkspaceBinding(
+        string WorkspacePath,
+        DateTimeOffset? StartedAt);
 
     internal string ExpectedHome() =>
         CopilotReasoningHost.ResolveCopilotSessionHome();
@@ -115,9 +122,13 @@ public sealed class CopilotSessionJournal
                     return false;
                 }
 
-                if (snapshot.StartedAt is { } sessionStartedAt &&
-                    new DateTimeOffset(process.StartTime).ToUniversalTime() <
-                    sessionStartedAt.AddMinutes(-2))
+                if (snapshot.StartedAt is not { } sessionStartedAt ||
+                    !IsProcessStartOwnedBySession(
+                        new DateTimeOffset(process.StartTime).ToUniversalTime(),
+                        sessionStartedAt) ||
+                    !CommandLineArgumentsBelongToSession(
+                        TryReadProcessArguments(processId),
+                        snapshot.SessionId))
                 {
                     return false;
                 }
@@ -182,31 +193,52 @@ public sealed class CopilotSessionJournal
                     sessionId.ToString("D"));
                 if (Directory.Exists(knownDirectory))
                 {
-                    var snapshot = await InspectDirectoryAsync(
-                        home,
+                    var binding = await ReadWorkspaceBindingAsync(
                         knownDirectory,
-                        sessionId,
-                        cancellationToken);
-                    if (snapshot.State != CopilotSessionJournalState.Missing &&
-                        !PathEquals(snapshot.WorkspacePath, workspacePath))
+                        requireStartedAt: true,
+                        cancellationToken: cancellationToken);
+                    if (string.IsNullOrWhiteSpace(binding.WorkspacePath) &&
+                        (File.Exists(Path.Combine(
+                             knownDirectory,
+                             "workspace.yaml")) ||
+                         File.Exists(Path.Combine(
+                             knownDirectory,
+                             "events.jsonl"))))
+                    {
+                        throw new InvalidOperationException(
+                            $"Copilot session {sessionId:D} has no verifiable workspace binding and will not be deleted.");
+                    }
+                    if (!string.IsNullOrWhiteSpace(binding.WorkspacePath) &&
+                        !PathEquals(binding.WorkspacePath, workspacePath))
                     {
                         throw new InvalidOperationException(
                             $"Copilot session {sessionId:D} is not bound to the flow workspace and will not be deleted.");
                     }
-                    if (snapshot.State == CopilotSessionJournalState.Missing)
+                    var activeProcessIds = FindActiveProcessIds(
+                        knownDirectory);
+                    if (activeProcessIds.Count > 0)
                     {
-                        snapshot = snapshot with
+                        if (binding.StartedAt is null)
                         {
-                            ActiveProcessIds = FindActiveProcessIds(
-                                knownDirectory,
-                                sessionStartedAt: null)
+                            throw new InvalidOperationException(
+                                $"Copilot session {sessionId:D} has an active PID lock but no verifiable start time; process ownership cannot be proven.");
+                        }
+                        var snapshot = Missing(
+                            sessionId,
+                            home,
+                            knownDirectory,
+                            "Copilot session is being deleted.") with
+                        {
+                            State = CopilotSessionJournalState.Active,
+                            WorkspacePath = binding.WorkspacePath,
+                            StartedAt = binding.StartedAt,
+                            ActiveProcessIds = activeProcessIds
                         };
-                    }
-                    if (snapshot.ActiveProcessIds.Count > 0 &&
-                        !TryStopActiveSession(snapshot))
-                    {
-                        throw new InvalidOperationException(
-                            $"Copilot session {snapshot.SessionId:D} could not be stopped before deletion.");
+                        if (!TryStopActiveSession(snapshot))
+                        {
+                            throw new InvalidOperationException(
+                                $"Copilot session {snapshot.SessionId:D} could not be stopped before deletion.");
+                        }
                     }
                     DeleteSessionDirectory(knownDirectory);
                     deleted.Add(knownDirectory);
@@ -221,26 +253,174 @@ public sealed class CopilotSessionJournal
                 {
                     continue;
                 }
-                var snapshot = await InspectDirectoryAsync(
-                    home,
+                var binding = await ReadWorkspaceBindingAsync(
                     directory,
-                    sessionId,
-                    cancellationToken);
-                if (!PathEquals(snapshot.WorkspacePath, workspacePath))
+                    requireStartedAt: false,
+                    cancellationToken: cancellationToken);
+                if (!PathEquals(binding.WorkspacePath, workspacePath))
                 {
                     continue;
                 }
-                if (snapshot.ActiveProcessIds.Count > 0 &&
-                    !TryStopActiveSession(snapshot))
+                var activeProcessIds = FindActiveProcessIds(
+                    directory);
+                if (activeProcessIds.Count > 0)
                 {
-                    throw new InvalidOperationException(
-                        $"Copilot session {snapshot.SessionId:D} could not be stopped before deletion.");
+                    binding = await ReadWorkspaceBindingAsync(
+                        directory,
+                        requireStartedAt: true,
+                        cancellationToken: cancellationToken);
+                    if (!PathEquals(binding.WorkspacePath, workspacePath))
+                    {
+                        continue;
+                    }
+                    if (binding.StartedAt is null)
+                    {
+                        throw new InvalidOperationException(
+                            $"Copilot session {sessionId:D} has an active PID lock but no verifiable start time; process ownership cannot be proven.");
+                    }
+                    var snapshot = Missing(
+                        sessionId,
+                        home,
+                        directory,
+                        "Copilot session is being deleted.") with
+                    {
+                        State = CopilotSessionJournalState.Active,
+                        WorkspacePath = binding.WorkspacePath,
+                        StartedAt = binding.StartedAt,
+                        ActiveProcessIds = activeProcessIds
+                    };
+                    if (!TryStopActiveSession(snapshot))
+                    {
+                        throw new InvalidOperationException(
+                            $"Copilot session {snapshot.SessionId:D} could not be stopped before deletion.");
+                    }
                 }
                 DeleteSessionDirectory(directory);
                 deleted.Add(directory);
             }
         }
         return deleted.Count;
+    }
+
+    internal static async Task<SessionWorkspaceBinding> ReadWorkspaceBindingAsync(
+        string sessionDirectory,
+        bool requireStartedAt,
+        CancellationToken cancellationToken)
+    {
+        var workspacePath = string.Empty;
+        DateTimeOffset? startedAt = null;
+        var workspaceMetadataPath =
+            Path.Combine(sessionDirectory, "workspace.yaml");
+        if (File.Exists(workspaceMetadataPath))
+        {
+            try
+            {
+                var yaml = new YamlStream();
+                yaml.Load(new StringReader(
+                    await File.ReadAllTextAsync(
+                        workspaceMetadataPath,
+                        cancellationToken)));
+                if (yaml.Documents.Count == 1 &&
+                    yaml.Documents[0].RootNode is YamlMappingNode mapping)
+                {
+                    foreach (var pair in mapping.Children)
+                    {
+                        if (pair.Key is YamlScalarNode { Value: "cwd" } &&
+                            pair.Value is YamlScalarNode { Value: { } cwd })
+                        {
+                            workspacePath = cwd;
+                        }
+                        else if (pair.Key is YamlScalarNode
+                                 {
+                                     Value: "created_at"
+                                 } &&
+                                 pair.Value is YamlScalarNode
+                                 {
+                                     Value: { } createdAt
+                                 } &&
+                                 DateTimeOffset.TryParse(
+                                     createdAt,
+                                     out var parsedCreatedAt))
+                        {
+                            startedAt = parsedCreatedAt;
+                        }
+                    }
+                    if (!requireStartedAt &&
+                        !string.IsNullOrWhiteSpace(workspacePath))
+                    {
+                        return new SessionWorkspaceBinding(
+                            workspacePath,
+                            startedAt);
+                    }
+                }
+            }
+            catch (YamlException exception)
+            {
+                throw new InvalidOperationException(
+                    $"Copilot workspace metadata '{workspaceMetadataPath}' is invalid.",
+                    exception);
+            }
+        }
+
+        var journalPath = Path.Combine(sessionDirectory, "events.jsonl");
+        if (!File.Exists(journalPath))
+        {
+            return new SessionWorkspaceBinding(
+                workspacePath,
+                startedAt);
+        }
+
+        await using var stream = new FileStream(
+            journalPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        var scannedLines = 0;
+        while ((requireStartedAt ||
+                scannedLines++ < MaximumBindingScanLines) &&
+               await reader.ReadLineAsync(cancellationToken) is { } line)
+        {
+            if (!CopilotJsonlParser.TryPayload(
+                    line,
+                    out var eventType,
+                    out var document,
+                    out var payload))
+            {
+                continue;
+            }
+
+            using (document)
+            {
+                if (eventType is "session.start" or "session.resume" &&
+                    payload.TryGetProperty("context", out var context) &&
+                    context.ValueKind == JsonValueKind.Object)
+                {
+                    workspacePath =
+                        CopilotJsonlParser.ReadString(context, "cwd") ??
+                        workspacePath;
+                    startedAt =
+                        ReadTimestamp(document.RootElement) ??
+                        startedAt;
+                    if (!requireStartedAt &&
+                        eventType == "session.start")
+                    {
+                        return new SessionWorkspaceBinding(
+                            workspacePath,
+                            startedAt);
+                    }
+                }
+                else if (eventType == "session.resume")
+                {
+                    startedAt =
+                        ReadTimestamp(document.RootElement) ??
+                        startedAt;
+                }
+            }
+        }
+        return new SessionWorkspaceBinding(
+            workspacePath,
+            startedAt);
     }
 
     internal static async Task<CopilotSessionSnapshot> InspectDirectoryAsync(
@@ -329,6 +509,17 @@ public sealed class CopilotSessionJournal
                         {
                             observedSessionId = resumedSessionId;
                         }
+                        if (payload.TryGetProperty(
+                                "context",
+                                out var resumedContext) &&
+                            resumedContext.ValueKind == JsonValueKind.Object)
+                        {
+                            workspacePath =
+                                CopilotJsonlParser.ReadString(
+                                    resumedContext,
+                                    "cwd") ??
+                                workspacePath;
+                        }
                         break;
 
                     case "subagent.selected":
@@ -384,7 +575,7 @@ public sealed class CopilotSessionJournal
         }
 
         workspacePath ??= string.Empty;
-        var activeProcessIds = FindActiveProcessIds(sessionDirectory, startedAt);
+        var activeProcessIds = FindActiveProcessIds(sessionDirectory);
         var parsed = CopilotJsonlParser.Parse(
             validJournal.ToString(),
             workingDirectory: workspacePath);
@@ -461,8 +652,7 @@ public sealed class CopilotSessionJournal
             detail);
 
     private static List<int> FindActiveProcessIds(
-        string sessionDirectory,
-        DateTimeOffset? sessionStartedAt)
+        string sessionDirectory)
     {
         var active = new List<int>();
         foreach (var lockPath in Directory.EnumerateFiles(
@@ -486,10 +676,7 @@ public sealed class CopilotSessionJournal
                     string.Equals(
                         process.ProcessName,
                         "copilot",
-                        StringComparison.OrdinalIgnoreCase) &&
-                    (sessionStartedAt is null ||
-                     new DateTimeOffset(process.StartTime).ToUniversalTime() >=
-                     sessionStartedAt.Value.AddMinutes(-2)))
+                        StringComparison.OrdinalIgnoreCase))
                 {
                     active.Add(processId);
                 }
@@ -505,6 +692,248 @@ public sealed class CopilotSessionJournal
         }
 
         return active;
+    }
+
+    internal static bool IsProcessStartOwnedBySession(
+        DateTimeOffset processStartedAt,
+        DateTimeOffset sessionStartedAt) =>
+        processStartedAt >= sessionStartedAt.AddMinutes(-2) &&
+        processStartedAt <= sessionStartedAt.AddMinutes(2);
+
+    internal static bool CommandLineBelongsToSession(
+        string? commandLine,
+        Guid sessionId) =>
+        !string.IsNullOrWhiteSpace(commandLine) &&
+        CommandLineArgumentsBelongToSession(
+            TokenizeCommandLine(commandLine),
+            sessionId);
+
+    internal static bool CommandLineArgumentsBelongToSession(
+        IReadOnlyList<string>? arguments,
+        Guid sessionId)
+    {
+        if (arguments is null)
+        {
+            return false;
+        }
+        var formatted = sessionId.ToString("D");
+        for (var index = 0; index < arguments.Count; index++)
+        {
+            var argument = arguments[index];
+            if (argument.Equals(
+                    "-p",
+                    StringComparison.OrdinalIgnoreCase) ||
+                argument.Equals(
+                    "--prompt",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                index++;
+                continue;
+            }
+            if (argument.StartsWith(
+                    "--prompt=",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (argument.Equals(
+                    "--session-id",
+                    StringComparison.OrdinalIgnoreCase) ||
+                argument.Equals(
+                    "--resume",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                if (index + 1 < arguments.Count &&
+                    arguments[index + 1].Equals(
+                        formatted,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            else if (argument.StartsWith(
+                         "--session-id=",
+                         StringComparison.OrdinalIgnoreCase) ||
+                     argument.StartsWith(
+                         "--resume=",
+                         StringComparison.OrdinalIgnoreCase))
+            {
+                var separator = argument.IndexOf('=');
+                if (argument[(separator + 1)..].Equals(
+                        formatted,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static IReadOnlyList<string> TokenizeCommandLine(string commandLine)
+    {
+        var tokens = new List<string>();
+        var index = 0;
+        while (index < commandLine.Length)
+        {
+            while (index < commandLine.Length &&
+                   char.IsWhiteSpace(commandLine[index]))
+            {
+                index++;
+            }
+            if (index >= commandLine.Length)
+            {
+                break;
+            }
+
+            var current = new StringBuilder();
+            var inQuotes = false;
+            do
+            {
+                if (commandLine[index] == '\\')
+                {
+                    var slashStart = index;
+                    while (index < commandLine.Length &&
+                           commandLine[index] == '\\')
+                    {
+                        index++;
+                    }
+                    var slashCount = index - slashStart;
+                    if (index < commandLine.Length &&
+                        commandLine[index] == '"')
+                    {
+                        current.Append('\\', slashCount / 2);
+                        if (slashCount % 2 == 1)
+                        {
+                            current.Append('"');
+                            index++;
+                        }
+                        else if (inQuotes &&
+                                 index + 1 < commandLine.Length &&
+                                 commandLine[index + 1] == '"')
+                        {
+                            current.Append('"');
+                            index += 2;
+                        }
+                        else
+                        {
+                            inQuotes = !inQuotes;
+                            index++;
+                        }
+                    }
+                    else
+                    {
+                        current.Append('\\', slashCount);
+                    }
+                    continue;
+                }
+                if (commandLine[index] == '"')
+                {
+                    if (inQuotes &&
+                        index + 1 < commandLine.Length &&
+                        commandLine[index + 1] == '"')
+                    {
+                        current.Append('"');
+                        index += 2;
+                    }
+                    else
+                    {
+                        inQuotes = !inQuotes;
+                        index++;
+                    }
+                    continue;
+                }
+                if (!inQuotes &&
+                    char.IsWhiteSpace(commandLine[index]))
+                {
+                    break;
+                }
+                current.Append(commandLine[index]);
+                index++;
+            }
+            while (index < commandLine.Length);
+            tokens.Add(current.ToString());
+        }
+        return tokens;
+    }
+
+    private static IReadOnlyList<string>? TryReadProcessArguments(
+        int processId)
+    {
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                var path = $"/proc/{processId}/cmdline";
+                if (!File.Exists(path))
+                {
+                    return null;
+                }
+                var values = Encoding.UTF8
+                    .GetString(File.ReadAllBytes(path))
+                    .Split('\0');
+                var count = values.Length > 0 &&
+                            values[^1].Length == 0
+                    ? values.Length - 1
+                    : values.Length;
+                return count > 0
+                    ? values[..count]
+                    : null;
+            }
+            if (!OperatingSystem.IsWindows())
+            {
+                return null;
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            startInfo.ArgumentList.Add("-NoLogo");
+            startInfo.ArgumentList.Add("-NoProfile");
+            startInfo.ArgumentList.Add("-NonInteractive");
+            startInfo.ArgumentList.Add("-Command");
+            startInfo.ArgumentList.Add(
+                $"(Get-CimInstance Win32_Process -Filter \"ProcessId = {processId}\").CommandLine");
+
+            using var query = Process.Start(startInfo);
+            if (query is null)
+            {
+                return null;
+            }
+            var outputTask = query.StandardOutput.ReadToEndAsync();
+            var errorTask = query.StandardError.ReadToEndAsync();
+            if (!query.WaitForExit(5_000))
+            {
+                try
+                {
+                    query.Kill(entireProcessTree: true);
+                    query.WaitForExit(1_000);
+                }
+                catch (InvalidOperationException)
+                {
+                    // The query exited at the timeout boundary.
+                }
+                return null;
+            }
+            var output = outputTask.GetAwaiter().GetResult().Trim();
+            _ = errorTask.GetAwaiter().GetResult();
+            return query.ExitCode == 0 && output.Length > 0
+                ? TokenizeCommandLine(output)
+                : null;
+        }
+        catch (Exception exception) when (
+            exception is IOException or
+                InvalidOperationException or
+                System.ComponentModel.Win32Exception or
+                UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     private static bool HasToolRequests(JsonElement payload) =>

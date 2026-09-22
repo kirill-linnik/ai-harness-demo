@@ -248,6 +248,175 @@ public sealed class DeliveryReadinessPolicyTests
     }
 
     [Fact]
+    public void HostEvidence_ClassifiesShellBrowserAutomationAsCommand()
+    {
+        var step = new FlowStep
+        {
+            Sequence = 80,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer"
+        };
+        var browserCheck = new AgentToolCall
+        {
+            FlowStepId = step.Id,
+            ToolName = "powershell",
+            ToolType = "Command",
+            ArgumentsSummary = "Run a Playwright viewport check.",
+            NormalizedCommand =
+                """node -e "const { chromium } = require('playwright'); page.goto(url); return document.documentElement.scrollWidth;" """,
+            Succeeded = true,
+            ExitCode = 0,
+            ResultSummary = "scrollWidth=390 clientWidth=390"
+        };
+
+        var observed = DeliveryReadinessService
+            .BuildEvidence(step, [browserCheck])
+            .Items[1];
+
+        Assert.Equal(OutcomeEvidenceKind.Command, observed.Kind);
+        Assert.True(observed.SupportsVerification);
+    }
+
+    [Theory]
+    [InlineData("npx", "playwright test", OutcomeEvidenceKind.Test)]
+    [InlineData("npm", "exec playwright test", OutcomeEvidenceKind.Test)]
+    [InlineData("node", "-e \"const { chromium } = require('playwright'); chromium.launch(); page.goto(url);\"", OutcomeEvidenceKind.Command)]
+    [InlineData("node", "build.js", OutcomeEvidenceKind.Command)]
+    public void HostEvidence_DistinguishesBrowserTestsObservationsAndMentions(
+        string command,
+        string arguments,
+        OutcomeEvidenceKind expected)
+    {
+        var step = new FlowStep
+        {
+            Sequence = 80,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer"
+        };
+        var call = new AgentToolCall
+        {
+            FlowStepId = step.Id,
+            ToolName = "powershell",
+            ToolType = "Command",
+            ArgumentsSummary = $"{command} {arguments}",
+            NormalizedCommand = $"{command} {arguments}",
+            NormalizedArguments = arguments,
+            Succeeded = true,
+            ExitCode = 0,
+            ResultSummary = "The output mentions playwright overflow."
+        };
+
+        Assert.Equal(
+            expected,
+            DeliveryReadinessService.BuildEvidence(step, [call]).Items[1].Kind);
+    }
+
+    [Theory]
+    [InlineData(
+        "$env:PLAYWRIGHT_BROWSERS_PATH='cache'\nnpx playwright test",
+        OutcomeEvidenceKind.Test)]
+    [InlineData(
+        "$env:NODE_PATH='node_modules'\nnode -e \"const { chromium } = require('playwright'); chromium.launch(); page.goto(url);\"",
+        OutcomeEvidenceKind.Command)]
+    public void HostEvidence_RecognizesNewlineSeparatedBrowserCommands(
+        string rawCommand,
+        OutcomeEvidenceKind expected)
+    {
+        var step = new FlowStep
+        {
+            Sequence = 80,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer"
+        };
+        var call = new AgentToolCall
+        {
+            FlowStepId = step.Id,
+            ToolName = "powershell",
+            ToolType = "Command",
+            ArgumentsSummary = rawCommand,
+            NormalizedCommand =
+                HostObservedToolLocator.NormalizeCommand(rawCommand),
+            Succeeded = true,
+            ExitCode = 0,
+            ResultSummary = "Browser command completed."
+        };
+
+        Assert.Equal(
+            expected,
+            DeliveryReadinessService.BuildEvidence(step, [call]).Items[1].Kind);
+    }
+
+    [Fact]
+    public void EvidenceEpoch_ExcludesPreRestorationEvidence()
+    {
+        var oldStepId = Guid.NewGuid();
+        var retryStepId = Guid.NewGuid();
+        var events = new[]
+        {
+            new FlowEvent
+            {
+                Type = DeliveryReadinessService.EvidenceEventType,
+                Message = "Old evidence.",
+                DataJson = DeliveryReadinessService.SerializeEvidence(
+                    new DeliveryEvidenceLedgerEntry(
+                        1,
+                        oldStepId,
+                        80,
+                        "quality-engineer",
+                        [
+                            new DeliveryEvidenceItem(
+                                "EV-S080-001",
+                                OutcomeEvidenceKind.Command,
+                                "old-check",
+                                "Old candidate passed.",
+                                true,
+                                0,
+                                OutcomeVerificationRules.ComputeSha256("old"))
+                        ]))
+            },
+            new FlowEvent
+            {
+                Type = DeliveryReadinessService.EvidenceEpochEventType,
+                Message = "Scaffold restoration started a new epoch.",
+                DataJson = DeliveryReadinessService.SerializeEvidenceEpoch(
+                    new DeliveryEvidenceEpoch(
+                        1,
+                        retryStepId,
+                        120))
+            },
+            new FlowEvent
+            {
+                Type = DeliveryReadinessService.EvidenceEventType,
+                Message = "Fresh evidence.",
+                DataJson = DeliveryReadinessService.SerializeEvidence(
+                    new DeliveryEvidenceLedgerEntry(
+                        1,
+                        retryStepId,
+                        120,
+                        "quality-engineer",
+                        [
+                            new DeliveryEvidenceItem(
+                                "EV-S120-001",
+                                OutcomeEvidenceKind.Command,
+                                "fresh-check",
+                                "Restored candidate passed.",
+                                true,
+                                0,
+                                OutcomeVerificationRules.ComputeSha256("fresh"))
+                        ]))
+            }
+        };
+
+        var evidence = DeliveryReadinessService.ReadEvidence(events, 1);
+
+        Assert.Single(evidence);
+        Assert.Equal("EV-S120-001", evidence[0].EvidenceId);
+    }
+
+    [Fact]
     public void EvidencePrompt_KeepsTheCompleteTypedIndexWithoutRepeatingLargeTranscripts()
     {
         var evidence = Enumerable.Range(1, 1_200)

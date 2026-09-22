@@ -88,11 +88,12 @@ public sealed class ReviewedCandidateService(
                 outcomeOwnerStepId.ToString("D"),
                 outcomeOwnerPlanStepKey,
                 outcomeHash));
+        var requiresPreview = RequiresCustomerPreview(flow);
         var snapshot = await fingerprints.PrepareAsync(
             flow,
             acceptancePlanHash,
             outcomeOwnerStepId,
-            requiresPreview: false,
+            requiresPreview,
             cancellationToken);
         var identity = new ReviewedCandidateIdentity(
             flow.Id,
@@ -187,7 +188,7 @@ public sealed class ReviewedCandidateService(
             flow,
             identity.AcceptancePlanHash,
             identity.OutcomeOwnerStepId,
-            requiresPreview: false,
+            RequiresCustomerPreview(flow),
             cancellationToken);
         var repositories = current.Manifest.Repositories
             .Select(repository =>
@@ -215,6 +216,23 @@ public sealed class ReviewedCandidateService(
                 "The Delivery workspace no longer matches the exact candidate sealed for customer review.");
         }
         return current;
+    }
+
+    internal static bool RequiresCustomerPreview(FlowRun flow)
+    {
+        if (flow.Kind != FlowKind.Delivery)
+        {
+            return false;
+        }
+
+        var (plan, _, errors) =
+            DeliveryReadinessService.TryReadAcceptancePlan(flow);
+        return errors.Count == 0 &&
+               plan!.Criteria.Any(criterion =>
+                   criterion.CustomerVisible &&
+                   criterion.EvidenceKinds?.Any(kind =>
+                       kind is OutcomeEvidenceKind.Artifact or
+                           OutcomeEvidenceKind.Observation) == true);
     }
 
     private void CachePreviewVerification(

@@ -75,6 +75,9 @@ internal static partial class HostObservedToolLocator
                 " ");
     }
 
+    internal static string NormalizeCommand(string value) =>
+        Normalize(value.ReplaceLineEndings("; "));
+
     internal static bool IsReadOnlyGitCommand(string command)
     {
         var tokens = Tokenize(command);

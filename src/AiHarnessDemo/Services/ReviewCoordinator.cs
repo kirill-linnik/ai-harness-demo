@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text.Json;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
@@ -682,8 +683,48 @@ public sealed class ReviewCoordinator(
 
             if (action == ReadinessResolutionAction.Continue)
             {
-                var permissionSource = await WorkflowEngine.ResolveTaskPermissionSourceAsync(
-                    database, reviewedStep, cancellationToken);
+                var taskAttempt = flow.Steps
+                    .Where(step =>
+                        step.Iteration == flow.Iteration &&
+                        step.AgentId == reviewedStep.AgentId &&
+                        string.Equals(
+                            step.PlanStepKey,
+                            reviewedStep.PlanStepKey,
+                            StringComparison.Ordinal) &&
+                        !step.Label.StartsWith(
+                            "Correct invalid response from ",
+                            StringComparison.Ordinal))
+                    .OrderByDescending(step => step.Sequence)
+                    .First();
+                var permissionSource =
+                    await WorkflowEngine.ResolveTaskPermissionSourceAsync(
+                        database,
+                        taskAttempt,
+                        cancellationToken);
+                var persistedPermission =
+                    JsonSerializer.Deserialize<EffectiveExecutionPermission>(
+                        permissionSource.EffectivePermissionJson)
+                    ?? throw new InvalidOperationException(
+                        "The blocked verification attempt has no persisted permission document.");
+                PermissionProfileResolver.ValidatePersisted(
+                    persistedPermission,
+                    permissionSource.PermissionProfile);
+                var workflow = workflowProvider.GetEffective();
+                var duties = WorkflowEngine.ReadPlanDuties(
+                    permissionSource.PlanDutiesJson);
+                var currentPermission = _permissionResolver.Resolve(
+                    new PermissionResolutionRequest(
+                        flow.Kind,
+                        permissionSource.InvocationKind,
+                        permissionSource.PlanStage,
+                        duties.ToImmutableArray(),
+                        DurableReviewDecision: null,
+                        DurableApproval: false,
+                        IsOnlyPlannedPublishStep: false),
+                    PermissionProfileResolver.FromWorkflow(workflow));
+                var effectivePermission = PermissionProfileResolver.Tighten(
+                    persistedPermission,
+                    currentPermission);
                 var continuation = new FlowStep
                 {
                     FlowRunId = flow.Id,
@@ -702,9 +743,10 @@ public sealed class ReviewCoordinator(
                     PlanStage = reviewedStep.PlanStage,
                     InvocationKind = reviewedStep.InvocationKind,
                     IsOutcomeOwner = true,
-                    PermissionProfile = permissionSource.PermissionProfile,
-                    EffectivePermissionJson = permissionSource.EffectivePermissionJson,
-                    WorkflowRevision = reviewedStep.WorkflowRevision,
+                    PermissionProfile = effectivePermission.Profile,
+                    EffectivePermissionJson =
+                        JsonSerializer.Serialize(effectivePermission),
+                    WorkflowRevision = workflow.Revision,
                     RemotePublicationAllowed = false,
                     Status = StepStatus.Pending,
                     Phase = AgentRunPhase.PreparingWorkspace,
@@ -719,7 +761,11 @@ public sealed class ReviewCoordinator(
                         $"{permissionSource.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
                         "Customer requested another attempt after the blocked readiness result. " +
                         "Re-check the current candidate, address the blocker if it is now resolvable, " +
-                        "and return a complete replacement verification and outcome.",
+                        "and return a complete replacement verification and outcome. " +
+                        "Unchanged host-owned scaffold files validated by candidate sealing are allowed " +
+                        "and are not stray workspace output. For missing browser evidence, run one bounded " +
+                        "browser-automation command per variant and viewport and print a compact result " +
+                        "that names that variant, viewport, scrollWidth, and clientWidth.",
                     RetryOfStepId = reviewedStep.RetryOfStepId ?? reviewedStep.Id,
                     DependsOnStepId = reviewedStep.DependsOnStepId
                 };
@@ -745,6 +791,20 @@ public sealed class ReviewCoordinator(
                     Type = "delivery.verification-retry-scheduled",
                     Message =
                         $"Customer continuation scheduled attempt {continuation.Attempt} for the final verification and outcome owner."
+                });
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = continuation.Id,
+                    Type = DeliveryReadinessService.EvidenceEpochEventType,
+                    Message =
+                        "Started a new evidence epoch for the customer-requested substantive verification continuation.",
+                    DataJson =
+                        DeliveryReadinessService.SerializeEvidenceEpoch(
+                            new DeliveryEvidenceEpoch(
+                                flow.Iteration,
+                                continuation.Id,
+                                continuation.Sequence))
                 });
                 lifecycle.ResolveReadinessState(
                     flow,

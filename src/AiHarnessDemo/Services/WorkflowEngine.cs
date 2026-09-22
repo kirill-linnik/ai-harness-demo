@@ -105,6 +105,8 @@ public sealed class WorkflowEngine(
         (candidateFingerprintService is null
             ? null
             : new ReviewedCandidateService(candidateFingerprintService));
+    private readonly CandidateFingerprintService? _candidateFingerprints =
+        candidateFingerprintService;
     private readonly DeliveryReadinessService _readiness =
         deliveryReadinessService ?? new DeliveryReadinessService();
     private readonly LinkedFlowCoordinator? _linkedFlows =
@@ -127,6 +129,36 @@ public sealed class WorkflowEngine(
                 return _activeFlows;
             }
         }
+    }
+
+    internal static bool IsCurrentCandidateSealFailure(
+        FlowRun flow,
+        FlowStep? candidateStep)
+    {
+        if (candidateStep is null ||
+            candidateStep.Iteration != flow.Iteration ||
+            !candidateStep.IsOutcomeOwner)
+        {
+            return false;
+        }
+
+        var failure = flow.Events
+            .Where(item =>
+                item.FlowStepId == candidateStep.Id &&
+                item.Type == "delivery.review-candidate-seal-failed")
+            .OrderByDescending(item => item.CreatedAt)
+            .FirstOrDefault();
+        if (failure is null)
+        {
+            return false;
+        }
+        var sealedAt = flow.Events
+            .Where(item =>
+                item.FlowStepId == candidateStep.Id &&
+                item.Type == ReviewedCandidateLedger.EventType)
+            .Select(item => (DateTimeOffset?)item.CreatedAt)
+            .Max();
+        return sealedAt is null || sealedAt < failure.CreatedAt;
     }
 
     private (ValidatedTeamPlan Plan, string RawJson)
@@ -2994,40 +3026,168 @@ public sealed class WorkflowEngine(
     {
         var source = step;
         var visited = new HashSet<Guid>();
-        while (source.Label.StartsWith(
-                   StudioContractCorrectionLabelPrefix,
-                   StringComparison.Ordinal))
+        while (true)
         {
             if (!visited.Add(source.Id))
             {
                 throw new InvalidOperationException(
                     "The response-correction permission lineage contains a cycle.");
             }
-            var binding = await database.FlowEvents.AsNoTracking()
-                .SingleAsync(item =>
-                    item.FlowRunId == step.FlowRunId &&
-                    item.FlowStepId == source.Id &&
-                    item.Type == "agent.contract-correction-scheduled",
-                    cancellationToken);
-            using var document = JsonDocument.Parse(
-                binding.DataJson ?? throw new InvalidOperationException(
-                    "The response-correction permission binding is missing."));
-            if (!document.RootElement.TryGetProperty("SourceStepId", out var sourceValue) ||
-                !sourceValue.TryGetGuid(out var sourceId))
+            var eventType = source.Label.StartsWith(
+                    StudioContractCorrectionLabelPrefix,
+                    StringComparison.Ordinal)
+                ? "agent.contract-correction-scheduled"
+                : "step.manual-retry-scheduled";
+            var sourceId = await ReadLineageSourceStepIdAsync(
+                database,
+                step.FlowRunId,
+                source.Id,
+                eventType,
+                cancellationToken);
+            if (sourceId is null)
             {
-                throw new InvalidOperationException(
-                    "The response correction has no durable task-permission source.");
+                return source;
             }
-            source = await database.FlowSteps.AsNoTracking()
+            var prior = await database.FlowSteps.AsNoTracking()
                 .SingleAsync(item =>
-                    item.Id == sourceId &&
+                    item.Id == sourceId.Value &&
                     item.FlowRunId == step.FlowRunId &&
                     item.Iteration == step.Iteration &&
                     item.AgentId == step.AgentId &&
                     item.PlanStepKey == step.PlanStepKey,
                     cancellationToken);
+            if (eventType == "step.manual-retry-scheduled" &&
+                !await IsResponseCorrectionAttemptAsync(
+                    database,
+                    prior,
+                    cancellationToken))
+            {
+                return source;
+            }
+            source = prior;
         }
-        return source;
+    }
+
+    internal static async Task<bool> IsResponseCorrectionAttemptAsync(
+        HarnessDbContext database,
+        FlowStep step,
+        CancellationToken cancellationToken)
+    {
+        var source = step;
+        var visited = new HashSet<Guid>();
+        while (visited.Add(source.Id))
+        {
+            if (source.Label.StartsWith(
+                    StudioContractCorrectionLabelPrefix,
+                    StringComparison.Ordinal))
+            {
+                return true;
+            }
+            var sourceId = await ReadLineageSourceStepIdAsync(
+                database,
+                step.FlowRunId,
+                source.Id,
+                "step.manual-retry-scheduled",
+                cancellationToken);
+            if (sourceId is null)
+            {
+                return false;
+            }
+            source = await database.FlowSteps.AsNoTracking()
+                .SingleAsync(item =>
+                    item.Id == sourceId.Value &&
+                    item.FlowRunId == step.FlowRunId &&
+                    item.Iteration == step.Iteration,
+                    cancellationToken);
+        }
+        throw new InvalidOperationException(
+            "The response-correction retry lineage contains a cycle.");
+    }
+
+    private static async Task<Guid?> ReadLineageSourceStepIdAsync(
+        HarnessDbContext database,
+        Guid flowId,
+        Guid stepId,
+        string eventType,
+        CancellationToken cancellationToken)
+    {
+        var bindings = await database.FlowEvents.AsNoTracking()
+            .Where(item =>
+                item.FlowRunId == flowId &&
+                item.FlowStepId == stepId &&
+                item.Type == eventType)
+            .ToListAsync(cancellationToken);
+        var recorded = ReadConsistentLineageSourceStepId(bindings);
+        if (recorded is not null ||
+            eventType != "step.manual-retry-scheduled" ||
+            bindings.Count == 0 ||
+            bindings.Any(item =>
+                !string.IsNullOrWhiteSpace(item.DataJson)))
+        {
+            return recorded;
+        }
+
+        var retry = await database.FlowSteps.AsNoTracking()
+            .SingleAsync(
+                item =>
+                    item.Id == stepId &&
+                    item.FlowRunId == flowId,
+                cancellationToken);
+        var bindingCreatedAt = bindings.Min(item => item.CreatedAt);
+        var restartSourceId = await database.FlowEvents.AsNoTracking()
+            .Where(item =>
+                item.FlowRunId == flowId &&
+                item.Type == "flow.manual-restart" &&
+                item.FlowStepId != null &&
+                item.CreatedAt <= bindingCreatedAt)
+            .OrderByDescending(item => item.CreatedAt)
+            .Select(item => item.FlowStepId!.Value)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (restartSourceId == Guid.Empty)
+        {
+            return null;
+        }
+        var candidate = await database.FlowSteps.AsNoTracking()
+            .SingleOrDefaultAsync(
+                item =>
+                item.Id == restartSourceId &&
+                item.FlowRunId == flowId &&
+                item.Iteration == retry.Iteration &&
+                item.AgentId == retry.AgentId &&
+                item.PlanStepKey == retry.PlanStepKey &&
+                item.Sequence < retry.Sequence,
+                cancellationToken);
+        return candidate?.Id;
+    }
+
+    private static Guid? ReadConsistentLineageSourceStepId(
+        IReadOnlyList<FlowEvent> bindings)
+    {
+        var sourceIds = new HashSet<Guid>();
+        foreach (var binding in bindings)
+        {
+            if (string.IsNullOrWhiteSpace(binding.DataJson))
+            {
+                continue;
+            }
+            using var document = JsonDocument.Parse(binding.DataJson);
+            if (!document.RootElement.TryGetProperty(
+                    "SourceStepId",
+                    out var sourceValue) ||
+                !sourceValue.TryGetGuid(out var sourceId))
+            {
+                throw new InvalidOperationException(
+                    "The retry lineage has an invalid source-step binding.");
+            }
+            sourceIds.Add(sourceId);
+        }
+        return sourceIds.Count switch
+        {
+            0 => null,
+            1 => sourceIds.Single(),
+            _ => throw new InvalidOperationException(
+                "The retry lineage contains conflicting source-step bindings.")
+        };
     }
 
     private static async Task<IReadOnlyList<StudioDependencyOutput>>
@@ -5704,7 +5864,182 @@ public sealed class WorkflowEngine(
                 FindUnresolvedFailure(iterationSteps) ??
                 FindUnresolvedPushback(iterationSteps);
             var finalizationStep = FindRetryableStudioFinalizationStep(flow);
+            var retryingCandidateSeal =
+                IsCurrentCandidateSealFailure(
+                    flow,
+                    failedStep is { IsOutcomeOwner: true }
+                        ? failedStep
+                        : finalizationStep);
+            if (retryingCandidateSeal)
+            {
+                var sealFailureStep =
+                    finalizationStep ?? failedStep ??
+                    throw new InvalidOperationException(
+                        "The candidate seal failure has no outcome-owner step.");
+                var verificationRetrySequence = flow.Steps
+                    .Where(step => step.Iteration == flow.Iteration)
+                    .Select(step => step.Sequence)
+                    .DefaultIfEmpty()
+                    .Max() + 10;
+                var restorationEpochPersisted = false;
+                var restoredMissingScaffold =
+                    await (_candidateFingerprints ??
+                       throw new InvalidOperationException(
+                           "No candidate fingerprint service is configured for finalization recovery."))
+                    .RestoreAndValidateTrustedScaffoldAsync(
+                        flow,
+                        async restorationCancellationToken =>
+                        {
+                            database.FlowEvents.Add(new FlowEvent
+                            {
+                                FlowRunId = flow.Id,
+                                FlowStepId = sealFailureStep.Id,
+                                Type =
+                                    "workspace.trusted-scaffold-restoration-started",
+                                Message =
+                                    "Manual restart recorded restoration intent before copying missing host-owned scaffold bytes."
+                            });
+                            database.FlowEvents.Add(new FlowEvent
+                            {
+                                FlowRunId = flow.Id,
+                                FlowStepId = sealFailureStep.Id,
+                                Type =
+                                    DeliveryReadinessService.EvidenceEpochEventType,
+                                Message =
+                                    "Started a new evidence epoch before trusted scaffold bytes can change during candidate-seal recovery.",
+                                DataJson =
+                                    DeliveryReadinessService.SerializeEvidenceEpoch(
+                                        new DeliveryEvidenceEpoch(
+                                            flow.Iteration,
+                                            sealFailureStep.Id,
+                                            verificationRetrySequence))
+                            });
+                            await database.SaveChangesAsync(
+                                restorationCancellationToken);
+                            restorationEpochPersisted = true;
+                        },
+                        cancellationToken);
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = sealFailureStep.Id,
+                    Type = restoredMissingScaffold
+                        ? "workspace.trusted-scaffold-restored"
+                        : "workspace.trusted-scaffold-validated",
+                    Message = restoredMissingScaffold
+                        ? "Manual restart restored missing host-owned scaffold bytes and revalidated the exact root path set."
+                        : "Manual restart revalidated the exact host-owned scaffold path set without restoring bytes."
+                });
+                if (!restorationEpochPersisted)
+                {
+                    database.FlowEvents.Add(new FlowEvent
+                    {
+                        FlowRunId = flow.Id,
+                        FlowStepId = sealFailureStep.Id,
+                        Type = DeliveryReadinessService.EvidenceEpochEventType,
+                        Message =
+                            "Started a new evidence epoch for candidate-seal recovery.",
+                        DataJson =
+                            DeliveryReadinessService.SerializeEvidenceEpoch(
+                                new DeliveryEvidenceEpoch(
+                                    flow.Iteration,
+                                    sealFailureStep.Id,
+                                    verificationRetrySequence))
+                    });
+                }
+                var permissionSource =
+                    await ResolveTaskPermissionSourceAsync(
+                        database,
+                        sealFailureStep,
+                        cancellationToken);
+                var verificationRetry = new FlowStep
+                {
+                    FlowRunId = flow.Id,
+                    Iteration = flow.Iteration,
+                    Sequence = verificationRetrySequence,
+                    AgentId = permissionSource.AgentId,
+                    AgentName = permissionSource.AgentName,
+                    AgentRole = permissionSource.AgentRole,
+                    Label =
+                        $"Reverify restored candidate with {permissionSource.AgentName}",
+                    PlanStepKey = permissionSource.PlanStepKey,
+                    PlanDutiesJson = permissionSource.PlanDutiesJson,
+                    PlanStage = permissionSource.PlanStage,
+                    InvocationKind = permissionSource.InvocationKind,
+                    IsOutcomeOwner = true,
+                    PermissionProfile = permissionSource.PermissionProfile,
+                    EffectivePermissionJson =
+                        permissionSource.EffectivePermissionJson,
+                    WorkflowRevision = permissionSource.WorkflowRevision,
+                    Status = StepStatus.Pending,
+                    Phase = AgentRunPhase.PreparingWorkspace,
+                    Attempt = flow.Steps
+                        .Where(step =>
+                            step.Iteration == flow.Iteration &&
+                            step.AgentId == permissionSource.AgentId)
+                        .Select(step => step.Attempt)
+                        .DefaultIfEmpty()
+                        .Max() + 1,
+                    InputSummary =
+                        $"{permissionSource.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+                        "Host finalization restored missing trusted scaffold bytes before this attempt. " +
+                        "Run the complete substantive verification again against the current workspace " +
+                        "and return a fresh outcome and QA contract; prior evidence does not authorize review.",
+                    RetryOfStepId = GetRetryRootId(permissionSource),
+                    DependsOnStepId = permissionSource.DependsOnStepId,
+                    StableSemanticRootId =
+                        GetStableSemanticRootId(permissionSource),
+                    RemotePublicationAllowed = false
+                };
+                PreserveOrTightenRetryPermission(
+                    flow,
+                    permissionSource,
+                    verificationRetry);
+                flow.Steps.Add(verificationRetry);
+                database.Entry(verificationRetry).State =
+                    EntityState.Added;
+                var sourceProfile = await database.TaskProfiles
+                    .AsNoTracking()
+                    .SingleAsync(
+                        item =>
+                            item.FlowStepId == permissionSource.Id,
+                        cancellationToken);
+                database.TaskProfiles.Add(
+                    TaskProfileRules.CopyForStep(
+                        sourceProfile,
+                        verificationRetry.Id));
+                foreach (var dependent in flow.Steps.Where(step =>
+                             (step.Status is StepStatus.Pending or
+                                 StepStatus.Skipped) &&
+                             (step.DependsOnStepId == sealFailureStep.Id ||
+                              step.DependsOnStepId == permissionSource.Id)))
+                {
+                    dependent.DependsOnStepId =
+                        verificationRetry.Id;
+                    if (dependent.Status == StepStatus.Skipped)
+                    {
+                        ResetSkippedStep(dependent);
+                    }
+                }
+                _lifecycle.Transition(flow, FlowStatus.Queued);
+                flow.FailureReason = string.Empty;
+                flow.CompletedAt = null;
+                flow.OutcomeUrl = string.Empty;
+                flow.OutcomeLabel = string.Empty;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = verificationRetry.Id,
+                    Type = "delivery.review-candidate-reverification-queued",
+                    Message =
+                        "Candidate seal recovery queued a fresh substantive verification after restoring trusted scaffold bytes."
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                return flow;
+            }
             if (finalizationStep is not null &&
+                !retryingCandidateSeal &&
                 (failedStep is null || failedStep.Id == finalizationStep.Id))
             {
                 finalizationStep.Status = StepStatus.Completed;
@@ -5801,7 +6136,8 @@ public sealed class WorkflowEngine(
                 }
             }
 
-            if (isVerification &&
+            if (!retryingCandidateSeal &&
+                isVerification &&
                 snapshot is
                 {
                     State: CopilotSessionJournalState.Completed,
@@ -6091,15 +6427,52 @@ public sealed class WorkflowEngine(
                 Message =
                     $"Manual restart requested after {failedStep.AgentName} failed: {failureReason}"
             });
-            database.FlowEvents.Add(new FlowEvent
+            var retryBindings = await database.FlowEvents
+                .Where(item =>
+                    item.FlowRunId == flow.Id &&
+                    item.FlowStepId == retryStep.Id &&
+                    item.Type == "step.manual-retry-scheduled")
+                .ToListAsync(cancellationToken);
+            foreach (var retryBinding in retryBindings)
             {
-                FlowRunId = flow.Id,
-                FlowStepId = retryStep.Id,
-                Type = "step.manual-retry-scheduled",
-                Message = canResume
-                    ? $"{failedStep.AgentName} will resume Copilot session {snapshot!.SessionId:D}."
-                    : $"{failedStep.AgentName} will continue in a new Copilot session using the preserved workspace."
-            });
+                if (string.IsNullOrWhiteSpace(retryBinding.DataJson))
+                {
+                    retryBinding.DataJson = JsonSerializer.Serialize(new
+                    {
+                        SourceStepId = failedStep.Id,
+                        RetryStepId = retryStep.Id
+                    });
+                    continue;
+                }
+                using var document = JsonDocument.Parse(
+                    retryBinding.DataJson);
+                if (!document.RootElement.TryGetProperty(
+                        "SourceStepId",
+                        out var sourceValue) ||
+                    !sourceValue.TryGetGuid(out var sourceId) ||
+                    sourceId != failedStep.Id)
+                {
+                    throw new InvalidOperationException(
+                        "The reusable manual retry is bound to a different failed source step.");
+                }
+            }
+            if (retryBindings.Count == 0)
+            {
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = retryStep.Id,
+                    Type = "step.manual-retry-scheduled",
+                    Message = canResume
+                        ? $"{failedStep.AgentName} will resume Copilot session {snapshot!.SessionId:D}."
+                        : $"{failedStep.AgentName} will continue in a new Copilot session using the preserved workspace.",
+                    DataJson = JsonSerializer.Serialize(new
+                    {
+                        SourceStepId = failedStep.Id,
+                        RetryStepId = retryStep.Id
+                    })
+                });
+            }
             if (permissionTightened)
             {
                 database.FlowEvents.Add(new FlowEvent
@@ -7441,7 +7814,7 @@ public sealed class WorkflowEngine(
         safeReviewOutput;
     }
 
-    private static IReadOnlySet<PlanDuty> ReadPlanDuties(string json)
+    internal static IReadOnlySet<PlanDuty> ReadPlanDuties(string json)
     {
         try
         {
@@ -8304,6 +8677,57 @@ public sealed class WorkflowEngine(
         {
             return null;
         }
+        if (_candidateFingerprints is not null &&
+            !await IsResponseCorrectionAttemptAsync(
+                database,
+                step,
+                cancellationToken))
+        {
+            var restoredMissingScaffold =
+                await _candidateFingerprints
+                .RestoreAndValidateTrustedScaffoldAsync(
+                    flow,
+                    async restorationCancellationToken =>
+                    {
+                        database.FlowEvents.Add(new FlowEvent
+                        {
+                            FlowRunId = flow.Id,
+                            FlowStepId = step.Id,
+                            Type =
+                                "workspace.trusted-scaffold-restoration-started",
+                            Message =
+                                "Restoration intent recorded before copying missing host-owned scaffold bytes for substantive verification."
+                        });
+                        database.FlowEvents.Add(new FlowEvent
+                        {
+                            FlowRunId = flow.Id,
+                            FlowStepId = step.Id,
+                            Type = DeliveryReadinessService.EvidenceEpochEventType,
+                            Message =
+                                "Started a new evidence epoch before trusted scaffold bytes can change for substantive verification.",
+                            DataJson =
+                                DeliveryReadinessService.SerializeEvidenceEpoch(
+                                    new DeliveryEvidenceEpoch(
+                                        flow.Iteration,
+                                        step.Id,
+                                        step.Sequence))
+                        });
+                        await database.SaveChangesAsync(
+                            restorationCancellationToken);
+                    },
+                    cancellationToken);
+            if (restoredMissingScaffold)
+            {
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = step.Id,
+                    Type = "workspace.trusted-scaffold-restored",
+                    Message =
+                        "Restored and validated missing host-owned scaffold bytes before substantive verification."
+                });
+            }
+        }
         var completedSteps = await database.FlowSteps
             .AsNoTracking()
             .Where(item =>
@@ -8344,7 +8768,8 @@ public sealed class WorkflowEngine(
             .Where(item =>
                 item.FlowRunId == flow.Id &&
                 (item.Type == DeliveryReadinessService.AcceptancePlanEventType ||
-                 item.Type == DeliveryReadinessService.EvidenceEventType))
+                 item.Type == DeliveryReadinessService.EvidenceEventType ||
+                 item.Type == DeliveryReadinessService.EvidenceEpochEventType))
             .ToListAsync(cancellationToken);
         var (plan, planHash, planErrors) =
             DeliveryReadinessService.TryReadAcceptancePlan(events, flow.Iteration);

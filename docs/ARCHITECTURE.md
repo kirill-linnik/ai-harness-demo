@@ -209,9 +209,12 @@ and final approval re-read the current readiness and candidate binding. A stale 
 changed candidate fails closed.
 
 For browser-visible work, `.customer-preview\<variant>` is part of the sealed candidate and is
-served only after length and digest checks. Its reviewed representation is network-disabled. A
-separately requested loopback live demo is convenience only and contributes no readiness evidence
-or publication authority.
+served only after length and digest checks. The directory must be at the flow workspace root rather
+than inside a registered repository. Candidate sealing fails when a required preview is missing or
+when a `customer-demo.json` has an invalid artifact ID, launch policy, working directory, host
+binding, port placeholder, health path, or startup timeout. Its reviewed representation is
+network-disabled. A separately requested loopback live demo is convenience only and contributes no
+readiness evidence or publication authority.
 
 Before sealing, the active Delivery verifier receives an absolute verification-preview metadata
 URL on Studio's actual listening address. Its unreviewed artifact views share the customer-preview
@@ -268,6 +271,26 @@ correction event remain visible. QA correction starts a fresh CLI context using 
 response and evidence, rather than resuming an already bloated conversation. Its own interrupted
 attempt still resumes exactly. An interrupted completed QA session follows this same bounded
 path during restart reconciliation.
+
+Shell-driven browser automation is recorded as `Command`, Playwright test-runner invocations as
+`Test`, and successful host image views as `Observation`. Browser-visible acceptance criteria
+therefore permit `Observation`, `Command`, `SourceInspection`, and `Test`; this keeps the hashed plan
+aligned with the host's evidence types without inferring observations from arbitrary source text. A
+blocked same-iteration continuation preserves the latest substantive verification permission
+ceiling, intersects it with the current workflow ceiling, and can run a fresh browser check without
+inheriting a response-correction turn's temporary read-only policy. Because that continuation may
+write candidate bytes, it starts a new evidence epoch and cannot cite observations from before the
+continuation.
+
+Before the final verification turn, and again during same-iteration finalization recovery, Studio
+restores only missing host-owned scaffold files from the trusted source. Candidate sealing itself
+never mutates the verified workspace. Changed scaffold bytes and unexpected root files still fail
+closed. Before copying any missing bytes, Studio durably starts a new evidence epoch; interrupted
+restoration therefore cannot make pre-restoration evidence eligible after restart. Flow abandonment
+deletes known Copilot sessions by deterministic ID and uses lightweight workspace metadata for
+fallback discovery. An active fallback match is checked against the complete journal, process start
+window, and exact CLI session argument; Linux process arguments retain their native boundaries so
+prompt text cannot impersonate `--session-id` or `--resume`.
 
 Pre-mortem response envelopes receive the same bounded, read-only format correction rather than
 failing an otherwise completed investigation. Their correction uses a distinct persisted CLI

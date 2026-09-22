@@ -124,6 +124,50 @@ public sealed class AgentCatalogTests
         Assert.Equal(60, manifest.SortOrder);
         Assert.Contains("Produce working code", manifest.Instructions);
     }
+
+    [Fact]
+    public void BrowserDeliveryAgents_RequireMobileOverflowProofBeforeHandoff()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null &&
+               !File.Exists(Path.Combine(root.FullName, "AiHarnessDemo.slnx")))
+        {
+            root = root.Parent;
+        }
+
+        Assert.NotNull(root);
+        var agents = Path.Combine(root!.FullName, ".github", "agents");
+        var teamLead = AgentCatalogLoader.Parse(
+            "team-lead",
+            "team-lead.agent.md",
+            File.ReadAllText(Path.Combine(agents, "team-lead.agent.md")));
+        var engineer = AgentCatalogLoader.Parse(
+            "software-engineer",
+            "software-engineer.agent.md",
+            File.ReadAllText(Path.Combine(agents, "software-engineer.agent.md")));
+
+        Assert.Contains("390px mobile", teamLead.Instructions);
+        Assert.Contains("scrollWidth", teamLead.Instructions);
+        Assert.Contains("390px mobile", engineer.Instructions);
+        Assert.Contains("scrollWidth", engineer.Instructions);
+        Assert.Contains("host-owned scaffold", engineer.Instructions);
+        Assert.Contains("*_conf.json", engineer.Instructions);
+        Assert.Contains(
+            "workspace root with its initial scaffold",
+            teamLead.Instructions);
+        Assert.Contains(
+            "Never checkpoint the final outcome owner",
+            teamLead.Instructions);
+        Assert.Contains(
+            "`Observation`, `Command`, `SourceInspection`, and `Test`",
+            teamLead.Instructions);
+        Assert.Contains(
+            "production-visible",
+            engineer.Instructions);
+        Assert.Contains(
+            "including skip links",
+            engineer.Instructions);
+    }
 }
 
 public sealed class PreviewArtifactCatalogTests

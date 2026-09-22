@@ -105,7 +105,7 @@ public sealed class CandidateFingerprintService(
                 "The candidate requires its Release Engineer step ID.");
         }
 
-        var trustedScaffoldFiles = await ValidateNonRepositoryFilesAsync(
+        var (trustedScaffoldFiles, _) = await ValidateNonRepositoryFilesAsync(
             flow,
             workspaceContext.Workspace,
             workspaceContext.Repositories,
@@ -440,6 +440,23 @@ public sealed class CandidateFingerprintService(
         }
 
         return new LocalCandidateSealResult(repositories);
+    }
+
+    internal async Task<bool> RestoreAndValidateTrustedScaffoldAsync(
+        FlowRun flow,
+        Func<CancellationToken, Task> beforeRestore,
+        CancellationToken cancellationToken = default)
+    {
+        var workspaceContext = ResolveWorkspaceContext(flow);
+        var (_, restoredMissingFiles) =
+            await ValidateNonRepositoryFilesAsync(
+            flow,
+            workspaceContext.Workspace,
+            workspaceContext.Repositories,
+            cancellationToken,
+            restoreMissingTrustedFiles: true,
+            beforeRestore);
+        return restoredMissingFiles;
     }
 
     private async Task<bool> RecoverPendingSealAsync(
@@ -1673,12 +1690,16 @@ public sealed class CandidateFingerprintService(
         }
     }
 
-    private static async Task<IReadOnlyList<CandidateScaffoldFile>>
+    private static async Task<(
+        IReadOnlyList<CandidateScaffoldFile> Files,
+        bool RestoredMissingFiles)>
         ValidateNonRepositoryFilesAsync(
         FlowRun flow,
         string workspace,
         IReadOnlyCollection<string> workspaceRepositories,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool restoreMissingTrustedFiles = false,
+        Func<CancellationToken, Task>? beforeRestore = null)
     {
         var workspaceFiles = EnumerateNonRepositoryFiles(
             workspace,
@@ -1694,7 +1715,7 @@ public sealed class CandidateFingerprintService(
                     "Candidate workspace contains product files outside every Git repository: " +
                     string.Join(", ", workspaceFiles.Keys.Order(StringComparer.Ordinal).Take(5)));
             }
-            return [];
+            return ([], false);
         }
         if (!Directory.Exists(sourceRoot))
         {
@@ -1725,6 +1746,84 @@ public sealed class CandidateFingerprintService(
         var sourcePaths = sourceFiles.Keys
             .Order(StringComparer.Ordinal)
             .ToArray();
+        var restoredMissingFiles = false;
+        if (restoreMissingTrustedFiles)
+        {
+            var unexpectedWorkspaceFiles = workspacePaths
+                .Except(sourcePaths, StringComparer.Ordinal)
+                .Take(5)
+                .ToArray();
+            if (unexpectedWorkspaceFiles.Length > 0)
+            {
+                throw new CandidateValidationException(
+                    "Candidate changed the exact trusted project scaffold path set: " +
+                    string.Join(", ", unexpectedWorkspaceFiles));
+            }
+            foreach (var relativePath in workspacePaths)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var workspaceFile = workspaceFiles[relativePath];
+                var sourceFile = sourceFiles[relativePath];
+                if (new FileInfo(workspaceFile).Length !=
+                        new FileInfo(sourceFile).Length ||
+                    !string.Equals(
+                        await HashFileAsync(
+                            workspaceFile,
+                            cancellationToken),
+                        await HashFileAsync(
+                            sourceFile,
+                            cancellationToken),
+                        StringComparison.Ordinal))
+                {
+                    throw new CandidateValidationException(
+                        $"Candidate changed an untracked project scaffold file: {relativePath}");
+                }
+            }
+            var missingTrustedFiles = sourcePaths
+                .Except(workspacePaths, StringComparer.Ordinal)
+                .ToArray();
+            restoredMissingFiles = missingTrustedFiles.Length > 0;
+            if (restoredMissingFiles)
+            {
+                var persistRestorationIntent =
+                    beforeRestore ??
+                    throw new InvalidOperationException(
+                        "Trusted scaffold restoration requires a durable pre-restoration callback.");
+                await persistRestorationIntent(cancellationToken);
+            }
+            foreach (var relativePath in missingTrustedFiles)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var destination = Path.GetFullPath(
+                    Path.Combine(
+                        workspace,
+                        relativePath.Replace(
+                            '/',
+                            Path.DirectorySeparatorChar)));
+                var workspacePrefix =
+                    Path.TrimEndingDirectorySeparator(workspace) +
+                    Path.DirectorySeparatorChar;
+                if (!destination.StartsWith(
+                        workspacePrefix,
+                        OperatingSystem.IsWindows()
+                            ? StringComparison.OrdinalIgnoreCase
+                            : StringComparison.Ordinal))
+                {
+                    throw new CandidateValidationException(
+                        $"Trusted scaffold path escapes the candidate workspace: {relativePath}");
+                }
+                Directory.CreateDirectory(
+                    Path.GetDirectoryName(destination)!);
+                File.Copy(sourceFiles[relativePath], destination);
+            }
+            workspaceFiles = EnumerateNonRepositoryFiles(
+                workspace,
+                workspaceRepositories,
+                applyWorkspaceCopyExclusions: false);
+            workspacePaths = workspaceFiles.Keys
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+        }
         if (!workspacePaths.SequenceEqual(sourcePaths, StringComparer.Ordinal))
         {
             var mismatch = workspacePaths
@@ -1764,7 +1863,7 @@ public sealed class CandidateFingerprintService(
                 sourceInfo.Length,
                 "sha256:" + sourceDigest.ToLowerInvariant()));
         }
-        return trustedFiles;
+        return (trustedFiles, restoredMissingFiles);
     }
 
     private static IReadOnlyDictionary<string, string> EnumerateNonRepositoryFiles(
@@ -2531,16 +2630,83 @@ public sealed class CandidateFingerprintService(
                 throw new CandidateValidationException(
                     $"Candidate preview exceeds the {MaximumPreviewBytes}-byte limit.");
             }
+            var relativePath = NormalizeRelativePath(workspace, file);
+            if (string.Equals(
+                    Path.GetFileName(file),
+                    SealedDemoManifestService.ManifestFileName,
+                    StringComparison.Ordinal))
+            {
+                await ValidateDemoManifestAsync(
+                    workspace,
+                    file,
+                    relativePath,
+                    cancellationToken);
+            }
             await using var stream = File.OpenRead(file);
             var digest = Convert.ToHexString(
                 await SHA256.HashDataAsync(stream, cancellationToken))
                 .ToLowerInvariant();
             entries.Add(new CandidatePreviewArtifact(
-                NormalizeRelativePath(workspace, file),
+                relativePath,
                 info.Length,
                 $"sha256:{digest}"));
         }
         return entries;
+    }
+
+    private static async Task ValidateDemoManifestAsync(
+        string workspace,
+        string manifestPath,
+        string relativePath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var segments = relativePath.Split(
+                '/',
+                StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length != 3 ||
+                !string.Equals(
+                    segments[0],
+                    ".customer-preview",
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    segments[2],
+                    SealedDemoManifestService.ManifestFileName,
+                    StringComparison.Ordinal))
+            {
+                throw new CustomerDemoContractException(
+                    "customer-demo.json must be directly under .customer-preview\\<variant>.");
+            }
+
+            var manifest = CustomerDemoManifestParser.Parse(
+                await File.ReadAllBytesAsync(
+                    manifestPath,
+                    cancellationToken));
+            if (!string.Equals(
+                    manifest.ArtifactId,
+                    segments[1],
+                    StringComparison.Ordinal))
+            {
+                throw new CustomerDemoContractException(
+                    "ArtifactId must exactly match its preview variant directory.");
+            }
+            var workingDirectory =
+                CustomerDemoManifestParser.ResolveWorkingDirectory(
+                    manifest,
+                    workspace);
+            _ = CustomerDemoLaunchPolicy.Resolve(
+                manifest.LaunchProfile);
+            CustomerDemoLaunchPolicy.ValidateResolvedArguments(
+                manifest.LaunchProfile,
+                manifest.Arguments,
+                workingDirectory);
+        }
+        catch (CustomerDemoContractException exception)
+        {
+            throw new CandidateValidationException(
+                $"Candidate demo manifest '{relativePath}' is invalid: {exception.Message}");
+        }
     }
 
     private static IReadOnlyList<string> EnumeratePreviewFiles(string previewRoot)

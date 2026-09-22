@@ -55,6 +55,11 @@ public sealed record DeliveryEvidenceLedgerEntry(
     string Role,
     IReadOnlyList<DeliveryEvidenceItem> Items);
 
+internal sealed record DeliveryEvidenceEpoch(
+    int Iteration,
+    Guid StepId,
+    int MinimumSequence);
+
 /// <summary>
 /// Derives, persists, and re-reads the host-owned Delivery readiness assessment. The service owns
 /// the only path that may bind a readiness snapshot to a sealed candidate, so review, waiver,
@@ -64,6 +69,8 @@ public sealed class DeliveryReadinessService
 {
     public const string AcceptancePlanEventType = "delivery.acceptance-plan-recorded";
     public const string EvidenceEventType = "delivery.readiness-evidence-recorded";
+    public const string EvidenceEpochEventType =
+        "delivery.readiness-evidence-epoch-started";
     public const string QaEventType = "delivery.readiness-qa-recorded";
     public const string DerivedEventType = "delivery.readiness-derived";
     public const string SupersededEventType = "delivery.readiness-superseded";
@@ -81,12 +88,11 @@ public sealed class DeliveryReadinessService
         }
     };
     private static readonly Regex TestCommandPattern = new(
-        @"(?im)(?:^|[;&|]\s*)(?:dotnet\s+test\b|node\s+--test\b|npm\s+(?:run\s+)?test(?:\s|$)|pnpm\s+(?:run\s+)?test(?:\s|$)|yarn\s+(?:run\s+)?test(?:\s|$)|pytest\b|(?:npx\s+)?(?:vitest|jest)\b|(?:npx\s+)?playwright\s+test\b)",
+        @"(?im)(?:^|[;&|]\s*)(?:dotnet\s+test\b|node\s+--test\b|npm\s+(?:run\s+)?test(?:\s|$)|pnpm\s+(?:run\s+)?test(?:\s|$)|yarn\s+(?:run\s+)?test(?:\s|$)|pytest\b|(?:npx\s+)?(?:vitest|jest)\b|(?:(?:npx|npm\s+exec(?:\s+--)?|pnpm(?:\s+exec)?|yarn(?:\s+dlx)?)\s+)?playwright\s+test\b)",
         RegexOptions.CultureInvariant);
     private static readonly Regex SourceInspectionCommandPattern = new(
         @"(?im)(?:^|[;&|]\s*)(?:git\s+(?:--no-pager\s+)?(?:diff|show|status|log)\b|Get-Content\b|Select-String\b|rg\b)",
         RegexOptions.CultureInvariant);
-
     public static bool AppliesTo(FlowRun flow) =>
         flow.Kind == FlowKind.Delivery;
 
@@ -241,6 +247,10 @@ public sealed class DeliveryReadinessService
     public static string SerializeEvidence(DeliveryEvidenceLedgerEntry entry) =>
         JsonSerializer.Serialize(entry, LedgerOptions);
 
+    internal static string SerializeEvidenceEpoch(
+        DeliveryEvidenceEpoch epoch) =>
+        JsonSerializer.Serialize(epoch, LedgerOptions);
+
     internal static string SerializeEvidenceDocument(
         IReadOnlyList<DeliveryEvidenceItem> evidence) =>
         string.Join(
@@ -261,15 +271,28 @@ public sealed class DeliveryReadinessService
     /// <summary>The complete host-owned evidence registry for one iteration.</summary>
     public static IReadOnlyList<DeliveryEvidenceItem> ReadEvidence(
         IEnumerable<FlowEvent> events,
-        int iteration) =>
-        [.. ReadLedger<DeliveryEvidenceLedgerEntry>(
-                events,
+        int iteration)
+    {
+        var materialized = events.ToList();
+        var minimumSequence =
+            ReadLedger<DeliveryEvidenceEpoch>(
+                    materialized,
+                    EvidenceEpochEventType,
+                    entry => entry.Iteration == iteration)
+                .Select(entry => entry.MinimumSequence)
+                .DefaultIfEmpty(int.MinValue)
+                .Max();
+        return [.. ReadLedger<DeliveryEvidenceLedgerEntry>(
+                materialized,
                 EvidenceEventType,
-                entry => entry.Iteration == iteration)
+                entry =>
+                    entry.Iteration == iteration &&
+                    entry.Sequence >= minimumSequence)
             .GroupBy(entry => entry.StepId)
             .Select(group => group.OrderBy(entry => entry.Items.Count).Last())
             .OrderBy(entry => entry.Sequence)
             .SelectMany(entry => entry.Items)];
+    }
 
     /// <summary>
     /// The identifiers a verification result may cite. The set is always authoritative, so an empty
@@ -299,7 +322,7 @@ public sealed class DeliveryReadinessService
                 "Shell",
                 StringComparison.OrdinalIgnoreCase))
         {
-            var command = $"{call.NormalizedCommand} {call.NormalizedArguments}";
+            var command = BuildClassificationCommand(call);
             if (TestCommandPattern.IsMatch(command))
             {
                 return OutcomeEvidenceKind.Test;
@@ -319,6 +342,20 @@ public sealed class DeliveryReadinessService
                 ? OutcomeEvidenceKind.Artifact
                 : OutcomeEvidenceKind.Observation;
     }
+
+    private static string BuildClassificationCommand(AgentToolCall call) =>
+        string.IsNullOrWhiteSpace(call.NormalizedCommand)
+            ? string.Empty
+            : IsSimpleExecutable(call.NormalizedCommand) &&
+              !string.IsNullOrWhiteSpace(call.NormalizedArguments) &&
+              call.NormalizedArguments[0] is not ('{' or '[')
+                ? $"{call.NormalizedCommand} {call.NormalizedArguments}"
+                : call.NormalizedCommand;
+
+    private static bool IsSimpleExecutable(string value) =>
+        value.All(character =>
+            !char.IsWhiteSpace(character) &&
+            character is not ';' and not '&' and not '|');
 
     private static string EvidenceId(int sequence, int index) =>
         $"EV-S{Math.Max(sequence, 0):000}-{index:000}";

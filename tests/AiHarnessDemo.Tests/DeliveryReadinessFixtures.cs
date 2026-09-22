@@ -29,7 +29,7 @@ internal static class DeliveryReadinessFixtures
         @"(?m)^- (EV-S[0-9]{3}-[0-9]{3}) \[[^\]]*supportsVerification=true",
         RegexOptions.CultureInvariant);
     private static readonly Regex CurrentEvidencePrefixPattern = new(
-        @"(?m)^Current verification step evidence prefix: (EV-S[0-9]{3}-)$",
+        @"(?m)^Current verification step evidence prefix: (EV-S[0-9]{3}-)\r?$",
         RegexOptions.CultureInvariant);
 
     public static IReadOnlyList<DeliveryAcceptanceCriterion> Criteria(
@@ -84,6 +84,15 @@ internal static class DeliveryReadinessFixtures
         return currentPrefix.Success
             ? [$"{currentPrefix.Groups[1].Value}001"]
             : [];
+    }
+
+    public static string CurrentEvidenceIdFromPrompt(string? prompt)
+    {
+        var currentPrefix = CurrentEvidencePrefixPattern.Match(
+            prompt ?? string.Empty);
+        return currentPrefix.Success
+            ? $"{currentPrefix.Groups[1].Value}001"
+            : "EV-MISSING";
     }
 
     /// <summary>

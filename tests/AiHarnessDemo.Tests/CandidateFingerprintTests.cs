@@ -148,6 +148,45 @@ public sealed class CandidateFingerprintTests
     }
 
     [Fact]
+    public async Task ReviewedCandidate_RequiresWorkspaceRootPreviewForObservableDelivery()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var flow = workspace.Flow;
+        ConfigureReviewedFlow(flow);
+        RecordCustomerObservableAcceptancePlan(flow);
+        var service = new ReviewedCandidateService(
+            new CandidateFingerprintService(
+                new ProcessRunner(),
+                TimeProvider.System));
+
+        var exception = await Assert.ThrowsAsync<CandidateValidationException>(
+            () => service.SealAsync(
+                flow,
+                Guid.NewGuid(),
+                "outcome",
+                flow.OutcomeContractJson));
+        Assert.Contains(".customer-preview", exception.Message);
+
+        var preview = Path.Combine(
+            workspace.Root,
+            ".customer-preview",
+            "eu");
+        Directory.CreateDirectory(preview);
+        await File.WriteAllTextAsync(
+            Path.Combine(preview, "index.html"),
+            "<h1>Reviewed delivery</h1>");
+
+        var identity = await service.SealAsync(
+            flow,
+            Guid.NewGuid(),
+            "outcome",
+            flow.OutcomeContractJson);
+
+        Assert.Equal(1, identity.PreviewFileCount);
+        Assert.True(identity.PreviewTotalBytes > 0);
+    }
+
+    [Fact]
     public async Task Fingerprint_IsDeterministicAndOrdersMultipleRepositories()
     {
         using var workspace = CandidateWorkspace.Create(multipleRepositories: true);
@@ -688,6 +727,70 @@ public sealed class CandidateFingerprintTests
     }
 
     [Fact]
+    public async Task Candidate_RejectsInvalidSealedDemoManifest()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var preview = Path.Combine(
+            workspace.Root,
+            ".customer-preview",
+            "eu");
+        Directory.CreateDirectory(preview);
+        await File.WriteAllTextAsync(
+            Path.Combine(preview, "index.html"),
+            "<h1>Preview</h1>");
+        var manifestPath =
+            Path.Combine(preview, "customer-demo.json");
+        await File.WriteAllTextAsync(
+            manifestPath,
+            """
+            {
+              "ArtifactId": "eu",
+              "LaunchProfile": "npm",
+              "WorkingDirectory": "",
+              "Arguments": ["run", "start", "--", "--host", "127.0.0.1", "--port", "{port}"],
+              "HealthPath": "/",
+              "StartupTimeoutSeconds": 120
+            }
+            """);
+        var service = new CandidateFingerprintService(
+            new ProcessRunner(),
+            TimeProvider.System);
+
+        var timeout = await Assert.ThrowsAsync<CandidateValidationException>(
+            () => service.PrepareAsync(
+                workspace.Flow,
+                Digest('a'),
+                Guid.NewGuid(),
+                requiresPreview: true));
+        Assert.Contains(
+            "StartupTimeoutSeconds must be an integer from 1 to 60",
+            timeout.Message);
+
+        await File.WriteAllTextAsync(
+            manifestPath,
+            """
+            {
+              "ArtifactId": "wrong",
+              "LaunchProfile": "npm",
+              "WorkingDirectory": "",
+              "Arguments": ["run", "start", "--", "--host", "127.0.0.1", "--port", "{port}"],
+              "HealthPath": "/",
+              "StartupTimeoutSeconds": 60
+            }
+            """);
+        var artifactId =
+            await Assert.ThrowsAsync<CandidateValidationException>(
+                () => service.PrepareAsync(
+                    workspace.Flow,
+                    Digest('a'),
+                    Guid.NewGuid(),
+                    requiresPreview: true));
+        Assert.Contains(
+            "ArtifactId must exactly match its preview variant directory",
+            artifactId.Message);
+    }
+
+    [Fact]
     public async Task Candidate_RejectsPreviewFilesThatCustomerApiCannotServe()
     {
         using var workspace = CandidateWorkspace.Create();
@@ -809,6 +912,78 @@ public sealed class CandidateFingerprintTests
                     Guid.NewGuid(),
                     requiresPreview: false));
             Assert.Contains("scaffold path set", exception.Message);
+        }
+        finally
+        {
+            ClearAndDelete(root);
+        }
+    }
+
+    [Fact]
+    public async Task ScaffoldRecovery_RestoresMissingHostOwnedFileBeforeVerification()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"cand-sc-restore-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var workspace = Path.Combine(root, "workspace");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(workspace);
+        try
+        {
+            CandidateWorkspace.InitializeRepositoryAt(
+                Path.Combine(source, "repo"));
+            CandidateWorkspace.InitializeRepositoryAt(
+                Path.Combine(workspace, "repo"));
+            var sourceScaffold =
+                Path.Combine(source, "package-lock.json");
+            var workspaceScaffold =
+                Path.Combine(workspace, "package-lock.json");
+            await File.WriteAllTextAsync(
+                sourceScaffold,
+                """{"lockfileVersion":3}""");
+            await File.WriteAllTextAsync(
+                workspaceScaffold,
+                """{"lockfileVersion":3}""");
+            var flow = MultiRepositoryFlow(source, workspace, "repo");
+            var service = new CandidateFingerprintService(
+                new ProcessRunner(),
+                TimeProvider.System);
+
+            File.Delete(workspaceScaffold);
+            await Assert.ThrowsAsync<CandidateValidationException>(
+                () => service.SealAsync(flow));
+
+            var restorationIntentRecorded = false;
+            Assert.True(
+                await service.RestoreAndValidateTrustedScaffoldAsync(
+                    flow,
+                    _ =>
+                    {
+                        Assert.False(File.Exists(workspaceScaffold));
+                        restorationIntentRecorded = true;
+                        return Task.CompletedTask;
+                    }));
+            Assert.True(restorationIntentRecorded);
+
+            Assert.Equal(
+                await File.ReadAllTextAsync(sourceScaffold),
+                await File.ReadAllTextAsync(workspaceScaffold));
+            Assert.False(
+                await service.RestoreAndValidateTrustedScaffoldAsync(
+                    flow,
+                    _ => throw new InvalidOperationException(
+                        "A no-op restoration must not persist another intent.")));
+
+            await File.WriteAllTextAsync(
+                workspaceScaffold,
+                """{"lockfileVersion":2}""");
+            var exception =
+                await Assert.ThrowsAsync<CandidateValidationException>(
+                    () => service.SealAsync(flow));
+            Assert.Contains(
+                "changed an untracked project scaffold file",
+                exception.Message);
         }
         finally
         {
@@ -1663,6 +1838,36 @@ public sealed class CandidateFingerprintTests
         flow.OutcomeContractJson =
             """{"Goal":"Ship it.","Summary":"Ready.","ImplementationDetails":["Changed tracked product bytes."],"Artifacts":[]}""";
         RecordTrustedRepositories(flow, ["."]);
+    }
+
+    private static void RecordCustomerObservableAcceptancePlan(FlowRun flow)
+    {
+        var plan = new DeliveryAcceptancePlan(
+        [
+            new DeliveryAcceptanceCriterion
+            {
+                Id = "AC-001",
+                Requirement = "The customer can inspect the delivered browser result.",
+                Verification = "Open the isolated customer preview.",
+                OwnerRoles = ["quality-engineer"],
+                EvidenceKinds =
+                [
+                    OutcomeEvidenceKind.Artifact,
+                    OutcomeEvidenceKind.Observation
+                ],
+                CustomerVisible = true
+            }
+        ]);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = DeliveryReadinessService.AcceptancePlanEventType,
+            Message = "Fixture acceptance plan.",
+            DataJson = DeliveryReadinessService.SerializeAcceptancePlan(
+                plan,
+                flow.Iteration,
+                Guid.NewGuid())
+        });
     }
 
     private static string Digest(char value) => $"sha256:{new string(value, 64)}";

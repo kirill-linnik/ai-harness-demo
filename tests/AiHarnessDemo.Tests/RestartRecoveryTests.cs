@@ -15,6 +15,71 @@ namespace AiHarnessDemo.Tests;
 public sealed class CopilotSessionJournalTests
 {
     [Fact]
+    public void ProcessOwnership_RejectsPidReuseOutsideSessionStartWindow()
+    {
+        var sessionStartedAt = DateTimeOffset.UtcNow;
+
+        Assert.True(CopilotSessionJournal.IsProcessStartOwnedBySession(
+            sessionStartedAt.AddMinutes(-1),
+            sessionStartedAt));
+        Assert.True(CopilotSessionJournal.IsProcessStartOwnedBySession(
+            sessionStartedAt.AddMinutes(1),
+            sessionStartedAt));
+        Assert.False(CopilotSessionJournal.IsProcessStartOwnedBySession(
+            sessionStartedAt.AddMinutes(-3),
+            sessionStartedAt));
+        Assert.False(CopilotSessionJournal.IsProcessStartOwnedBySession(
+            sessionStartedAt.AddMinutes(3),
+            sessionStartedAt));
+
+        var sessionId = Guid.NewGuid();
+        Assert.True(CopilotSessionJournal.CommandLineBelongsToSession(
+            $"copilot --session-id {sessionId:D}",
+            sessionId));
+        Assert.True(CopilotSessionJournal.CommandLineBelongsToSession(
+            $"copilot --resume={sessionId:D}",
+            sessionId));
+        Assert.True(CopilotSessionJournal.CommandLineBelongsToSession(
+            $"copilot --resume \"{sessionId:D}\"",
+            sessionId));
+        Assert.False(CopilotSessionJournal.CommandLineBelongsToSession(
+            $"copilot --session-id {Guid.NewGuid():D}",
+            sessionId));
+        Assert.False(CopilotSessionJournal.CommandLineBelongsToSession(
+            $"copilot -p \"inspect --resume={sessionId:D}\" --session-id {Guid.NewGuid():D}",
+            sessionId));
+        Assert.False(CopilotSessionJournal.CommandLineBelongsToSession(
+            $"copilot -p \"inspect \\\" --resume={sessionId:D} \\\" now\" --session-id {Guid.NewGuid():D}",
+            sessionId));
+        Assert.False(CopilotSessionJournal.CommandLineBelongsToSession(
+            $"copilot -p --resume={sessionId:D} --session-id {Guid.NewGuid():D}",
+            sessionId));
+        Assert.False(
+            CopilotSessionJournal.CommandLineArgumentsBelongToSession(
+                [
+                    "copilot",
+                    "--session-id",
+                    Guid.NewGuid().ToString("D"),
+                    "-p",
+                    $"inspect --resume={sessionId:D}"
+                ],
+                sessionId));
+        Assert.True(
+            CopilotSessionJournal.CommandLineArgumentsBelongToSession(
+                [
+                    "copilot",
+                    "--resume",
+                    sessionId.ToString("D"),
+                    "-p",
+                    "inspect current session"
+                ],
+                sessionId));
+        Assert.False(CopilotSessionJournal.CommandLineBelongsToSession(
+            null,
+            sessionId));
+    }
+
+    [Fact]
     public async Task InspectAsync_RecoversACompletedFinalHandoff()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
@@ -124,6 +189,61 @@ public sealed class CopilotSessionJournalTests
 
         Assert.Equal(CopilotSessionJournalState.Interrupted, snapshot.State);
         Assert.Null(snapshot.Result);
+        var binding =
+            await CopilotSessionJournal.ReadWorkspaceBindingAsync(
+                fixture.SessionDirectory,
+                requireStartedAt: true,
+                cancellationToken: CancellationToken.None);
+        Assert.Equal(fixture.WorkspacePath, binding.WorkspacePath);
+        Assert.Equal(resumedAt, binding.StartedAt);
+    }
+
+    [Fact]
+    public async Task WorkspaceBinding_FullScanOverridesYamlCreationWithLatestResume()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: true);
+        var createdAt = DateTimeOffset.UtcNow.AddHours(-1);
+        var resumedAt = DateTimeOffset.UtcNow;
+        var resumedWorkspacePath =
+            Path.Combine(fixture.Root, "resumed-workspace");
+        await File.WriteAllTextAsync(
+            Path.Combine(fixture.SessionDirectory, "workspace.yaml"),
+            $"""
+            cwd: '{fixture.WorkspacePath.Replace("'", "''")}'
+            created_at: '{createdAt:O}'
+            """);
+        await File.AppendAllTextAsync(
+            Path.Combine(fixture.SessionDirectory, "events.jsonl"),
+            Environment.NewLine +
+            RecoveryFixture.Serialize(
+                "session.resume",
+                resumedAt,
+                new
+                {
+                    sessionId = fixture.SessionId,
+                    context = new
+                    {
+                        cwd = resumedWorkspacePath
+                    }
+                }));
+
+        var lightweight =
+            await CopilotSessionJournal.ReadWorkspaceBindingAsync(
+                fixture.SessionDirectory,
+                requireStartedAt: false,
+                cancellationToken: CancellationToken.None);
+        var complete =
+            await CopilotSessionJournal.ReadWorkspaceBindingAsync(
+                fixture.SessionDirectory,
+                requireStartedAt: true,
+                cancellationToken: CancellationToken.None);
+
+        Assert.Equal(createdAt, lightweight.StartedAt);
+        Assert.Equal(fixture.WorkspacePath, lightweight.WorkspacePath);
+        Assert.Equal(resumedAt, complete.StartedAt);
+        Assert.Equal(resumedWorkspacePath, complete.WorkspacePath);
     }
 
     [Fact]
@@ -178,6 +298,42 @@ public sealed class CopilotSessionJournalTests
             [fixture.CopilotHome],
             fixture.WorkspacePath,
             [fixture.SessionId]);
+
+        Assert.Equal(1, deleted);
+        Assert.False(Directory.Exists(fixture.SessionDirectory));
+        Assert.True(Directory.Exists(unrelatedDirectory));
+    }
+
+    [Fact]
+    public async Task DeleteWorkspaceSessionsAsync_DoesNotReadUnrelatedLockedJournal()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: true,
+            persistSessionId: true);
+        var unrelatedId = Guid.NewGuid();
+        var unrelatedDirectory = Path.Combine(
+            fixture.CopilotHome,
+            "session-state",
+            unrelatedId.ToString("D"));
+        Directory.CreateDirectory(unrelatedDirectory);
+        await File.WriteAllTextAsync(
+            Path.Combine(unrelatedDirectory, "workspace.yaml"),
+            $"id: {unrelatedId:D}{Environment.NewLine}" +
+            $"cwd: {Path.Combine(fixture.Root, "unrelated")}{Environment.NewLine}");
+        var unrelatedJournal =
+            Path.Combine(unrelatedDirectory, "events.jsonl");
+        await File.WriteAllTextAsync(unrelatedJournal, "locked");
+        await using var journalLock = new FileStream(
+            unrelatedJournal,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.None);
+
+        var deleted = await new CopilotSessionJournal()
+            .DeleteWorkspaceSessionsAsync(
+                [fixture.CopilotHome],
+                fixture.WorkspacePath,
+                [fixture.SessionId]);
 
         Assert.Equal(1, deleted);
         Assert.False(Directory.Exists(fixture.SessionDirectory));
@@ -250,6 +406,194 @@ public sealed class WorkflowRestartRecoveryTests
 
         flow.OutcomeContractJson = string.Empty;
         Assert.False(WorkflowEngine.CanRetryStudioFinalization(flow));
+    }
+
+    [Fact]
+    public void CandidateSealRecovery_IsScopedToCurrentOutcomeAttempt()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Current seal recovery",
+            OriginalRequest = "Recover only the current failed seal.",
+            Iteration = 2
+        };
+        var priorOwner = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 1,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            IsOutcomeOwner = true
+        };
+        var currentOwner = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = 2,
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            IsOutcomeOwner = true
+        };
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = priorOwner.Id,
+            Type = "delivery.review-candidate-seal-failed",
+            Message = "Prior iteration seal failed."
+        });
+
+        Assert.False(
+            WorkflowEngine.IsCurrentCandidateSealFailure(
+                flow,
+                currentOwner));
+
+        var currentFailure = new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = currentOwner.Id,
+            Type = "delivery.review-candidate-seal-failed",
+            Message = "Current seal failed."
+        };
+        flow.Events.Add(currentFailure);
+        Assert.True(
+            WorkflowEngine.IsCurrentCandidateSealFailure(
+                flow,
+                currentOwner));
+
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = currentOwner.Id,
+            Type = ReviewedCandidateLedger.EventType,
+            Message = "Current candidate sealed.",
+            CreatedAt = currentFailure.CreatedAt.AddSeconds(1)
+        });
+        Assert.False(
+            WorkflowEngine.IsCurrentCandidateSealFailure(
+                flow,
+                currentOwner));
+    }
+
+    [Fact]
+    public async Task ManualRestartedCorrection_ResolvesOriginalPermissionSource()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false,
+            persistSessionId: true);
+        await using var database =
+            await fixture.DatabaseFactory.CreateDbContextAsync();
+        var flow = await database.Flows
+            .Include(item => item.Steps)
+            .Include(item => item.Events)
+            .SingleAsync();
+        var original = Assert.Single(flow.Steps);
+        original.PlanStepKey = "verify";
+        var correction = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = original.Sequence + 10,
+            AgentId = original.AgentId,
+            AgentName = original.AgentName,
+            AgentRole = original.AgentRole,
+            Label = "Correct invalid response from Software Engineer",
+            PlanStepKey = original.PlanStepKey,
+            PlanDutiesJson = original.PlanDutiesJson
+        };
+        var manualRetry = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = correction.Sequence + 10,
+            AgentId = original.AgentId,
+            AgentName = original.AgentName,
+            AgentRole = original.AgentRole,
+            Label = "Manual restart of Software Engineer",
+            PlanStepKey = original.PlanStepKey,
+            PlanDutiesJson = original.PlanDutiesJson
+        };
+        flow.Steps.AddRange([correction, manualRetry]);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = correction.Id,
+            Type = "agent.contract-correction-scheduled",
+            Message = "Correction scheduled.",
+            DataJson = JsonSerializer.Serialize(new
+            {
+                SourceStepId = original.Id,
+                CorrectionStepId = correction.Id
+            })
+        });
+        var legacyRestartedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = correction.Id,
+            Type = "flow.manual-restart",
+            Message = "Legacy correction restart requested.",
+            CreatedAt = legacyRestartedAt
+        });
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = manualRetry.Id,
+            Type = "step.manual-retry-scheduled",
+            Message = "Manual retry scheduled.",
+            DataJson = null,
+            CreatedAt = legacyRestartedAt.AddSeconds(1)
+        });
+        await database.SaveChangesAsync();
+
+        var source = await WorkflowEngine.ResolveTaskPermissionSourceAsync(
+            database,
+            manualRetry,
+            CancellationToken.None);
+
+        Assert.Equal(original.Id, source.Id);
+        Assert.True(await WorkflowEngine.IsResponseCorrectionAttemptAsync(
+            database,
+            manualRetry,
+            CancellationToken.None));
+
+        var ordinaryRetry = new FlowStep
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            Sequence = manualRetry.Sequence + 10,
+            AgentId = original.AgentId,
+            AgentName = original.AgentName,
+            AgentRole = original.AgentRole,
+            Label = "Manual restart of Software Engineer",
+            PlanStepKey = original.PlanStepKey,
+            PlanDutiesJson = original.PlanDutiesJson
+        };
+        flow.Steps.Add(ordinaryRetry);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            FlowStepId = ordinaryRetry.Id,
+            Type = "step.manual-retry-scheduled",
+            Message = "Ordinary retry scheduled.",
+            DataJson = JsonSerializer.Serialize(new
+            {
+                SourceStepId = original.Id,
+                RetryStepId = ordinaryRetry.Id
+            })
+        });
+        await database.SaveChangesAsync();
+
+        var ordinarySource =
+            await WorkflowEngine.ResolveTaskPermissionSourceAsync(
+                database,
+                ordinaryRetry,
+                CancellationToken.None);
+        Assert.Equal(ordinaryRetry.Id, ordinarySource.Id);
+        Assert.False(await WorkflowEngine.IsResponseCorrectionAttemptAsync(
+            database,
+            ordinaryRetry,
+            CancellationToken.None));
     }
 
     [Fact]
@@ -1153,13 +1497,27 @@ public sealed class WorkflowRestartRecoveryTests
             step.Label == "Manual restart of Software Engineer").Id;
         await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
         {
-            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var flow = await database.Flows
+                .Include(item => item.Steps)
+                .Include(item => item.Events)
+                .SingleAsync();
             flow.Status = FlowStatus.Failed;
             flow.FailureReason = "Setup failed before the retry ran.";
             var retry = flow.Steps.Single(step => step.Id == retryId);
             retry.Status = StepStatus.Skipped;
             retry.Phase = AgentRunPhase.Failed;
             retry.CompletedAt = DateTimeOffset.UtcNow;
+            var binding = flow.Events.Single(item =>
+                item.FlowStepId == retryId &&
+                item.Type == "step.manual-retry-scheduled");
+            binding.DataJson = null;
+            flow.Events.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = retryId,
+                Type = "step.manual-retry-scheduled",
+                Message = "Legacy duplicate retry binding."
+            });
             await database.SaveChangesAsync();
         }
 
@@ -1173,6 +1531,17 @@ public sealed class WorkflowRestartRecoveryTests
         Assert.Equal(
             StepStatus.Pending,
             secondRestart.Steps.Single(step => step.Id == retryId).Status);
+        await using var verify =
+            await fixture.DatabaseFactory.CreateDbContextAsync();
+        var canonicalBindings = await verify.FlowEvents
+            .Where(item =>
+                item.FlowStepId == retryId &&
+                item.Type == "step.manual-retry-scheduled")
+            .ToListAsync();
+        Assert.Equal(2, canonicalBindings.Count);
+        Assert.All(
+            canonicalBindings,
+            item => Assert.False(string.IsNullOrWhiteSpace(item.DataJson)));
     }
 
     [Fact]

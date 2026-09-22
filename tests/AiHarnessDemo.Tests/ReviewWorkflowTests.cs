@@ -1840,13 +1840,57 @@ public sealed class ReviewWorkflowTests
                 step.Status == StepStatus.Pending &&
                 step.IsOutcomeOwner &&
                 step.PlanStepKey == "prepare");
+        Assert.Contains(
+            flow.Events,
+            item =>
+                item.FlowStepId == continuation.Id &&
+                item.Type == DeliveryReadinessService.EvidenceEpochEventType);
+        Assert.Empty(
+            DeliveryReadinessService.ReadEvidence(
+                flow.Events,
+                flow.Iteration));
+        Assert.Contains(
+            "one bounded browser-automation command per variant and viewport",
+            continuation.InputSummary);
+        Assert.Contains(
+            "host-owned scaffold files",
+            continuation.InputSummary);
+        var continuationPermission =
+            JsonSerializer.Deserialize<EffectiveExecutionPermission>(
+                continuation.EffectivePermissionJson)!;
+        Assert.Contains("create", continuationPermission.AllowedTools);
+        Assert.Contains("edit", continuationPermission.AllowedTools);
+        Assert.Equal(
+            harness.WorkflowProvider.GetEffective().Revision,
+            continuation.WorkflowRevision);
 
         harness.Runner.QaBlockOverride = context =>
-            DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext);
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                evidenceOverride:
+                [
+                    DeliveryReadinessFixtures.CurrentEvidenceIdFromPrompt(
+                        context.OutcomeContext)
+                ]);
+        harness.Runner.VerificationToolCallsOverride = _ =>
+        [
+            new ToolCallRecord(
+                "observe",
+                "Fresh continuation verification.",
+                Succeeded: true,
+                ToolType: "Observation",
+                ResultDigest:
+                    OutcomeVerificationRules.ComputeSha256(
+                        "review-workflow-continuation-observation"),
+                ResultSummary:
+                    "The continued customer-visible behavior was observed.")
+        ];
         await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
 
         var completed = await harness.LoadFlowAsync();
-        Assert.Equal(FlowStatus.WaitingForFeedback, completed.Status);
+        Assert.True(
+            completed.Status == FlowStatus.WaitingForFeedback,
+            $"Expected customer review, got {completed.Status}: {completed.FailureReason}");
         Assert.Equal(StepStatus.Completed, completed.Steps.Single(
             step => step.Id == continuation.Id).Status);
         Assert.Equal(
