@@ -53,6 +53,7 @@ builder.Services.AddSingleton<RoutingObservationRecorder>();
 builder.Services.AddSingleton<PreviewArtifactCatalog>();
 builder.Services.AddSingleton<AdvisoryArtifactCatalog>();
 builder.Services.AddSingleton<CandidateFingerprintService>();
+builder.Services.AddSingleton<ReviewedPreviewStore>();
 builder.Services.AddSingleton<IReviewedCandidateService, ReviewedCandidateService>();
 builder.Services.AddSingleton<ISealedDemoManifestService, SealedDemoManifestService>();
 builder.Services.AddSingleton<IDemoProcessLauncher, SystemDemoProcessLauncher>();

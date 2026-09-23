@@ -52,10 +52,17 @@ public interface IReviewedCandidateService
         ReviewedCandidateIdentity identity,
         CancellationToken cancellationToken = default) =>
         VerifyAsync(flow, identity, cancellationToken);
+
+    Task<OutcomeCandidateSnapshot> MaterializePreviewAsync(
+        FlowRun flow,
+        ReviewedCandidateIdentity identity,
+        CancellationToken cancellationToken = default) =>
+        VerifyPreviewAsync(flow, identity, cancellationToken);
 }
 
 public sealed class ReviewedCandidateService(
-    CandidateFingerprintService fingerprints) : IReviewedCandidateService
+    CandidateFingerprintService fingerprints,
+    ReviewedPreviewStore? previewStore = null) : IReviewedCandidateService
 {
     private readonly ConcurrentDictionary<
         string,
@@ -118,6 +125,14 @@ public sealed class ReviewedCandidateService(
                 .ToArray(),
             snapshot.PreparedAt);
         ReviewedCandidateLedger.Validate(identity);
+        if (previewStore is not null)
+        {
+            await previewStore.PersistAsync(
+                flow,
+                identity,
+                snapshot,
+                cancellationToken);
+        }
         CachePreviewVerification(identity, snapshot);
         return identity;
     }
@@ -159,6 +174,15 @@ public sealed class ReviewedCandidateService(
             throw;
         }
     }
+
+    public Task<OutcomeCandidateSnapshot> MaterializePreviewAsync(
+        FlowRun flow,
+        ReviewedCandidateIdentity identity,
+        CancellationToken cancellationToken = default) =>
+        fingerprints.ReconstructPreviewAsync(
+            flow,
+            identity,
+            cancellationToken);
 
     public async Task<OutcomeCandidateSnapshot> VerifyAsync(
         FlowRun flow,

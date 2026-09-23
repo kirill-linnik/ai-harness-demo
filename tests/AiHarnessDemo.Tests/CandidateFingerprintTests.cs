@@ -4,14 +4,278 @@ using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Workflow;
 using AiHarnessDemo.Core.Verification;
+using AiHarnessDemo.Data;
 using AiHarnessDemo.Infrastructure;
 using AiHarnessDemo.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AiHarnessDemo.Tests;
 
 public sealed class CandidateFingerprintTests
 {
+    [Fact]
+    public async Task LegacyPreviewReconstruction_UsesSealedRepositoryIdentity()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"reviewed-preview-reconstruction-{Guid.NewGuid():N}");
+        var repository = Path.Combine(root, "repo");
+        var previewRoot = Path.Combine(
+            root,
+            ".customer-preview",
+            "eu");
+        Directory.CreateDirectory(Path.Combine(repository, ".git"));
+        Directory.CreateDirectory(previewRoot);
+        var previewPath = Path.Combine(previewRoot, "index.html");
+        var previewBytes = Encoding.UTF8.GetBytes(
+            "<h1>legacy reviewed preview</h1>");
+        await File.WriteAllBytesAsync(previewPath, previewBytes);
+        var flow = new FlowRun
+        {
+            Title = "Legacy preview",
+            OriginalRequest = "Preserve the preview.",
+            ConsolidatedRequest = "Preserve the preview.",
+            Kind = FlowKind.Delivery,
+            Status = FlowStatus.WaitingForFeedback,
+            Iteration = 1,
+            WorkspacePath = root,
+            RepositoryPath = root,
+            OutcomeOwnerPlanStepKey = "outcome",
+            OutcomeContractJson =
+                """{"Goal":"Preview","Summary":"Ready","ImplementationDetails":[],"Artifacts":[]}"""
+        };
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = StudioWorkspaceRepositoryMapLedger.EventType,
+            Message = "Trusted repository map.",
+            DataJson = StudioWorkspaceRepositoryMapLedger.Serialize(
+                StudioWorkspaceRepositoryMapLedger.Create(
+                    flow,
+                    root,
+                    [new WorkspaceRepositoryIdentity("repo", "example/repo")]))
+        });
+        var ownerStepId = Guid.NewGuid();
+        var acceptancePlanHash = OutcomeVerificationRules.ComputeSha256(
+            $"plan:{flow.Id:D}");
+        var previewDigest =
+            "sha256:" +
+            Convert.ToHexString(
+                    System.Security.Cryptography.SHA256.HashData(previewBytes))
+                .ToLowerInvariant();
+        var repositories =
+            new[]
+            {
+                new CandidateRepositoryManifest(
+                    "repo",
+                    new string('1', 40),
+                    new string('2', 40),
+                    "example/repo")
+            };
+        var previewArtifacts =
+            new[]
+            {
+                new CandidatePreviewArtifact(
+                    ".customer-preview/eu/index.html",
+                    previewBytes.LongLength,
+                    previewDigest)
+            };
+        var manifest = new CandidateManifest(
+            flow.Iteration,
+            acceptancePlanHash,
+            repositories,
+            [],
+            previewArtifacts);
+        var identity = new ReviewedCandidateIdentity(
+            flow.Id,
+            flow.Iteration,
+            ownerStepId,
+            "outcome",
+            OutcomeVerificationRules.ComputeSha256(
+                flow.OutcomeContractJson),
+            acceptancePlanHash,
+            OutcomeVerificationRules.HashCandidateManifest(manifest),
+            0,
+            0,
+            previewArtifacts.Length,
+            previewArtifacts.Sum(item => item.Length),
+            [
+                new ReviewedCandidateRepositoryIdentity(
+                    "repo",
+                    repositories[0].Head,
+                    repositories[0].Tree,
+                    repositories[0].RemoteRepository)
+            ],
+            DateTimeOffset.UtcNow);
+        var fingerprints = new CandidateFingerprintService(
+            new ProcessRunner(),
+            TimeProvider.System);
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(repository, "changed-after-review.txt"),
+                "This mutable repository byte is not served by the preview.");
+            var reconstructed = await fingerprints.ReconstructPreviewAsync(
+                flow,
+                identity);
+            Assert.Equal(identity.Fingerprint, reconstructed.Fingerprint);
+
+            await File.WriteAllTextAsync(
+                previewPath,
+                "<h1>changed preview</h1>");
+            await Assert.ThrowsAsync<CandidateValidationException>(() =>
+                fingerprints.ReconstructPreviewAsync(flow, identity));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ReviewedPreviewStore_PersistsImmutablePreviewBytes()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"reviewed-preview-store-{Guid.NewGuid():N}");
+        var previewRoot = Path.Combine(
+            root,
+            ".customer-preview",
+            "eu");
+        Directory.CreateDirectory(previewRoot);
+        var previewPath = Path.Combine(previewRoot, "index.html");
+        var content = Encoding.UTF8.GetBytes(
+            "<h1>sealed durable preview</h1>");
+        await File.WriteAllBytesAsync(previewPath, content);
+        var flow = new FlowRun
+        {
+            Title = "Durable preview",
+            OriginalRequest = "Persist the preview.",
+            ConsolidatedRequest = "Persist the preview.",
+            Kind = FlowKind.Delivery,
+            Status = FlowStatus.WaitingForFeedback,
+            Iteration = 1,
+            WorkspacePath = root,
+            RepositoryPath = root,
+            OutcomeOwnerPlanStepKey = "outcome",
+            OutcomeContractJson =
+                """{"Goal":"Preview","Summary":"Ready","ImplementationDetails":[],"Artifacts":[]}"""
+        };
+        var ownerStepId = Guid.NewGuid();
+        var outcomeHash = OutcomeVerificationRules.ComputeSha256(
+            flow.OutcomeContractJson);
+        var acceptancePlanHash = OutcomeVerificationRules.ComputeSha256(
+            $"plan:{flow.Id:D}");
+        var fingerprint = OutcomeVerificationRules.ComputeSha256(
+            $"candidate:{flow.Id:D}");
+        var digest =
+            "sha256:" +
+            Convert.ToHexString(
+                    System.Security.Cryptography.SHA256.HashData(content))
+                .ToLowerInvariant();
+        var identity = new ReviewedCandidateIdentity(
+            flow.Id,
+            flow.Iteration,
+            ownerStepId,
+            "outcome",
+            outcomeHash,
+            acceptancePlanHash,
+            fingerprint,
+            0,
+            0,
+            1,
+            content.LongLength,
+            [
+                new ReviewedCandidateRepositoryIdentity(
+                    ".",
+                    new string('1', 40),
+                    new string('2', 40),
+                    "example/repository")
+            ],
+            DateTimeOffset.UtcNow);
+        var previewArtifact = new CandidatePreviewArtifact(
+            ".customer-preview/eu/index.html",
+            content.LongLength,
+            digest);
+        var snapshot = new OutcomeCandidateSnapshot(
+            new CandidateManifest(
+                flow.Iteration,
+                acceptancePlanHash,
+                [
+                    new CandidateRepositoryManifest(
+                        ".",
+                        new string('1', 40),
+                        new string('2', 40),
+                        "example/repository")
+                ],
+                [],
+                [previewArtifact]),
+            fingerprint,
+            ownerStepId,
+            DateTimeOffset.UtcNow);
+
+        try
+        {
+            await using var connection =
+                new Microsoft.Data.Sqlite.SqliteConnection(
+                    "Data Source=:memory:");
+            await connection.OpenAsync();
+            var factory = new CandidateDbContextFactory(
+                new DbContextOptionsBuilder<HarnessDbContext>()
+                    .UseSqlite(connection)
+                    .Options);
+            await using (var database = await factory.CreateDbContextAsync())
+            {
+                await database.Database.EnsureCreatedAsync();
+                database.Flows.Add(flow);
+                await database.SaveChangesAsync();
+            }
+            var previewStore = new ReviewedPreviewStore(
+                factory,
+                TimeProvider.System);
+
+            await previewStore.PersistAsync(flow, identity, snapshot);
+            await File.WriteAllTextAsync(
+                previewPath,
+                "<h1>changed workspace preview</h1>");
+
+            await using var verification =
+                await factory.CreateDbContextAsync();
+            var stored = await verification.ReviewedPreviewArtifacts
+                .AsNoTracking()
+                .SingleAsync();
+            Assert.Equal(identity.Fingerprint, stored.CandidateFingerprint);
+            Assert.Equal(
+                "<h1>sealed durable preview</h1>",
+                Encoding.UTF8.GetString(stored.Content));
+
+            stored.Content = Encoding.UTF8.GetBytes(
+                "<h1>tampered durable preview</h1>");
+            verification.Entry(stored).State = EntityState.Modified;
+            await verification.SaveChangesAsync();
+            var durableSnapshot = new ReviewedPreviewSnapshot(
+                identity,
+                [
+                    new ReviewedPreviewArtifactMetadata(
+                        stored.RelativePath,
+                        stored.Length,
+                        stored.Digest)
+                ],
+                Materialized: true);
+            await Assert.ThrowsAsync<CandidateValidationException>(() =>
+                previewStore.ReadAsync(
+                    durableSnapshot,
+                    "eu",
+                    "index.html"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task ReviewedCandidate_SealsPersistsAndRejectsPostReviewByteChanges()
     {
@@ -2154,6 +2418,18 @@ public sealed class CandidateFingerprintTests
         {
             ClearAndDelete(Root);
         }
+
+    }
+
+    private sealed class CandidateDbContextFactory(
+        DbContextOptions<HarnessDbContext> options)
+        : IDbContextFactory<HarnessDbContext>
+    {
+        public HarnessDbContext CreateDbContext() => new(options);
+
+        public Task<HarnessDbContext> CreateDbContextAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(CreateDbContext());
     }
 
     private static void ClearAndDelete(string root)

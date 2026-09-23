@@ -208,18 +208,23 @@ A failed, blocked, missing, or malformed criterion cannot be waived. Review, wai
 and final approval re-read the current readiness and candidate binding. A stale browser request or
 changed candidate fails closed.
 
-For browser-visible work, `.customer-preview\<variant>` is part of the sealed candidate and is
-served only after length and digest checks. The directory must be at the flow workspace root rather
+For browser-visible work, `.customer-preview\<variant>` is part of the sealed candidate. During
+sealing, the host validates every preview file, copies its exact bytes into immutable
+`ReviewedPreviewArtifacts` SQLite rows, and binds each row to the flow iteration and candidate
+fingerprint. Customer requests verify only the selected stored BLOB's length and digest; they never
+rescan or serve from the mutable worktree. The directory must be at the flow workspace root rather
 than inside a registered repository. Candidate sealing fails when a required preview is missing or
 when a `customer-demo.json` has an invalid artifact ID, launch policy, working directory, host
 binding, port placeholder, health path, or startup timeout. Its reviewed representation is
 network-disabled. A separately requested loopback live demo is convenience only and contributes no
 readiness evidence or publication authority.
 
-The flow-detail projection shows **Open reviewed preview** from the current durable seal and the
-presence of its workspace-root artifact, without waiting for a full candidate re-hash after host
-restart. Following that link does not trust the projection: the preview metadata and file endpoints
-still revalidate the complete sealed candidate byte-for-byte before serving customer content.
+The flow-detail projection shows **Open reviewed preview** from the current durable seal without
+touching the workspace. Preview metadata and file endpoints authorize the active reviewed-candidate
+row, validate the persisted file set against its sealed counts and sizes, and hash the requested
+BLOB before serving it. A legacy reviewed candidate created before durable preview storage is
+reconstructed once from its sealed repository identities plus current scaffold and preview hashes;
+tracked repository contents are not rescanned. Subsequent restarts use only the stored snapshot.
 
 Before sealing, the active Delivery verifier receives an absolute verification-preview metadata
 URL on Studio's actual listening address. Its unreviewed artifact views share the customer-preview
@@ -352,16 +357,18 @@ SQLite runs in write-ahead logging mode. The durable model includes:
 
 - `Flows`, `FlowSteps`, `FlowMessages`, and append-only `FlowEvents`;
 - `FlowAgentSnapshots` and `FlowPlanDocuments`;
-- customer gates, Delivery readiness, reviewed candidates, waivers, and publication records;
+- customer gates, Delivery readiness, reviewed candidates, immutable reviewed-preview artifacts,
+  waivers, and publication records;
 - observed tool calls, task profiles, model-routing decisions, and learnings; and
 - live-demo process records.
 
 `FlowLifecycleCoordinator` serializes mutations per flow and guards status transitions. API and UI
 projections render persisted state; they do not independently authorize lifecycle changes.
 
-Startup calls `Database.EnsureCreatedAsync()`. It creates the current schema only when the database
-does not exist and does not update an existing schema. During development, stop Studio and recreate
-the database after entity-shape changes:
+Startup calls `Database.EnsureCreatedAsync()`. It creates the current schema when the database does
+not exist and performs the additive creation of `ReviewedPreviewArtifacts` for existing databases.
+Other entity-shape changes are not migrated. During development, stop Studio and recreate the
+database after other entity-shape changes:
 
 ```powershell
 Remove-Item .\data\ai-harness.db, .\data\ai-harness.db-wal, .\data\ai-harness.db-shm `

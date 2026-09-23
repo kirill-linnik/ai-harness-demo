@@ -81,6 +81,32 @@ public sealed class ReviewedCandidateRecord
 }
 
 /// <summary>
+/// One immutable file from the customer preview that was sealed for review. Preview bytes are
+/// copied into host-owned durable storage before the flow enters customer review, so serving the
+/// reviewed result never depends on the mutable flow workspace.
+/// </summary>
+public sealed class ReviewedPreviewArtifactRecord
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid FlowRunId { get; set; }
+
+    public int Iteration { get; set; }
+
+    public required string CandidateFingerprint { get; set; }
+
+    public required string RelativePath { get; set; }
+
+    public long Length { get; set; }
+
+    public required string Digest { get; set; }
+
+    public required byte[] Content { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
 /// One immutable customer waiver receipt for a single waiver-required residual risk. A waiver can
 /// never name an acceptance criterion, a failed or blocked result, or a blocking risk.
 /// </summary>

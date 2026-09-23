@@ -36,6 +36,9 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
     public DbSet<ReviewedCandidateRecord> ReviewedCandidateRecords =>
         Set<ReviewedCandidateRecord>();
 
+    public DbSet<ReviewedPreviewArtifactRecord> ReviewedPreviewArtifacts =>
+        Set<ReviewedPreviewArtifactRecord>();
+
     public DbSet<ReadinessWaiverRecord> ReadinessWaiverRecords =>
         Set<ReadinessWaiverRecord>();
 
@@ -351,6 +354,28 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
+        modelBuilder.Entity<ReviewedPreviewArtifactRecord>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.CandidateFingerprint).HasMaxLength(128);
+            entity.Property(item => item.RelativePath).HasMaxLength(1_024);
+            entity.Property(item => item.Digest).HasMaxLength(128);
+            entity.HasIndex(item => new
+            {
+                item.FlowRunId,
+                item.Iteration,
+                item.CandidateFingerprint,
+                item.RelativePath
+            })
+                .HasDatabaseName("IX_ReviewedPreviewArtifacts_Identity")
+                .IsUnique();
+            entity.HasOne<FlowRun>()
+                .WithMany()
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
         modelBuilder.Entity<ReadinessWaiverRecord>(entity =>
         {
             entity.HasKey(item => item.Id);
@@ -503,6 +528,7 @@ public static class DatabaseInitializer
         await using var database = await factory.CreateDbContextAsync();
 
         await database.Database.EnsureCreatedAsync();
+        await EnsureReviewedPreviewArtifactSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         if (!await database.Settings.AnyAsync())
@@ -520,5 +546,36 @@ public static class DatabaseInitializer
         await scope.ServiceProvider
             .GetRequiredService<AgentCatalog>()
             .LoadAsync();
+    }
+
+    private static async Task EnsureReviewedPreviewArtifactSchemaAsync(
+        HarnessDbContext database)
+    {
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE TABLE IF NOT EXISTS "ReviewedPreviewArtifacts" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_ReviewedPreviewArtifacts" PRIMARY KEY,
+                "FlowRunId" TEXT NOT NULL,
+                "Iteration" INTEGER NOT NULL,
+                "CandidateFingerprint" TEXT NOT NULL,
+                "RelativePath" TEXT NOT NULL,
+                "Length" INTEGER NOT NULL,
+                "Digest" TEXT NOT NULL,
+                "Content" BLOB NOT NULL,
+                "CreatedAt" INTEGER NOT NULL,
+                CONSTRAINT "FK_ReviewedPreviewArtifacts_Flows_FlowRunId"
+                    FOREIGN KEY ("FlowRunId") REFERENCES "Flows" ("Id") ON DELETE CASCADE
+            );
+            """);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_ReviewedPreviewArtifacts_Identity"
+            ON "ReviewedPreviewArtifacts" (
+                "FlowRunId",
+                "Iteration",
+                "CandidateFingerprint",
+                "RelativePath"
+            );
+            """);
     }
 }

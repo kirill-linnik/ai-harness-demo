@@ -146,6 +146,50 @@ public sealed partial class PreviewArtifactCatalog(
             .ToList();
     }
 
+    public IReadOnlyList<PreviewArtifact> DescribeStored(
+        Guid flowId,
+        IReadOnlyList<ReviewedPreviewArtifactMetadata> artifacts)
+    {
+        ArgumentNullException.ThrowIfNull(artifacts);
+        return artifacts
+            .Select(item => item.RelativePath.Replace('\\', '/'))
+            .Select(path => path.Split(
+                '/',
+                StringSplitOptions.RemoveEmptyEntries))
+            .Where(segments =>
+                segments.Length >= 3 &&
+                string.Equals(
+                    segments[0],
+                    ArtifactDirectoryName,
+                    StringComparison.Ordinal) &&
+                ArtifactIdPattern().IsMatch(segments[1]) &&
+                (segments.Length == 3 &&
+                 string.Equals(
+                     segments[2],
+                     "index.html",
+                     StringComparison.Ordinal) ||
+                 segments.Length == 4 &&
+                 string.Equals(
+                     segments[2],
+                     "browser",
+                     StringComparison.Ordinal) &&
+                 string.Equals(
+                     segments[3],
+                     "index.html",
+                     StringComparison.Ordinal)))
+            .Select(segments => segments[1])
+            .Distinct(StringComparer.Ordinal)
+            .Select(id => CreateArtifact(flowId, id, string.Empty))
+            .OrderBy(artifact => artifact.Id switch
+            {
+                "eu" => 0,
+                "ee" => 1,
+                _ => 2
+            })
+            .ThenBy(artifact => artifact.Id, StringComparer.Ordinal)
+            .ToList();
+    }
+
     public string ResolveFile(
         FlowRun flow,
         string artifactId,
@@ -212,13 +256,16 @@ public sealed partial class PreviewArtifactCatalog(
         string root) =>
         new(
             id,
-            id.ToLowerInvariant() switch
-            {
-                "eu" => "devclub.eu",
-                "ee" => "devclub.ee",
-                _ => id.Replace('-', ' ')
-            },
+            LabelForId(id),
             root,
             $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(id)}/index.html",
             $"/api/previews/{flowId:D}/artifacts/{Uri.EscapeDataString(id)}/view");
+
+    internal static string LabelForId(string id) =>
+        id.ToLowerInvariant() switch
+        {
+            "eu" => "devclub.eu",
+            "ee" => "devclub.ee",
+            _ => id.Replace('-', ' ')
+        };
 }

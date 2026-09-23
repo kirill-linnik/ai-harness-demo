@@ -23,10 +23,11 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
   approval, or publication.
 - **Reviewable outcomes** — customers can inspect Advisory artifacts or an immutable,
   network-disabled Delivery preview. Browser previews are sealed only from workspace-root
-  `.customer-preview\<variant>` artifacts. The flow page restores **Open reviewed preview**
-  immediately from the durable seal after restart, while the preview endpoint revalidates the
-  exact candidate bytes before serving them. An optional loopback-only live demo is available for
-  convenience but never counts as readiness evidence.
+  `.customer-preview\<variant>` artifacts. Before review opens, the host copies the verified files
+  into content-addressed SQLite records bound to the candidate fingerprint. The flow page and
+  preview endpoint serve those immutable bytes after restart without rescanning the worktree. An
+  optional loopback-only live demo is available for convenience but never counts as readiness
+  evidence.
 - **Durable orchestration** — plans, attempts, sessions, permissions, events, reviews, links,
   learnings, readiness, and publication state survive restart and remain visible in the dashboard.
 - **Bounded agent context** — working prompts stay within 32 KiB of UTF-8; complete larger
@@ -108,8 +109,9 @@ Open `http://localhost:5283`. Runtime state is stored in `data\ai-harness.db`; i
 workspaces are created under `data\worktrees`.
 
 Startup uses `Database.EnsureCreatedAsync()` to create a fresh schema when the database file is
-absent. It does not update an existing schema. After entity-shape changes, stop Studio and recreate
-the development database:
+absent. The additive reviewed-preview artifact table is created automatically for existing
+databases; other entity-shape changes are not migrated. After other shape changes, stop Studio and
+recreate the development database:
 
 ```powershell
 Remove-Item .\data\ai-harness.db, .\data\ai-harness.db-wal, .\data\ai-harness.db-shm `

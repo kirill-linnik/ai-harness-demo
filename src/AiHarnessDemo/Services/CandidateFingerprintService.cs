@@ -182,6 +182,94 @@ public sealed class CandidateFingerprintService(
             timeProvider.GetUtcNow());
     }
 
+    public async Task<OutcomeCandidateSnapshot> ReconstructPreviewAsync(
+        FlowRun flow,
+        ReviewedCandidateIdentity identity,
+        CancellationToken cancellationToken = default)
+    {
+        ReviewedCandidateLedger.ValidateForFlow(flow, identity);
+        var workspace = ValidateWorkspaceRoot(flow);
+        var repositoryMap = StudioWorkspaceRepositoryMapLedger.Read(flow);
+        var mappedRepositories = repositoryMap.Repositories
+            .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+            .ToArray();
+        var reviewedRepositories = identity.Repositories
+            .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+            .ToArray();
+        if (mappedRepositories.Length != reviewedRepositories.Length ||
+            mappedRepositories.Zip(reviewedRepositories).Any(pair =>
+                !string.Equals(
+                    pair.First.RelativePath,
+                    pair.Second.RelativePath,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    pair.First.RemoteRepository,
+                    pair.Second.RemoteRepository,
+                    StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new CandidateValidationException(
+                "The reviewed candidate repository identities no longer match the trusted workspace map.");
+        }
+
+        var workspaceRepositories = ResolveMappedRepositoryRoots(
+            workspace,
+            reviewedRepositories.Select(item => item.RelativePath),
+            "reviewed workspace");
+        var sourceRoot = Path.GetFullPath(flow.RepositoryPath);
+        var sourceRepositories = PathsEqual(sourceRoot, workspace)
+            ? workspaceRepositories
+            : ResolveMappedRepositoryRoots(
+                sourceRoot,
+                reviewedRepositories.Select(item => item.RelativePath),
+                "reviewed source project");
+        var (trustedScaffoldFiles, _) =
+            await ValidateNonRepositoryFilesAsync(
+                flow,
+                workspace,
+                workspaceRepositories,
+                cancellationToken,
+                sourceRepositoriesOverride: sourceRepositories);
+        var previewEntries = await ReadPreviewArtifactsAsync(
+            workspace,
+            cancellationToken);
+        var manifest = new CandidateManifest(
+            identity.Iteration,
+            identity.AcceptancePlanHash,
+            reviewedRepositories
+                .Select(repository => new CandidateRepositoryManifest(
+                    repository.RelativePath,
+                    repository.Head,
+                    repository.Tree,
+                    repository.RemoteRepository))
+                .ToArray(),
+            trustedScaffoldFiles,
+            previewEntries
+                .OrderBy(item => item.RelativePath, StringComparer.Ordinal)
+                .ToArray());
+        var snapshot = new OutcomeCandidateSnapshot(
+            manifest,
+            OutcomeVerificationRules.HashCandidateManifest(manifest),
+            identity.OutcomeOwnerStepId,
+            identity.SealedAt);
+        if (!string.Equals(
+                snapshot.Fingerprint,
+                identity.Fingerprint,
+                StringComparison.Ordinal) ||
+            snapshot.Manifest.TrustedScaffoldFiles.Count !=
+                identity.TrustedScaffoldFileCount ||
+            snapshot.Manifest.TrustedScaffoldFiles.Sum(item => item.Length) !=
+                identity.TrustedScaffoldTotalBytes ||
+            snapshot.Manifest.PreviewArtifacts.Count !=
+                identity.PreviewFileCount ||
+            snapshot.Manifest.PreviewArtifacts.Sum(item => item.Length) !=
+                identity.PreviewTotalBytes)
+        {
+            throw new CandidateValidationException(
+                "The available preview bytes do not match the reviewed candidate seal.");
+        }
+        return snapshot;
+    }
+
     public async Task<bool> IsCurrentAsync(
         FlowRun flow,
         OutcomeCandidateSnapshot expected,
@@ -760,6 +848,43 @@ public sealed class CandidateFingerprintService(
             workspace,
             repositories,
             trustedRepositories);
+    }
+
+    private static IReadOnlyList<string> ResolveMappedRepositoryRoots(
+        string rootPath,
+        IEnumerable<string> relativePaths,
+        string description)
+    {
+        var root = Path.GetFullPath(rootPath);
+        if (!Directory.Exists(root))
+        {
+            throw new CandidateValidationException(
+                $"The {description} root does not exist: {root}");
+        }
+        var repositories = new List<string>();
+        foreach (var relativePath in relativePaths)
+        {
+            var repository = string.Equals(
+                relativePath,
+                ".",
+                StringComparison.Ordinal)
+                ? root
+                : Path.GetFullPath(
+                    Path.Combine(
+                        root,
+                        relativePath.Replace(
+                            '/',
+                            Path.DirectorySeparatorChar)));
+            if (!IsContainedOrEqual(root, repository) ||
+                IsLink(repository) ||
+                !RepositoryAnalyzer.IsGitRepository(repository))
+            {
+                throw new CandidateValidationException(
+                    $"The {description} repository '{relativePath}' is missing, linked, or outside its root.");
+            }
+            repositories.Add(repository);
+        }
+        return repositories;
     }
 
     internal static IReadOnlyList<string> DiscoverRepositories(string workspacePath)
@@ -1699,7 +1824,8 @@ public sealed class CandidateFingerprintService(
         IReadOnlyCollection<string> workspaceRepositories,
         CancellationToken cancellationToken,
         bool restoreMissingTrustedFiles = false,
-        Func<CancellationToken, Task>? beforeRestore = null)
+        Func<CancellationToken, Task>? beforeRestore = null,
+        IReadOnlyCollection<string>? sourceRepositoriesOverride = null)
     {
         var workspaceFiles = EnumerateNonRepositoryFiles(
             workspace,
@@ -1730,11 +1856,12 @@ public sealed class CandidateFingerprintService(
             IsContainedOrEqual(sourceRoot, workspaceContainer)
                 ? Path.GetFullPath(workspaceContainer)
                 : null;
-        var sourceRepositories = DiscoverRepositories(sourceRoot)
-            .Where(repository =>
-                excludedWorkspaceRoot is null ||
-                !IsContainedOrEqual(excludedWorkspaceRoot, repository))
-            .ToArray();
+        var sourceRepositories = sourceRepositoriesOverride?.ToArray() ??
+            DiscoverRepositories(sourceRoot)
+                .Where(repository =>
+                    excludedWorkspaceRoot is null ||
+                    !IsContainedOrEqual(excludedWorkspaceRoot, repository))
+                .ToArray();
         var sourceFiles = EnumerateNonRepositoryFiles(
             sourceRoot,
             sourceRepositories,

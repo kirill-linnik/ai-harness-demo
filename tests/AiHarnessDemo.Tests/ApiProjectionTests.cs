@@ -500,10 +500,13 @@ public sealed class ApiProjectionTests
                 StringComparison.Ordinal);
 
             var reviewedContext = NewContext("/api/previews");
+            var previewStore = new ReviewedPreviewStore(
+                factory,
+                TimeProvider.System);
             await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 DemoApi.GetPreviewArtifactAsync(
                     flow.Id, "eu", "index.html", reviewedContext, factory,
-                    new PreviewArtifactCatalog(), new PreviewReviewedCandidateService(),
+                    new PreviewReviewedCandidateService(), previewStore,
                     CancellationToken.None));
             Assert.Equal(0, reviewedContext.Response.Body.Length);
             await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
@@ -613,9 +616,14 @@ public sealed class ApiProjectionTests
         {
             await database.Database.EnsureCreatedAsync();
             database.Flows.Add(flow);
+            database.ReviewedCandidateRecords.Add(
+                CreateReviewedCandidateRecord(flow));
             await database.SaveChangesAsync();
         }
         var verifier = new PreviewReviewedCandidateService();
+        var previewStore = new ReviewedPreviewStore(
+            factory,
+            TimeProvider.System);
 
         try
         {
@@ -625,6 +633,7 @@ public sealed class ApiProjectionTests
                 new PreviewArtifactCatalog(),
                 null!,
                 verifier,
+                previewStore,
                 CancellationToken.None);
             Assert.IsAssignableFrom<IValueHttpResult>(metadata);
 
@@ -640,8 +649,8 @@ public sealed class ApiProjectionTests
                 "index.html",
                 context,
                 factory,
-                new PreviewArtifactCatalog(),
                 verifier,
+                previewStore,
                 CancellationToken.None);
             await artifact.ExecuteAsync(context);
             context.Response.Body.Position = 0;
@@ -658,7 +667,64 @@ public sealed class ApiProjectionTests
                 "<h1>sealed preview</h1>",
                 body,
                 StringComparison.Ordinal);
-            Assert.Equal(2, verifier.VerifyCalls);
+            Assert.Equal(1, verifier.VerifyCalls);
+
+            await File.WriteAllTextAsync(
+                Path.Combine(browserRoot, "index.html"),
+                "<h1>workspace changed after review</h1>");
+            var restartedVerifier = new PreviewReviewedCandidateService
+            {
+                FailVerification = true
+            };
+            var restartedStore = new ReviewedPreviewStore(
+                factory,
+                TimeProvider.System);
+            _ = await DemoApi.GetPreviewAsync(
+                flow.Id,
+                factory,
+                new PreviewArtifactCatalog(),
+                null!,
+                restartedVerifier,
+                restartedStore,
+                CancellationToken.None);
+            var restartedContext = NewContext(
+                $"/api/previews/{flow.Id:D}/artifacts/eu/index.html");
+            restartedContext.RequestServices = services;
+            var restartedArtifact = await DemoApi.GetPreviewArtifactAsync(
+                flow.Id,
+                "eu",
+                "index.html",
+                restartedContext,
+                factory,
+                restartedVerifier,
+                restartedStore,
+                CancellationToken.None);
+            await restartedArtifact.ExecuteAsync(restartedContext);
+            restartedContext.Response.Body.Position = 0;
+            var restartedBody = await new StreamReader(
+                    restartedContext.Response.Body,
+                    leaveOpen: true)
+                .ReadToEndAsync();
+
+            Assert.Contains(
+                "<h1>sealed preview</h1>",
+                restartedBody,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                "workspace changed after review",
+                restartedBody,
+                StringComparison.Ordinal);
+            Assert.Equal(0, restartedVerifier.VerifyCalls);
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+                DemoApi.GetPreviewArtifactAsync(
+                    flow.Id,
+                    "eu",
+                    "../outside.html",
+                    restartedContext,
+                    factory,
+                    restartedVerifier,
+                    restartedStore,
+                    CancellationToken.None));
         }
         finally
         {
@@ -697,6 +763,9 @@ public sealed class ApiProjectionTests
             await database.SaveChangesAsync();
         }
         var verifier = new PreviewReviewedCandidateService();
+        var previewStore = new ReviewedPreviewStore(
+            factory,
+            TimeProvider.System);
         var context = NewContext(
             $"/api/previews/{flow.Id:D}/artifacts/eu/index.html");
 
@@ -709,6 +778,7 @@ public sealed class ApiProjectionTests
                     new PreviewArtifactCatalog(),
                     null!,
                     verifier,
+                    previewStore,
                     CancellationToken.None));
             await Assert.ThrowsAsync<CandidateValidationException>(() =>
                 DemoApi.GetPreviewArtifactAsync(
@@ -717,8 +787,8 @@ public sealed class ApiProjectionTests
                     "index.html",
                     context,
                     factory,
-                    new PreviewArtifactCatalog(),
                     verifier,
+                    previewStore,
                     CancellationToken.None));
             Assert.Equal(0, context.Response.Body.Length);
 
@@ -731,6 +801,8 @@ public sealed class ApiProjectionTests
                     .SingleAsync(item => item.Id == flow.Id);
                 var owner = Assert.Single(stored.Steps);
                 stored.Events.Add(CreateReviewedSeal(stored, owner));
+                database.ReviewedCandidateRecords.Add(
+                    CreateReviewedCandidateRecord(stored));
                 await database.SaveChangesAsync();
             }
             verifier.FailVerification = true;
@@ -741,6 +813,7 @@ public sealed class ApiProjectionTests
                     new PreviewArtifactCatalog(),
                     null!,
                     verifier,
+                    previewStore,
                     CancellationToken.None));
             await Assert.ThrowsAsync<CandidateValidationException>(() =>
                 DemoApi.GetPreviewArtifactAsync(
@@ -749,8 +822,8 @@ public sealed class ApiProjectionTests
                     "index.html",
                     context,
                     factory,
-                    new PreviewArtifactCatalog(),
                     verifier,
+                    previewStore,
                     CancellationToken.None));
             Assert.Equal(0, context.Response.Body.Length);
 
@@ -763,8 +836,8 @@ public sealed class ApiProjectionTests
                     "index.html",
                     context,
                     factory,
-                    new PreviewArtifactCatalog(),
                     verifier,
+                    previewStore,
                     CancellationToken.None));
             Assert.Equal(0, context.Response.Body.Length);
         }
@@ -789,35 +862,25 @@ public sealed class ApiProjectionTests
         await File.WriteAllTextAsync(
             Path.Combine(browserRoot, "index.html"),
             "<h1>reviewed preview</h1>");
-        var catalog = new PreviewArtifactCatalog();
-
         try
         {
             var reviewed = CreatePreviewFlow(root, includeSeal: true);
-            var url = DemoApi.ResolveReviewedPreviewUrl(
-                reviewed,
-                catalog);
+            var url = DemoApi.ResolveReviewedPreviewUrl(reviewed);
 
             Assert.Equal($"#/preview/{reviewed.Id:D}", url);
 
             reviewed.Status = FlowStatus.Approved;
-            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(
-                reviewed,
-                catalog));
+            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(reviewed));
 
             var missingSeal = CreatePreviewFlow(root, includeSeal: false);
-            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(
-                missingSeal,
-                catalog));
+            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(missingSeal));
 
             var missingArtifactRoot = Path.Combine(root, "missing-artifact");
             Directory.CreateDirectory(missingArtifactRoot);
             var noBrowser = CreatePreviewFlow(
                 missingArtifactRoot,
                 includeSeal: true);
-            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(
-                noBrowser,
-                catalog));
+            Assert.Null(DemoApi.ResolveReviewedPreviewUrl(noBrowser));
 
         }
         finally
@@ -844,9 +907,7 @@ public sealed class ApiProjectionTests
         try
         {
             var flow = CreatePreviewFlow(root, includeSeal: true);
-            var url = DemoApi.ResolveReviewedPreviewUrl(
-                flow,
-                new PreviewArtifactCatalog());
+            var url = DemoApi.ResolveReviewedPreviewUrl(flow);
 
             Assert.Equal($"#/preview/{flow.Id:D}", url);
         }
@@ -1013,8 +1074,19 @@ public sealed class ApiProjectionTests
 
     private static FlowEvent CreateReviewedSeal(
         FlowRun flow,
-        FlowStep owner) =>
-        new()
+        FlowStep owner)
+    {
+        var previewRoot = Path.Combine(
+            flow.WorkspacePath,
+            ".customer-preview");
+        var previewFiles = Directory.Exists(previewRoot)
+            ? Directory.EnumerateFiles(
+                    previewRoot,
+                    "*",
+                    SearchOption.AllDirectories)
+                .ToArray()
+            : [];
+        return new FlowEvent
         {
             FlowRunId = flow.Id,
             FlowStepId = owner.Id,
@@ -1034,8 +1106,8 @@ public sealed class ApiProjectionTests
                         .ComputeSha256($"candidate:{flow.Id:D}"),
                     0,
                     0,
-                    1,
-                    24,
+                    previewFiles.Length,
+                    previewFiles.Sum(path => new FileInfo(path).Length),
                     [
                         new ReviewedCandidateRepositoryIdentity(
                             ".",
@@ -1045,6 +1117,31 @@ public sealed class ApiProjectionTests
                     ],
                     DateTimeOffset.UtcNow))
         };
+    }
+
+    private static ReviewedCandidateRecord CreateReviewedCandidateRecord(
+        FlowRun flow)
+    {
+        var seal = Assert.Single(
+            flow.Events,
+            item => item.Type == ReviewedCandidateLedger.EventType);
+        var identity = ReviewedCandidateLedger.Deserialize(seal.DataJson!);
+        return new ReviewedCandidateRecord
+        {
+            FlowRunId = flow.Id,
+            Iteration = flow.Iteration,
+            CandidateFingerprint = identity.Fingerprint,
+            OutcomeOwnerStepId = identity.OutcomeOwnerStepId,
+            OutcomeContractHash = identity.OutcomeContractHash,
+            AcceptancePlanHash = identity.AcceptancePlanHash,
+            ReadinessSnapshotId = Guid.NewGuid(),
+            ReadinessContractHash =
+                AiHarnessDemo.Core.Verification.OutcomeVerificationRules
+                    .ComputeSha256($"readiness:{flow.Id:D}"),
+            IdentityJson = ReviewedCandidateLedger.Serialize(identity),
+            Active = true
+        };
+    }
 
     private sealed class PreviewReviewedCandidateService
         : IReviewedCandidateService

@@ -9,7 +9,6 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 
 namespace AiHarnessDemo.Api;
@@ -355,14 +354,11 @@ public static class DemoApi
     private static async Task<IResult> GetFlowAsync(
         Guid flowId,
         IDbContextFactory<HarnessDbContext> databaseFactory,
-        PreviewArtifactCatalog artifactCatalog,
         DeliveryReadinessService readinessService,
         CancellationToken cancellationToken)
     {
         var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
-        var reviewedPreviewUrl = ResolveReviewedPreviewUrl(
-            flow,
-            artifactCatalog);
+        var reviewedPreviewUrl = ResolveReviewedPreviewUrl(flow);
         return Results.Ok(flow.ToDetailDto(
             reviewedPreviewUrl,
             await LoadReadinessDtoAsync(
@@ -440,17 +436,12 @@ public static class DemoApi
     }
 
     /// <summary>
-    /// Projects navigation to a durably sealed reviewed preview without re-hashing the full
-    /// candidate on every flow-detail request. The preview endpoints still verify the candidate
-    /// byte-for-byte before returning metadata or content, so this link grants no readiness or
-    /// publication authority.
+    /// Projects navigation from the durable reviewed-candidate seal. Preview availability never
+    /// scans the mutable workspace; the preview endpoint serves only the host-owned sealed bytes.
     /// </summary>
-    internal static string? ResolveReviewedPreviewUrl(
-        FlowRun flow,
-        PreviewArtifactCatalog artifactCatalog)
+    internal static string? ResolveReviewedPreviewUrl(FlowRun flow)
     {
         ArgumentNullException.ThrowIfNull(flow);
-        ArgumentNullException.ThrowIfNull(artifactCatalog);
         if (flow.Kind != FlowKind.Delivery ||
             flow.Status != FlowStatus.WaitingForFeedback)
         {
@@ -473,24 +464,11 @@ public static class DemoApi
         try
         {
             var reviewed = ReviewedCandidateLedger.Read(flow);
-            return reviewed.PreviewFileCount > 0 &&
-                   artifactCatalog.Discover(flow).Count > 0
+            return reviewed.PreviewFileCount > 0
                 ? $"#/preview/{flow.Id:D}"
                 : null;
         }
         catch (CandidateValidationException)
-        {
-            return null;
-        }
-        catch (DirectoryNotFoundException)
-        {
-            return null;
-        }
-        catch (FileNotFoundException)
-        {
-            return null;
-        }
-        catch (UnauthorizedAccessException)
         {
             return null;
         }
@@ -758,25 +736,37 @@ public static class DemoApi
         PreviewArtifactCatalog artifactCatalog,
         AdvisoryArtifactCatalog advisoryArtifactCatalog,
         IReviewedCandidateService reviewedCandidateService,
+        [FromServices] ReviewedPreviewStore previewStore,
         CancellationToken cancellationToken,
         [FromServices] DeliveryReadinessService? readinessService = null,
         [FromServices] DemoRuntimeManager? demoRuntime = null)
     {
-        var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
+        var flow = await LoadPreviewFlowAsync(
+            databaseFactory,
+            flowId,
+            cancellationToken);
         if (flow.Status is not (FlowStatus.WaitingForFeedback or FlowStatus.Approved))
         {
             throw new InvalidOperationException("This flow does not have a customer preview yet.");
         }
-        var reviewedSnapshot =
-            await EnsureDeliveryPreviewCurrentAsync(
-            flow,
-            reviewedCandidateService,
-            cancellationToken);
+        var reviewedSnapshot = flow.Kind == FlowKind.Delivery
+            ? await EnsureStoredPreviewAsync(
+                flow,
+                databaseFactory,
+                reviewedCandidateService,
+                previewStore,
+                cancellationToken)
+            : null;
         var deliveredBy = flow.Steps
             .Where(item => item.Status == StepStatus.Completed)
             .OrderBy(item => item.Iteration)
             .ThenBy(item => item.Sequence)
-            .Select(item => item.ToDto())
+            .Select(item => new PreviewContributorDto(
+                item.Id,
+                item.AgentName,
+                item.Label,
+                item.Status,
+                item.DurationMilliseconds))
             .ToList();
         List<PreviewArtifactDto> artifacts;
         if (flow.Kind == FlowKind.Advisory)
@@ -814,43 +804,33 @@ public static class DemoApi
         }
         else
         {
-            var discovered = reviewedSnapshot is null
-                ? artifactCatalog.Discover(flow)
-                : artifactCatalog.DiscoverVerified(
-                    flow,
-                    reviewedSnapshot.Manifest.PreviewArtifacts);
+            var discovered = artifactCatalog.DescribeStored(
+                flow.Id,
+                reviewedSnapshot!.Artifacts);
             artifacts = [];
             foreach (var item in discovered)
             {
-                DemoRuntimeStatus status;
-                try
-                {
-                    status = demoRuntime is null
-                        ? new DemoRuntimeStatus(
-                            DemoCapability.OfflineOnly,
-                            null,
-                            DemoInstanceState.Stopped,
-                            null,
-                            null,
-                            null,
-                            null)
-                        : await demoRuntime.GetStatusAsync(
-                            flow.Id,
-                            item.Id,
-                            cancellationToken);
-                }
-                catch (CustomerDemoContractException exception)
-                {
-                    status = new DemoRuntimeStatus(
+                var demoManifest = reviewedSnapshot.Artifacts
+                    .SingleOrDefault(artifact =>
+                        string.Equals(
+                            artifact.RelativePath,
+                            $".customer-preview/{item.Id}/{SealedDemoManifestService.ManifestFileName}",
+                            StringComparison.Ordinal));
+                var status = demoRuntime is null || demoManifest is null
+                    ? new DemoRuntimeStatus(
                         DemoCapability.OfflineOnly,
                         null,
-                        DemoInstanceState.Failed,
+                        DemoInstanceState.Stopped,
                         null,
-                        "The sealed live-demo manifest is invalid: " +
-                        exception.Message,
-                        reviewedSnapshot?.Fingerprint,
-                        null);
-                }
+                        null,
+                        null,
+                        null)
+                    : await demoRuntime.GetStoredStatusAsync(
+                        flow.Id,
+                        item.Id,
+                        reviewedSnapshot.Identity.Fingerprint,
+                        demoManifest.Digest,
+                        cancellationToken);
                 artifacts.Add(new PreviewArtifactDto(
                     item.Id,
                     item.Label,
@@ -899,29 +879,45 @@ public static class DemoApi
         string? path,
         HttpContext httpContext,
         IDbContextFactory<HarnessDbContext> databaseFactory,
-        PreviewArtifactCatalog artifactCatalog,
         IReviewedCandidateService reviewedCandidateService,
+        [FromServices] ReviewedPreviewStore previewStore,
         CancellationToken cancellationToken)
     {
-        var flow = await LoadFlowAsync(databaseFactory, flowId, cancellationToken);
+        var flow = await LoadPreviewHeaderAsync(
+            databaseFactory,
+            flowId,
+            cancellationToken);
         if (flow.Status is not (FlowStatus.WaitingForFeedback or FlowStatus.Approved))
         {
             throw new InvalidOperationException(
                 "This flow does not have a customer preview yet.");
         }
-        var reviewedSnapshot =
-            await EnsureDeliveryPreviewCurrentAsync(
+        if (flow.Kind != FlowKind.Delivery)
+        {
+            throw new InvalidOperationException(
+                "Browser preview artifacts are available only for Delivery flows.");
+        }
+        var reviewedSnapshot = await EnsureStoredPreviewAsync(
             flow,
+            databaseFactory,
             reviewedCandidateService,
+            previewStore,
             cancellationToken);
-        return await ServePreviewArtifactAsync(
-            flow,
+        var file = await previewStore.ReadAsync(
+            reviewedSnapshot,
             artifactId,
             path,
-            httpContext,
-            artifactCatalog,
-            reviewedSnapshot,
             cancellationToken);
+        var contentTypes = new FileExtensionContentTypeProvider();
+        if (!contentTypes.TryGetContentType(file.RelativePath, out var contentType))
+        {
+            contentType = "application/octet-stream";
+        }
+        ApplyPreviewArtifactSecurityHeaders(httpContext.Response);
+        return Results.File(
+            ApplyPreviewSecurityLayer(file.Content, contentType),
+            contentType,
+            enableRangeProcessing: true);
     }
 
     internal static async Task<IResult> GetVerificationPreviewAsync(
@@ -973,7 +969,6 @@ public static class DemoApi
             path,
             httpContext,
             artifactCatalog,
-            reviewedSnapshot: null,
             cancellationToken);
     }
 
@@ -1003,7 +998,6 @@ public static class DemoApi
         string? path,
         HttpContext httpContext,
         PreviewArtifactCatalog artifactCatalog,
-        OutcomeCandidateSnapshot? reviewedSnapshot,
         CancellationToken cancellationToken)
     {
         var filePath = artifactCatalog.ResolveFile(flow, artifactId, path);
@@ -1013,19 +1007,6 @@ public static class DemoApi
             contentType = "application/octet-stream";
         }
         ApplyPreviewArtifactSecurityHeaders(httpContext.Response);
-        if (reviewedSnapshot is not null)
-        {
-            var bytes = await ReadVerifiedPreviewFileAsync(
-                flow,
-                filePath,
-                reviewedSnapshot,
-                cancellationToken);
-            bytes = ApplyPreviewSecurityLayer(bytes, contentType);
-            return Results.File(
-                bytes,
-                contentType,
-                enableRangeProcessing: true);
-        }
         if (contentType.StartsWith(
                 "text/html",
                 StringComparison.OrdinalIgnoreCase))
@@ -1101,65 +1082,47 @@ public static class DemoApi
         CancellationToken cancellationToken) =>
         proxy.ProxyAsync(instanceId, path, context, cancellationToken);
 
-    internal static async Task<OutcomeCandidateSnapshot?>
-        EnsureDeliveryPreviewCurrentAsync(
+    internal static async Task<ReviewedPreviewSnapshot> EnsureStoredPreviewAsync(
         FlowRun flow,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
         IReviewedCandidateService reviewedCandidateService,
+        ReviewedPreviewStore previewStore,
         CancellationToken cancellationToken)
     {
         if (flow.Kind != FlowKind.Delivery)
         {
-            return null;
+            throw new InvalidOperationException(
+                "A durable browser preview is available only for Delivery flows.");
         }
 
-        var identity = ReviewedCandidateLedger.Read(flow);
-        return await reviewedCandidateService.VerifyPreviewAsync(
+        var stored = await previewStore.LoadCurrentAsync(
             flow,
-            identity,
             cancellationToken);
-    }
-
-    private static async Task<byte[]> ReadVerifiedPreviewFileAsync(
-        FlowRun flow,
-        string filePath,
-        OutcomeCandidateSnapshot verified,
-        CancellationToken cancellationToken)
-    {
-        var workspace = Path.GetFullPath(flow.WorkspacePath);
-        CandidateFingerprintService.ValidateLinksStayInside(workspace);
-        var relativePath = Path.GetRelativePath(workspace, filePath)
-            .Replace('\\', '/');
-        var entries = verified.Manifest.PreviewArtifacts
-            .Where(item => string.Equals(
-                item.RelativePath.Replace('\\', '/'),
-                relativePath,
-                StringComparison.Ordinal))
-            .ToArray();
-        if (entries.Length != 1)
+        if (stored.Materialized)
         {
-            throw new CandidateValidationException(
-                entries.Length == 0
-                    ? "The requested preview file is not part of the reviewed candidate."
-                    : "The reviewed candidate contains duplicate preview file identities.");
+            return stored;
         }
 
-        var bytes = await File.ReadAllBytesAsync(
-            filePath,
+        var verificationFlow = await LoadPreviewVerificationFlowAsync(
+            databaseFactory,
+            flow.Id,
             cancellationToken);
-        var digest =
-            "sha256:" +
-            Convert.ToHexString(SHA256.HashData(bytes))
-                .ToLowerInvariant();
-        if (entries[0].Length != bytes.LongLength ||
-            !string.Equals(
-                entries[0].Digest,
-                digest,
-                StringComparison.Ordinal))
+        var verified = await reviewedCandidateService.MaterializePreviewAsync(
+            verificationFlow,
+            stored.Identity,
+            cancellationToken);
+        await previewStore.PersistAsync(
+            verificationFlow,
+            stored.Identity,
+            verified,
+            cancellationToken);
+        stored = await previewStore.LoadCurrentAsync(flow, cancellationToken);
+        if (!stored.Materialized)
         {
             throw new CandidateValidationException(
-                "The requested preview file changed after candidate verification.");
+                "The reviewed preview snapshot could not be materialized.");
         }
-        return bytes;
+        return stored;
     }
 
     internal static byte[] ApplyPreviewSecurityLayer(
@@ -1388,6 +1351,62 @@ public static class DemoApi
         response.Headers["Referrer-Policy"] = "no-referrer";
         response.Headers["X-Content-Type-Options"] = "nosniff";
         response.Headers.CacheControl = "no-store";
+    }
+
+    private static async Task<FlowRun> LoadPreviewHeaderAsync(
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        return await database.Flows
+                   .AsNoTracking()
+                   .SingleOrDefaultAsync(
+                       item => item.Id == flowId,
+                       cancellationToken)
+               ?? throw new KeyNotFoundException(
+                   $"Factory flow '{flowId}' was not found.");
+    }
+
+    private static async Task<FlowRun> LoadPreviewFlowAsync(
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        return await database.Flows
+                   .AsNoTracking()
+                   .AsSplitQuery()
+                   .Include(item => item.Steps)
+                   .Include(item => item.GateRecords)
+                   .Include(item => item.Events.Where(
+                       flowEvent =>
+                           flowEvent.Type ==
+                           AdvisoryArtifactCatalog.MaterializationEventType))
+                   .SingleOrDefaultAsync(
+                       item => item.Id == flowId,
+                       cancellationToken)
+               ?? throw new KeyNotFoundException(
+                   $"Factory flow '{flowId}' was not found.");
+    }
+
+    private static async Task<FlowRun> LoadPreviewVerificationFlowAsync(
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        Guid flowId,
+        CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        return await database.Flows
+                   .AsNoTracking()
+                   .Include(item => item.Events)
+                   .SingleOrDefaultAsync(
+                       item => item.Id == flowId,
+                       cancellationToken)
+               ?? throw new KeyNotFoundException(
+                   $"Factory flow '{flowId}' was not found.");
     }
 
     private static async Task<FlowRun> LoadFlowAsync(

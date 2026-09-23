@@ -701,11 +701,19 @@ export interface PreviewDto {
   outcomeLabel: string;
   outcomeResult: FlowOutcomeDto | null;
   artifacts: PreviewArtifactDto[];
-  deliveredBy: FlowStepDto[];
+  deliveredBy: PreviewContributorDto[];
   review: FlowReviewSummaryDto;
   publicationStatus: ReviewPublicationStatus;
   deliveryReadiness: DeliveryReadinessDto | null;
   generatedAt: string;
+}
+
+export interface PreviewContributorDto {
+  id: string;
+  agentName: string;
+  label: string;
+  status: StepStatus;
+  durationMilliseconds: number;
 }
 
 export type DemoCapability = "Available" | "OfflineOnly";

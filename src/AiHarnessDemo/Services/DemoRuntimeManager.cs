@@ -432,6 +432,36 @@ public sealed class DemoRuntimeManager(
         return ToStatus(record, binding);
     }
 
+    public async Task<DemoRuntimeStatus> GetStoredStatusAsync(
+        Guid flowId,
+        string artifactId,
+        string candidateFingerprint,
+        string manifestHash,
+        CancellationToken cancellationToken = default)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var record = await database.DemoInstances
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                item =>
+                    item.FlowRunId == flowId &&
+                    item.ArtifactId == artifactId &&
+                    item.CandidateFingerprint == candidateFingerprint &&
+                    item.ManifestHash == manifestHash,
+                cancellationToken);
+        return new DemoRuntimeStatus(
+            DemoCapability.Available,
+            record?.Id,
+            record?.State ?? DemoInstanceState.Stopped,
+            record is null ? null : $"/api/demos/{record.Id:D}/",
+            string.IsNullOrWhiteSpace(record?.FailureDetail)
+                ? null
+                : record.FailureDetail,
+            candidateFingerprint,
+            manifestHash);
+    }
+
     public Task<DemoRuntimeStatus> StartAsync(
         Guid flowId,
         string artifactId,

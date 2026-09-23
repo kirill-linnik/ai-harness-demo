@@ -433,11 +433,18 @@ public sealed record PreviewDto(
     string OutcomeLabel,
     FlowOutcomeDto? OutcomeResult,
     IReadOnlyList<PreviewArtifactDto> Artifacts,
-    IReadOnlyList<FlowStepDto> DeliveredBy,
+    IReadOnlyList<PreviewContributorDto> DeliveredBy,
     FlowReviewSummaryDto Review,
     ReviewPublicationStatus PublicationStatus,
     DeliveryReadinessDto? DeliveryReadiness,
     DateTimeOffset GeneratedAt);
+
+public sealed record PreviewContributorDto(
+    Guid Id,
+    string AgentName,
+    string Label,
+    StepStatus Status,
+    long DurationMilliseconds);
 
 public sealed record PreviewArtifactDto(
     string Id,
