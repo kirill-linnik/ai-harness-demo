@@ -259,7 +259,7 @@ export function SettingsPage() {
             <div className="card-header">
               <div>
                 <h3>Source project</h3>
-                <p>Choose a project folder containing one or more Git repositories, then run Copilot init and the static study.</p>
+                <p>Choose a project folder, with or without Git, then run Copilot init and the source study.</p>
               </div>
             </div>
             <div className="card-body">
@@ -365,6 +365,7 @@ export function SettingsPage() {
                     Pull request
                   </button>
                 </div>
+                <small>Projects without source control use a local commit in the isolated workspace; pull requests require a GitHub repository.</small>
               </div>
               <div className="field" style={{ marginTop: 16 }}>
                 <label htmlFor="max-handoff-retries">Correction and pre-mortem rounds</label>

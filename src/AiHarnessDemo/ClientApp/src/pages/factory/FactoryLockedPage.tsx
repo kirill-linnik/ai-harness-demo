@@ -25,7 +25,7 @@ export function FactoryLockedPage() {
           <p>{reason}</p>
           <div className="quick-prompts" style={{ justifyContent: "center", marginTop: 22 }}>
             <span className="model-chip">1 · Verify Copilot CLI</span>
-            <span className="model-chip">2 · Choose a Git repository</span>
+            <span className="model-chip">2 · Choose a source project</span>
             <span className="model-chip">3 · Review project knowledge</span>
           </div>
           <Link className="button primary" to="/settings" style={{ marginTop: 22 }}>

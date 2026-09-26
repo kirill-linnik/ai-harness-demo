@@ -15,6 +15,84 @@ namespace AiHarnessDemo.Tests;
 public sealed class CandidateFingerprintTests
 {
     [Fact]
+    public async Task SelectedFolderCandidate_RejectsCommittedChangesOutsideFolder()
+    {
+        var root = Path.Combine(
+            AppContext.BaseDirectory, "candidate-tests", Guid.NewGuid().ToString("N"));
+        var source = Path.Combine(root, "source");
+        var workspace = Path.Combine(root, "workspace");
+        CandidateWorkspace.InitializeRepositoryAt(source);
+        Directory.CreateDirectory(Path.Combine(source, "application"));
+        await File.WriteAllTextAsync(
+            Path.Combine(source, "application", "app.txt"), "baseline");
+        var git = new ProcessRunner();
+        async Task RunAsync(string directory, params string[] args)
+        {
+            var result = await git.RunAsync(
+                "git", ["-C", directory, .. args], directory,
+                TimeSpan.FromSeconds(30));
+            Assert.True(result.ExitCode == 0, result.CombinedOutput);
+        }
+        await RunAsync(source, "add", ".");
+        await RunAsync(source, "commit", "--quiet", "-m", "Add application");
+        await RunAsync(source, "worktree", "add", "-b", "scope-flow", workspace);
+        var flow = new FlowRun
+        {
+            Title = "Scoped candidate",
+            OriginalRequest = "Change the application",
+            RepositoryPath = Path.Combine(source, "application"),
+            WorkspacePath = workspace,
+            BranchName = "scope-flow",
+            Outcome = OutcomeType.Commit,
+            Iteration = 1
+        };
+        RecordTrustedRepositories(flow, ["."]);
+        var baseline = await git.RunAsync(
+            "git", ["-C", source, "rev-parse", "HEAD"],
+            source, TimeSpan.FromSeconds(30));
+        Assert.Equal(0, baseline.ExitCode);
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = WorkspaceSourceScopeLedger.EventType,
+            Message = "Selected folder scope.",
+            DataJson = WorkspaceSourceScopeLedger.Serialize(
+                new WorkspaceInfo(
+                    workspace, "scope-flow", true,
+                    SourceScopeRelativePath: "application",
+                    SourceBaselineCommit: baseline.StandardOutput.Trim()))
+        });
+        var service = new CandidateFingerprintService(git, TimeProvider.System);
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(workspace, "application", "app.txt"), "changed");
+            await RunAsync(workspace, "add", ".");
+            await RunAsync(workspace, "commit", "--quiet", "-m", "In scope");
+            var accepted = await service.PrepareAsync(
+                flow, Digest('a'), Guid.NewGuid(), requiresPreview: false);
+            Assert.Single(accepted.Manifest.Repositories);
+
+            await File.WriteAllTextAsync(
+                Path.Combine(workspace, "tracked.txt"), "out of scope");
+            var unsealed = await Assert.ThrowsAsync<CandidateValidationException>(
+                () => service.SealAsync(flow));
+            Assert.Contains("outside the selected project folder", unsealed.Message);
+            await RunAsync(workspace, "add", ".");
+            await RunAsync(workspace, "commit", "--quiet", "-m", "Outside folder");
+            var error = await Assert.ThrowsAsync<CandidateValidationException>(
+                () => service.PrepareAsync(
+                    flow, Digest('a'), Guid.NewGuid(), requiresPreview: false));
+            Assert.Contains("outside the selected project folder", error.Message);
+        }
+        finally
+        {
+            await RunAsync(source, "worktree", "remove", "--force", workspace);
+            ClearAndDelete(root);
+        }
+    }
+
+    [Fact]
     public async Task LegacyPreviewReconstruction_UsesSealedRepositoryIdentity()
     {
         var root = Path.Combine(

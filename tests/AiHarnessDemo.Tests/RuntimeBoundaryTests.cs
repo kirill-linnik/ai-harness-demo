@@ -3304,6 +3304,325 @@ public sealed class RepositoryBrowserTests
 public sealed class WorkspaceManagerTests
 {
     [Fact]
+    public void ReconciledFolderScope_UsesLatestDurableBaseline()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Folder flow",
+            OriginalRequest = "Update folder",
+            RepositoryPath = @"C:\project\application"
+        };
+        var first = WorkspaceSourceScopeLedger.Serialize(
+            new WorkspaceInfo(@"C:\workspace", "branch", true,
+                SourceScopeRelativePath: "application",
+                SourceBaselineCommit: new string('a', 40)));
+        var second = WorkspaceSourceScopeLedger.Serialize(
+            new WorkspaceInfo(@"C:\workspace", "branch", false,
+                SourceScopeRelativePath: "application",
+                SourceBaselineCommit: new string('b', 40)));
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = WorkspaceSourceScopeLedger.EventType,
+            Message = "Initial baseline",
+            DataJson = first,
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-1)
+        });
+        flow.Events.Add(new FlowEvent
+        {
+            FlowRunId = flow.Id,
+            Type = WorkspaceSourceScopeLedger.EventType,
+            Message = "Reconciled baseline",
+            DataJson = second,
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(new string('b', 40),
+            WorkspaceSourceScopeLedger.Read(flow).BaselineCommit);
+    }
+
+    [Fact]
+    public async Task UnversionedProject_UsesLocalFilesAndOnlyInitializesWorkspaceGit()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(), $"ai-harness-local-source-{Guid.NewGuid():N}");
+        var project = Path.Combine(root, "project");
+        Directory.CreateDirectory(project);
+        await File.WriteAllTextAsync(
+            Path.Combine(project, "source.txt"), "local source");
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "WORKFLOW.md"),
+            "---\nworkspace:\n  root: workspaces\n---\n\nTest workflow.\n");
+        var git = new ProcessRunner();
+        var provider = new WorkflowDefinitionProvider(
+            new HarnessPaths(root, Path.Combine(root, ".github", "agents"),
+                Path.Combine(root, "harness.db")),
+            new WorkflowLoader(),
+            NullLogger<WorkflowDefinitionProvider>.Instance);
+        await provider.StartAsync(CancellationToken.None);
+        var manager = new WorkspaceManager(
+            git, provider,
+            new WorkspaceHookRunner(
+                provider, git, NullLogger<WorkspaceHookRunner>.Instance),
+            NullLogger<WorkspaceManager>.Instance);
+        var flow = new FlowRun
+        {
+            Title = "Local change", OriginalRequest = "Local change",
+            RepositoryPath = project, Status = FlowStatus.Intake,
+            Outcome = OutcomeType.Commit
+        };
+        try
+        {
+            Assert.True(RepositoryAnalyzer.IsProjectDirectory(project));
+            var snapshot = await manager.PrepareAsync(flow);
+            Assert.Equal("local source", await File.ReadAllTextAsync(
+                Path.Combine(snapshot.Path, "source.txt")));
+            flow.WorkspacePath = snapshot.Path;
+            flow.Status = FlowStatus.Queued;
+            var delivery = await manager.PrepareAsync(flow);
+            flow.WorkspacePath = delivery.Path;
+            flow.BranchName = delivery.BranchName;
+            Assert.True(Directory.Exists(Path.Combine(delivery.Path, ".git")));
+            Assert.Equal("local source", await File.ReadAllTextAsync(
+                Path.Combine(delivery.Path, "source.txt")));
+            Assert.Single(delivery.TrustedRepositories!);
+            Assert.Equal(".", delivery.TrustedRepositories![0].RelativePath);
+            Assert.Equal(string.Empty, delivery.TrustedRepositories[0].RemoteRepository);
+            Assert.False(Directory.Exists(Path.Combine(project, ".git")));
+            flow.Events.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                Type = StudioWorkspaceRepositoryMapLedger.EventType,
+                Message = "Trusted local workspace.",
+                DataJson = StudioWorkspaceRepositoryMapLedger.Serialize(
+                    StudioWorkspaceRepositoryMapLedger.Create(
+                        flow, delivery.Path, delivery.TrustedRepositories))
+            });
+            var candidate = await new CandidateFingerprintService(
+                    git, TimeProvider.System)
+                .PrepareAsync(
+                    flow, $"sha256:{new string('a', 64)}",
+                    Guid.NewGuid(), requiresPreview: false);
+            Assert.Single(candidate.Manifest.Repositories);
+            Assert.Equal(WorkspaceCleanupResult.Empty, await manager.RemoveAsync(flow));
+            Assert.False(Directory.Exists(delivery.Path));
+            Assert.True(File.Exists(Path.Combine(project, "source.txt")));
+        }
+        finally
+        {
+            provider.Dispose();
+            if (Directory.Exists(root))
+            {
+                DeleteDirectory(root);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task SelectedFolder_UsesLatestParentRepositoryWithoutPullingSource()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(), $"ai-harness-subfolder-{Guid.NewGuid():N}");
+        var repository = Path.Combine(root, "source");
+        var project = Path.Combine(repository, "application");
+        Directory.CreateDirectory(project);
+        await File.WriteAllTextAsync(
+            Path.Combine(project, "app.txt"), "initial");
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "WORKFLOW.md"),
+            "---\nworkspace:\n  root: workspaces\n---\n\nTest workflow.\n");
+        var git = new ProcessRunner();
+        await RunGitAsync(git, repository, ["init", "--quiet"]);
+        await RunGitAsync(git, repository, ["add", "."]);
+        await RunGitAsync(git, repository,
+            ["-c", "user.name=AI Harness Tests",
+             "-c", "user.email=ai-harness@example.invalid",
+             "commit", "--quiet", "-m", "Initial commit"]);
+        await RunGitAsync(git, repository, ["branch", "-M", "main"]);
+        var remote = Path.Combine(root, "origin.git");
+        await RunGitAsync(git, repository, ["init", "--bare", "--quiet", remote]);
+        await RunGitAsync(git, repository, ["remote", "add", "origin", remote]);
+        await RunGitAsync(git, repository, ["push", "--quiet", "origin", "main"]);
+        await RunGitAsync(git, repository,
+            ["--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/main"]);
+        var contributor = Path.Combine(root, "contributor");
+        await RunGitAsync(git, repository, ["clone", "--quiet", remote, contributor]);
+        Directory.CreateDirectory(Path.Combine(contributor, "application"));
+        await CommitAndPushAsync(
+            git, Path.Combine(contributor, "application"), "app.txt",
+            "latest upstream", "main");
+        var provider = new WorkflowDefinitionProvider(
+            new HarnessPaths(root, Path.Combine(root, ".github", "agents"),
+                Path.Combine(root, "harness.db")),
+            new WorkflowLoader(),
+            NullLogger<WorkflowDefinitionProvider>.Instance);
+        await provider.StartAsync(CancellationToken.None);
+        var manager = new WorkspaceManager(
+            git, provider,
+            new WorkspaceHookRunner(
+                provider, git, NullLogger<WorkspaceHookRunner>.Instance),
+            NullLogger<WorkspaceManager>.Instance);
+        var flow = new FlowRun
+        {
+            Title = "Scoped work", OriginalRequest = "Scoped work",
+            RepositoryPath = project, Status = FlowStatus.Intake
+        };
+        try
+        {
+            Assert.Equal(repository,
+                RepositoryAnalyzer.FindContainingGitRepository(project));
+            var snapshot = await manager.PrepareAsync(flow);
+            Assert.Equal("latest upstream", await File.ReadAllTextAsync(
+                Path.Combine(snapshot.Path, "app.txt")));
+            flow.WorkspacePath = snapshot.Path;
+            flow.Status = FlowStatus.Queued;
+            var delivery = await manager.PrepareAsync(flow);
+            flow.WorkspacePath = delivery.Path;
+            flow.BranchName = delivery.BranchName;
+            Assert.Equal("latest upstream", await File.ReadAllTextAsync(
+                Path.Combine(delivery.Path, "application", "app.txt")));
+            Assert.Equal("initial", await File.ReadAllTextAsync(
+                Path.Combine(project, "app.txt")));
+            Assert.True(Directory.Exists(Path.Combine(delivery.Path, ".git")) ||
+                        File.Exists(Path.Combine(delivery.Path, ".git")));
+            Assert.Single(delivery.TrustedRepositories!);
+            Assert.Equal(".", delivery.TrustedRepositories![0].RelativePath);
+            Assert.Equal("application", delivery.SourceScopeRelativePath);
+            Assert.Matches("^[0-9a-f]{40}([0-9a-f]{24})?$",
+                delivery.SourceBaselineCommit);
+            flow.Events.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                Type = WorkspaceSourceScopeLedger.EventType,
+                Message = "Selected folder scope.",
+                DataJson = WorkspaceSourceScopeLedger.Serialize(delivery)
+            });
+            Assert.Equal("application",
+                WorkspaceSourceScopeLedger.Read(flow).RelativePath);
+            Assert.Equal(1, (await manager.RemoveAsync(flow)).WorktreesRemoved);
+        }
+        finally
+        {
+            provider.Dispose();
+            if (Directory.Exists(root))
+            {
+                DeleteDirectory(root);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("main")]
+    [InlineData("master")]
+    public async Task RemoteBase_IsUsedForEveryRepositoryWithoutUpdatingSourceCheckouts(
+        string baseBranch)
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(), $"ai-harness-current-source-{Guid.NewGuid():N}");
+        var project = Path.Combine(root, "project");
+        Directory.CreateDirectory(project);
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "WORKFLOW.md"),
+            "---\nworkspace:\n  root: workspaces\n---\n\nTest workflow.\n");
+        var git = new ProcessRunner();
+        var repositories = new[] { "site", "data" };
+        foreach (var name in repositories)
+        {
+            var source = Path.Combine(project, name);
+            var remote = Path.Combine(root, $"{name}.git");
+            var contributor = Path.Combine(root, $"{name}-contributor");
+            await CreateRepositoryAsync(git, source, $"{name}.txt");
+            await RunGitAsync(git, source, ["branch", "-M", baseBranch]);
+            await RunGitAsync(git, source, ["init", "--bare", "--quiet", remote]);
+            await RunGitAsync(git, source, ["remote", "add", "origin", remote]);
+            await RunGitAsync(git, source, ["push", "--quiet", "origin", baseBranch]);
+            await RunGitAsync(git, source,
+                ["--git-dir", remote, "symbolic-ref", "HEAD",
+                    $"refs/heads/{baseBranch}"]);
+            await RunGitAsync(git, source, ["clone", "--quiet", remote, contributor]);
+            await CommitAndPushAsync(
+                git, contributor, $"{name}.txt", "new upstream", baseBranch);
+        }
+        var paths = new HarnessPaths(
+            root, Path.Combine(root, ".github", "agents"),
+            Path.Combine(root, "harness.db"));
+        var provider = new WorkflowDefinitionProvider(
+            paths, new WorkflowLoader(),
+            NullLogger<WorkflowDefinitionProvider>.Instance);
+        await provider.StartAsync(CancellationToken.None);
+        var manager = new WorkspaceManager(
+            git, provider,
+            new WorkspaceHookRunner(
+                provider, git, NullLogger<WorkspaceHookRunner>.Instance),
+            NullLogger<WorkspaceManager>.Instance);
+        var intake = new FlowRun
+        {
+            Title = "Read latest", OriginalRequest = "Read latest",
+            RepositoryPath = project, Status = FlowStatus.Intake
+        };
+        var delivery = new FlowRun
+        {
+            Title = "Change latest", OriginalRequest = "Change latest",
+            RepositoryPath = project, Status = FlowStatus.Queued
+        };
+        try
+        {
+            var snapshot = await manager.PrepareAsync(intake);
+            intake.WorkspacePath = snapshot.Path;
+            foreach (var name in repositories)
+            {
+                Assert.Equal("new upstream", await File.ReadAllTextAsync(
+                    Path.Combine(snapshot.Path, name, $"{name}.txt")));
+                Assert.Equal("initial", await File.ReadAllTextAsync(
+                    Path.Combine(project, name, $"{name}.txt")));
+            }
+            var workspace = await manager.PrepareAsync(delivery);
+            delivery.WorkspacePath = workspace.Path;
+            delivery.BranchName = workspace.BranchName;
+            foreach (var name in repositories)
+            {
+                Assert.Equal("new upstream", await File.ReadAllTextAsync(
+                    Path.Combine(workspace.Path, name, $"{name}.txt")));
+            }
+
+            await CommitAndPushAsync(
+                git, Path.Combine(root, "site-contributor"), "site.txt",
+                "newer upstream", baseBranch);
+            var stale = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => manager.PrepareAsync(delivery));
+            Assert.Contains("behind", stale.Message);
+            Assert.Equal("new upstream", await File.ReadAllTextAsync(
+                Path.Combine(workspace.Path, "site", "site.txt")));
+        }
+        finally
+        {
+            if (Directory.Exists(delivery.WorkspacePath))
+            {
+                await manager.RemoveAsync(delivery);
+            }
+            if (Directory.Exists(intake.WorkspacePath))
+            {
+                await manager.RemoveAsync(intake);
+            }
+            provider.Dispose();
+            DeleteDirectory(root);
+        }
+    }
+
+    private static async Task CommitAndPushAsync(
+        ProcessRunner git, string repository, string fileName, string contents,
+        string baseBranch)
+    {
+        await File.WriteAllTextAsync(Path.Combine(repository, fileName), contents);
+        await RunGitAsync(git, repository, ["add", fileName]);
+        await RunGitAsync(git, repository,
+            ["-c", "user.name=AI Harness Tests",
+             "-c", "user.email=ai-harness@example.invalid",
+             "commit", "--quiet", "-m", contents]);
+        await RunGitAsync(git, repository, ["push", "--quiet", "origin", baseBranch]);
+    }
+
+    [Fact]
     public async Task PrepareAsync_CreatesAFlowWorktreeForEveryProjectRepository()
     {
         var root = Path.Combine(

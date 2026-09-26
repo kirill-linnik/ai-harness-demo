@@ -21,7 +21,9 @@ public sealed record WorkspaceInfo(
     WorkspaceMode Mode = WorkspaceMode.Delivery,
     string BaselineDigest = "",
     int BaselineFileCount = 0,
-    long BaselineTotalBytes = 0);
+    long BaselineTotalBytes = 0,
+    string SourceScopeRelativePath = "",
+    string SourceBaselineCommit = "");
 
 public sealed record WorkspaceCleanupResult(
     int WorktreesRemoved,

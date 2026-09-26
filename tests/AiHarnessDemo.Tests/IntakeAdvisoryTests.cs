@@ -1137,6 +1137,31 @@ public sealed class IntakeAdvisoryTests
     }
 
     [Fact]
+    public void UnversionedIntake_UsesCommitOutcomeInsteadOfUnpublishablePullRequest()
+    {
+        var project = Path.Combine(
+            Path.GetTempPath(), $"ai-harness-unversioned-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(project);
+        try
+        {
+            var flow = IntakeCoordinator.CreateFlow(
+                "Update local source.",
+                new HarnessSettings
+                {
+                    RepositoryPath = project,
+                    RepositoryKnowledge = "Studied local source.",
+                    Outcome = OutcomeType.PullRequest
+                });
+
+            Assert.Equal(OutcomeType.Commit, flow.Outcome);
+        }
+        finally
+        {
+            Directory.Delete(project);
+        }
+    }
+
+    [Fact]
     public void DeliveryIntake_RejectsMalformedPersistedNoneButAdvisoryUsesNoneLocally()
     {
         var malformed = new HarnessSettings

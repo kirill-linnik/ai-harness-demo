@@ -7546,6 +7546,38 @@ public sealed class WorkflowEngine(
                 });
             }
         }
+        if (flow.Kind == FlowKind.Delivery &&
+            !string.IsNullOrWhiteSpace(workspace.SourceScopeRelativePath))
+        {
+            var scope = WorkspaceSourceScopeLedger.Serialize(workspace);
+            var existingScopes = await database.FlowEvents
+                .Where(item =>
+                    item.FlowRunId == flow.Id &&
+                    item.Type == WorkspaceSourceScopeLedger.EventType)
+                .ToListAsync(cancellationToken);
+            var latestScope = existingScopes
+                .OrderByDescending(item => item.CreatedAt)
+                .ThenByDescending(item => item.Id)
+                .FirstOrDefault();
+            if (latestScope is null ||
+                !string.Equals(
+                    latestScope.DataJson, scope, StringComparison.Ordinal))
+            {
+                var now = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    Type = WorkspaceSourceScopeLedger.EventType,
+                    Message =
+                        $"Bound selected project folder '{workspace.SourceScopeRelativePath}' to source commit {workspace.SourceBaselineCommit}.",
+                    DataJson = scope,
+                    CreatedAt = latestScope is not null &&
+                                now <= latestScope.CreatedAt
+                        ? latestScope.CreatedAt.AddTicks(1)
+                        : now
+                });
+            }
+        }
         flow.UpdatedAt = DateTimeOffset.UtcNow;
         await database.SaveChangesAsync(cancellationToken);
     }

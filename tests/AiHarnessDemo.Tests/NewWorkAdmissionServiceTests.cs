@@ -8,6 +8,29 @@ namespace AiHarnessDemo.Tests;
 public sealed class NewWorkAdmissionServiceTests
 {
     [Fact]
+    public async Task UnversionedProject_WithStudiedKnowledgeIsReady()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(), $"ai-harness-admission-local-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(root, "source.txt"), "local");
+            var factory = await CreateFactoryAsync(
+                root, root, "Studied local project knowledge.");
+            var admission = new NewWorkAdmissionService(factory, () => []);
+
+            await admission.EnsureReadyAsync();
+            await admission.EnsureReadyForContextAsync(
+                root, "Studied local project knowledge.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task LinkedContext_UsesParentSnapshotInsteadOfInvalidGlobalSettings()
     {
         var root = CreateProjectRoot();

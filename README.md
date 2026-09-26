@@ -65,6 +65,17 @@ Different flows may run concurrently; steps inside one flow remain sequential.
   `ReadOnlySource`, `WorkspaceWrite`, `Publish`, or `PreMortemReadOnly`.
 - `WorkspaceManager` isolates each flow. `FlowLifecycleCoordinator` guards status changes, while
   `FlowStep` and `FlowEvent` make attempts, retries, recovery, and handoffs auditable.
+- A source project may be a Git repository, a folder containing several repositories, a folder
+  inside a larger repository, or a folder without source control. Studio fetches each available
+  `origin` `main` or `master` (preferring the remote default when it is one of those branches).
+  New Delivery branches and guarded intake/Advisory snapshots use those commits without pulling
+  into source checkouts. Repositories without a remote use local `main` or `master`. For a selected
+  folder inside a larger repository, Delivery retains the parent Git history but limits reviewed
+  changes to that folder. A folder without Git uses its present files; Delivery initializes and
+  commits a baseline **only in its isolated workspace**, with commit rather than PR publication.
+  If a remote cannot be checked or fetched, preparation stops; if an existing Delivery branch
+  falls behind, resumption stops instead of merging or rebasing it automatically. Existing guarded
+  snapshots remain fixed to their creation-time source.
 - Delivery publication uses sealed, reviewed Git and preview identities. The host revalidates those
   identities and readiness state before and after publishing.
 

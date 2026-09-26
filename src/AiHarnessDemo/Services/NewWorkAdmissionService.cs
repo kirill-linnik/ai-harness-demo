@@ -161,12 +161,6 @@ public sealed class NewWorkAdmissionService : INewWorkAdmissionService
                 ? "The linked source project path does not exist."
                 : "The configured source project path does not exist.");
         }
-        else if (!RepositoryAnalyzer.IsProjectDirectory(repositoryPath))
-        {
-            failures.Add(linkedContext
-                ? "The linked source project contains no Git repositories."
-                : "The configured source project contains no Git repositories.");
-        }
         if (string.IsNullOrWhiteSpace(repositoryKnowledge))
         {
             failures.Add(linkedContext

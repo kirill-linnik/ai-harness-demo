@@ -920,9 +920,7 @@ public sealed partial class IntakeCoordinator(
         }
         await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
         var settings = await database.Settings.AsNoTracking().SingleAsync(cancellationToken);
-        var configuredDeliveryOutcome = OutcomeTypeRules.RequireDelivery(
-            settings.Outcome,
-            nameof(settings.Outcome));
+        var configuredDeliveryOutcome = ResolveDeliveryOutcome(settings);
 
         var flow = request.FlowId is null
             ? CreateFlow(message, settings)
@@ -1092,7 +1090,7 @@ public sealed partial class IntakeCoordinator(
                     FlowRunId = flow.Id,
                     Type = "workspace.guarded-snapshot-created",
                     Message =
-                        "Created a guarded per-flow source snapshot without adding worktrees, branches, refs, or remotes to the source repositories.",
+                        "Created a guarded per-flow source snapshot from the latest available Git base, or local files when unversioned, without changing source checkout files or leaving temporary worktrees.",
                     DataJson = JsonSerializer.Serialize(new
                     {
                         Mode = workspace.Mode.ToString(),
@@ -2292,12 +2290,19 @@ public sealed partial class IntakeCoordinator(
             ConsolidatedRequest = message,
             RepositoryPath = settings.RepositoryPath,
             RepositoryKnowledge = settings.RepositoryKnowledge,
-            Outcome = OutcomeTypeRules.RequireDelivery(
-                settings.Outcome,
-                nameof(settings.Outcome)),
+            Outcome = ResolveDeliveryOutcome(settings),
             ModelSelectionStrategy = settings.ModelSelectionStrategy
         };
     }
+
+    private static OutcomeType ResolveDeliveryOutcome(HarnessSettings settings) =>
+        Directory.Exists(settings.RepositoryPath) &&
+        RepositoryAnalyzer.FindGitRepositories(settings.RepositoryPath).Count == 0 &&
+        RepositoryAnalyzer.FindContainingGitRepository(settings.RepositoryPath) is null
+            ? OutcomeType.Commit
+            : OutcomeTypeRules.RequireDelivery(
+                settings.Outcome,
+                nameof(settings.Outcome));
 
     private static async Task<FlowRun> LoadFlowAsync(
         HarnessDbContext database,

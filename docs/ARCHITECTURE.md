@@ -152,6 +152,15 @@ snapshot and workspace rather than altering the blocked plan.
 
 ## Advisory flow
 
+Workspace preparation handles a selected Git root, several nested repositories, a selected
+subfolder of a parent Git repository, or a folder without source control. For each available
+`origin`, it fetches the remote default `main` or `master` (or `main`, then `master` when the
+remote default is different); without an `origin`, it uses local `main` or `master`. New guarded
+snapshots read the selected project files from the fetched commit through temporary worktrees,
+which are removed before journaling. Source checkout files are not pulled or merged. Projects
+without source control snapshot their present files without attempting a network update. A
+recovered guarded snapshot remains immutable at its creation-time baseline.
+
 Advisory work uses a guarded source snapshot and the `ReadOnlySource` permission profile. Agent
 turns cannot modify the source, run a shell, or publish.
 
@@ -171,8 +180,16 @@ fresh snapshot, fresh workspace, and normal Account Manager intake.
 
 ## Delivery flow
 
-Delivery work uses an isolated Git worktree. Pre-review duties that need to change or validate the
-candidate run under at most `WorkspaceWrite`; remote publication remains unavailable.
+Delivery work starts an isolated Git worktree at the fetched base commit. For a selected folder
+inside a repository, the worktree retains its parent's history, while agent instructions and
+candidate sealing restrict edits to the selected folder. The selected-folder baseline commit is
+recorded in the flow ledger and advanced there when a reconciled flow resumes. Without source
+control, Studio copies the source into an isolated workspace, initializes Git and commits a
+baseline there only, and selects a local commit outcome instead of a pull request. On recovery,
+each flow branch must contain its repository's current base commit; a branch that falls behind
+stops for explicit reconciliation instead of being merged or rebased automatically. Pre-review
+duties that need to change or validate the candidate run under at most `WorkspaceWrite`; remote
+publication remains unavailable.
 
 ### Readiness and reviewed candidate
 

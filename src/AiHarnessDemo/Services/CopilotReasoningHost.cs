@@ -1762,7 +1762,7 @@ public sealed partial class CopilotReasoningHost(
             context.InvocationKind == ExecutionInvocationKind.PreMortem;
         var usesCompactPreMortemContext =
             isPreMortem || context.IsPreMortemRevision;
-        var workspace = PrepareWorkspace(workingDirectory);
+        var workspace = PrepareScopedWorkspace(context, workingDirectory);
         var repositoryKnowledge = PrepareRepositoryKnowledgeContent(
             context.RepositoryKnowledge,
             context.SourceProjectPath);
@@ -2111,6 +2111,32 @@ public sealed partial class CopilotReasoningHost(
         "- **Boundary:** Work only in this isolated workspace. Treat original source locations " +
         "as metadata and prefer workspace-relative paths.";
 
+    private static string PrepareScopedWorkspace(
+        AgentExecutionContext context,
+        string workingDirectory)
+    {
+        var workspace = PrepareWorkspace(workingDirectory);
+        var containingRepository =
+            RepositoryAnalyzer.FindContainingGitRepository(context.SourceProjectPath);
+        if (containingRepository is null ||
+            !RepositoryAnalyzer.IsGitRepository(workingDirectory) ||
+            string.Equals(
+                Path.GetFullPath(containingRepository),
+                Path.GetFullPath(context.SourceProjectPath),
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal))
+        {
+            return workspace;
+        }
+        var relativeFolder = Path.GetRelativePath(
+            containingRepository, context.SourceProjectPath);
+        return workspace + Environment.NewLine +
+            $"- **Selected project folder:** `{relativeFolder}`. " +
+            "Read parent-repository context as needed, but change files only inside this folder. " +
+            "Changes outside it cannot be sealed for review.";
+    }
+
     internal static string PrepareRepositoryKnowledgeContent(
         string knowledge,
         string sourceProjectPath)
@@ -2238,7 +2264,7 @@ public sealed partial class CopilotReasoningHost(
         {
             context.DirectPrompt.Trim(),
             $"## Workspace{Environment.NewLine}{Environment.NewLine}" +
-            PrepareWorkspace(workingDirectory)
+            PrepareScopedWorkspace(context, workingDirectory)
         };
         var repositoryKnowledgeBlock = BuildRepositoryKnowledgeBlock(
             context.RepositoryKnowledge,

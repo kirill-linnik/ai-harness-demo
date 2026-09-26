@@ -44,6 +44,126 @@ public sealed class CandidateFingerprintService(
     ICandidateSealFaultInjector? sealFaultInjector = null,
     WorkflowDefinitionProvider? workflowProvider = null)
 {
+    private static void ValidateSelectedFolderPaths(
+        FlowRun flow,
+        IEnumerable<string> changedPaths)
+    {
+        var source = Path.GetFullPath(flow.RepositoryPath);
+        var containing = RepositoryAnalyzer.FindContainingGitRepository(source);
+        if (containing is null || PathsEqual(containing, source))
+        {
+            return;
+        }
+        var relativeFolder = ReadSelectedFolderScope(flow, containing).RelativePath + "/";
+        var outside = changedPaths
+            .Where(path => !path.Replace('\\', '/').StartsWith(
+                relativeFolder,
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal))
+            .Take(5).ToArray();
+        if (outside.Length > 0)
+        {
+            throw new CandidateValidationException(
+                "The candidate changed files outside the selected project folder: " +
+                string.Join(", ", outside));
+        }
+    }
+
+    private static WorkspaceSourceScope ReadSelectedFolderScope(
+        FlowRun flow,
+        string containingRepository)
+    {
+        var scope = WorkspaceSourceScopeLedger.Read(flow);
+        var relativeFolder = Path.GetRelativePath(
+            containingRepository, flow.RepositoryPath).Replace('\\', '/');
+        if (!string.Equals(
+                relativeFolder,
+                scope.RelativePath,
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal))
+        {
+            throw new CandidateValidationException(
+                "The durable selected-folder scope no longer matches the source project.");
+        }
+        return scope;
+    }
+
+    private static IReadOnlyCollection<string>? VirtualSourceRepositories(
+        FlowRun flow)
+    {
+        var source = Path.GetFullPath(flow.RepositoryPath);
+        if (RepositoryAnalyzer.IsGitRepository(source) ||
+            RepositoryAnalyzer.FindGitRepositories(source).Count != 0)
+        {
+            return null;
+        }
+        var mapping = StudioWorkspaceRepositoryMapLedger.Read(flow);
+        return mapping.Repositories.Count == 1 &&
+               mapping.Repositories[0].RelativePath == "."
+            ? [source]
+            : null;
+    }
+
+    private async Task ValidateSelectedFolderScopeAsync(
+        FlowRun flow,
+        CandidateWorkspaceContext context,
+        CancellationToken cancellationToken)
+    {
+        var source = Path.GetFullPath(flow.RepositoryPath);
+        var containing = RepositoryAnalyzer.FindContainingGitRepository(source);
+        if (containing is null || PathsEqual(containing, source))
+        {
+            return;
+        }
+        if (context.Repositories.Count != 1 ||
+            !PathsEqual(context.Repositories[0], context.Workspace))
+        {
+            throw new CandidateValidationException(
+                "The selected-folder project must use one root workspace repository.");
+        }
+        var scope = ReadSelectedFolderScope(flow, containing);
+        var relativeFolder = scope.RelativePath + "/";
+        var repository = context.Repositories[0];
+        var ancestry = await RunGitAsync(
+            repository,
+            ["merge-base", "--is-ancestor", scope.BaselineCommit, "HEAD"],
+            TimeSpan.FromSeconds(20), cancellationToken, null);
+        if (ancestry.ExitCode != 0)
+        {
+            throw new CandidateValidationException(
+                $"The candidate no longer descends from its durable source commit: {ancestry.CombinedOutput}");
+        }
+        var changed = await RunGitAsync(
+            repository,
+            ["diff", "--name-only", "--no-renames", "-z",
+                $"{scope.BaselineCommit}...HEAD"],
+            TimeSpan.FromSeconds(30), cancellationToken, null);
+        if (changed.ExitCode != 0)
+        {
+            throw new CandidateValidationException(
+                $"Unable to verify selected-folder changes against its durable baseline: {changed.CombinedOutput}");
+        }
+        var outside = changed.StandardOutput
+            .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            .Select(path => path.Trim('\r', '\n').Replace('\\', '/'))
+            .Where(path => path.Length > 0 &&
+                           !path.StartsWith(
+                               relativeFolder,
+                               OperatingSystem.IsWindows()
+                                   ? StringComparison.OrdinalIgnoreCase
+                                   : StringComparison.Ordinal))
+            .Take(5)
+            .ToArray();
+        if (outside.Length > 0)
+        {
+            throw new CandidateValidationException(
+                "The candidate changed files outside the selected project folder: " +
+                string.Join(", ", outside));
+        }
+    }
+
     public const int MaximumPreviewFiles =
         CandidateManifest.MaximumPreviewArtifacts;
     public const long MaximumPreviewBytes = 100L * 1024 * 1024;
@@ -109,7 +229,11 @@ public sealed class CandidateFingerprintService(
             flow,
             workspaceContext.Workspace,
             workspaceContext.Repositories,
-            cancellationToken);
+            cancellationToken,
+            sourceRepositoriesOverride: VirtualSourceRepositories(flow));
+
+        await ValidateSelectedFolderScopeAsync(
+            flow, workspaceContext, cancellationToken);
 
         var repositoryEntries = new List<CandidateRepositoryManifest>();
         foreach (var repository in workspaceContext.Repositories)
@@ -221,7 +345,8 @@ public sealed class CandidateFingerprintService(
             : ResolveMappedRepositoryRoots(
                 sourceRoot,
                 reviewedRepositories.Select(item => item.RelativePath),
-                "reviewed source project");
+                "reviewed source project",
+                allowVirtualRoot: VirtualSourceRepositories(flow) is not null);
         var (trustedScaffoldFiles, _) =
             await ValidateNonRepositoryFilesAsync(
                 flow,
@@ -229,6 +354,13 @@ public sealed class CandidateFingerprintService(
                 workspaceRepositories,
                 cancellationToken,
                 sourceRepositoriesOverride: sourceRepositories);
+        await ValidateSelectedFolderScopeAsync(
+            flow,
+            new CandidateWorkspaceContext(
+                workspace, workspaceRepositories,
+                mappedRepositories.Select(item => new OutcomeTrustedRepository(
+                    item.RelativePath, item.RemoteRepository)).ToArray()),
+            cancellationToken);
         var previewEntries = await ReadPreviewArtifactsAsync(
             workspace,
             cancellationToken);
@@ -297,7 +429,10 @@ public sealed class CandidateFingerprintService(
             flow,
             workspaceContext.Workspace,
             workspaceContext.Repositories,
-            cancellationToken);
+            cancellationToken,
+            sourceRepositoriesOverride: VirtualSourceRepositories(flow));
+        await ValidateSelectedFolderScopeAsync(
+            flow, workspaceContext, cancellationToken);
 
         var repositories = new List<LocalCandidateSealRepositoryResult>(
             workspaceContext.Repositories.Count);
@@ -388,6 +523,9 @@ public sealed class CandidateFingerprintService(
                     !string.Equals(tracked.ObjectId, entry.ObjectId, StringComparison.Ordinal))
                 .OrderBy(entry => entry.Path, StringComparer.Ordinal)
                 .ToArray();
+            ValidateSelectedFolderPaths(
+                flow,
+                removedPaths.Concat(changedEntries.Select(entry => entry.Path)));
 
             if (removedPaths.Length == 0 &&
                 changedEntries.Length == 0)
@@ -543,7 +681,8 @@ public sealed class CandidateFingerprintService(
             workspaceContext.Repositories,
             cancellationToken,
             restoreMissingTrustedFiles: true,
-            beforeRestore);
+            beforeRestore,
+            sourceRepositoriesOverride: VirtualSourceRepositories(flow));
         return restoredMissingFiles;
     }
 
@@ -853,7 +992,8 @@ public sealed class CandidateFingerprintService(
     private static IReadOnlyList<string> ResolveMappedRepositoryRoots(
         string rootPath,
         IEnumerable<string> relativePaths,
-        string description)
+        string description,
+        bool allowVirtualRoot = false)
     {
         var root = Path.GetFullPath(rootPath);
         if (!Directory.Exists(root))
@@ -877,7 +1017,10 @@ public sealed class CandidateFingerprintService(
                             Path.DirectorySeparatorChar)));
             if (!IsContainedOrEqual(root, repository) ||
                 IsLink(repository) ||
-                !RepositoryAnalyzer.IsGitRepository(repository))
+                !RepositoryAnalyzer.IsGitRepository(repository) &&
+                !(allowVirtualRoot &&
+                  relativePath == "." &&
+                  PathsEqual(root, repository)))
             {
                 throw new CandidateValidationException(
                     $"The {description} repository '{relativePath}' is missing, linked, or outside its root.");

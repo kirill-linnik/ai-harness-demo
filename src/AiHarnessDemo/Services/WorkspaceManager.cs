@@ -58,12 +58,6 @@ public sealed partial class WorkspaceManager(
         bool suppressAfterCreateHook,
         CancellationToken cancellationToken)
     {
-        if (!ExecutableLocator.Exists("git"))
-        {
-            throw new InvalidOperationException(
-                "Git is required for isolated live Copilot execution.");
-        }
-
         var projectPath = Path.GetFullPath(flow.RepositoryPath);
         if (!Directory.Exists(projectPath))
         {
@@ -72,16 +66,53 @@ public sealed partial class WorkspaceManager(
         }
 
         var repositories = RepositoryAnalyzer.FindGitRepositories(projectPath);
-        if (repositories.Count == 0)
+        var containingRepository = repositories.Count == 0
+            ? RepositoryAnalyzer.FindContainingGitRepository(projectPath)
+            : null;
+        if (containingRepository is not null)
+        {
+            repositories = [containingRepository];
+        }
+        var unversioned = repositories.Count == 0;
+        if (!ExecutableLocator.Exists("git"))
         {
             throw new InvalidOperationException(
-                "Copilot flows require at least one Git repository inside the selected project folder.");
+                "Git is required for isolated live Copilot execution.");
         }
-        var trustedRepositories = await ReadTrustedRepositoriesAsync(
-            flow,
-            projectPath,
-            repositories,
-            cancellationToken);
+        var trustedRepositories = unversioned
+            ? new WorkspaceRepositoryIdentity[] { new(".", string.Empty) }
+            : await ReadTrustedRepositoriesAsync(
+                flow, projectPath, repositories, cancellationToken);
+        var baselines = new Dictionary<string, string>();
+        foreach (var repository in repositories)
+        {
+            baselines.Add(
+                repository,
+                await FetchBaseBranchAsync(repository, cancellationToken));
+        }
+        var scopePath = containingRepository is null
+            ? string.Empty
+            : Path.GetRelativePath(containingRepository, projectPath)
+                .Replace('\\', '/');
+        var scopeCommit = string.Empty;
+        if (containingRepository is not null)
+        {
+            var revision = await processRunner.RunAsync(
+                "git",
+                ["-C", containingRepository, "rev-parse", "--verify",
+                    $"{baselines[containingRepository]}^{{commit}}"],
+                containingRepository, TimeSpan.FromSeconds(20),
+                cancellationToken);
+            if (revision.ExitCode != 0 ||
+                !System.Text.RegularExpressions.Regex.IsMatch(
+                    revision.StandardOutput.Trim(),
+                    @"\A[0-9a-fA-F]{40}([0-9a-fA-F]{24})?\z"))
+            {
+                throw new InvalidOperationException(
+                    $"Unable to resolve the selected project's Git baseline: {revision.CombinedOutput}");
+            }
+            scopeCommit = revision.StandardOutput.Trim().ToLowerInvariant();
+        }
         var authorizedWorkspaceRoot = Path.GetFullPath(
             workflowProvider.GetValidated().Config.Workspace.ResolvedRoot);
         Directory.CreateDirectory(authorizedWorkspaceRoot);
@@ -173,12 +204,17 @@ public sealed partial class WorkspaceManager(
                     validatedWorkspace,
                     recoveredBranchName,
                     cancellationToken);
+                await VerifyDeliveryBaselinesAsync(
+                    projectPath, repositories, baselines, validatedWorkspace,
+                    cancellationToken);
                 return new WorkspaceInfo(
                     validatedWorkspace,
                     recoveredBranchName,
                     CreatedNow: false,
                     trustedRepositories,
-                    WorkspaceMode.Delivery);
+                    WorkspaceMode.Delivery,
+                    SourceScopeRelativePath: scopePath,
+                    SourceBaselineCommit: scopeCommit);
             }
         }
 
@@ -230,6 +266,8 @@ public sealed partial class WorkspaceManager(
             await PrepareGuardedSnapshotAsync(
                 flow,
                 projectPath,
+                repositories,
+                baselines,
                 workspacePath,
                 authorizedWorkspaceRoot,
                 requestedMode,
@@ -262,13 +300,21 @@ public sealed partial class WorkspaceManager(
         var branchName = $"ai-harness/{Slug(flow.Title)}-{shortId}";
 
         bool createdNow;
-        if (repositories.Count == 1 &&
-            PathsEqual(projectPath, repositories[0]))
+        if (unversioned)
+        {
+            createdNow = await PrepareUnversionedDeliveryAsync(
+                projectPath, workspacePath, branchName,
+                authorizedWorkspaceRoot, cancellationToken);
+        }
+        else if (repositories.Count == 1 &&
+                 (PathsEqual(projectPath, repositories[0]) ||
+                  containingRepository is not null))
         {
             createdNow = await EnsureWorktreeAsync(
                 repositories[0],
                 workspacePath,
                 branchName,
+                baselines[repositories[0]],
                 cancellationToken);
         }
         else
@@ -278,6 +324,7 @@ public sealed partial class WorkspaceManager(
                 repositories,
                 workspacePath,
                 branchName,
+                baselines,
                 cancellationToken);
         }
         workspacePath = WorkspacePathGuard.ValidateExistingRoot(
@@ -311,7 +358,9 @@ public sealed partial class WorkspaceManager(
             branchName,
             createdNow,
             trustedRepositories,
-            WorkspaceMode.Delivery);
+            WorkspaceMode.Delivery,
+            SourceScopeRelativePath: scopePath,
+            SourceBaselineCommit: scopeCommit);
     }
 
     private async Task VerifyRecoveredDeliveryWorkspaceAsync(
@@ -326,7 +375,8 @@ public sealed partial class WorkspaceManager(
             var relativePath = Path.GetRelativePath(projectPath, repository);
             var repositoryWorkspace =
                 repositories.Count == 1 &&
-                PathsEqual(projectPath, repository)
+                (PathsEqual(projectPath, repository) ||
+                 IsContainedOrEqual(repository, projectPath))
                     ? workspacePath
                     : ResolveUnderWorkspace(
                         workspacePath,
@@ -352,6 +402,155 @@ public sealed partial class WorkspaceManager(
                     $"Recovered Delivery worktree '{repositoryWorkspace}' is not on the durable flow branch '{expectedBranchName}'.");
             }
         }
+        if (repositories.Count == 0)
+        {
+            var branch = await processRunner.RunAsync(
+                "git", ["-C", workspacePath, "branch", "--show-current"],
+                workspacePath, TimeSpan.FromSeconds(20), cancellationToken);
+            if (branch.ExitCode != 0 ||
+                !string.Equals(
+                    branch.StandardOutput.Trim(), expectedBranchName,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Recovered local Delivery workspace '{workspacePath}' is not on its durable flow branch.");
+            }
+        }
+    }
+
+    private async Task<string> FetchBaseBranchAsync(
+        string repository,
+        CancellationToken cancellationToken)
+    {
+        var remote = await processRunner.RunAsync(
+            "git", ["-C", repository, "remote", "get-url", "origin"],
+            repository, TimeSpan.FromSeconds(20), cancellationToken);
+        if (remote.ExitCode != 0)
+        {
+            var remotes = await processRunner.RunAsync(
+                "git", ["-C", repository, "remote"],
+                repository, TimeSpan.FromSeconds(20), cancellationToken);
+            if (remotes.ExitCode == 0 &&
+                string.IsNullOrWhiteSpace(remotes.StandardOutput))
+            {
+                var current = await processRunner.RunAsync(
+                    "git", ["-C", repository, "branch", "--show-current"],
+                    repository, TimeSpan.FromSeconds(20), cancellationToken);
+                if (current.ExitCode != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unable to inspect the local base branch for '{repository}': {current.CombinedOutput}");
+                }
+                if (current.StandardOutput.Trim() is "main" or "master")
+                {
+                    return $"refs/heads/{current.StandardOutput.Trim()}";
+                }
+                foreach (var localBranch in new[] { "main", "master" })
+                {
+                    var probe = await processRunner.RunAsync(
+                        "git",
+                        ["-C", repository, "show-ref", "--verify", "--quiet",
+                            $"refs/heads/{localBranch}"],
+                        repository, TimeSpan.FromSeconds(20), cancellationToken);
+                    if (probe.ExitCode == 0)
+                    {
+                        return $"refs/heads/{localBranch}";
+                    }
+                    if (probe.ExitCode != 1)
+                    {
+                        throw new InvalidOperationException(
+                            $"Unable to inspect local '{localBranch}' in '{repository}': {probe.CombinedOutput}");
+                    }
+                }
+                throw new InvalidOperationException(
+                    $"Local repository '{repository}' has no main or master branch.");
+            }
+            throw new InvalidOperationException(
+                $"Unable to inspect origin for '{repository}': {remote.CombinedOutput}");
+        }
+
+        var heads = await processRunner.RunAsync(
+            "git",
+            ["-C", repository, "ls-remote", "--symref", "origin",
+                "HEAD", "refs/heads/main", "refs/heads/master"],
+            repository, TimeSpan.FromMinutes(1), cancellationToken);
+        if (heads.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to check the latest main/master branch for '{repository}': {heads.CombinedOutput}");
+        }
+        var lines = heads.StandardOutput.Split(
+            '\n',
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var defaultBranch = lines
+            .Where(line => line.StartsWith("ref: refs/heads/", StringComparison.Ordinal) &&
+                           line.EndsWith("\tHEAD", StringComparison.Ordinal))
+            .Select(line => line["ref: refs/heads/".Length..^"\tHEAD".Length])
+            .FirstOrDefault();
+        var branch = defaultBranch is "main" or "master"
+            ? defaultBranch
+            : lines.Any(line => line.EndsWith("\trefs/heads/main", StringComparison.Ordinal))
+                ? "main"
+                : lines.Any(line => line.EndsWith("\trefs/heads/master", StringComparison.Ordinal))
+                    ? "master"
+                    : throw new InvalidOperationException(
+                        $"Origin for '{repository}' has neither a main nor a master branch: {heads.CombinedOutput}");
+        var baseline = $"refs/remotes/origin/{branch}";
+        var fetch = await processRunner.RunAsync(
+            "git",
+            ["-C", repository, "fetch", "--no-tags", "origin",
+                $"+refs/heads/{branch}:{baseline}"],
+            repository, TimeSpan.FromMinutes(2), cancellationToken);
+        if (fetch.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to fetch the latest origin/{branch} for '{repository}': {fetch.CombinedOutput}");
+        }
+        return baseline;
+    }
+
+    private async Task VerifyDeliveryBaselinesAsync(
+        string projectPath,
+        IReadOnlyList<string> repositories,
+        IReadOnlyDictionary<string, string> baselines,
+        string workspacePath,
+        CancellationToken cancellationToken)
+    {
+        foreach (var repository in repositories)
+        {
+            var worktree = repositories.Count == 1 &&
+                           (PathsEqual(projectPath, repository) ||
+                            IsContainedOrEqual(repository, projectPath))
+                ? workspacePath
+                : ResolveUnderWorkspace(
+                    workspacePath, Path.GetRelativePath(projectPath, repository));
+            await VerifyBaseAncestorAsync(
+                repository, worktree, baselines[repository], cancellationToken);
+        }
+    }
+
+    private async Task VerifyBaseAncestorAsync(
+        string repository,
+        string worktree,
+        string baseline,
+        CancellationToken cancellationToken,
+        string target = "HEAD")
+    {
+        var ancestry = await processRunner.RunAsync(
+            "git",
+            ["-C", worktree, "merge-base", "--is-ancestor", baseline, target],
+            worktree, TimeSpan.FromSeconds(20), cancellationToken);
+        if (ancestry.ExitCode == 1)
+        {
+            throw new InvalidOperationException(
+                $"Flow worktree '{worktree}' is behind {baseline} in '{repository}'. " +
+                "Resolve the upstream changes explicitly before resuming; Studio will not merge or rebase an existing flow.");
+        }
+        if (ancestry.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to check upstream ancestry for '{worktree}': {ancestry.CombinedOutput}");
+        }
     }
 
     private async Task<IReadOnlyList<WorkspaceRepositoryIdentity>>
@@ -361,10 +560,6 @@ public sealed partial class WorkspaceManager(
             IReadOnlyList<string> repositories,
             CancellationToken cancellationToken)
     {
-        var relativePaths = repositories
-            .Select(repository => NormalizeRepositoryPath(projectPath, repository))
-            .Order(StringComparer.Ordinal)
-            .ToArray();
         var result = new List<WorkspaceRepositoryIdentity>(repositories.Count);
         foreach (var repository in repositories)
         {
@@ -372,7 +567,9 @@ public sealed partial class WorkspaceManager(
                 repository,
                 cancellationToken);
             result.Add(new WorkspaceRepositoryIdentity(
-                NormalizeRepositoryPath(projectPath, repository),
+                IsContainedOrEqual(repository, projectPath)
+                    ? "."
+                    : NormalizeRepositoryPath(projectPath, repository),
                 remoteRepository));
         }
         return result
@@ -559,10 +756,56 @@ public sealed partial class WorkspaceManager(
             return WorkspaceCleanupResult.Empty;
         }
         var repositories = RepositoryAnalyzer.FindGitRepositories(projectPath);
+        var containingRepository = repositories.Count == 0
+            ? RepositoryAnalyzer.FindContainingGitRepository(projectPath)
+            : null;
+        if (containingRepository is not null)
+        {
+            repositories = [containingRepository];
+        }
         if (repositories.Count == 0)
         {
-            throw new InvalidOperationException(
-                "No source Git repositories remain for flow cleanup.");
+            if (Directory.Exists(expectedWorkspace))
+            {
+                if (persistedMode != WorkspaceMode.Delivery ||
+                    string.IsNullOrWhiteSpace(flow.WorkspacePath))
+                {
+                    return new WorkspaceCleanupResult(
+                        0, 0, 0,
+                        ["Preserved local workspace path without a durable Delivery ownership record."]);
+                }
+                var marker = Path.Combine(expectedWorkspace, ".git");
+                if (!RepositoryAnalyzer.IsGitRepository(expectedWorkspace) ||
+                    (File.GetAttributes(marker) & FileAttributes.ReparsePoint) != 0)
+                {
+                    return new WorkspaceCleanupResult(
+                        0, 0, 0,
+                        ["Preserved local workspace path without an owned Git repository."]);
+                }
+                var branch = await processRunner.RunAsync(
+                    "git", ["-C", expectedWorkspace, "branch", "--show-current"],
+                    expectedWorkspace, TimeSpan.FromSeconds(20), cancellationToken);
+                if (branch.ExitCode != 0 ||
+                    !string.Equals(
+                        branch.StandardOutput.Trim(), branchName,
+                        StringComparison.Ordinal))
+                {
+                    return new WorkspaceCleanupResult(
+                        0, 0, 0,
+                        ["Preserved local workspace path not on the durable flow branch."]);
+                }
+                await hookRunner.RunAsync(
+                    WorkspaceHookStage.BeforeRemove,
+                    expectedWorkspace,
+                    workflowProvider.GetEffective(),
+                    flow.Kind,
+                    provisional: false,
+                    cancellationToken: cancellationToken);
+                DeleteSnapshotSafely(expectedWorkspace);
+            }
+            await _advisoryArtifacts.DeleteMetadataAsync(
+                flow.Id, cancellationToken);
+            return WorkspaceCleanupResult.Empty;
         }
         var branchValidation = await processRunner.RunAsync(
             "git",
@@ -594,7 +837,9 @@ public sealed partial class WorkspaceManager(
         {
             var relativePath = Path.GetRelativePath(projectPath, repository);
             var repositoryWorkspace =
-                repositories.Count == 1 && PathsEqual(projectPath, repository)
+                repositories.Count == 1 &&
+                (PathsEqual(projectPath, repository) ||
+                 IsContainedOrEqual(repository, projectPath))
                     ? expectedWorkspace
                     : ResolveUnderWorkspace(expectedWorkspace, relativePath);
             if (Directory.Exists(repositoryWorkspace))
@@ -724,6 +969,8 @@ public sealed partial class WorkspaceManager(
     private async Task PrepareGuardedSnapshotAsync(
         FlowRun flow,
         string projectPath,
+        IReadOnlyList<string> repositories,
+        IReadOnlyDictionary<string, string> baselines,
         string workspacePath,
         string authorizedWorkspaceRoot,
         WorkspaceMode mode,
@@ -745,11 +992,90 @@ public sealed partial class WorkspaceManager(
                 mode,
                 workspacePath,
                 flow.Id);
-            CopyGuardedSource(
-                projectPath,
-                stagingPath,
-                authorizedWorkspaceRoot,
-                cancellationToken);
+            if (repositories.Count == 0 ||
+                !IsContainedOrEqual(repositories[0], projectPath) ||
+                PathsEqual(repositories[0], projectPath))
+            {
+                CopyGuardedSource(
+                    projectPath,
+                    stagingPath,
+                    authorizedWorkspaceRoot,
+                    cancellationToken,
+                    repositories);
+            }
+            foreach (var repository in repositories)
+            {
+                var relativeProjectPath = IsContainedOrEqual(repository, projectPath)
+                    ? Path.GetRelativePath(repository, projectPath)
+                    : ".";
+                var snapshotSource = relativeProjectPath == "."
+                    ? repository
+                    : projectPath;
+                var snapshotDestination =
+                    relativeProjectPath != "." ||
+                    repositories.Count == 1 && PathsEqual(projectPath, repository)
+                        ? stagingPath
+                        : ResolveUnderWorkspace(
+                            stagingPath,
+                            Path.GetRelativePath(projectPath, repository));
+                if (baselines[repository].StartsWith("refs/heads/", StringComparison.Ordinal))
+                {
+                    var current = await processRunner.RunAsync(
+                        "git", ["-C", repository, "branch", "--show-current"],
+                        repository, TimeSpan.FromSeconds(20), cancellationToken);
+                    if (current.ExitCode != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Unable to inspect local branch for '{repository}': {current.CombinedOutput}");
+                    }
+                    if (baselines[repository] ==
+                        $"refs/heads/{current.StandardOutput.Trim()}")
+                    {
+                        CopyGuardedSource(
+                            snapshotSource,
+                            snapshotDestination,
+                            authorizedWorkspaceRoot,
+                            cancellationToken);
+                        continue;
+                    }
+                }
+                var temporaryWorktree = Path.Combine(
+                    authorizedWorkspaceRoot,
+                    $"{Path.GetFileName(workspacePath)}.source-{Guid.NewGuid():N}");
+                var add = await processRunner.RunAsync(
+                    "git",
+                    ["-C", repository, "worktree", "add", "--detach",
+                        temporaryWorktree, baselines[repository]],
+                    repository, TimeSpan.FromMinutes(2), cancellationToken);
+                if (add.ExitCode != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unable to snapshot latest source for '{repository}': {add.CombinedOutput}");
+                }
+                try
+                {
+                    CopyGuardedSource(
+                        relativeProjectPath == "."
+                            ? temporaryWorktree
+                            : Path.Combine(temporaryWorktree, relativeProjectPath),
+                        snapshotDestination,
+                        authorizedWorkspaceRoot,
+                        cancellationToken);
+                }
+                finally
+                {
+                    var remove = await processRunner.RunAsync(
+                        "git",
+                        ["-C", repository, "worktree", "remove", "--force",
+                            temporaryWorktree],
+                        repository, TimeSpan.FromMinutes(2), CancellationToken.None);
+                    if (remove.ExitCode != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Unable to remove temporary source worktree '{temporaryWorktree}': {remove.CombinedOutput}");
+                    }
+                }
+            }
             _ = await _advisoryArtifacts.JournalGuardedSnapshotAsync(
                 flow,
                 stagingPath,
@@ -785,7 +1111,8 @@ public sealed partial class WorkspaceManager(
         string projectPath,
         string destinationPath,
         string authorizedWorkspaceRoot,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyCollection<string>? excludedRepositories = null)
     {
         var comparison = OperatingSystem.IsWindows()
             ? StringComparer.OrdinalIgnoreCase
@@ -797,6 +1124,19 @@ public sealed partial class WorkspaceManager(
             Path.TrimEndingDirectorySeparator(
                 Path.GetFullPath(destinationPath))
         };
+        if (excludedRepositories is not null)
+        {
+            foreach (var repository in excludedRepositories)
+            {
+                excludedRoots.Add(Path.TrimEndingDirectorySeparator(
+                    Path.GetFullPath(repository)));
+            }
+        }
+        if (excludedRoots.Contains(Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(projectPath))))
+        {
+            return;
+        }
         var pending = new Stack<(string Source, string Destination)>();
         pending.Push((projectPath, destinationPath));
 
@@ -893,6 +1233,7 @@ public sealed partial class WorkspaceManager(
         IReadOnlyList<string> repositories,
         string workspacePath,
         string branchName,
+        IReadOnlyDictionary<string, string> baselines,
         CancellationToken cancellationToken)
     {
         var createdNow = !Directory.Exists(workspacePath);
@@ -907,16 +1248,64 @@ public sealed partial class WorkspaceManager(
                 repository,
                 repositoryWorkspace,
                 branchName,
+                baselines[repository],
                 cancellationToken);
         }
 
         return createdNow;
     }
 
+    private async Task<bool> PrepareUnversionedDeliveryAsync(
+        string projectPath,
+        string workspacePath,
+        string branchName,
+        string authorizedWorkspaceRoot,
+        CancellationToken cancellationToken)
+    {
+        if (Directory.Exists(workspacePath) || File.Exists(workspacePath))
+        {
+            throw new IOException(
+                $"Local Delivery workspace path already exists: {workspacePath}");
+        }
+        CopyGuardedSource(
+            projectPath, workspacePath, authorizedWorkspaceRoot,
+            cancellationToken);
+        var init = await processRunner.RunAsync(
+            "git", ["-C", workspacePath, "init", "-b", branchName],
+            workspacePath, TimeSpan.FromSeconds(30), cancellationToken);
+        if (init.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to initialize isolated local Delivery repository: {init.CombinedOutput}");
+        }
+        var add = await processRunner.RunAsync(
+            "git", ["-C", workspacePath, "add", "--all"],
+            workspacePath, TimeSpan.FromMinutes(2), cancellationToken);
+        if (add.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to stage isolated local Delivery baseline: {add.CombinedOutput}");
+        }
+        var commit = await processRunner.RunAsync(
+            "git",
+            ["-C", workspacePath, "-c", "user.name=AI Harness Studio",
+                "-c", "user.email=studio@example.invalid",
+                "-c", "commit.gpgsign=false",
+                "commit", "--allow-empty", "-m", "Capture source project baseline"],
+            workspacePath, TimeSpan.FromMinutes(2), cancellationToken);
+        if (commit.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to commit isolated local Delivery baseline: {commit.CombinedOutput}");
+        }
+        return true;
+    }
+
     private async Task<bool> EnsureWorktreeAsync(
         string repositoryPath,
         string workspacePath,
         string branchName,
+        string baseline,
         CancellationToken cancellationToken)
     {
         if (Directory.Exists(workspacePath))
@@ -933,6 +1322,8 @@ public sealed partial class WorkspaceManager(
                     branchName,
                     StringComparison.Ordinal))
             {
+                await VerifyBaseAncestorAsync(
+                    repositoryPath, workspacePath, baseline, cancellationToken);
                 logger.LogInformation(
                     "Recovered existing worktree {WorkspacePath} on {BranchName}",
                     workspacePath,
@@ -967,8 +1358,19 @@ public sealed partial class WorkspaceManager(
                 "worktree", "add",
                 "-b", branchName,
                 workspacePath,
-                "HEAD"
+                baseline
             ];
+        if (branchProbe.ExitCode is not (0 or 1))
+        {
+            throw new InvalidOperationException(
+                $"Unable to inspect flow branch in '{repositoryPath}': {branchProbe.CombinedOutput}");
+        }
+        if (branchProbe.ExitCode == 0)
+        {
+            await VerifyBaseAncestorAsync(
+                repositoryPath, repositoryPath, baseline, cancellationToken,
+                $"refs/heads/{branchName}");
+        }
         var create = await processRunner.RunAsync(
             "git",
             arguments,
@@ -981,6 +1383,8 @@ public sealed partial class WorkspaceManager(
             throw new InvalidOperationException(
                 $"Unable to create isolated worktree for '{repositoryPath}': {create.CombinedOutput}");
         }
+        await VerifyBaseAncestorAsync(
+            repositoryPath, workspacePath, baseline, cancellationToken);
 
         return true;
     }
@@ -1101,5 +1505,19 @@ public sealed partial class WorkspaceManager(
             Path.TrimEndingDirectorySeparator(Path.GetFullPath(left)),
             Path.TrimEndingDirectorySeparator(Path.GetFullPath(right)),
             comparison);
+    }
+
+    private static bool IsContainedOrEqual(string root, string path)
+    {
+        var relative = Path.GetRelativePath(root, path);
+        return relative == "." ||
+               !Path.IsPathRooted(relative) &&
+               relative != ".." &&
+               !relative.StartsWith(
+                   ".." + Path.DirectorySeparatorChar,
+                   StringComparison.Ordinal) &&
+               !relative.StartsWith(
+                   ".." + Path.AltDirectorySeparatorChar,
+                   StringComparison.Ordinal);
     }
 }

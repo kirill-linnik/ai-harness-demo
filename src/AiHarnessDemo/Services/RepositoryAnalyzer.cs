@@ -36,7 +36,25 @@ public sealed class RepositoryAnalyzer(
         );
 
     public static bool IsProjectDirectory(string path) =>
-        FindGitRepositories(path).Count > 0;
+        Directory.Exists(path);
+
+    public static string? FindContainingGitRepository(string projectPath)
+    {
+        if (!Directory.Exists(projectPath))
+        {
+            return null;
+        }
+        for (var directory = new DirectoryInfo(Path.GetFullPath(projectPath));
+             directory is not null;
+             directory = directory.Parent)
+        {
+            if (IsGitRepository(directory.FullName))
+            {
+                return directory.FullName;
+            }
+        }
+        return null;
+    }
 
     public static IReadOnlyList<string> FindGitRepositories(string projectPath)
     {
@@ -112,10 +130,10 @@ public sealed class RepositoryAnalyzer(
                 $"The selected project folder does not exist: {repositoryPath}");
         }
         var gitRepositories = FindGitRepositories(repositoryPath);
-        if (gitRepositories.Count == 0)
+        if (gitRepositories.Count == 0 &&
+            FindContainingGitRepository(repositoryPath) is not null)
         {
-            throw new InvalidOperationException(
-                "The selected project folder must contain at least one Git repository.");
+            gitRepositories = [repositoryPath];
         }
         var workflow = workflowProvider.GetValidated();
         var copilotCommand = workflow.Config.Copilot.Command;
@@ -309,7 +327,7 @@ public sealed class RepositoryAnalyzer(
         builder.AppendLine("Deterministic inventory (seed evidence, not final knowledge):");
         builder.AppendLine($"- Project: {Path.GetFileName(repositoryPath)}");
         builder.AppendLine(
-            $"- Git repositories: {string.Join(", ", repositoryPaths.DefaultIfEmpty("."))}");
+            $"- Git repositories: {string.Join(", ", repositoryPaths.DefaultIfEmpty("None (unversioned project)"))}");
         builder.AppendLine(
             $"- Top-level areas: {string.Join(", ", topDirectories.DefaultIfEmpty("No child directories"))}");
         builder.AppendLine(
