@@ -37,6 +37,7 @@ export function IntakePage() {
   const continueIntake = useContinueIntakeMutation();
 
   const [message, setMessage] = useState("");
+  const [recording, setRecording] = useState(false);
   const [pendingMessage, setPendingMessage] = useState<PendingCustomerMessage | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
   const initialized = useRef(false);
@@ -60,7 +61,10 @@ export function IntakePage() {
     const draft = consumeDraftPrompt();
     if (draft) setMessage(draft);
     if (consumeStartVoiceHint()) {
-      setTimeout(() => toggleVoice("intake-message", "intake-mic", setMessage), 250);
+      setTimeout(
+        () => toggleVoice("intake-message", "intake-mic", setMessage, setRecording),
+        250
+      );
     }
   }, []);
 
@@ -237,11 +241,15 @@ export function IntakePage() {
             <div className="composer-row">
               <button
                 id="intake-mic"
-                className="icon-button"
-                aria-label="Record task"
-                onClick={() => toggleVoice("intake-message", "intake-mic", setMessage)}
+                className={`icon-button intake-mic-toggle${recording ? " recording" : ""}`}
+                aria-label={recording ? "Stop voice recording" : "Start voice recording"}
+                aria-pressed={recording}
+                onClick={() =>
+                  toggleVoice("intake-message", "intake-mic", setMessage, setRecording)
+                }
               >
                 <MicIcon />
+                <span>{recording ? "Recording" : "Mic off"}</span>
               </button>
               <textarea
                 id="intake-message"

@@ -155,9 +155,59 @@ function confirmationFlow(status: FlowDetailDto["status"] = "Intake"): FlowDetai
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("IntakePage", () => {
+  it("shows whether the microphone is off or recording", () => {
+    class MockSpeechRecognition extends EventTarget {
+      lang = "";
+      continuous = false;
+      interimResults = false;
+      onstart: (() => void) | null = null;
+      onresult = null;
+      onerror = null;
+      onend: (() => void) | null = null;
+
+      start(): void { this.onstart?.(); }
+      stop(): void { this.onend?.(); }
+    }
+    vi.stubGlobal("SpeechRecognition", MockSpeechRecognition);
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={["/intake"]}>
+            <Routes>
+              <Route path="/intake" element={<IntakePage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    const microphone = screen.getByRole("button", { name: "Start voice recording" });
+    expect(microphone).toHaveTextContent("Mic off");
+    expect(microphone).toHaveAttribute("aria-pressed", "false");
+    expect(microphone).not.toHaveClass("recording");
+
+    fireEvent.click(microphone);
+    expect(microphone).toHaveTextContent("Recording");
+    expect(microphone).toHaveAttribute("aria-pressed", "true");
+    expect(microphone).toHaveClass("recording");
+    expect(screen.getByRole("button", { name: "Stop voice recording" })).toBe(microphone);
+
+    fireEvent.click(microphone);
+    expect(microphone).toHaveTextContent("Mic off");
+    expect(microphone).toHaveAttribute("aria-pressed", "false");
+    expect(microphone).not.toHaveClass("recording");
+  });
+
   it("shows the customer message while the account manager is thinking", async () => {
     let rejectIntake!: (reason: Error) => void;
     const intakeRequest = new Promise<IntakeResponse>((_resolve, reject) => {
@@ -457,8 +507,8 @@ describe("IntakePage", () => {
     expect(screen.getByRole("heading", { name: "Proposed as Advisory" })).toBeInTheDocument();
     expect(screen.getByText(/without changing or publishing source code/i)).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Start voice recording" })
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Start voice recording" })
+    ).toHaveAttribute("aria-pressed", "false");
     fireEvent.change(screen.getByLabelText("Customer request"), {
       target: { value: "Please include rollout risks." }
     });

@@ -62,4 +62,33 @@ describe("toggleVoice", () => {
     expect(onTranscript).toHaveBeenCalledWith("Existing request with more detail");
     expect(document.querySelector<HTMLTextAreaElement>("#message")?.value).toBe("Existing request");
   });
+
+  it("reports microphone activation, stopping, and natural completion", () => {
+    document.body.innerHTML = `
+      <textarea id="message"></textarea>
+      <button id="microphone" aria-pressed="false">Mic off</button>
+    `;
+    Object.defineProperty(window, "SpeechRecognition", {
+      configurable: true,
+      value: MockSpeechRecognition
+    });
+    const onRecordingChange = vi.fn();
+    const button = document.querySelector<HTMLButtonElement>("#microphone")!;
+
+    toggleVoice("message", "microphone", undefined, onRecordingChange);
+    expect(button).toHaveClass("recording");
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveAttribute("aria-label", "Stop voice recording");
+
+    toggleVoice("message", "microphone", undefined, onRecordingChange);
+    expect(button).not.toHaveClass("recording");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+
+    toggleVoice("message", "microphone", undefined, onRecordingChange);
+    MockSpeechRecognition.current?.onend?.();
+    expect(button).not.toHaveClass("recording");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(onRecordingChange.mock.calls.map(([recording]) => recording))
+      .toEqual([true, false, true, false]);
+  });
 });

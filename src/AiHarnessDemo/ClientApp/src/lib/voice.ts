@@ -42,7 +42,8 @@ export function isVoiceRecognitionAvailable(): boolean {
 export function toggleVoice(
   textareaId: string,
   buttonId: string,
-  onTranscript?: (transcript: string) => void
+  onTranscript?: (transcript: string) => void,
+  onRecordingChange?: (recording: boolean) => void
 ): void {
   if (activeRecognition) {
     activeRecognition.stop();
@@ -75,6 +76,8 @@ export function toggleVoice(
     button.classList.add("recording");
     document.querySelector("#intake-signal")?.classList.add("listening");
     button.setAttribute("aria-label", "Stop voice recording");
+    button.setAttribute("aria-pressed", "true");
+    onRecordingChange?.(true);
   };
   recognition.onresult = event => {
     let finalText = "";
@@ -101,7 +104,9 @@ export function toggleVoice(
     button.classList.remove("recording");
     document.querySelector("#intake-signal")?.classList.remove("listening");
     button.setAttribute("aria-label", "Start voice recording");
+    button.setAttribute("aria-pressed", "false");
     activeRecognition = null;
+    onRecordingChange?.(false);
   };
   recognition.start();
 }

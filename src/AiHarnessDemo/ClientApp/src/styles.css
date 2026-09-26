@@ -735,6 +735,31 @@ summary:focus-visible {
   stroke-width: 1.8;
 }
 
+.intake-mic-toggle {
+  display: inline-flex;
+  justify-content: center;
+  width: auto;
+  min-width: 112px;
+  height: 44px;
+  gap: 6px;
+  padding: 0 10px;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.intake-mic-toggle.recording {
+  border-color: #ff667d;
+  color: #fff;
+  background: #a62948;
+  box-shadow: 0 0 0 3px rgba(255, 102, 125, 0.18);
+}
+
+.intake-mic-toggle.recording:hover {
+  border-color: #ff8fa0;
+  color: #fff;
+}
+
 .card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
