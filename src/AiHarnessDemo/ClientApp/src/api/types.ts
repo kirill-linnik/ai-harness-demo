@@ -283,6 +283,14 @@ export interface FlowMessageDto {
   content: string;
   isQuestion: boolean;
   createdAt: string;
+  attachments?: FlowAttachmentDto[];
+}
+
+export interface FlowAttachmentDto {
+  id: string;
+  fileName: string;
+  contentType: string;
+  length: number;
 }
 
 export interface FlowEventDto {
@@ -523,6 +531,8 @@ export interface BootstrapDto {
   admission: NewWorkAdmissionStatusDto;
   factoryEnabled: boolean;
   factoryDisabledReason: string;
+  githubCliAvailable: boolean;
+  githubCliAuthenticated: boolean;
 }
 
 export interface SaveSettingsRequest {
@@ -564,6 +574,7 @@ export interface DirectoryListingDto {
 export interface IntakeRequest {
   flowId: string | null;
   message: string;
+  files?: File[];
 }
 
 export interface IntakeResponse {

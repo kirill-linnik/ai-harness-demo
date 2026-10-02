@@ -25,6 +25,10 @@ interface PendingCustomerMessage {
   existingMessageIds: ReadonlySet<string>;
 }
 
+const MAX_FILES_PER_MESSAGE = 8;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_FLOW_BYTES = 16 * 1024 * 1024;
+
 export function IntakePage() {
   const params = useParams<{ id?: string }>();
   const navigate = useNavigate();
@@ -37,9 +41,11 @@ export function IntakePage() {
   const continueIntake = useContinueIntakeMutation();
 
   const [message, setMessage] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
   const [recording, setRecording] = useState(false);
   const [pendingMessage, setPendingMessage] = useState<PendingCustomerMessage | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const initialized = useRef(false);
   const submitting = useRef(false);
   const messages = flow?.messages ?? [];
@@ -110,7 +116,8 @@ export function IntakePage() {
   async function submitIntake() {
     if (submitting.current) return;
 
-    const trimmed = message.trim();
+    const trimmed = message.trim() ||
+      (files.length > 0 && flow ? "I attached the requested files." : "");
     if (!trimmed) {
       toast("Describe the change before sending.", "error");
       return;
@@ -123,7 +130,13 @@ export function IntakePage() {
         role: "Customer",
         content: trimmed,
         isQuestion: false,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        attachments: files.map((file, index) => ({
+          id: `pending-file-${index}`,
+          fileName: file.name,
+          contentType: file.type,
+          length: file.size
+        }))
       },
       existingMessageIds: new Set(messages.map(item => item.id))
     });
@@ -132,10 +145,13 @@ export function IntakePage() {
     try {
       const response = await continueIntake.mutateAsync({
         flowId: flow?.id ?? params.id ?? null,
-        message: trimmed
+        message: trimmed,
+        ...(files.length ? { files } : {})
       });
       queryClient.setQueryData(queryKeys.flow(response.flow.id), response.flow);
       setPendingMessage(null);
+      setFiles([]);
+      if (fileInputRef.current) fileInputRef.current.value = "";
       if (response.shouldSpeak) speak(response.reply);
       if (response.readyToStart || response.flow.status !== "Intake") {
         navigate(`/factory/${response.flow.id}`, { replace: true });
@@ -177,6 +193,24 @@ export function IntakePage() {
   }
 
   const sending = continueIntake.isPending || pendingMessage !== null;
+  const usedBytes = messages.reduce(
+    (total, item) =>
+      total + (item.attachments ?? []).reduce((sum, file) => sum + file.length, 0),
+    0
+  );
+
+  function addFiles(selected: FileList | null) {
+    if (!selected) return;
+    const next = [...files, ...Array.from(selected)];
+    if (next.length > MAX_FILES_PER_MESSAGE ||
+        next.some(file => file.size > MAX_FILE_BYTES) ||
+        usedBytes + next.reduce((total, file) => total + file.size, 0) > MAX_FLOW_BYTES) {
+      toast("Attach up to 8 files (8 MB each, 16 MB per flow).", "error");
+    } else {
+      setFiles(next);
+    }
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
 
   return (
     <AppShell
@@ -238,6 +272,35 @@ export function IntakePage() {
             </section>
           )}
           <div className="composer">
+            <div className="composer-attachments">
+              <label htmlFor="intake-files">Attach files for the Account Manager</label>
+              <input
+                id="intake-files"
+                type="file"
+                multiple
+                ref={fileInputRef}
+                disabled={sending}
+                onChange={event => addFiles(event.target.files)}
+              />
+              {files.length > 0 && (
+                <ul aria-label="Files ready to send">
+                  {files.map((file, index) => (
+                    <li key={`${file.name}-${index}`}>
+                      <span>{file.name} ({Math.ceil(file.size / 1024)} KB)</span>
+                      <button
+                        type="button"
+                        aria-label={`Remove ${file.name}`}
+                        disabled={sending}
+                        onClick={() => setFiles(current =>
+                          current.filter((_, itemIndex) => itemIndex !== index))}
+                      >
+                        Remove
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
             <div className="composer-row">
               <button
                 id="intake-mic"
@@ -272,7 +335,7 @@ export function IntakePage() {
                 <SendIcon /> {sending ? "Thinking..." : "Send"}
               </button>
             </div>
-            <div className="composer-hint">Use voice in Edge or Chrome on localhost, or type when the room is noisy.</div>
+            <div className="composer-hint">Upload files outside the selected project instead of granting folder access. Use voice in Edge or Chrome on localhost, or type when the room is noisy.</div>
           </div>
         </div>
       </section>

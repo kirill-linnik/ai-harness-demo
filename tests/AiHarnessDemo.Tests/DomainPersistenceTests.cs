@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
 using AiHarnessDemo.Core.Orchestration;
@@ -25,6 +26,7 @@ public sealed class DomainPersistenceTests
         Assert.True(await TableExistsAsync(connection, "FlowAgentSnapshots"));
         Assert.True(await TableExistsAsync(connection, "FlowPlanDocuments"));
         Assert.True(await TableExistsAsync(connection, "DemoInstances"));
+        Assert.True(await TableExistsAsync(connection, "FlowAttachments"));
         Assert.Equal(
             IntakeParser.MaximumJsonCharacters,
             database.Model.FindEntityType(typeof(FlowEvent))!
@@ -50,6 +52,56 @@ public sealed class DomainPersistenceTests
         Assert.Equal(
             1L,
             Convert.ToInt64(await demoIndexProbe.ExecuteScalarAsync()));
+    }
+
+    [Fact]
+    public async Task CustomerUploadSchema_UpgradesExistingDatabaseAndPersistsExactBytes()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var database = CreateDatabase(connection);
+        await database.Database.EnsureCreatedAsync();
+        await database.Database.ExecuteSqlRawAsync(
+            """DROP TABLE "FlowAttachments";""");
+
+        await DatabaseInitializer.EnsureFlowAttachmentSchemaAsync(database);
+        await DatabaseInitializer.EnsureFlowAttachmentSchemaAsync(database);
+
+        Assert.True(await TableExistsAsync(connection, "FlowAttachments"));
+        var flow = new FlowRun
+        {
+            Title = "Create a meeting",
+            OriginalRequest = "Use the attached photo."
+        };
+        var message = new FlowMessage
+        {
+            FlowRunId = flow.Id,
+            Role = ConversationRole.Customer,
+            Content = flow.OriginalRequest
+        };
+        byte[] photoBytes = [0xff, 0xd8, 0xff, 0xe0, 23, 42];
+        var photo = Assert.Single(CustomerAttachmentStore.Prepare(
+            flow.Id, message.Id,
+            [new IntakeAttachment("speaker.jpg", "image/jpeg", photoBytes)],
+            existingFlowBytes: 0,
+            existingFlowFiles: 0));
+        flow.Messages.Add(message);
+        message.Attachments.Add(photo);
+        database.Flows.Add(flow);
+        await database.SaveChangesAsync();
+        database.ChangeTracker.Clear();
+
+        var restored = await database.Flows.AsNoTracking()
+            .Include(item => item.Messages)
+            .ThenInclude(item => item.Attachments)
+            .SingleAsync(item => item.Id == flow.Id);
+        var stored = Assert.Single(Assert.Single(restored.Messages).Attachments);
+        Assert.Equal(photoBytes, stored.Content);
+        CustomerAttachmentStore.Validate(stored, flow.Id);
+
+        database.Flows.Remove(await database.Flows.SingleAsync(item => item.Id == flow.Id));
+        await database.SaveChangesAsync();
+        Assert.Empty(await database.FlowAttachments.ToListAsync());
     }
 
     [Fact]

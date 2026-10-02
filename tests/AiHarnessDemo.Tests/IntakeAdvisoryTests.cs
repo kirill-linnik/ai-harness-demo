@@ -18,6 +18,276 @@ namespace AiHarnessDemo.Tests;
 
 public sealed class IntakeAdvisoryTests
 {
+    private const string MeetingWithOutsidePhoto = """
+        Add one meeting with two speakers.
+        picture is located here: Downloads\Photo_Speaker.jpg
+        The first talk has a complete description and links in this message.
+        """;
+
+    [Fact]
+    public async Task OutsideProjectPhoto_KeepsIntakeOpenUntilUploaded()
+    {
+        await using var harness = await StudioFlowHarness.CreateAsync(FlowKind.Delivery);
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(item => item.Id == harness.FlowId);
+            flow.OriginalRequest = MeetingWithOutsidePhoto;
+            await database.SaveChangesAsync();
+        }
+        var before = await harness.LoadFlowAsync();
+        Assert.Equal(MeetingWithOutsidePhoto, before.OriginalRequest);
+        Assert.True(CustomerExternalFileGate.IsOutsideProject(
+            @"Downloads\Photo_Speaker.jpg", before.RepositoryPath));
+        Assert.Equal(["Photo_Speaker.jpg"],
+            CustomerExternalFileGate.MissingFiles(before));
+
+        var result = await harness.Intake.ContinueAsync(
+            new IntakeRequest(harness.FlowId, MeetingWithOutsidePhoto));
+
+        Assert.False(result.ReadyToStart);
+        Assert.Equal(FlowStatus.Intake, result.Flow.Status);
+        Assert.Contains("Photo_Speaker.jpg", result.Reply);
+        Assert.Contains("attach", result.Reply, StringComparison.OrdinalIgnoreCase);
+        var flowAfter = await harness.LoadFlowAsync();
+        Assert.Contains(flowAfter.Events,
+            item => item.Type == "intake.external-upload-required");
+        Assert.DoesNotContain(flowAfter.Events,
+            item => item.Type == "flow.queued");
+    }
+
+    [Fact]
+    public async Task UploadedPhoto_IsDurableOnMessageAndDoesNotBlockConfirmation()
+    {
+        await using var harness = await StudioFlowHarness.CreateAsync(FlowKind.Delivery);
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(item => item.Id == harness.FlowId);
+            flow.OriginalRequest = MeetingWithOutsidePhoto;
+            await database.SaveChangesAsync();
+        }
+        var bytes = Enumerable.Range(0, 24_000)
+            .Select(index => (byte)(index % 251))
+            .ToArray();
+        var upload = new IntakeAttachment("Photo_Speaker.jpg", "image/jpeg", bytes);
+
+        var proposal = await harness.Intake.ContinueAsync(new IntakeRequest(
+            harness.FlowId, MeetingWithOutsidePhoto, [upload]));
+
+        Assert.False(proposal.ReadyToStart);
+        Assert.Contains("Customer-uploaded files: Photo_Speaker.jpg",
+            Assert.Single(harness.Runner.Contexts).Task);
+        var proposalMessage = Assert.Single(proposal.Flow.Messages,
+            item => item.Role == ConversationRole.Customer);
+        var projected = Assert.Single(proposalMessage.Attachments!);
+        Assert.Equal(upload.FileName, projected.FileName);
+        Assert.Equal(bytes.Length, projected.Length);
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var persisted = await database.FlowAttachments.AsNoTracking()
+                .SingleAsync(item => item.FlowRunId == harness.FlowId);
+            Assert.Equal(proposalMessage.Id, persisted.FlowMessageId);
+            Assert.Equal(bytes, persisted.Content);
+            CustomerAttachmentStore.Validate(persisted, harness.FlowId);
+        }
+
+        var confirmed = await harness.Intake.ContinueAsync(
+            new IntakeRequest(harness.FlowId, "Yes, use the attached photo."));
+
+        Assert.True(confirmed.ReadyToStart);
+        Assert.Equal(FlowStatus.Queued, confirmed.Flow.Status);
+        Assert.Single(confirmed.Flow.Messages
+            .Where(item => item.Role == ConversationRole.Customer)
+            .SelectMany(item => item.Attachments ?? []));
+        Assert.DoesNotContain(confirmed.Flow.Events,
+            item => item.Type == "intake.external-upload-required");
+    }
+
+    [Fact]
+    public async Task PullRequestDelivery_RequiresGitHubCliBeforeCustomerConfirmation()
+    {
+        await using var harness = await StudioFlowHarness.CreateAsync(FlowKind.Delivery);
+        var proposal = await harness.Intake.ContinueAsync(
+            new IntakeRequest(harness.FlowId, "Add a reviewed meeting."));
+        Assert.False(proposal.ReadyToStart);
+        harness.Intake.GitHubCliAvailableOverride = () => false;
+
+        var failure = await Assert.ThrowsAsync<NewWorkAdmissionException>(() =>
+            harness.Intake.ContinueAsync(
+                new IntakeRequest(harness.FlowId, "Yes, please proceed.")));
+
+        Assert.Contains("GitHub CLI (gh)", failure.Message);
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Intake, flow.Status);
+        Assert.DoesNotContain(flow.Events, item => item.Type == "flow.queued");
+        Assert.Single(flow.Steps, step =>
+            step.InvocationKind == ExecutionInvocationKind.Intake);
+    }
+
+    [Fact]
+    public async Task PullRequestDelivery_RequiresStudioAuthenticationBeforeCustomerConfirmation()
+    {
+        await using var harness = await StudioFlowHarness.CreateAsync(FlowKind.Delivery);
+        var proposal = await harness.Intake.ContinueAsync(
+            new IntakeRequest(harness.FlowId, "Add a reviewed meeting."));
+        Assert.False(proposal.ReadyToStart);
+        harness.Intake.GitHubAuthenticationAvailableOverride =
+            _ => Task.FromResult(false);
+
+        var failure = await Assert.ThrowsAsync<NewWorkAdmissionException>(() =>
+            harness.Intake.ContinueAsync(
+                new IntakeRequest(harness.FlowId, "Yes, please proceed.")));
+
+        Assert.Contains("no GitHub token", failure.Message);
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Intake, flow.Status);
+        Assert.DoesNotContain(flow.Events, item => item.Type == "flow.queued");
+        Assert.Single(flow.Steps, step =>
+            step.InvocationKind == ExecutionInvocationKind.Intake);
+    }
+
+    [Fact]
+    public async Task AdvisoryIntake_DoesNotRequireGitHubCliForDeliveryPreference()
+    {
+        await using var harness = await StudioFlowHarness.CreateAsync(FlowKind.Advisory);
+        harness.Intake.GitHubCliAvailableOverride = () => false;
+        var proposal = await harness.Intake.ContinueAsync(
+            new IntakeRequest(harness.FlowId, "Assess the current project."));
+        Assert.False(proposal.ReadyToStart);
+
+        var confirmed = await harness.Intake.ContinueAsync(
+            new IntakeRequest(harness.FlowId, "Yes, please proceed."));
+
+        Assert.True(confirmed.ReadyToStart);
+        Assert.Equal(FlowStatus.Queued, confirmed.Flow.Status);
+        Assert.Equal(OutcomeType.None, confirmed.Flow.Outcome);
+    }
+
+    [Theory]
+    [InlineData(@"..\secrets.txt")]
+    [InlineData(@"C:\secret.txt")]
+    [InlineData("bad/name.txt")]
+    [InlineData("photo\nheader.jpg")]
+    public void UploadedFileNames_CannotEscapeHostOwnedStaging(string fileName)
+    {
+        Assert.Throws<ArgumentException>(() => CustomerAttachmentStore.Prepare(
+            Guid.NewGuid(), Guid.NewGuid(),
+            [new IntakeAttachment(fileName, "image/jpeg", [1, 2, 3])],
+            existingFlowBytes: 0,
+            existingFlowFiles: 0));
+    }
+
+    [Fact]
+    public void UploadedFiles_AreBoundedAndUrlsDoNotRequireAnUpload()
+    {
+        Assert.Throws<ArgumentException>(() => CustomerAttachmentStore.Prepare(
+            Guid.NewGuid(), Guid.NewGuid(),
+            [new IntakeAttachment("photo.jpg", "image/jpeg",
+                new byte[CustomerAttachmentStore.MaximumFileBytes + 1])],
+            existingFlowBytes: 0,
+            existingFlowFiles: 0));
+        var flow = new FlowRun
+        {
+            Title = "One meeting",
+            OriginalRequest =
+                "Photo url: https://example.test/photo.jpg\n" +
+                "image: pictures/speaker.jpg",
+            RepositoryPath = Path.GetTempPath()
+        };
+        Assert.Empty(CustomerExternalFileGate.MissingFiles(flow));
+    }
+
+    [Fact]
+    public void IntakePrompt_UsesOnlyTaskRelevantFactsFromSourceMaterial()
+    {
+        var task = IntakeCoordinator.BuildDialogueTask(
+            [
+                new FlowMessage
+                {
+                    Role = ConversationRole.Customer,
+                    Content = "Update an invoice template; attached notes also include internal routing details."
+                }
+            ],
+            OutcomeType.PullRequest);
+
+        Assert.Contains("Use only supplied facts needed for the requested outcome", task);
+        Assert.Contains("do not copy unrelated fields into requirements", task);
+    }
+
+    [Fact]
+    public void OutsideProjectFolder_RequestsFilesInsteadOfGrantingFolderAccess()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Use a customer file",
+            OriginalRequest = @"folder: C:\Users\customer\Downloads\Talks\",
+            RepositoryPath = Path.GetTempPath()
+        };
+        Assert.Equal(
+            ["the needed files from folder Talks"],
+            CustomerExternalFileGate.MissingFiles(flow));
+
+        var message = new FlowMessage
+        {
+            FlowRunId = flow.Id,
+            Role = ConversationRole.Customer,
+            Content = "I uploaded the talk notes."
+        };
+        message.Attachments.AddRange(CustomerAttachmentStore.Prepare(
+            flow.Id, message.Id,
+            [new IntakeAttachment("notes.txt", "text/plain", [1, 2])],
+            0, 0));
+        flow.Messages.Add(message);
+        Assert.Empty(CustomerExternalFileGate.MissingFiles(flow));
+    }
+
+    [Fact]
+    public void ProjectRootFolder_DoesNotRequireAnUpload()
+    {
+        var projectPath = Path.Combine(
+            Path.GetTempPath(), $"studio-project-{Guid.NewGuid():N}");
+        var flow = new FlowRun
+        {
+            Title = "Use files in this project",
+            OriginalRequest = $"folder: {projectPath}",
+            RepositoryPath = projectPath
+        };
+
+        Assert.False(CustomerExternalFileGate.IsOutsideProject(
+            projectPath, projectPath));
+        Assert.Empty(CustomerExternalFileGate.MissingFiles(flow));
+        Assert.True(CustomerExternalFileGate.IsOutsideProject(
+            Path.GetFullPath(Path.Combine(projectPath, "..", "other-project")),
+            projectPath));
+        Assert.False(CustomerExternalFileGate.IsOutsideProject(
+            projectPath, Path.GetPathRoot(projectPath)!));
+    }
+
+    [Fact]
+    public void RetriedUpload_MustMatchPersistedBytesRegardlessOfQueryOrder()
+    {
+        var flowId = Guid.NewGuid();
+        var message = new FlowMessage
+        {
+            FlowRunId = flowId,
+            Role = ConversationRole.Customer,
+            Content = "Here are the two speaker photos."
+        };
+        IntakeAttachment[] uploads =
+        [
+            new("first.jpg", "image/jpeg", [1, 2]),
+            new("second.jpg", "image/jpeg", [3, 4])
+        ];
+        message.Attachments.AddRange(CustomerAttachmentStore.Prepare(
+            flowId, message.Id, uploads, 0, 0));
+        message.Attachments.Reverse();
+
+        Assert.True(CustomerAttachmentStore.MatchesRetriedMessage(
+            flowId, message, uploads));
+        Assert.False(CustomerAttachmentStore.MatchesRetriedMessage(
+            flowId, message,
+            [uploads[0], new IntakeAttachment("second.jpg", "image/jpeg", [3, 5])]));
+    }
+
     [Fact]
     public async Task OptionalAgentWithAccountManagerRoleDoesNotShadowCanonicalCoreIdentity()
     {
@@ -92,6 +362,46 @@ public sealed class IntakeAdvisoryTests
                         "Assess checkout resilience",
                         new string('x', IntakeParser.MaximumTaskTitleCharacters + 1),
                         StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void ConfirmedBriefJson_IsValidatedAndNormalizedIndependently()
+    {
+        var json = IntakeParser.SerializeBrief(new IntakeBrief
+        {
+            Goal = "Prepare a meeting.",
+            Details = ["Keep the speaker's description.\r\nUse the provided image."],
+            SuccessCriteria = ["Both talks are visible."],
+            Constraints = [],
+            Assumptions = []
+        });
+
+        var brief = IntakeParser.ParseBriefJson(json);
+
+        Assert.Equal("Prepare a meeting.", brief.Goal);
+        Assert.Equal(
+            "Keep the speaker's description.\nUse the provided image.",
+            Assert.Single(brief.Details!));
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.ParseBriefJson(
+                json.Replace(
+                    "\"Goal\":",
+                    "\"Goal\":\"duplicate\",\"Goal\":",
+                    StringComparison.Ordinal)));
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.ParseBriefJson(
+                json.Replace(
+                    "\"Details\":",
+                    "\"Unexpected\":true,\"Details\":",
+                    StringComparison.Ordinal)));
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.ParseBriefJson(
+                json.Replace(
+                    "\"Constraints\":[],",
+                    string.Empty,
+                    StringComparison.Ordinal)));
+        Assert.Throws<IntakeContractException>(() =>
+            IntakeParser.ParseBriefJson("""{"Goal":"incomplete"}"""));
     }
 
     [Fact]
@@ -2343,6 +2653,9 @@ public sealed class IntakeAdvisoryTests
                 workflowProvider,
                 admission,
                 snapshotService);
+            intake.GitHubCliAvailableOverride = () => true;
+            intake.GitHubAuthenticationAvailableOverride =
+                _ => Task.FromResult(true);
             var engine = new WorkflowEngine(
                 factory,
                 catalog,

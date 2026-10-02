@@ -98,6 +98,7 @@ public sealed class ApiProjectionTests
             ("POST", "/api/agent-catalog/reload"),
             ("PUT", "/api/agents/{agentId}"),
             ("POST", "/api/intake"),
+            ("POST", "/api/intake/attachments"),
             ("GET", "/api/flows"),
             ("GET", "/api/flows/{flowId:guid}"),
             ("POST", "/api/flows/{flowId:guid}/restart"),
@@ -131,6 +132,87 @@ public sealed class ApiProjectionTests
             route => route.Pattern is
                 "/api/flows/{flowId:guid}/feedback" or
                 "/api/flows/{flowId:guid}/decision");
+    }
+
+    [Fact]
+    public void FlowProjection_UsesUploadMetadataWithoutIncludingFileBytes()
+    {
+        var flow = new FlowRun
+        {
+            Title = "New meetup",
+            OriginalRequest = "Use the attached photo."
+        };
+        var customer = new FlowMessage
+        {
+            FlowRunId = flow.Id,
+            Role = ConversationRole.Customer,
+            Content = flow.OriginalRequest
+        };
+        flow.Messages.Add(customer);
+        var metadata = new Dictionary<Guid, IReadOnlyList<FlowAttachmentDto>>
+        {
+            [customer.Id] =
+            [
+                new FlowAttachmentDto(
+                    Guid.NewGuid(), "speaker.jpg", "image/jpeg", 17_823)
+            ]
+        };
+
+        var projection = flow.ToDetailDto(attachmentsByMessage: metadata);
+
+        var attachment = Assert.Single(Assert.Single(projection.Messages).Attachments!);
+        Assert.Equal("speaker.jpg", attachment.FileName);
+        Assert.Equal(17_823, attachment.Length);
+        Assert.DoesNotContain(
+            "\"Content\":",
+            JsonSerializer.Serialize(attachment),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FlowAttachmentProjection_ReadsMetadataWithoutLoadingBinaryPayload()
+    {
+        await using var connection =
+            new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var commands = new List<string>();
+        var factory = new PreviewDbContextFactory(
+            new DbContextOptionsBuilder<HarnessDbContext>()
+                .UseSqlite(connection)
+                .LogTo(commands.Add, Microsoft.Extensions.Logging.LogLevel.Information)
+                .Options);
+        var flow = new FlowRun
+        {
+            Title = "New meetup",
+            OriginalRequest = "Attach a photo."
+        };
+        var message = new FlowMessage
+        {
+            FlowRunId = flow.Id,
+            Role = ConversationRole.Customer,
+            Content = flow.OriginalRequest
+        };
+        message.Attachments.Add(Assert.Single(CustomerAttachmentStore.Prepare(
+            flow.Id, message.Id,
+            [new IntakeAttachment("speaker.jpg", "image/jpeg", [1, 2, 3])],
+            existingFlowBytes: 0, existingFlowFiles: 0)));
+        flow.Messages.Add(message);
+        await using (var database = await factory.CreateDbContextAsync())
+        {
+            await database.Database.EnsureCreatedAsync();
+            database.Flows.Add(flow);
+            await database.SaveChangesAsync();
+        }
+        commands.Clear();
+
+        var metadata = await DemoApi.LoadFlowAttachmentMetadataAsync(
+            factory, flow.Id, CancellationToken.None);
+
+        Assert.Equal("speaker.jpg", Assert.Single(metadata[message.Id]).FileName);
+        Assert.DoesNotContain(
+            "\"Content\"",
+            string.Join(Environment.NewLine, commands),
+            StringComparison.Ordinal);
     }
 
     [Fact]

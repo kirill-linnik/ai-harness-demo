@@ -122,7 +122,14 @@ public sealed record FlowMessageDto(
     ConversationRole Role,
     string Content,
     bool IsQuestion,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    IReadOnlyList<FlowAttachmentDto>? Attachments = null);
+
+public sealed record FlowAttachmentDto(
+    Guid Id,
+    string FileName,
+    string ContentType,
+    long Length);
 
 public sealed record FlowEventDto(
     Guid Id,
@@ -374,7 +381,9 @@ public sealed record BootstrapDto(
     AgentCatalogStatusDto AgentCatalog,
     NewWorkAdmissionStatusDto Admission,
     bool FactoryEnabled,
-    string FactoryDisabledReason);
+    string FactoryDisabledReason,
+    bool GitHubCliAvailable,
+    bool GitHubCliAuthenticated);
 
 public sealed record SaveSettingsRequest(
     string? RepositoryPath,
@@ -404,7 +413,15 @@ public sealed record DirectoryListingDto(
     public IReadOnlyList<DirectoryEntryDto> Drives => Locations;
 }
 
-public sealed record IntakeRequest(Guid? FlowId, string Message);
+public sealed record IntakeAttachment(
+    string FileName,
+    string ContentType,
+    byte[] Content);
+
+public sealed record IntakeRequest(
+    Guid? FlowId,
+    string Message,
+    IReadOnlyList<IntakeAttachment>? Attachments = null);
 
 public sealed record IntakeResponse(
     FlowDetailDto Flow,
@@ -537,7 +554,9 @@ public static class ApiMappings
     public static FlowDetailDto ToDetailDto(
         this FlowRun flow,
         string? reviewedPreviewUrl = null,
-        DeliveryReadinessDto? deliveryReadiness = null)
+        DeliveryReadinessDto? deliveryReadiness = null,
+        IReadOnlyDictionary<Guid, IReadOnlyList<FlowAttachmentDto>>?
+            attachmentsByMessage = null)
     {
         var planStepKeyById = flow.Steps
             .Where(step => !string.IsNullOrWhiteSpace(step.PlanStepKey))
@@ -601,7 +620,19 @@ public static class ApiMappings
                     message.Role,
                     message.Content,
                     message.IsQuestion,
-                    message.CreatedAt))
+                    message.CreatedAt,
+                    attachmentsByMessage is not null &&
+                    attachmentsByMessage.TryGetValue(message.Id, out var metadata)
+                        ? metadata
+                        : message.Attachments
+                            .OrderBy(attachment => attachment.CreatedAt)
+                            .ThenBy(attachment => attachment.Id)
+                            .Select(attachment => new FlowAttachmentDto(
+                                attachment.Id,
+                                attachment.FileName,
+                                attachment.ContentType,
+                                attachment.Length))
+                            .ToList()))
                 .ToList(),
             flow.Events
                 .OrderByDescending(item => item.CreatedAt)

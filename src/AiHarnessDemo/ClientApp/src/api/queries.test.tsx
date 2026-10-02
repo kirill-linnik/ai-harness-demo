@@ -10,9 +10,36 @@ const flowId = "11111111-1111-4111-8111-111111111111";
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("server projection invalidation", () => {
+  it("sends uploads as multipart without overriding the browser boundary or local guard", async () => {
+    const photo = new File(["photo"], "speaker.jpg", { type: "image/jpeg" });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ reply: "Received." }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.continueIntake({
+      flowId,
+      message: "Use this photo.",
+      files: [photo]
+    });
+
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/intake/attachments");
+    expect(options.headers).toEqual({ "X-AI-Harness-Request": "1" });
+    const form = options.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect(form.get("flowId")).toBe(flowId);
+    expect(form.get("message")).toBe("Use this photo.");
+    expect((form.get("files") as File).name).toBe(photo.name);
+  });
+
   it("invalidates bootstrap, lists, detail, review, settings, and catalog after a review action", async () => {
     vi.spyOn(api, "reviewFlow").mockResolvedValue({
       flowId,

@@ -1,4 +1,6 @@
+using AiHarnessDemo.Contracts;
 using AiHarnessDemo.Core.Domain;
+using AiHarnessDemo.Core.Orchestration;
 using System.Text;
 using AiHarnessDemo.Core.Reasoning;
 using AiHarnessDemo.Core.Verification;
@@ -13,6 +15,392 @@ namespace AiHarnessDemo.Tests;
 
 public sealed class DurablePromptRecoveryTests
 {
+    [Fact]
+    public async Task LongIntakeSubmission_StagesFullDialogueInsteadOfDroppingLaterTalks()
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(
+            executionPrompt: string.Empty,
+            invocationKind: ExecutionInvocationKind.Intake);
+        const string secondTalk =
+            "SECOND_TALK_ABSTRACT: Keep the source-tracked project decisions in full.";
+        var submission = "Create a meeting with two speakers.\n" +
+            new string('a', 120_000) + "\n" + secondTalk;
+        var dialogue = IntakeCoordinator.BuildDialogueTask(
+            [
+                new FlowMessage
+                {
+                    Role = ConversationRole.Customer,
+                    Content = submission
+                }
+            ],
+            OutcomeType.PullRequest);
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}");
+        var stager = new AgentManifestStager();
+        var manifest = await stager.StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+
+        var prepared = await AgentPromptContext.PrepareAsync(
+            fixture.Context with
+            {
+                InvocationKind = ExecutionInvocationKind.Intake,
+                Task = dialogue
+            },
+            "Capture all relevant speaker details.",
+            workflow.Revision, manifest, stager, fixture.Factory,
+            CancellationToken.None);
+        var assignment = Assert.Single(
+            prepared.DocumentPaths,
+            path => path.EndsWith("assignment.md", StringComparison.Ordinal));
+        Assert.Contains(secondTalk, await File.ReadAllTextAsync(assignment));
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath,
+            null, new WorkflowPromptRenderer(), fixture.Factory,
+            CancellationToken.None, prepared);
+
+        Assert.Contains(assignment, instructions.Prompt);
+        Assert.DoesNotContain(secondTalk, instructions.Prompt);
+        Assert.True(Encoding.UTF8.GetByteCount(instructions.Prompt) <=
+            AgentPromptContext.MaximumWorkingPromptBytes);
+    }
+
+    [Fact]
+    public async Task LargeCustomerSubmission_DoesNotExceedTheWorkingPromptOrLoseRelevantFacts()
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(
+            executionPrompt: string.Empty);
+        const string essential = "SECOND_SPEAKER_TALK: Keep the entire supplied abstract.";
+        var submitted = "Speaker submission form:\n" +
+            new string('x', 120_000) + "\n" + essential;
+        await using (var database = await fixture.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(item => item.Id == fixture.FlowId);
+            flow.OriginalRequest = submitted;
+            await database.SaveChangesAsync();
+        }
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}\n{{ outcome.context }}");
+        var stager = new AgentManifestStager();
+        var manifest = await stager.StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+
+        var prepared = await AgentPromptContext.PrepareAsync(
+            fixture.Context with { Task = "Create the meeting from the submitted talks." },
+            "Use the relevant exact customer facts.",
+            workflow.Revision, manifest, stager, fixture.Factory,
+            CancellationToken.None);
+        var customerPath = Assert.Single(
+            prepared.DocumentPaths,
+            path => path.EndsWith(
+                AgentPromptContext.CustomerInputFileName,
+                StringComparison.Ordinal));
+        var contents = await File.ReadAllTextAsync(customerPath);
+        Assert.Contains(submitted, contents);
+        Assert.Contains(essential, contents);
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath,
+            null, new WorkflowPromptRenderer(), fixture.Factory,
+            CancellationToken.None, prepared);
+
+        Assert.True(Encoding.UTF8.GetByteCount(instructions.Prompt) <=
+            AgentPromptContext.MaximumWorkingPromptBytes);
+        Assert.Contains(customerPath, instructions.Prompt);
+        Assert.DoesNotContain(essential, instructions.Prompt);
+        Assert.Contains(essential, prepared.SnapshotJson);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Publication_StagedKnowledgeRetainsProjectNameForRecap(
+        bool hasKnowledgeTitle)
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(
+            executionPrompt: string.Empty,
+            invocationKind: ExecutionInvocationKind.Publication);
+        var projectName = hasKnowledgeTitle
+            ? "Example project"
+            : Path.GetFileName(fixture.Root);
+        var knowledge = (hasKnowledgeTitle ? "# Example project\n\n" : "") +
+            new string('k', 6_000);
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}\n{{ role.context }}\n{{ response.contract }}");
+        var stager = new AgentManifestStager();
+        var manifest = await stager.StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+
+        var prepared = await AgentPromptContext.PrepareAsync(
+            fixture.Context with { RepositoryKnowledge = knowledge },
+            "Publish the reviewed candidate.",
+            workflow.Revision, manifest, stager, fixture.Factory,
+            CancellationToken.None);
+        var knowledgePath = Assert.Single(
+            prepared.DocumentPaths,
+            path => path.EndsWith("repository-knowledge.md", StringComparison.Ordinal));
+        Assert.Equal(knowledge, await File.ReadAllTextAsync(knowledgePath));
+        Assert.Empty(prepared.Context.SourceProjectPath);
+
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath,
+            null, new WorkflowPromptRenderer(), fixture.Factory,
+            CancellationToken.None, prepared);
+
+        Assert.Contains(knowledgePath, instructions.Prompt);
+        Assert.Contains(
+            $"Project must remain exactly \"{projectName}\"",
+            instructions.Prompt);
+        Assert.True(Encoding.UTF8.GetByteCount(instructions.Prompt) <=
+            AgentPromptContext.MaximumWorkingPromptBytes);
+    }
+
+    [Theory]
+    [InlineData(ExecutionInvocationKind.Intake)]
+    [InlineData(ExecutionInvocationKind.Planning)]
+    [InlineData(ExecutionInvocationKind.Worker)]
+    [InlineData(ExecutionInvocationKind.PreMortem)]
+    public async Task UploadedFile_IsAvailableWithoutExposingItsBytesInThePrompt(
+        ExecutionInvocationKind invocationKind)
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(
+            executionPrompt: string.Empty, invocationKind);
+        var bytes = Enumerable.Range(0, 18_000)
+            .Select(index => (byte)(index % 251))
+            .ToArray();
+        var stored = await AddCustomerPhotoAsync(fixture, bytes);
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}\n{{ outcome.context }}");
+        var stager = new AgentManifestStager();
+        var manifest = await stager.StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+        var prepared = await AgentPromptContext.PrepareAsync(
+            fixture.Context with { InvocationKind = invocationKind },
+            "Use only the files this assignment needs.",
+            workflow.Revision, manifest, stager, fixture.Factory,
+            CancellationToken.None);
+        var indexPath = Assert.Single(
+            prepared.DocumentPaths,
+            path => path.EndsWith("customer-attachments.md", StringComparison.Ordinal));
+        var stagedImagePath = Path.Combine(
+            manifest.Root, "host-context", "inputs",
+            fixture.FlowId.ToString("N"), fixture.StepId.ToString("N"),
+            "attempt-1", CustomerAttachmentStore.StagedFileName(stored));
+
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(stagedImagePath));
+        var index = await File.ReadAllTextAsync(indexPath);
+        Assert.Contains("Photo_Speaker.jpg", index);
+        Assert.Contains(stagedImagePath, index);
+        Assert.Contains(stored.Digest, index);
+        Assert.Contains(indexPath, prepared.Context.Task);
+        Assert.DoesNotContain(Convert.ToBase64String(bytes), prepared.Context.Task);
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath,
+            null, new WorkflowPromptRenderer(), fixture.Factory,
+            CancellationToken.None, prepared);
+        Assert.Contains(indexPath, instructions.Prompt);
+        Assert.DoesNotContain(Convert.ToBase64String(bytes), instructions.Prompt);
+        Assert.DoesNotContain(Convert.ToBase64String(bytes), prepared.SnapshotJson);
+        Assert.True(Encoding.UTF8.GetByteCount(instructions.Prompt) <=
+            AgentPromptContext.MaximumWorkingPromptBytes);
+    }
+
+    [Fact]
+    public async Task UploadedFile_RecoveryRestagesExactBytesAndRejectsDatabaseTampering()
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(
+            executionPrompt: string.Empty);
+        byte[] bytes = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
+        var stored = await AddCustomerPhotoAsync(fixture, bytes);
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}\n{{ outcome.context }}");
+        var stager = new AgentManifestStager();
+        var manifest = await stager.StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+        var prepared = await AgentPromptContext.PrepareAsync(
+            fixture.Context, "Use the uploaded photo.", workflow.Revision,
+            manifest, stager, fixture.Factory, CancellationToken.None);
+        _ = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath,
+            null, new WorkflowPromptRenderer(), fixture.Factory,
+            CancellationToken.None, prepared);
+        var photoPath = Path.Combine(
+            manifest.Root, "host-context", "inputs",
+            fixture.FlowId.ToString("N"), fixture.StepId.ToString("N"),
+            "attempt-1", CustomerAttachmentStore.StagedFileName(stored));
+        File.Delete(photoPath);
+        var recovered = fixture.Context with { RecoverInterruptedSession = true };
+
+        var restored = await AgentPromptContext.PrepareAsync(
+            recovered, "Changed instructions.", workflow.Revision,
+            manifest, stager, fixture.Factory, CancellationToken.None);
+
+        Assert.Equal(prepared.SnapshotJson, restored.SnapshotJson);
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(photoPath));
+        await using (var database = await fixture.Factory.CreateDbContextAsync())
+        {
+            var attachment = await database.FlowAttachments.SingleAsync(
+                item => item.Id == stored.Id);
+            var changed = (byte[])attachment.Content.Clone();
+            changed[0] ^= 0xff;
+            attachment.Content = changed;
+            await database.SaveChangesAsync();
+        }
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            AgentPromptContext.PrepareAsync(
+                recovered, "Changed instructions.", workflow.Revision,
+                manifest, stager, fixture.Factory, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CustomerUpload_RemainsIsolatedToItsOwningFlow()
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(
+            executionPrompt: string.Empty);
+        _ = await AddCustomerPhotoAsync(fixture, [1, 2, 3]);
+        var other = new FlowRun
+        {
+            Title = "Independent flow",
+            OriginalRequest = "Implement an unrelated change.",
+            RepositoryPath = fixture.Root
+        };
+        await using (var database = await fixture.Factory.CreateDbContextAsync())
+        {
+            database.Flows.Add(other);
+            await database.SaveChangesAsync();
+        }
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}\n{{ outcome.context }}");
+        var stager = new AgentManifestStager();
+        var otherSession = Guid.NewGuid();
+        var manifest = await stager.StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), otherSession);
+
+        var context = await AgentPromptContext.PrepareAsync(
+            fixture.Context with
+            {
+                FlowId = other.Id,
+                FlowStepId = Guid.NewGuid(),
+                CopilotSessionId = otherSession,
+                Task = "Implement the unrelated change."
+            },
+            "Use only this flow's inputs.",
+            workflow.Revision, manifest, stager, fixture.Factory,
+            CancellationToken.None);
+
+        Assert.DoesNotContain(context.DocumentPaths,
+            path => path.EndsWith("customer-attachments.md", StringComparison.Ordinal));
+        Assert.DoesNotContain("Customer-uploaded files", context.Context.Task);
+        Assert.DoesNotContain("Photo_Speaker.jpg", context.SnapshotJson);
+    }
+
+    [Theory]
+    [InlineData(ExecutionInvocationKind.Planning)]
+    [InlineData(ExecutionInvocationKind.Worker)]
+    [InlineData(ExecutionInvocationKind.PreMortem)]
+    public async Task SummarizedBrief_PreservesExactCustomerDetailsForDownstreamAttempts(
+        ExecutionInvocationKind invocationKind)
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(
+            executionPrompt: string.Empty,
+            invocationKind);
+        const string description =
+            "The talk explains how source tracking and human ownership make the system reliable.";
+        const string original = """
+            Create a meeting with two speakers.
+            First talk description: The talk explains how source tracking and human ownership make the system reliable.
+            Speaker profile: https://example.test/speaker
+            Photo: Downloads\speaker-photo.jpg
+            """;
+        const string correction =
+            "Use 30 minutes for the second speaker instead of 40 minutes.";
+        await using (var database = await fixture.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(item => item.Id == fixture.FlowId);
+            flow.OriginalRequest = original;
+            flow.ConsolidatedRequest = IntakeParser.SerializeBrief(new IntakeBrief
+            {
+                Goal = "Create a meeting with two speakers.",
+                Details = ["Publish the submitted talks and supplied details."],
+                SuccessCriteria = ["Both talks appear in the meeting."],
+                Constraints = [],
+                Assumptions = []
+            });
+            database.FlowMessages.AddRange(
+                new FlowMessage
+                {
+                    FlowRunId = flow.Id,
+                    Role = ConversationRole.Customer,
+                    Content = original,
+                    CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-3)
+                },
+                new FlowMessage
+                {
+                    FlowRunId = flow.Id,
+                    Role = ConversationRole.AccountManager,
+                    Content = "Please confirm.",
+                    CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-2)
+                },
+                new FlowMessage
+                {
+                    FlowRunId = flow.Id,
+                    Role = ConversationRole.Customer,
+                    Content = correction,
+                    CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-1)
+                });
+            await database.SaveChangesAsync();
+        }
+
+        var workflow = await fixture.ReloadWorkflowAsync(
+            "{{ task }}\n{{ agent.instructions }}\n{{ outcome.context }}");
+        var manifest = await new AgentManifestStager().StageAsync(
+            fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+        var stager = new AgentManifestStager();
+        var prepared = await AgentPromptContext.PrepareAsync(
+            fixture.Context with
+            {
+                InvocationKind = invocationKind,
+                Task = "Publish the two submitted talks."
+            },
+            "Preserve supplied details.",
+            workflow.Revision, manifest, stager, fixture.Factory,
+            CancellationToken.None);
+        var customerPath = Assert.Single(
+            prepared.DocumentPaths,
+            path => path.EndsWith(
+                AgentPromptContext.CustomerInputFileName,
+                StringComparison.Ordinal));
+        var customerContent = await File.ReadAllTextAsync(customerPath);
+        Assert.Equal(1, customerContent.Split(description).Length - 1);
+        Assert.Contains(@"Downloads\speaker-photo.jpg", customerContent);
+        Assert.Contains("https://example.test/speaker", customerContent);
+        Assert.Contains(correction, customerContent);
+        Assert.DoesNotContain("Please confirm.", customerContent);
+        Assert.Contains(customerPath, prepared.Context.Task);
+        Assert.DoesNotContain(description, prepared.Context.Task);
+
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath,
+            null, new WorkflowPromptRenderer(), fixture.Factory,
+            CancellationToken.None, prepared);
+        Assert.True(Encoding.UTF8.GetByteCount(instructions.Prompt) <=
+            AgentPromptContext.MaximumWorkingPromptBytes);
+        Assert.Contains(customerPath, instructions.Prompt);
+        Assert.DoesNotContain(description, instructions.Prompt);
+
+        await using (var database = await fixture.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(item => item.Id == fixture.FlowId);
+            flow.OriginalRequest = "This later change must not rewrite the in-flight attempt.";
+            await database.SaveChangesAsync();
+        }
+        File.Delete(customerPath);
+        var restored = await AgentPromptContext.PrepareAsync(
+            fixture.Context with { RecoverInterruptedSession = true },
+            "Different instructions.", workflow.Revision,
+            manifest, stager, fixture.Factory, CancellationToken.None);
+        Assert.Equal(prepared.SnapshotJson, restored.SnapshotJson);
+        Assert.Equal(customerContent, await File.ReadAllTextAsync(customerPath));
+    }
+
     [Fact]
     public async Task LargeContext_IsPagedDurablyWithinA32KiBWorkingPromptAndRestoredExactly()
     {
@@ -62,6 +450,7 @@ public sealed class DurablePromptRecoveryTests
             Assert.Contains("SPEC-CORE", snapshot.DataJson);
             Assert.Contains("EV-1200", snapshot.DataJson);
         }
+
         foreach (var path in prepared.DocumentPaths)
         {
             File.Delete(path);
@@ -89,6 +478,28 @@ public sealed class DurablePromptRecoveryTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => AgentPromptContext.PrepareAsync(
             recoveredContext, "Changed instructions.", recoveredInstructions.WorkflowRevision,
             manifest, stager, fixture.Factory, CancellationToken.None));
+    }
+
+    private static async Task<FlowAttachment> AddCustomerPhotoAsync(
+        DurablePromptFixture fixture,
+        byte[] bytes)
+    {
+        await using var database = await fixture.Factory.CreateDbContextAsync();
+        var message = new FlowMessage
+        {
+            FlowRunId = fixture.FlowId,
+            Role = ConversationRole.Customer,
+            Content = "Please use my attached speaker photo."
+        };
+        var photo = Assert.Single(CustomerAttachmentStore.Prepare(
+            fixture.FlowId, message.Id,
+            [new IntakeAttachment("Photo_Speaker.jpg", "image/jpeg", bytes)],
+            existingFlowBytes: 0,
+            existingFlowFiles: 0));
+        database.FlowMessages.Add(message);
+        database.FlowAttachments.Add(photo);
+        await database.SaveChangesAsync();
+        return photo;
     }
 
     [Fact]

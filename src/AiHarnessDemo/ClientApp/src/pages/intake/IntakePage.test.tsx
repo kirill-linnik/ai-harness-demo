@@ -72,7 +72,9 @@ const bootstrap: BootstrapDto = {
     checkedAt: "2026-09-02T12:00:00Z"
   },
   factoryEnabled: true,
-  factoryDisabledReason: ""
+  factoryDisabledReason: "",
+  githubCliAvailable: true,
+  githubCliAuthenticated: true
 };
 
 const flowId = "11111111-1111-1111-1111-111111111111";
@@ -159,6 +161,103 @@ afterEach(() => {
 });
 
 describe("IntakePage", () => {
+  it("sends the selected photo with the customer message and keeps its receipt visible", async () => {
+    const initialFlow = confirmationFlow();
+    const photo = new File(["speaker-photo"], "Photo_Speaker.jpg", {
+      type: "image/jpeg"
+    });
+    const persisted = {
+      ...initialFlow,
+      messages: [
+        ...initialFlow.messages,
+        {
+          id: "88888888-8888-8888-8888-888888888888",
+          role: "Customer" as const,
+          content: "Here is the requested photo.",
+          isQuestion: false,
+          createdAt: timestamp,
+          attachments: [{
+            id: "99999999-9999-9999-9999-999999999999",
+            fileName: photo.name,
+            contentType: photo.type,
+            length: photo.size
+          }]
+        }
+      ]
+    } satisfies FlowDetailDto;
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    vi.spyOn(api, "flow").mockResolvedValue(initialFlow);
+    const continueIntake = vi.spyOn(api, "continueIntake").mockResolvedValue({
+      flow: persisted,
+      reply: "I have the photo.",
+      readyToStart: false,
+      shouldSpeak: false
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } }
+    });
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    queryClient.setQueryData(queryKeys.flow(flowId), initialFlow);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={[`/intake/${flowId}`]}>
+            <Routes>
+              <Route path="/intake/:id" element={<IntakePage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    fireEvent.change(screen.getByLabelText("Attach files for the Account Manager"), {
+      target: { files: [photo] }
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Customer request" }), {
+      target: { value: "Here is the requested photo." }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(continueIntake).toHaveBeenCalledWith({
+      flowId,
+      message: "Here is the requested photo.",
+      files: [photo]
+    }));
+    await waitFor(() =>
+      expect(screen.getByRole("list", { name: "Uploaded files" })).toHaveTextContent(
+        "Photo_Speaker.jpg"
+      )
+    );
+    expect(screen.queryByRole("list", { name: "Files ready to send" })).not.toBeInTheDocument();
+  });
+
+  it("rejects oversized files before submitting a customer message", () => {
+    vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+    const continueIntake = vi.spyOn(api, "continueIntake");
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={["/intake"]}>
+            <Routes>
+              <Route path="/intake" element={<IntakePage />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+    const oversized = new File(["x"], "huge.jpg");
+    Object.defineProperty(oversized, "size", { value: 8 * 1024 * 1024 + 1 });
+    fireEvent.change(screen.getByLabelText("Attach files for the Account Manager"), {
+      target: { files: [oversized] }
+    });
+
+    expect(screen.queryByRole("list", { name: "Files ready to send" })).not.toBeInTheDocument();
+    expect(continueIntake).not.toHaveBeenCalled();
+  });
+
   it("shows whether the microphone is off or recording", () => {
     class MockSpeechRecognition extends EventTarget {
       lang = "";

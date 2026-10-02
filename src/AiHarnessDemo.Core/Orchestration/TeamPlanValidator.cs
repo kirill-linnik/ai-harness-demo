@@ -13,13 +13,16 @@ public sealed record TeamPlanValidationContext(
     int MaximumSteps,
     int MaximumDependenciesPerStep,
     int MaximumAssignmentCharacters,
-    IReadOnlyCollection<PlanDuty> RequiredDuties)
+    IReadOnlyCollection<PlanDuty> RequiredDuties,
+    bool PreservePersistedCheckpointPlacement = false,
+    bool CustomerUploadsPresent = false)
 {
     public static TeamPlanValidationContext FromWorkflow(
         FlowKind flowKind,
         IReadOnlyCollection<FlowAgentSnapshot> snapshots,
         bool preMortemEnabled,
-        WorkflowDefinition workflow)
+        WorkflowDefinition workflow,
+        bool customerUploadsPresent = false)
     {
         ArgumentNullException.ThrowIfNull(workflow);
         var planning = workflow.Config.Studio.Planning;
@@ -33,7 +36,8 @@ public sealed record TeamPlanValidationContext(
             planning.MaxSteps,
             planning.MaxDependenciesPerStep,
             planning.MaxAssignmentCharacters,
-            required);
+            required,
+            CustomerUploadsPresent: customerUploadsPresent);
     }
 
     public static TeamPlanValidationContext ForPersistedPlan(
@@ -55,7 +59,8 @@ public sealed record TeamPlanValidationContext(
                     PlanDuty.Verify,
                     PlanDuty.PrepareOutcome,
                     PlanDuty.Publish
-                ]);
+                ],
+            PreservePersistedCheckpointPlacement: true);
 }
 
 public sealed record ValidatedTeamPlan(
@@ -204,8 +209,11 @@ public sealed class TeamPlanValidator
         ValidateCheckpoints(
             checkpoints,
             stepById,
+            context.FlowKind,
             context.PreMortemEnabled,
+            context.CustomerUploadsPresent,
             context.MaximumSteps,
+            context.PreservePersistedCheckpointPlacement,
             errors);
         ValidateOutcomeAndFlowRules(steps, context, errors);
         ValidateAcceptanceCriteria(document, context, errors);
@@ -553,8 +561,11 @@ public sealed class TeamPlanValidator
     private static void ValidateCheckpoints(
         IReadOnlyList<string> checkpoints,
         IReadOnlyDictionary<string, TeamPlanStep> stepById,
+        FlowKind flowKind,
         bool preMortemEnabled,
+        bool customerUploadsPresent,
         int maximumCheckpoints,
+        bool preservePersistedCheckpointPlacement,
         ICollection<string> errors)
     {
         if (checkpoints.Count !=
@@ -572,6 +583,36 @@ public sealed class TeamPlanValidator
             errors.Add(
                 "preMortemCheckpoints must be empty because the Pre-mortem Sceptic is disabled in the flow snapshot");
         }
+        if (!preservePersistedCheckpointPlacement &&
+            preMortemEnabled &&
+            flowKind == FlowKind.Delivery &&
+            checkpoints.Count == 0)
+        {
+            var downstream = stepById.Values.Where(step =>
+                step.Stage == PlanStage.BeforeReview &&
+                step.Duties?.Any(duty =>
+                    duty is PlanDuty.Design or PlanDuty.Implement) == true).ToArray();
+            if (downstream.Any(step =>
+                    step.TaskProfile?.Risk is
+                        TaskRisk.Medium or TaskRisk.High or TaskRisk.Critical))
+            {
+                errors.Add(
+                    "medium-or-higher-risk Delivery design or implementation requires a pre-mortem checkpoint on an Analyze-duty requirements step before downstream work");
+            }
+            else if (customerUploadsPresent && downstream.Length > 0)
+            {
+                errors.Add(
+                    "new Delivery work using uploaded customer files requires a pre-mortem checkpoint on an Analyze-duty requirements step before downstream work");
+            }
+        }
+        var firstDownstreamWorkOrder = stepById.Values
+            .Where(step =>
+                step.Stage == PlanStage.BeforeReview &&
+                step.Duties?.Any(duty =>
+                    duty is PlanDuty.Design or PlanDuty.Implement) == true)
+            .Select(step => step.Order)
+            .DefaultIfEmpty(int.MaxValue)
+            .Min();
         foreach (var checkpoint in checkpoints)
         {
             if (!ValidateBoundedText(
@@ -606,6 +647,22 @@ public sealed class TeamPlanValidator
             {
                 errors.Add(
                     $"pre-mortem checkpoint '{checkpoint}' must name a BeforeReview step");
+            }
+            else if (!preservePersistedCheckpointPlacement &&
+                     flowKind == FlowKind.Delivery &&
+                     (step.Order >= firstDownstreamWorkOrder ||
+                      step.Duties is not { Count: > 0 } ||
+                      step.Duties.Any(duty =>
+                          duty is not PlanDuty.Analyze)))
+            {
+                errors.Add(
+                    $"pre-mortem checkpoint '{checkpoint}' must name an Analyze-duty requirements step before the first Design or Implement step, not implementation or QA");
+            }
+            else if (!preservePersistedCheckpointPlacement &&
+                     step.Duties?.Contains(PlanDuty.Verify) == true)
+            {
+                errors.Add(
+                    $"pre-mortem checkpoint '{checkpoint}' cannot target a Verify-duty step");
             }
         }
     }

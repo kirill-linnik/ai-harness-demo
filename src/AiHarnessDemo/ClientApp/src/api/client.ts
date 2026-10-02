@@ -1,5 +1,5 @@
 // Typed fetch wrapper. Mirrors the original wwwroot/app.js `request()` helper:
-// - Always sends JSON content type.
+// - Sends JSON by default; multipart uploads let the browser set their own boundary.
 // - Always sends the LocalRequestGuard header (see Api/LocalRequestGuard.cs) so that
 //   state-changing requests pass the same-origin preflight check.
 // - Throws an Error using the ProblemDetails `detail`/`title` on non-2xx responses.
@@ -40,13 +40,18 @@ export interface RequestOptions {
 }
 
 export async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
+  const multipart = options.body instanceof FormData;
   const response = await fetch(url, {
     method: options.method ?? "GET",
-    headers: {
-      "Content-Type": "application/json",
-      "X-AI-Harness-Request": "1"
-    },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
+    headers: multipart
+      ? { "X-AI-Harness-Request": "1" }
+      : {
+          "Content-Type": "application/json",
+          "X-AI-Harness-Request": "1"
+        },
+    body: options.body === undefined
+      ? undefined
+      : multipart ? options.body as FormData : JSON.stringify(options.body)
   });
 
   if (!response.ok) {

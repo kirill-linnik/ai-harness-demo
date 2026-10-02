@@ -33,22 +33,34 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
 - **Bounded agent context** — working prompts stay within 32 KiB of UTF-8; complete larger
   handoffs and evidence remain available through durable, searchable context documents. Invalid
   QA responses receive a read-only correction without discarding completed work.
+- **Customer files without folder access** — intake messages can upload files (up to eight per
+  message, 8 MiB per file, 16 MiB per flow). Studio stores their bytes in SQLite, shows the
+  filenames in the conversation, and stages immutable per-attempt copies for the Account Manager
+  and downstream agents. An outside-project path alone prompts an upload, not access to a whole
+  personal folder. Incidental fields in source material are not public requirements without
+  explicit customer authorization.
 
 ## How a flow runs
 
 1. In **Settings**, choose a **Source project** and select **Initialize and study repository**.
 2. Submit a request. Creating the flow captures immutable agent definitions and enabled state.
 3. The Account Manager returns a strict `intake` brief for explicit customer confirmation as
-   Advisory or Delivery.
+   Advisory or Delivery. Attach outside-project source files to the intake conversation instead
+   of relying on a pathname; the exact submitted text and uploaded bytes remain available to
+   downstream agents even when the brief is concise.
 4. The Team Lead creates a validated `team plan` from that snapshot. Worker identities are optional,
    but required duties and dependency rules are enforced.
 5. Agents execute sequentially in the flow workspace. Dependencies carry results forward, optional
-   pre-mortem checks can challenge work, and bounded pushback can return work to an earlier
-   dependency.
+   pre-mortem checks can challenge requirements before design or implementation, and bounded
+   pushback can return work to an earlier dependency. Medium-or-higher-risk design or
+   implementation, or new Delivery using uploaded customer files, gets a requirements
+   checkpoint when the sceptic is available; routine Low-risk work without uploads can skip it.
 6. For Delivery, the final `BeforeReview` outcome owner is the sole `Verify` step and also owns
    `PrepareOutcome`. During that task, dedicated verification-preview URLs expose unreviewed
    artifacts through the real sandbox and network policy. The host then validates criterion
-   results, seals the candidate, and derives Delivery readiness.
+   results, seals the candidate, and derives Delivery readiness. Browser-visible changes must
+   also work in the production renderer; a standalone preview is not a substitute. Pre-mortem
+   advice never substitutes for this final QA.
 7. Customers can refine either flow kind, accept an Advisory, promote it to a fresh Delivery, or
    accept a ready Delivery. Only accepted Delivery work materializes the planned `AfterApproval`
    Publish step.
@@ -77,7 +89,11 @@ Different flows may run concurrently; steps inside one flow remain sequential.
   falls behind, resumption stops instead of merging or rebasing it automatically. Existing guarded
   snapshots remain fixed to their creation-time source.
 - Delivery publication uses sealed, reviewed Git and preview identities. The host revalidates those
-  identities and readiness state before and after publishing.
+  identities and readiness state before and after publishing. For a pull-request outcome, a
+  repository whose reviewed commit already matches the remote default branch, or whose verified
+  comparison has no file changes, is recorded without opening an empty or unrelated pull request.
+  New pull requests describe the confirmed outcome in readable Markdown rather than pasting the
+  brief JSON; verification identifiers are available in a collapsible section.
 
 These are strong controls for a trusted host, not kernel-level sandboxing against a hostile
 same-user process.
@@ -92,6 +108,10 @@ same-user process.
 | Quality Engineer | Optional and switchable. Any enabled suitable agent may carry `Verify`; selecting an independent Quality Engineer provides stronger separation from implementation. |
 | All other definitions | Optional, switchable, and selected by exact snapshot ID. |
 
+Agent definitions in `.github\agents` are project-agnostic role contracts, not a place for facts
+from one customer or repository. Each execution can consult its complete, durable flow input,
+but should use and hand off only what its assigned duty and confirmed outcome require.
+
 Use **Reload catalog** after editing definitions. Invalid optional definitions remain visible for
 diagnostics but cannot be selected; invalid required definitions block new work.
 
@@ -103,6 +123,12 @@ Prerequisites:
 - Node.js 20.19+ or 22.12+
 - Git
 - Authenticated GitHub Copilot CLI
+- For **Pull request** Delivery only: GitHub CLI (`gh`) installed on the Studio server's `PATH`
+  and authenticated **for that process** (`gh auth login -h github.com` as the Studio user, or
+  `GH_TOKEN` in its environment). A token visible in a separate terminal does not necessarily
+  reach Studio. Restart Studio after installing `gh` or changing its `PATH` or environment;
+  Studio checks both CLI availability and authentication before confirming a Delivery brief and
+  again before customer acceptance. Advisory and local **Commit** outcomes do not need `gh`.
 - Edge or Chrome only if browser speech recognition is wanted
 
 ```powershell
@@ -120,9 +146,9 @@ Open `http://localhost:5283`. Runtime state is stored in `data\ai-harness.db`; i
 workspaces are created under `data\worktrees`.
 
 Startup uses `Database.EnsureCreatedAsync()` to create a fresh schema when the database file is
-absent. The additive reviewed-preview artifact table is created automatically for existing
-databases; other entity-shape changes are not migrated. After other shape changes, stop Studio and
-recreate the development database:
+absent. The additive reviewed-preview and customer-upload tables are created automatically for
+existing databases; other entity-shape changes are not migrated. After other shape changes, stop
+Studio and recreate the development database:
 
 ```powershell
 Remove-Item .\data\ai-harness.db, .\data\ai-harness.db-wal, .\data\ai-harness.db-shm `

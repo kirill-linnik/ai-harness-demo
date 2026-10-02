@@ -46,6 +46,9 @@ public sealed partial class IntakeCoordinator(
         permissionProfileResolver ?? new PermissionProfileResolver();
     private readonly ILogger<IntakeCoordinator> _logger =
         logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeCoordinator>.Instance;
+    internal Func<bool>? GitHubCliAvailableOverride { get; set; }
+    internal Func<CancellationToken, Task<bool>>?
+        GitHubAuthenticationAvailableOverride { get; set; }
     internal Func<string, Guid, CancellationToken, Task<CopilotSessionSnapshot>>?
         SessionInspectorOverride
     { get; set; }
@@ -908,7 +911,7 @@ public sealed partial class IntakeCoordinator(
         bool reuseDurableCustomerMessage = false)
     {
         using var contextLease = await contextGate.EnterReadAsync(cancellationToken);
-        var message = request.Message.Trim();
+        var message = request.Message?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(message))
         {
             throw new ArgumentException("Tell the account manager what you want to build.");
@@ -954,6 +957,16 @@ public sealed partial class IntakeCoordinator(
                          flow.LinkKind is not null
             ? LinkedFlowCoordinator.ReadLinkedIntakeSeed(flow)
             : null;
+        if (configuredDeliveryOutcome == OutcomeType.PullRequest &&
+            (pendingConfirmation?.Document?.FlowKind == FlowKind.Delivery ||
+             linkedInitialTurn &&
+             flow.LinkKind == FlowLinkKind.AdvisoryPromotion))
+        {
+            await GitHubPublicationPrerequisites.RequireAsync(
+                GitHubCliAvailableOverride,
+                GitHubAuthenticationAvailableOverride,
+                cancellationToken);
+        }
         if (linkedInitialTurn &&
             !string.Equals(
                 message,
@@ -1056,6 +1069,56 @@ public sealed partial class IntakeCoordinator(
             };
             flow.Messages.Add(customerMessage);
             database.Entry(customerMessage).State = EntityState.Added;
+            var existingAttachmentBytes = flow.Messages
+                .Where(item => item.Id != customerMessage.Id)
+                .SelectMany(item => item.Attachments)
+                .Sum(item => item.Length);
+            var existingAttachmentCount = flow.Messages
+                .Where(item => item.Id != customerMessage.Id)
+                .Sum(item => item.Attachments.Count);
+            var attachments = CustomerAttachmentStore.Prepare(
+                flow.Id,
+                customerMessage.Id,
+                request.Attachments,
+                existingAttachmentBytes,
+                existingAttachmentCount);
+            customerMessage.Attachments.AddRange(attachments);
+            database.FlowAttachments.AddRange(attachments);
+            if (attachments.Count > 0)
+            {
+                var receipt = new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    Type = "customer.attachments-received",
+                    Message =
+                        $"Stored {attachments.Count} customer-uploaded file(s) for this flow.",
+                    DataJson = JsonSerializer.Serialize(attachments.Select(item => new
+                    {
+                        item.Id,
+                        item.FlowMessageId,
+                        item.FileName,
+                        item.Length,
+                        item.Digest
+                    }))
+                };
+                flow.Events.Add(receipt);
+                database.FlowEvents.Add(receipt);
+            }
+        }
+        else if (request.Attachments is { Count: > 0 })
+        {
+            var latest = flow.Messages
+                .Where(item => item.Role == ConversationRole.Customer)
+                .OrderBy(item => item.CreatedAt)
+                .LastOrDefault();
+            if (latest is null ||
+                !string.Equals(latest.Content, message, StringComparison.Ordinal) ||
+                !CustomerAttachmentStore.MatchesRetriedMessage(
+                    flow.Id, latest, request.Attachments))
+            {
+                throw new ArgumentException(
+                    "A retried intake turn cannot replace its saved attachments. Send a new customer message instead.");
+            }
         }
         var customerMessages = flow.Messages
             .Where(item => item.Role == ConversationRole.Customer)
@@ -1410,6 +1473,23 @@ public sealed partial class IntakeCoordinator(
                     : ApplyConfirmationGate(
                         response,
                         pendingConfirmation?.Document);
+                if (response.Status != AccountManagerIntakeStatus.NeedsClarification &&
+                    flow.LinkKind is null &&
+                    CustomerExternalFileGate.MissingFiles(flow) is { Count: > 0 } missing)
+                {
+                    response = RequireCustomerUploads(response, missing);
+                    var inputEvent = new FlowEvent
+                    {
+                        FlowRunId = flow.Id,
+                        FlowStepId = intakeStep.Id,
+                        Type = "intake.external-upload-required",
+                        Message =
+                            "The Account Manager cannot confirm an outside-project file reference without a customer upload.",
+                        DataJson = JsonSerializer.Serialize(new { MissingFiles = missing })
+                    };
+                    flow.Events.Add(inputEvent);
+                    database.FlowEvents.Add(inputEvent);
+                }
                 ValidateIntakeCompletion(
                     flow,
                     response,
@@ -1589,6 +1669,7 @@ public sealed partial class IntakeCoordinator(
                 .ThenInclude(step => step.RoutingDecisions)
                 .ThenInclude(decision => decision.Alternatives)
                 .Include(item => item.Messages)
+                .ThenInclude(message => message.Attachments)
                 .Include(item => item.Events)
                 .Include(item => item.GateRecords)
                 .SingleAsync(item => item.Id == flow.Id, cancellationToken);
@@ -2246,6 +2327,44 @@ public sealed partial class IntakeCoordinator(
         };
     }
 
+    internal static AccountManagerResponse RequireCustomerUploads(
+        AccountManagerResponse response,
+        IReadOnlyList<string> missingFiles)
+    {
+        if (missingFiles.Count == 0)
+        {
+            return response;
+        }
+        var brief = response.NormalizedBrief ?? new IntakeBrief
+        {
+            Details = [],
+            SuccessCriteria = [],
+            Constraints = [],
+            Assumptions = []
+        };
+        var document = new IntakeDocument
+        {
+            Status = IntakeStatus.NeedsClarification,
+            FlowKind = null,
+            TaskTitle = response.TaskTitle,
+            CustomerReply =
+                $"Please attach {string.Join(", ", missingFiles.Take(8))} to the conversation. " +
+                "It is outside the selected project; uploading the file lets the team use it " +
+                "without accessing your other folders. Then I can confirm the brief.",
+            Brief = brief
+        };
+        var normalized = IntakeParser.ParseJson(IntakeParser.Serialize(document));
+        return response with
+        {
+            Status = AccountManagerIntakeStatus.NeedsClarification,
+            Reply = normalized.Document.CustomerReply,
+            TaskBrief = string.Empty,
+            FlowKind = null,
+            NormalizedBrief = normalized.Document.Brief,
+            RawContractJson = IntakeParser.Serialize(normalized.Document)
+        };
+    }
+
     internal static FlowEvent? ApplyIntakeOutcome(
         FlowRun flow,
         AccountManagerResponse response,
@@ -2311,6 +2430,7 @@ public sealed partial class IntakeCoordinator(
         await database.Flows
             .AsSplitQuery()
             .Include(item => item.Messages)
+            .ThenInclude(message => message.Attachments)
             .Include(item => item.Steps)
             .ThenInclude(step => step.ToolCalls)
             .Include(item => item.Events)
@@ -2382,7 +2502,13 @@ public sealed partial class IntakeCoordinator(
             ? string.Join(
                 Environment.NewLine,
                 orderedMessages.Select(item =>
-                    $"{item.Role}: {item.Content}"))
+                    $"{item.Role}: {item.Content}" +
+                    (item.Attachments.Count == 0
+                        ? string.Empty
+                        : Environment.NewLine +
+                          "Customer-uploaded files: " +
+                          string.Join(", ", item.Attachments
+                              .Select(attachment => attachment.FileName)))))
             : "Customer: The customer accepted the Advisory result and explicitly requested " +
               "the linked Delivery represented by the host-controlled promotion context.";
         var confirmationPolicy = promotionSeed is not null
@@ -2412,6 +2538,10 @@ public sealed partial class IntakeCoordinator(
             "Advisory means inspect, recommend, or explain without source changes or publication. " +
             "Delivery means the customer is asking the team to implement or change the product. " +
             "Describe customer outcomes, not tools or implementation mechanics. " +
+            "Use only supplied facts needed for the requested outcome in the brief. The full " +
+            "input remains available to downstream agents; do not copy unrelated fields into " +
+            "requirements or treat a restated brief as authorization to disclose sensitive " +
+            "information. " +
             "Default to AwaitingConfirmation once meaningful work can begin; downstream details " +
             "do not need to be settled during intake. Treat all prior answers as settled and do " +
             "not ask for the same detail twice. Ask at most one focused clarification question. " +

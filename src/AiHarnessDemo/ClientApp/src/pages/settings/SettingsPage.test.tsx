@@ -66,7 +66,9 @@ const bootstrap: BootstrapDto = {
     checkedAt: timestamp
   },
   factoryEnabled: true,
-  factoryDisabledReason: ""
+  factoryDisabledReason: "",
+  githubCliAvailable: true,
+  githubCliAuthenticated: true
 };
 
 afterEach(() => {
@@ -118,6 +120,83 @@ describe("SettingsPage model strategy", () => {
     expect(screen.getByRole("button", { name: "Commit" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Pull request" })).toBeInTheDocument();
     expect(screen.queryByText("None")).not.toBeInTheDocument();
+  });
+
+  it("shows a pull-request prerequisite warning when the Studio process cannot find gh", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, {
+      ...bootstrap,
+      githubCliAvailable: false,
+      githubCliAuthenticated: false
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter>
+            <SettingsPage />
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(
+      screen.getByText(/Pull-request Delivery cannot be confirmed or accepted/)
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Commit" }));
+    expect(
+      screen.queryByText(/Pull-request Delivery cannot be confirmed or accepted/)
+    ).not.toBeInTheDocument();
+  });
+
+  it("distinguishes an installed CLI from missing Studio-process authentication", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, {
+      ...bootstrap,
+      githubCliAuthenticated: false
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter>
+            <SettingsPage />
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(
+      screen.getByText(/this Studio process has no GitHub token/)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/before confirming or accepting pull-request Delivery/)
+    ).toBeInTheDocument();
+  });
+
+  it("does not claim authentication is missing when an older Studio process has not reported it", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(queryKeys.bootstrap, {
+      ...bootstrap,
+      githubCliAuthenticated: undefined
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <MemoryRouter>
+            <SettingsPage />
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    );
+
+    expect(
+      screen.getByText(/Authentication status is unavailable from this Studio process/)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/this Studio process has no GitHub token/)
+    ).not.toBeInTheDocument();
   });
 
   it("hydrates a persisted strategy after an asynchronous bootstrap load", async () => {

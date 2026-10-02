@@ -80,7 +80,9 @@ const bootstrap: BootstrapDto = {
     checkedAt: timestamp
   },
   factoryEnabled: true,
-  factoryDisabledReason: ""
+  factoryDisabledReason: "",
+  githubCliAvailable: true,
+  githubCliAuthenticated: true
 };
 
 function step(overrides: Partial<FlowStepDto> = {}): FlowStepDto {

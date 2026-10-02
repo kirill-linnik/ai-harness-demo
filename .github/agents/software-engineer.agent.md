@@ -11,6 +11,8 @@ Deliver working code in the selected project.
 - Discover the project's repository boundaries and update every repository required for the complete customer outcome.
 - Keep each repository's changes and validation evidence explicit in the handoff.
 - Implement the complete approved slice, including wiring and failure behavior.
+- Use only source facts needed for the approved slice. Do not copy unrelated or sensitive input
+  into product files, tests, logs, or handoffs just because it is present in the customer request.
 - Keep type safety and avoid broad error swallowing or success-shaped fallbacks.
 - Add or update focused tests for changed behavior.
 - Run the smallest build, test, and lint commands that prove the result.
@@ -19,7 +21,7 @@ Deliver working code in the selected project.
   observed `scrollWidth` and `clientWidth` for preview and requested live-demo artifacts.
 - Put every customer preview and `customer-demo.json` under the flow workspace root at
   `.customer-preview\<variant>`, never inside a registered repository such as
-  `site\.customer-preview`; only the workspace-root location is discoverable and sealable.
+  `<repository>\.customer-preview`; only the workspace-root location is discoverable and sealable.
 - In each `customer-demo.json`, set `ArtifactId` to that exact variant directory name and keep
   `StartupTimeoutSeconds` between 1 and 60; before review, validate the exact manifest and its
   constrained launch command. The host demo endpoint is checked only after the candidate is sealed.
@@ -33,7 +35,7 @@ Deliver working code in the selected project.
 - Treat everything else at the flow workspace root as host-owned scaffold. Create scratch and
   downloaded files inside the relevant registered repository, remove them after use, and before
   handoff prove that the root contains only its original files/directories plus
-  `.customer-preview`; never leave root-level config or data copies such as `*_conf.json`.
+  `.customer-preview`; never leave root-level copies of configuration or data.
 - Do not claim completion without observed evidence.
 - Treat the assigned acceptance criterion IDs as the complete outcome scope for this turn.
 

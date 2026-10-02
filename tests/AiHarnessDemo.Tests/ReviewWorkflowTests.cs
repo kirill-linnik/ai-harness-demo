@@ -222,6 +222,68 @@ public sealed class ReviewWorkflowTests
             StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task DeliveryAcceptance_MissingGitHubCliRetainsOpenReviewWithoutPublication()
+    {
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery,
+            githubCliAvailable: false);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var review = Assert.Single(
+            (await harness.LoadFlowAsync()).GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+
+        var conflict = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(() =>
+            harness.ReviewAsync(new DirectReviewRequest
+            {
+                GateId = review.Id,
+                Intent = ReviewIntent.Accept
+            }));
+
+        Assert.Equal(
+            DeliveryReadinessConflicts.PublicationToolUnavailable,
+            conflict.Code);
+        Assert.Contains("Studio server's PATH", conflict.Message);
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.False(Assert.Single(flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview).Resolved);
+        Assert.DoesNotContain(flow.Steps,
+            step => step.PlanStage == PlanStage.AfterApproval);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+    }
+
+    [Fact]
+    public async Task DeliveryAcceptance_MissingHostAuthenticationRetainsOpenReview()
+    {
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery,
+            githubAuthenticationAvailable: false);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var review = Assert.Single(
+            (await harness.LoadFlowAsync()).GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+
+        var conflict = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(() =>
+            harness.ReviewAsync(new DirectReviewRequest
+            {
+                GateId = review.Id,
+                Intent = ReviewIntent.Accept
+            }));
+
+        Assert.Equal(
+            DeliveryReadinessConflicts.PublicationAuthenticationUnavailable,
+            conflict.Code);
+        Assert.Contains("Studio process has no GitHub token", conflict.Message);
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        Assert.False(Assert.Single(flow.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview).Resolved);
+        Assert.DoesNotContain(flow.Steps,
+            step => step.PlanStage == PlanStage.AfterApproval);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+    }
+
     [Theory]
     [InlineData(ExecutionPermissionProfile.WorkspaceWrite)]
     [InlineData(ExecutionPermissionProfile.ReadOnlySource)]
@@ -771,6 +833,179 @@ public sealed class ReviewWorkflowTests
             item => item.Type.StartsWith(
                 "publication.",
                 StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task PublicationContractCorrection_RetainsApprovalAndCannotRunShell()
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var review = Assert.Single(
+            (await harness.LoadFlowAsync()).GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        await harness.ReviewAsync(
+            new DirectReviewRequest
+            {
+                GateId = review.Id,
+                Intent = ReviewIntent.Accept
+            });
+        var publicationTurns = 0;
+        harness.Runner.PublicationOutputFactory = _ =>
+            ++publicationTurns == 1
+                ? "HANDOFF_STATUS: COMPLETE\n\n## Decision\nPublication prepared without a recap."
+                : "HANDOFF_STATUS: COMPLETE\n\n## Decision\nReviewed publication ready." +
+                  Environment.NewLine +
+                  RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
+                  Environment.NewLine +
+                  """{"Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
+                  Environment.NewLine +
+                  RepositoryKnowledgeSynthesizer.RecapEndSentinel;
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Approved, flow.Status);
+        Assert.Equal(2, publicationTurns);
+        Assert.Equal(1, harness.CandidatePublisher.Calls);
+        Assert.Equal(1, harness.PublicationVerifier.Calls);
+        var correctionEvent = Assert.Single(
+            flow.Events,
+            item => item.Type == "agent.contract-correction-scheduled");
+        var correction = Assert.Single(
+            flow.Steps, step => step.Id == correctionEvent.FlowStepId);
+        var source = Assert.Single(
+            flow.Steps, step => step.Id == correction.RetryOfStepId);
+        Assert.Equal(PlanStage.AfterApproval, correction.PlanStage);
+        Assert.Equal(StepStatus.Completed, source.Status);
+        Assert.Equal(StepStatus.Completed, correction.Status);
+        Assert.Equal(source.WorkflowRevision, correction.WorkflowRevision);
+        var permission = JsonSerializer.Deserialize<EffectiveExecutionPermission>(
+            correction.EffectivePermissionJson)!;
+        Assert.DoesNotContain("shell", permission.AllowedTools);
+        Assert.Contains("shell", permission.DeniedTools);
+        Assert.Equal(
+            ReviewDecision.Accepted,
+            Assert.Single(
+                flow.GateRecords,
+                gate => gate.ActionType == HandoffActionType.CustomerReview)
+                .ReviewDecision);
+    }
+
+    [Fact]
+    public async Task FailedPublicationWithRecordedInvalidOutput_RestartsAsResponseCorrection()
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var review = Assert.Single(
+            (await harness.LoadFlowAsync()).GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        await harness.ReviewAsync(new DirectReviewRequest
+        {
+            GateId = review.Id,
+            Intent = ReviewIntent.Accept
+        });
+        const string invalidOutput =
+            "HANDOFF_STATUS: COMPLETE\n\n## Decision\nPublication prepared without a recap.";
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows
+                .Include(item => item.Steps)
+                .Include(item => item.Events)
+                .SingleAsync(item => item.Id == harness.FlowId);
+            var publication = Assert.Single(
+                flow.Steps, step => step.PlanStage == PlanStage.AfterApproval);
+            var completedAt = DateTimeOffset.UtcNow;
+            publication.Status = StepStatus.Failed;
+            publication.Phase = AgentRunPhase.Failed;
+            publication.StartedAt = completedAt.AddMinutes(-1);
+            publication.CompletedAt = completedAt;
+            publication.DurationMilliseconds = 60_000;
+            publication.ExecutionAttempts = 1;
+            publication.CopilotSessionId = Guid.NewGuid();
+            publication.ExecutionPrompt = "The exact persisted publication prompt.";
+            publication.OutputSummary = invalidOutput;
+            publication.PushbackReason = "Response correction could not be scheduled.";
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = publication.PushbackReason;
+            flow.Events.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = publication.Id,
+                Type = "agent.Finishing",
+                Message = "Agent run completed."
+            });
+            flow.Events.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = publication.Id,
+                Type = "step.failed",
+                Message = publication.PushbackReason,
+                DataJson = JsonSerializer.Serialize(new
+                {
+                    FailureKind = AgentRunFailureKind.InvalidOutput.ToString(),
+                    OutputCharacters = invalidOutput.Length,
+                    OutputSha256 = OutcomeVerificationRules.ComputeSha256(invalidOutput)
+                })
+            });
+            await database.SaveChangesAsync();
+        }
+        var recorded = await harness.LoadFlowAsync();
+        var recordedPublication = Assert.Single(
+            recorded.Steps,
+            step => step.PlanStage == PlanStage.AfterApproval);
+        Assert.NotNull(WorkflowEngine.RecoverablePublicationCorrectionError(
+            recorded, recordedPublication));
+        recordedPublication.OutputSummary += "tampered";
+        Assert.Null(WorkflowEngine.RecoverablePublicationCorrectionError(
+            recorded, recordedPublication));
+
+        var restarted = await harness.Engine.RestartFailedFlowAsync(
+            harness.FlowId, CancellationToken.None);
+
+        Assert.Equal(FlowStatus.Queued, restarted.Status);
+        var correctionEvent = Assert.Single(
+            restarted.Events,
+            item => item.Type == "agent.contract-correction-scheduled");
+        var correction = Assert.Single(
+            restarted.Steps,
+            step => step.Id == correctionEvent.FlowStepId);
+        Assert.Contains("Previous response to correct:", correction.InputSummary);
+        Assert.Contains(invalidOutput, correction.InputSummary);
+        Assert.Single(
+            restarted.Steps,
+            step => step.PlanStage == PlanStage.AfterApproval &&
+                step.Id != correction.Id);
+        Assert.Equal(
+            ReviewDecision.Accepted,
+            Assert.Single(
+                restarted.GateRecords,
+                gate => gate.ActionType == HandoffActionType.CustomerReview)
+                .ReviewDecision);
+        harness.Runner.PublicationOutputFactory = _ =>
+            "HANDOFF_STATUS: COMPLETE\n\n## Decision\nReviewed publication ready." +
+            Environment.NewLine +
+            RepositoryKnowledgeSynthesizer.RecapBeginSentinel +
+            Environment.NewLine +
+            """{"Changed":false,"Reason":"The fixture publication does not alter durable repository knowledge.","Knowledge":null}""" +
+            Environment.NewLine +
+            RepositoryKnowledgeSynthesizer.RecapEndSentinel;
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var completed = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Approved, completed.Status);
+        Assert.Single(
+            harness.Runner.Contexts,
+            context => context.InvocationKind == ExecutionInvocationKind.Publication);
+        Assert.Equal(1, harness.CandidatePublisher.Calls);
+        Assert.Equal(1, harness.PublicationVerifier.Calls);
+        var permission = JsonSerializer.Deserialize<EffectiveExecutionPermission>(
+            completed.Steps.Single(step => step.Id == correction.Id)
+                .EffectivePermissionJson)!;
+        Assert.DoesNotContain("shell", permission.AllowedTools);
+        Assert.Contains("shell", permission.DeniedTools);
     }
 
     [Fact]
@@ -1963,6 +2198,115 @@ public sealed class ReviewWorkflowTests
             item => item.Type == DeliveryReadinessService.DeniedEventType);
     }
 
+    [Theory]
+    [InlineData(ReviewedPublicationStage.AlreadyCurrent)]
+    [InlineData(ReviewedPublicationStage.NoPullRequestDiff)]
+    public async Task SkippedPullRequestRepository_CompletesAndRecoversOnlyWithCurrentBinding(
+        ReviewedPublicationStage skippedStage)
+    {
+        await using var harness =
+            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var beforeReview = await harness.LoadFlowAsync();
+        var review = Assert.Single(
+            beforeReview.GateRecords,
+            gate => gate.ActionType == HandoffActionType.CustomerReview);
+        await harness.ReviewAsync(new DirectReviewRequest
+        {
+            GateId = review.Id,
+            Intent = ReviewIntent.Accept
+        });
+
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows
+                .Include(item => item.Steps)
+                .Include(item => item.Events)
+                .SingleAsync(item => item.Id == harness.FlowId);
+            var binding = await new DeliveryReadinessService().LoadCurrentAsync(
+                database, flow.Id);
+            Assert.NotNull(binding);
+            var identity = ReviewedCandidateLedger.Read(flow);
+            var publication = Assert.Single(
+                flow.Steps, step => step.PlanStage == PlanStage.AfterApproval);
+            foreach (var repository in identity.Repositories)
+            {
+                database.ReviewedPublicationRecords.Add(new ReviewedPublicationRecord
+                {
+                    FlowRunId = flow.Id,
+                    PublicationRootId =
+                        publication.StableSemanticRootId ?? publication.Id,
+                    Iteration = flow.Iteration,
+                    CandidateFingerprint = identity.Fingerprint,
+                    RelativePath = repository.RelativePath,
+                    RemoteRepository = repository.RemoteRepository,
+                    BranchName = flow.BranchName,
+                    Head = repository.Head,
+                    Tree = repository.Tree,
+                    Stage = skippedStage,
+                    ReviewedCandidateId = binding!.Candidate.Id,
+                    ReadinessSnapshotId = binding.Record.Id,
+                    ReadinessContractHash = binding.ContractHash,
+                    CustomerReviewGateId = review.Id,
+                    WaiverSetHash = binding.WaiverSetHash
+                });
+            }
+            await database.SaveChangesAsync();
+        }
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        Assert.Equal(FlowStatus.Approved, (await harness.LoadFlowAsync()).Status);
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(
+                item => item.Id == harness.FlowId);
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Final approval stopped after remote verification.";
+            flow.CompletedAt = null;
+            await database.SaveChangesAsync();
+        }
+        _ = await harness.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+        var waitingForRestart = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Failed, waitingForRestart.Status);
+        Assert.Single(
+            waitingForRestart.Events,
+            item => item.Type == "flow.recovery-publication-restart-required");
+        _ = await harness.Engine.RecoverInterruptedFlowsAsync(
+            CancellationToken.None);
+        Assert.Single(
+            (await harness.LoadFlowAsync()).Events,
+            item => item.Type == "flow.recovery-publication-restart-required");
+        var restart = await harness.Engine.RestartFailedFlowAsync(
+            harness.FlowId, CancellationToken.None);
+        Assert.Equal(FlowStatus.Queued, restart.Status);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        Assert.Equal(FlowStatus.Approved, (await harness.LoadFlowAsync()).Status);
+        Assert.Equal(1, harness.CandidatePublisher.Calls);
+
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.SingleAsync(
+                item => item.Id == harness.FlowId);
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = "Final approval stopped after remote verification.";
+            flow.CompletedAt = null;
+            var record = await database.ReviewedPublicationRecords.SingleAsync(
+                item => item.FlowRunId == flow.Id);
+            record.PullRequestUrl = "https://github.com/example/repository/pull/1";
+            await database.SaveChangesAsync();
+        }
+        var retry = await harness.Engine.RestartFailedFlowAsync(
+            harness.FlowId, CancellationToken.None);
+        Assert.Equal(FlowStatus.Queued, retry.Status);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var denied = await harness.LoadFlowAsync();
+        Assert.NotEqual(FlowStatus.Approved, denied.Status);
+        Assert.Contains(
+            denied.Events,
+            item => item.Type == DeliveryReadinessService.DeniedEventType);
+    }
+
     [Fact]
     public async Task GrantedWaiverReceipts_SurviveReDerivationIntoProjectionsAndPublication()
     {
@@ -2183,7 +2527,9 @@ public sealed class ReviewWorkflowTests
         public static async Task<ReviewHarness> CreateAsync(
             FlowKind kind,
             RecordingPublicationVerifier? publicationVerifier = null,
-            int maxAutoRefinementIterations = 3)
+            int maxAutoRefinementIterations = 3,
+            bool githubCliAvailable = true,
+            bool githubAuthenticationAvailable = true)
         {
             var root = Path.Combine(
                 AppContext.BaseDirectory,
@@ -2354,7 +2700,10 @@ public sealed class ReviewWorkflowTests
                 flowQueue,
                 lifecycle,
                 workflowProvider,
-                demoRuntimeRevoker: demoRevoker);
+                demoRuntimeRevoker: demoRevoker,
+                githubCliAvailable: () => githubCliAvailable,
+                githubAuthenticationAvailable:
+                    _ => Task.FromResult(githubAuthenticationAvailable));
             return new ReviewHarness(
                 root,
                 workspacePath,
@@ -2645,6 +2994,8 @@ public sealed class ReviewWorkflowTests
 
         public string? PublicationOutputOverride { get; set; }
 
+        public Func<AgentExecutionContext, string>? PublicationOutputFactory { get; set; }
+
         /// <summary>Optional strict outcome-QA block for a scripted readiness case.</summary>
         public Func<AgentExecutionContext, string>? QaBlockOverride { get; set; }
 
@@ -2656,11 +3007,14 @@ public sealed class ReviewWorkflowTests
             CancellationToken cancellationToken = default)
         {
             Contexts.Add(context);
-            if (context.AgentId == "sky-publisher" &&
-                PublicationOutputOverride is not null)
+            var publicationOutput = context.AgentId == "sky-publisher"
+                ? PublicationOutputFactory?.Invoke(context) ??
+                  PublicationOutputOverride
+                : null;
+            if (publicationOutput is not null)
             {
                 return Task.FromResult(new AgentExecutionResult(
-                    PublicationOutputOverride,
+                    publicationOutput,
                     "Fixture publication handoff.",
                     1,
                     []));

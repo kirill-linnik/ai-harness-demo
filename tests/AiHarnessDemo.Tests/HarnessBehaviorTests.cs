@@ -128,15 +128,7 @@ public sealed class AgentCatalogTests
     [Fact]
     public void BrowserDeliveryAgents_RequireMobileOverflowProofBeforeHandoff()
     {
-        var root = new DirectoryInfo(AppContext.BaseDirectory);
-        while (root is not null &&
-               !File.Exists(Path.Combine(root.FullName, "AiHarnessDemo.slnx")))
-        {
-            root = root.Parent;
-        }
-
-        Assert.NotNull(root);
-        var agents = Path.Combine(root!.FullName, ".github", "agents");
+        var agents = Path.Combine(RepositoryRoot(), ".github", "agents");
         var teamLead = AgentCatalogLoader.Parse(
             "team-lead",
             "team-lead.agent.md",
@@ -151,12 +143,15 @@ public sealed class AgentCatalogTests
         Assert.Contains("390px mobile", engineer.Instructions);
         Assert.Contains("scrollWidth", engineer.Instructions);
         Assert.Contains("host-owned scaffold", engineer.Instructions);
-        Assert.Contains("*_conf.json", engineer.Instructions);
+        Assert.Contains("never leave root-level copies of configuration or data", engineer.Instructions);
         Assert.Contains(
             "workspace root with its initial scaffold",
             teamLead.Instructions);
         Assert.Contains(
-            "Never checkpoint the final outcome owner",
+            "only an `Analyze` step that writes the requirements handoff",
+            teamLead.Instructions);
+        Assert.Contains(
+            "before any designer or engineer receives that handoff",
             teamLead.Instructions);
         Assert.Contains(
             "`Observation`, `Command`, `SourceInspection`, and `Test`",
@@ -167,6 +162,87 @@ public sealed class AgentCatalogTests
         Assert.Contains(
             "including skip links",
             engineer.Instructions);
+
+        var qualityEngineer = AgentCatalogLoader.Parse(
+            "quality-engineer",
+            "quality-engineer.agent.md",
+            File.ReadAllText(Path.Combine(agents, "quality-engineer.agent.md")));
+        Assert.Contains(
+            "repository's supported runtime",
+            qualityEngineer.Instructions);
+        Assert.Contains(
+            "a static preview, template inspection, or data record cannot substitute",
+            qualityEngineer.Instructions);
+        Assert.Contains(
+            "Read each cited observation's actual result",
+            qualityEngineer.Instructions);
+
+        var sceptic = AgentCatalogLoader.Parse(
+            "pre-mortem-sceptic",
+            "pre-mortem-sceptic.agent.md",
+            File.ReadAllText(Path.Combine(agents, "pre-mortem-sceptic.agent.md")));
+        Assert.Contains("Counterfactual case file", sceptic.Instructions);
+        Assert.Contains("Do not inspect implementation source", sceptic.Instructions);
+        Assert.Contains("Return `CLEAR`", sceptic.Instructions);
+        Assert.Contains("final Verify owner separately validates", sceptic.Instructions);
+    }
+
+    [Fact]
+    public void CheckedInAgentCatalog_IsValidAndHasNoIncidentOrProjectDetails()
+    {
+        var root = RepositoryRoot();
+        var agents = Path.Combine(root, ".github", "agents");
+        var files = Directory.GetFiles(agents, "*.agent.md");
+        Assert.NotEmpty(files);
+
+        var definitions = new AgentCatalogLoader().Load(agents).Definitions;
+        Assert.Equal(files.Length, definitions.Count);
+        foreach (var definition in definitions)
+        {
+            Assert.Equal(AgentDefinitionStatus.Valid, definition.Record.DefinitionStatus);
+            Assert.IsType<AgentManifest>(definition.Manifest);
+            var content = File.ReadAllText(definition.Record.SourcePath);
+            foreach (var projectDetail in new[]
+                     {
+                         "devclub",
+                         "ee_meetings",
+                         "eu_meetings",
+                         "*_conf.json",
+                         "site\\.customer-preview",
+                         "speaker submission"
+                     })
+            {
+                Assert.DoesNotContain(
+                    projectDetail,
+                    content,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        var authoring = File.ReadAllText(
+            Path.Combine(root, ".github", "copilot-instructions.md"));
+        var workflow = File.ReadAllText(Path.Combine(root, "WORKFLOW.md"));
+        Assert.Contains(
+            "Agent definitions are always project-agnostic role contracts",
+            authoring,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "only facts necessary for the confirmed outcome",
+            workflow,
+            StringComparison.Ordinal);
+    }
+
+    private static string RepositoryRoot()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null &&
+               !File.Exists(Path.Combine(root.FullName, "AiHarnessDemo.slnx")))
+        {
+            root = root.Parent;
+        }
+        return root?.FullName
+            ?? throw new DirectoryNotFoundException(
+                "The agent catalog tests must run from this repository.");
     }
 }
 
@@ -1343,6 +1419,9 @@ public sealed class CopilotReasoningHostTests
             error);
         Assert.Contains(
             RepositoryKnowledgeSynthesizer.RecapBeginSentinel,
+            promptValues["response.contract"]);
+        Assert.Contains(
+            "Reason must be nonempty and at most 500 characters",
             promptValues["response.contract"]);
         Assert.Null(
             WorkflowEngine.GetStudioContractCorrectionReason(

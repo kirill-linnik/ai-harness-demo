@@ -15,6 +15,53 @@ namespace AiHarnessDemo.Tests;
 public sealed class VerifiedCandidatePublisherTests
 {
     [Fact]
+    public void GitHubGitAuthorization_UsesBasicWithAValidatedToken()
+    {
+        const string token = "gho_fixture-token";
+        var header = VerifiedCandidatePublisher.GitHubGitAuthorizationHeader(token);
+
+        Assert.StartsWith("AUTHORIZATION: Basic ", header, StringComparison.Ordinal);
+        Assert.DoesNotContain(token, header, StringComparison.Ordinal);
+        var encoded = header["AUTHORIZATION: Basic ".Length..];
+        Assert.Equal(
+            $"x-access-token:{token}",
+            System.Text.Encoding.ASCII.GetString(
+                Convert.FromBase64String(encoded)));
+        Assert.Throws<ArgumentException>(() =>
+            VerifiedCandidatePublisher.GitHubGitAuthorizationHeader(
+                "invalid\r\nheader"));
+    }
+
+    [Fact]
+    public void GitHubEmptyCompare_RequiresExactHeadsAndAuthoritativeEmptyFileSet()
+    {
+        var baseHead = new string('a', 40);
+        var reviewedHead = new string('b', 40);
+        string Compare(object[] files) => JsonSerializer.Serialize(new
+        {
+            status = "diverged",
+            ahead_by = 1,
+            behind_by = 1,
+            base_commit = new { sha = baseHead },
+            commits = new[] { new { sha = reviewedHead } },
+            files
+        });
+
+        Assert.True(VerifiedCandidatePublisher.IsVerifiedEmptyCompare(
+            Compare([]), baseHead, reviewedHead));
+        Assert.False(VerifiedCandidatePublisher.IsVerifiedEmptyCompare(
+            Compare([new { filename = "changed.txt" }]),
+            baseHead, reviewedHead));
+        Assert.Throws<InvalidOperationException>(() =>
+            VerifiedCandidatePublisher.IsVerifiedEmptyCompare(
+                Compare([]), baseHead, new string('c', 40)));
+        Assert.Throws<InvalidOperationException>(() =>
+            VerifiedCandidatePublisher.IsVerifiedEmptyCompare(
+                """{"status":"diverged","ahead_by":1,"base_commit":{"sha":"a"}}""",
+                baseHead, reviewedHead));
+    }
+
+    [Fact]
     public async Task DeliveryNone_IsRejectedBeforePublisherOrVerifierSideEffects()
     {
         var databasePath = Path.Combine(

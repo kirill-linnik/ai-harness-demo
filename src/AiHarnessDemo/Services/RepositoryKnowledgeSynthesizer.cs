@@ -484,6 +484,9 @@ public sealed class RepositoryKnowledgeSynthesizer(
             prior claims against current documentation, manifests, representative source, and tests.
             Every Evidence value must be an exact existing project-relative path. When Changed is false,
             Knowledge must be null. Do not quote documentation or copy agent handoffs.
+            Reason must be nonempty and at most {{MaximumRecapReasonCharacters}} characters. Keep each
+            finding Summary or Purpose within {{MaximumFindingCharacters}} characters and each section
+            to at most {{MaximumFindingsPerSection}} entries; consolidate rather than copying a transcript.
             Project must remain exactly "{{projectName}}". {{repositoryRequirement}}
             Preserve user-authored corrections or domain facts from the prior baseline even when they
             cannot be derived from files: set their Basis to {{UserProvidedBasis}} and Evidence to [].

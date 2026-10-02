@@ -217,8 +217,14 @@ public sealed partial class PublishedOutcomeVerifier(
                                  StringComparison.Ordinal))
                          ?? throw new InvalidOperationException(
                              $"Reviewed publication verification has no journal row for '{repository.RelativePath}'.");
+            var noPullRequest =
+                outcome == OutcomeType.PullRequest &&
+                (record.Stage is
+                    ReviewedPublicationStage.AlreadyCurrent or
+                    ReviewedPublicationStage.NoPullRequestDiff);
             if (record.Iteration != identity.Iteration ||
-                record.Stage != ReviewedPublicationStage.Completed ||
+                record.Stage != ReviewedPublicationStage.Completed &&
+                !noPullRequest ||
                 !string.Equals(
                     record.CandidateFingerprint,
                     identity.Fingerprint,
@@ -245,15 +251,26 @@ public sealed partial class PublishedOutcomeVerifier(
             }
             if (outcome == OutcomeType.PullRequest)
             {
-                var durableReference = ParsePullRequest(record.PullRequestUrl);
-                if (durableReference is null ||
-                    !string.Equals(
-                        durableReference.Repository,
-                        repository.RemoteRepository,
-                        StringComparison.OrdinalIgnoreCase))
+                if (noPullRequest)
                 {
-                    throw new InvalidOperationException(
-                        $"Reviewed publication journal row '{repository.RelativePath}' has no trusted pull request.");
+                    if (!string.IsNullOrWhiteSpace(record.PullRequestUrl))
+                    {
+                        throw new InvalidOperationException(
+                            $"Reviewed publication journal row '{repository.RelativePath}' cannot both skip and contain a pull request.");
+                    }
+                }
+                else
+                {
+                    var durableReference = ParsePullRequest(record.PullRequestUrl);
+                    if (durableReference is null ||
+                        !string.Equals(
+                            durableReference.Repository,
+                            repository.RemoteRepository,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException(
+                            $"Reviewed publication journal row '{repository.RelativePath}' has no trusted pull request.");
+                    }
                 }
             }
             else if (!string.IsNullOrWhiteSpace(record.PullRequestUrl))
@@ -313,6 +330,52 @@ public sealed partial class PublishedOutcomeVerifier(
                     item.RelativePath,
                     repository.RelativePath,
                     StringComparison.Ordinal));
+            if (publicationRecord.Stage == ReviewedPublicationStage.AlreadyCurrent)
+            {
+                var unchangedReport =
+                    $"Repository {repository.RelativePath}: reviewed remote commit {repository.Head}, tree {repository.Tree}, already current on remote default branch (no PR)";
+                if (!publicationReport.Contains(
+                        unchangedReport,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"Publication report omitted the already-current reviewed repository '{repository.RelativePath}'.");
+                }
+                await VerifyRemoteDefaultHeadAsync(repository, cancellationToken);
+                continue;
+            }
+            if (publicationRecord.Stage == ReviewedPublicationStage.NoPullRequestDiff)
+            {
+                var noDiffReport =
+                    $"Repository {repository.RelativePath}: reviewed remote commit {repository.Head}, tree {repository.Tree}, no changes relative to the default branch (no PR)";
+                if (!publicationReport.Contains(
+                        noDiffReport, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"Publication report omitted the no-diff reviewed repository '{repository.RelativePath}'.");
+                }
+                var defaultHead = await ReadRemoteDefaultHeadAsync(
+                    repository, cancellationToken);
+                var compare = await processRunner.RunAsync(
+                    "gh",
+                    [
+                        "api",
+                        $"repos/{repository.RemoteRepository}/compare/{defaultHead}...{repository.Head}"
+                    ],
+                    AppContext.BaseDirectory,
+                    TimeSpan.FromSeconds(30),
+                    cancellationToken);
+                if (compare.ExitCode != 0 ||
+                    !VerifiedCandidatePublisher.IsVerifiedEmptyCompare(
+                        compare.StandardOutput,
+                        defaultHead,
+                        repository.Head))
+                {
+                    throw new InvalidOperationException(
+                        $"The reviewed repository '{repository.RelativePath}' no longer has an empty pull-request diff against the remote default branch.");
+                }
+                continue;
+            }
             if (string.IsNullOrWhiteSpace(repository.RemoteRepository) ||
                 !references.TryGetValue(
                     repository.RemoteRepository,
@@ -383,6 +446,81 @@ public sealed partial class PublishedOutcomeVerifier(
             verified.Count == 1
                 ? $"Published pull request #{first.Number}"
                 : $"Published pull requests · {verified.Count} repositories");
+    }
+
+    private async Task VerifyRemoteDefaultHeadAsync(
+        CandidateRepositoryManifest repository,
+        CancellationToken cancellationToken)
+    {
+        var defaultHead = await ReadRemoteDefaultHeadAsync(
+            repository, cancellationToken);
+        if (!string.Equals(
+                defaultHead,
+                repository.Head,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"The default branch of '{repository.RemoteRepository}' no longer holds reviewed commit {repository.Head}.");
+        }
+    }
+
+    private async Task<string> ReadRemoteDefaultHeadAsync(
+        CandidateRepositoryManifest repository,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(repository.RemoteRepository))
+        {
+            throw new InvalidOperationException(
+                $"The already-current repository '{repository.RelativePath}' has no trusted remote.");
+        }
+        var details = await processRunner.RunAsync(
+            "gh",
+            ["api", $"repos/{repository.RemoteRepository}"],
+            AppContext.BaseDirectory,
+            TimeSpan.FromSeconds(30),
+            cancellationToken);
+        if (details.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"The default branch of '{repository.RemoteRepository}' could not be verified: {details.CombinedOutput}");
+        }
+        using var repositoryDocument = JsonDocument.Parse(details.StandardOutput);
+        if (!repositoryDocument.RootElement.TryGetProperty(
+                "default_branch",
+                out var defaultBranch) ||
+            defaultBranch.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(defaultBranch.GetString()))
+        {
+            throw new InvalidOperationException(
+                $"The default branch of '{repository.RemoteRepository}' is invalid.");
+        }
+        var reference = await processRunner.RunAsync(
+            "gh",
+            [
+                "api",
+                $"repos/{repository.RemoteRepository}/git/ref/heads/{Uri.EscapeDataString(defaultBranch.GetString()!)}"
+            ],
+            AppContext.BaseDirectory,
+            TimeSpan.FromSeconds(30),
+            cancellationToken);
+        if (reference.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"The default branch head of '{repository.RemoteRepository}' could not be verified: {reference.CombinedOutput}");
+        }
+        using var referenceDocument = JsonDocument.Parse(reference.StandardOutput);
+        if (!referenceDocument.RootElement.TryGetProperty(
+                "object",
+                out var remoteObject) ||
+            remoteObject.ValueKind != JsonValueKind.Object ||
+            !remoteObject.TryGetProperty("sha", out var head) ||
+            head.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(head.GetString()))
+        {
+            throw new InvalidOperationException(
+                $"The default branch of '{repository.RemoteRepository}' has no usable commit identity.");
+        }
+        return head.GetString()!;
     }
 
     private static string ReadReviewedPublicationFingerprint(string? json)

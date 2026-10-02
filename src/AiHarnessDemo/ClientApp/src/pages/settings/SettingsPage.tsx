@@ -365,7 +365,30 @@ export function SettingsPage() {
                     Pull request
                   </button>
                 </div>
-                <small>Projects without source control use a local commit in the isolated workspace; pull requests require a GitHub repository.</small>
+                <small>
+                  Projects without source control use a local commit in the isolated workspace. Pull requests
+                  require a GitHub repository and an authenticated GitHub CLI (<span className="mono">gh</span>)
+                  on the Studio server&apos;s PATH. Restart Studio after installing it or changing its PATH.
+                </small>
+                {outcome === "PullRequest" && (
+                  <div
+                    className={
+                      data.githubCliAvailable && data.githubCliAuthenticated
+                        ? "callout"
+                        : "pushback-callout"
+                    }
+                    style={{ marginTop: 12 }}
+                  >
+                    <strong>GitHub CLI:</strong>{" "}
+                    {!data.githubCliAvailable
+                      ? "Not found on this Studio process's PATH. Pull-request Delivery cannot be confirmed or accepted."
+                      : typeof data.githubCliAuthenticated !== "boolean"
+                        ? "Authentication status is unavailable from this Studio process. Restart Studio to activate the current publication checks."
+                        : data.githubCliAuthenticated
+                        ? "Available and authenticated in this Studio process."
+                        : "Available, but this Studio process has no GitHub token. Sign in with gh auth login or launch Studio with GH_TOKEN before confirming or accepting pull-request Delivery."}
+                  </div>
+                )}
               </div>
               <div className="field" style={{ marginTop: 16 }}>
                 <label htmlFor="max-handoff-retries">Correction and pre-mortem rounds</label>

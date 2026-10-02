@@ -21,6 +21,8 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
 
     public DbSet<FlowMessage> FlowMessages => Set<FlowMessage>();
 
+    public DbSet<FlowAttachment> FlowAttachments => Set<FlowAttachment>();
+
     public DbSet<FlowEvent> FlowEvents => Set<FlowEvent>();
 
     public DbSet<FlowAgentSnapshot> FlowAgentSnapshots => Set<FlowAgentSnapshot>();
@@ -165,6 +167,21 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.HasOne(item => item.FlowRun)
                 .WithMany(flow => flow.Messages)
                 .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<FlowAttachment>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.Property(item => item.FileName).HasMaxLength(160);
+            entity.Property(item => item.ContentType).HasMaxLength(120);
+            entity.Property(item => item.Digest).HasMaxLength(128);
+            entity.HasIndex(item => new { item.FlowRunId, item.CreatedAt });
+            entity.HasIndex(item => item.FlowMessageId);
+            entity.HasOne(item => item.FlowMessage)
+                .WithMany(message => message.Attachments)
+                .HasForeignKey(item => item.FlowMessageId)
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
@@ -529,6 +546,7 @@ public static class DatabaseInitializer
 
         await database.Database.EnsureCreatedAsync();
         await EnsureReviewedPreviewArtifactSchemaAsync(database);
+        await EnsureFlowAttachmentSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         if (!await database.Settings.AnyAsync())
@@ -576,6 +594,37 @@ public static class DatabaseInitializer
                 "CandidateFingerprint",
                 "RelativePath"
             );
+            """);
+    }
+
+    internal static async Task EnsureFlowAttachmentSchemaAsync(
+        HarnessDbContext database)
+    {
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE TABLE IF NOT EXISTS "FlowAttachments" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_FlowAttachments" PRIMARY KEY,
+                "FlowRunId" TEXT NOT NULL,
+                "FlowMessageId" TEXT NOT NULL,
+                "FileName" TEXT NOT NULL,
+                "ContentType" TEXT NOT NULL,
+                "Length" INTEGER NOT NULL,
+                "Digest" TEXT NOT NULL,
+                "Content" BLOB NOT NULL,
+                "CreatedAt" INTEGER NOT NULL,
+                CONSTRAINT "FK_FlowAttachments_FlowMessages_FlowMessageId"
+                    FOREIGN KEY ("FlowMessageId") REFERENCES "FlowMessages" ("Id") ON DELETE CASCADE
+            );
+            """);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE INDEX IF NOT EXISTS "IX_FlowAttachments_FlowRunId_CreatedAt"
+            ON "FlowAttachments" ("FlowRunId", "CreatedAt");
+            """);
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE INDEX IF NOT EXISTS "IX_FlowAttachments_FlowMessageId"
+            ON "FlowAttachments" ("FlowMessageId");
             """);
     }
 }

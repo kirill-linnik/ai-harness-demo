@@ -1184,6 +1184,13 @@ summary:focus-visible {
   text-transform: uppercase;
 }
 
+.message-attachments {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted-strong);
+  overflow-wrap: anywhere;
+}
+
 .intake-proposal {
   display: grid;
   grid-template-columns: minmax(160px, 0.3fr) minmax(0, 1fr);
@@ -1210,6 +1217,41 @@ summary:focus-visible {
 .composer {
   border-top: 1px solid var(--line);
   padding: 16px;
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  margin-bottom: 10px;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
+.composer-attachments input {
+  max-width: 100%;
+}
+
+.composer-attachments ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  width: 100%;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.composer-attachments li {
+  overflow-wrap: anywhere;
+}
+
+.composer-attachments li button {
+  margin-left: 6px;
+  color: var(--violet-bright);
+  background: none;
+  border: 0;
+  cursor: pointer;
 }
 
 .composer-row {

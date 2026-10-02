@@ -18,7 +18,13 @@ public enum ReviewedPublicationStage
     PullRequestOpened = 2,
 
     /// <summary>Every external side effect for this repository is durably recorded.</summary>
-    Completed = 3
+    Completed = 3,
+
+    /// <summary>The reviewed head already equals the remote default branch; no PR is needed.</summary>
+    AlreadyCurrent = 4,
+
+    /// <summary>The reviewed head has no changes relative to the remote default branch's merge base.</summary>
+    NoPullRequestDiff = 5
 }
 
 /// <summary>

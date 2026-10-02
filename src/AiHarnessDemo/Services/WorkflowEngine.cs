@@ -359,6 +359,7 @@ public sealed class WorkflowEngine(
         }
         List<FlowAgentSnapshot> snapshots;
         FlowPlanDocument? persistedDocument;
+        bool initialCustomerUploadsPresent;
         await using (var database =
                      await databaseFactory.CreateDbContextAsync(cancellationToken))
         {
@@ -373,6 +374,13 @@ public sealed class WorkflowEngine(
                     item =>
                         item.FlowRunId == flow.Id &&
                         item.Iteration == flow.Iteration,
+                    cancellationToken);
+            initialCustomerUploadsPresent =
+                persistedDocument is null &&
+                flow.Kind == FlowKind.Delivery &&
+                flow.Iteration == 1 &&
+                await database.FlowAttachments.AsNoTracking().AnyAsync(
+                    item => item.FlowRunId == flow.Id,
                     cancellationToken);
         }
         if (snapshots.Count == 0)
@@ -401,7 +409,8 @@ public sealed class WorkflowEngine(
                 flow.Kind,
                 snapshots,
                 preMortemAvailableForNewPlan,
-                workflow)
+                workflow,
+                initialCustomerUploadsPresent)
             : TeamPlanValidationContext.ForPersistedPlan(
                 flow.Kind,
                 snapshots,
@@ -1129,7 +1138,7 @@ public sealed class WorkflowEngine(
                     Label = $"Pre-mortem review of {snapshot.Name} (round 1)",
                     PlanStepKey = reviewKey,
                     PlanDutiesJson = SerializePlanDuties(
-                        [PlanDuty.Analyze, PlanDuty.Verify]),
+                        [PlanDuty.Analyze]),
                     PlanStage = PlanStage.BeforeReview,
                     InvocationKind = ExecutionInvocationKind.PreMortem,
                     IsOutcomeOwner = false,
@@ -1517,6 +1526,12 @@ public sealed class WorkflowEngine(
             of inventing an agent. Workers receive the confirmed brief plus only their declared
             current-iteration dependencies and ancestors; never assign a worker to reconstruct
             an earlier iteration or inspect a full execution ledger.
+            For a narrow content change, inspect only enough repository evidence to select owners
+            and define verifiable outcomes. Delegate detailed implementation and history searches
+            to workers; do not expand planning into a second implementation pass. The complete
+            customer input remains available in host-owned context. Put only facts relevant to
+            each assigned duty in its step and acceptance criteria; do not propagate unrelated
+            source fields to every worker.
 
             Return exactly one strict JSON object between TEAM_PLAN_BEGIN and
             TEAM_PLAN_END. Disposition is Planned or
@@ -1545,6 +1560,15 @@ public sealed class WorkflowEngine(
             Implement, Verify, PrepareOutcome, and Publish. Stage is BeforeReview or AfterApproval.
             TaskProfile uses 1-10 integer metrics, 1-6 exact TaskTypeTags, exact Low/Medium/High/
             Critical Risk, bounded RiskReason and Rationales, and Confidence from 0 through 1.
+            For Delivery AcceptanceCriteria, allow every evidence kind the verifier will actually
+            produce. Shell, Node, and PowerShell checks (including browser scripts launched from
+            a shell) are usually Command; a test runner can produce Test; direct view/grep and
+            inspected source diffs can be SourceInspection; separately host-observed browser
+            results can be Observation; generated files are Artifact. A browser script launched
+            from a shell is not Observation just because it inspects a page. Git diff/status or
+            text searches can be classified SourceInspection. Where the verifier may use either
+            a shell check or direct inspection, allow both Command and SourceInspection. Do not
+            restrict a criterion to Test or Observation unless the planned tool issues that kind.
 
             Exactly one final BeforeReview worker is OutcomeOwner and has PrepareOutcome.
             Required configured duties: {{requiredDuties}}.
@@ -1560,6 +1584,12 @@ public sealed class WorkflowEngine(
             Studio serves those artifacts in a sandbox with connect-src 'none'; each preview must
             boot and render representative product content without any network request. Bundle or
             inline the required preview configuration, data, images, fonts, and other assets.
+            For browser-visible work, prove that the actual product delivers the requested
+            behavior. If it does not, plan the necessary implementation and observable
+            acceptance criterion rather than relying only on stored data or a standalone
+            preview. Follow the selected project's existing asset conventions for uploaded
+            files. Incidental fields in supplied source material are not public requirements;
+            restating a sensitive value in a brief does not authorize its publication.
             `.customer-preview` is the only generated top-level directory allowed to remain outside
             the registered repositories. Every assignment that creates `_release`, `.previous`,
             packaging-helper, browser-cache, report, test-result, or other temporary output must
@@ -1568,7 +1598,7 @@ public sealed class WorkflowEngine(
             because it resembles generated package-manager output.
 
             {{(preMortemAvailable
-                ? $"The Pre-mortem Sceptic snapshot is enabled. PreMortemCheckpoints may name justified BeforeReview step IDs; each has at most {maximumPreMortemRounds} round(s)."
+                ? $"The Pre-mortem Sceptic snapshot is enabled. In Delivery, a Design or Implement step profiled Medium, High, or Critical Risk requires an Analyze-duty requirements-authoring step and a checkpoint on it before the first Design or Implement step. A new Delivery flow with customer uploads also requires that checkpoint even if the worker is profiled Low risk. {(validationContext.CustomerUploadsPresent ? "This flow includes customer-uploaded files: write the requirements handoff in a separate Analyze step and checkpoint it before any Design or Implement worker starts." : string.Empty)} Profile material uncertainty about assumptions, constraints, failure behavior, or ownership honestly; do not lower its risk to avoid the checkpoint. The sceptic treats faithful implementation followed by serious failure as a counterfactual premise, identifies requirements gaps rather than code defects, and returns findings to the requirements author before any designer or engineer starts. Never checkpoint an implemented result or QA. In Advisory, the sceptic may challenge a recommendation before feedback. Omit checkpoints for genuinely routine Low-risk work without uploads. Each checkpoint has at most {maximumPreMortemRounds} round(s)."
                 : "The Pre-mortem Sceptic is unavailable. PreMortemCheckpoints must be empty.")}}
             """;
         if (assignment.Length >
@@ -1885,7 +1915,7 @@ public sealed class WorkflowEngine(
             Label = $"Pre-mortem review of {target.AgentName} (round {round})",
             PlanStepKey = PreMortemPlanStepKey(target.PlanStepKey, round),
             PlanDutiesJson = SerializePlanDuties(
-                [PlanDuty.Analyze, PlanDuty.Verify]),
+                [PlanDuty.Analyze]),
             PlanStage = PlanStage.BeforeReview,
             InvocationKind = ExecutionInvocationKind.PreMortem,
             IsOutcomeOwner = false,
@@ -2583,9 +2613,22 @@ public sealed class WorkflowEngine(
 
     internal static string? GetStudioContractCorrectionReason(
         AgentExecutionContext context,
+        string output) =>
+        GetStudioContractCorrectionReason(
+            context.InvocationKind,
+            context.IsPreMortemRevision,
+            context.IsOutcomeOwner,
+            context.RequiresDeliveryReadinessQa,
+            output);
+
+    private static string? GetStudioContractCorrectionReason(
+        ExecutionInvocationKind invocationKind,
+        bool isPreMortemRevision,
+        bool isOutcomeOwner,
+        bool requiresDeliveryReadinessQa,
         string output)
     {
-        if (context.InvocationKind == ExecutionInvocationKind.PreMortem)
+        if (invocationKind == ExecutionInvocationKind.PreMortem)
         {
             try
             {
@@ -2597,7 +2640,7 @@ public sealed class WorkflowEngine(
                 return exception.Message;
             }
         }
-        if (context.InvocationKind is not (
+        if (invocationKind is not (
                 ExecutionInvocationKind.Worker or
                 ExecutionInvocationKind.Publication))
         {
@@ -2608,15 +2651,15 @@ public sealed class WorkflowEngine(
         try
         {
             handoff = AgentHandoffInspector.ParseDynamic(output);
-            if (context.IsPreMortemRevision)
+            if (isPreMortemRevision)
             {
                 _ = ValidatePreMortemRevisionOutput(output);
             }
-            if (context.IsOutcomeOwner && !handoff.IsPushback)
+            if (isOutcomeOwner && !handoff.IsPushback)
             {
                 _ = FlowOutcomeParser.Parse(output);
             }
-            if (context.InvocationKind == ExecutionInvocationKind.Publication &&
+            if (invocationKind == ExecutionInvocationKind.Publication &&
                 !handoff.IsPushback)
             {
                 _ = RepositoryKnowledgeSynthesizer.ParseRecapEnvelope(output);
@@ -2628,7 +2671,7 @@ public sealed class WorkflowEngine(
         }
 
         if (!handoff.IsPushback &&
-            context.RequiresDeliveryReadinessQa &&
+            requiresDeliveryReadinessQa &&
             !DeliveryReadinessPolicy.ContainsQaContract(output))
         {
             return
@@ -2803,6 +2846,7 @@ public sealed class WorkflowEngine(
             .AsSplitQuery()
             .Include(item => item.Steps)
             .Include(item => item.TaskProfiles)
+            .Include(item => item.GateRecords)
             .SingleAsync(item => item.Id == flowId, cancellationToken);
         var source = flow.Steps.Single(item => item.Id == stepId);
         if (source.Status != StepStatus.Running &&
@@ -2997,6 +3041,16 @@ public sealed class WorkflowEngine(
                 "whose kind is allowed by its unchanged acceptance plan. Never cite a failed " +
                 "call as successful evidence. If the evidence is insufficient, report the honest " +
                 "Failed or Blocked result with remediation rather than claiming PASS." +
+                $"{Environment.NewLine}{Environment.NewLine}" +
+                $"Previous response to correct:{Environment.NewLine}" +
+                BoundFailedOutput(source.OutputSummary);
+        }
+        else if (source.InvocationKind == ExecutionInvocationKind.Publication)
+        {
+            assignment +=
+                " Return the complete repository knowledge recap between its exact sentinels. " +
+                "Correct the invalid fields without changing the reviewed candidate or repeating " +
+                "publication checks." +
                 $"{Environment.NewLine}{Environment.NewLine}" +
                 $"Previous response to correct:{Environment.NewLine}" +
                 BoundFailedOutput(source.OutputSummary);
@@ -5254,32 +5308,43 @@ public sealed class WorkflowEngine(
                 }
                 if (latestPublication?.Status == StepStatus.Completed)
                 {
-                    if (flow.Status != FlowStatus.Approved)
+                    if (flow.Status == FlowStatus.Failed)
                     {
-                        // Crash-window recovery must reauthorize from the durable readiness,
-                        // review, and publication-journal binding instead of transitioning a
-                        // Delivery flow to Approved directly.
-                        var authorized = await TryCompleteRecoveredDeliveryAsync(
-                            database,
+                        AddRecoveryEventOnce(
                             flow,
-                            accepted,
-                            latestPublication,
-                            cancellationToken);
-                        if (!authorized)
-                        {
-                            await database.SaveChangesAsync(cancellationToken);
-                            await transaction.CommitAsync(cancellationToken);
-                            continue;
-                        }
-                        flow.CompletedAt ??=
-                            latestPublication.CompletedAt ??
-                            DateTimeOffset.UtcNow;
+                            latestPublication.Id,
+                            "flow.recovery-publication-restart-required",
+                            "The reviewed publication completed, but failed final approval requires an explicit manual restart.");
                     }
-                    AddRecoveryEventOnce(
-                        flow,
-                        latestPublication.Id,
-                        "flow.recovery-publication-completed",
-                        "Restart reconciliation retained the verified customer-approved publication.");
+                    else
+                    {
+                        if (flow.Status != FlowStatus.Approved)
+                        {
+                            // Crash-window recovery must reauthorize from the durable readiness,
+                            // review, and publication-journal binding instead of transitioning a
+                            // Delivery flow to Approved directly.
+                            var authorized = await TryCompleteRecoveredDeliveryAsync(
+                                database,
+                                flow,
+                                accepted,
+                                latestPublication,
+                                cancellationToken);
+                            if (!authorized)
+                            {
+                                await database.SaveChangesAsync(cancellationToken);
+                                await transaction.CommitAsync(cancellationToken);
+                                continue;
+                            }
+                            flow.CompletedAt ??=
+                                latestPublication.CompletedAt ??
+                                DateTimeOffset.UtcNow;
+                        }
+                        AddRecoveryEventOnce(
+                            flow,
+                            latestPublication.Id,
+                            "flow.recovery-publication-completed",
+                            "Restart reconciliation retained the verified customer-approved publication.");
+                    }
                 }
                 else if (latestPublication?.Status == StepStatus.Failed)
                 {
@@ -5833,6 +5898,62 @@ public sealed class WorkflowEngine(
         return true;
     }
 
+    internal static string? RecoverablePublicationCorrectionError(
+        FlowRun flow,
+        FlowStep failedStep)
+    {
+        if (flow.Status != FlowStatus.Failed ||
+            !ReviewCoordinator.IsPublicationStep(flow, failedStep) ||
+            !ReviewCoordinator.HasAcceptedCustomerReview(flow) ||
+            failedStep.Status != StepStatus.Failed ||
+            failedStep.Phase != AgentRunPhase.Failed ||
+            failedStep.ExecutionAttempts < 1 ||
+            failedStep.CopilotSessionId is null ||
+            string.IsNullOrWhiteSpace(failedStep.ExecutionPrompt) ||
+            string.IsNullOrWhiteSpace(failedStep.OutputSummary) ||
+            !flow.Events.Any(item =>
+                item.FlowStepId == failedStep.Id &&
+                item.Type == "agent.Finishing"))
+        {
+            return null;
+        }
+
+        var failure = flow.Events
+            .Where(item =>
+                item.FlowStepId == failedStep.Id &&
+                item.Type == "step.failed")
+            .OrderByDescending(item => item.CreatedAt)
+            .FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(failure?.DataJson))
+        {
+            return null;
+        }
+
+        using var document = JsonDocument.Parse(failure.DataJson);
+        var witness = document.RootElement;
+        if (witness.ValueKind != JsonValueKind.Object ||
+            !witness.TryGetProperty("FailureKind", out var kind) ||
+            kind.ValueKind != JsonValueKind.String ||
+            kind.GetString() != AgentRunFailureKind.InvalidOutput.ToString() ||
+            !witness.TryGetProperty("OutputCharacters", out var characters) ||
+            !characters.TryGetInt32(out var length) ||
+            length != failedStep.OutputSummary.Length ||
+            !witness.TryGetProperty("OutputSha256", out var digest) ||
+            digest.ValueKind != JsonValueKind.String ||
+            digest.GetString() != OutcomeVerificationRules.ComputeSha256(
+                failedStep.OutputSummary))
+        {
+            return null;
+        }
+
+        return GetStudioContractCorrectionReason(
+            ExecutionInvocationKind.Publication,
+            isPreMortemRevision: false,
+            isOutcomeOwner: false,
+            requiresDeliveryReadinessQa: false,
+            failedStep.OutputSummary);
+    }
+
     internal async Task<FlowRun> RestartFailedFlowAsync(
         Guid flowId,
         CancellationToken cancellationToken)
@@ -5856,6 +5977,31 @@ public sealed class WorkflowEngine(
             if (flow.Status != FlowStatus.Failed)
             {
                 throw new InvalidOperationException("Only a failed flow can be restarted.");
+            }
+            var latestPublication = flow.Steps
+                .Where(step =>
+                    step.Iteration == flow.Iteration &&
+                    ReviewCoordinator.IsPublicationStep(flow, step))
+                .OrderByDescending(step => step.Sequence)
+                .ThenByDescending(step => step.Attempt)
+                .FirstOrDefault();
+            if (latestPublication?.Status == StepStatus.Completed &&
+                ReviewCoordinator.HasAcceptedCustomerReview(flow))
+            {
+                _lifecycle.Transition(flow, FlowStatus.Queued);
+                flow.FailureReason = string.Empty;
+                flow.CompletedAt = null;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = latestPublication.Id,
+                    Type = "flow.publication-finalization-retry-queued",
+                    Message =
+                        "Manual restart queued host finalization of the completed reviewed publication without repeating remote work."
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                return flow;
             }
             var iterationSteps = flow.Steps
                 .Where(step => step.Iteration == flow.Iteration)
@@ -6078,6 +6224,34 @@ public sealed class WorkflowEngine(
             {
                 throw new InvalidOperationException(
                     $"The flow cannot be restarted because its agent snapshot has no definition for '{failedStep.AgentId}'.");
+            }
+            var publicationContractError =
+                RecoverablePublicationCorrectionError(flow, failedStep);
+            if (publicationContractError is not null)
+            {
+                await ScheduleStudioContractCorrectionAsync(
+                    flow.Id,
+                    failedStep.Id,
+                    new AgentExecutionResult(
+                        failedStep.OutputSummary,
+                        "Recovered the exact completed publication response from the durable attempt.",
+                        failedStep.ExecutionAttempts,
+                        []),
+                    publicationContractError,
+                    failedStep.CompletedAt ?? DateTimeOffset.UtcNow,
+                    Math.Max(1, failedStep.DurationMilliseconds),
+                    cancellationToken,
+                    recoveringFailedAttempt: true);
+                database.ChangeTracker.Clear();
+                return await database.Flows
+                    .AsSplitQuery()
+                    .Include(item => item.Steps)
+                    .ThenInclude(step => step.ToolCalls)
+                    .Include(item => item.Messages)
+                    .Include(item => item.Events)
+                    .Include(item => item.GateRecords)
+                    .Include(item => item.AgentSnapshots)
+                    .SingleAsync(item => item.Id == flowId, cancellationToken);
             }
             var copilotHome = string.IsNullOrWhiteSpace(failedStep.CopilotSessionHome)
                 ? sessionJournal.ExpectedHome()
@@ -7776,15 +7950,21 @@ public sealed class WorkflowEngine(
     }
 
     internal static string BuildPreMortemAssignment(FlowStep target) =>
-        "Assume this result was adopted and, six months later, became a disaster. " +
-        "Independently reconstruct what failed, what the result missed, and the precise prevention. " +
-        "Research the isolated workspace and authoritative sources as needed. Report no more than " +
-        "five findings, and report CLEAR when no evidence-backed failure case remains. Keep the " +
+        "Counterfactual case file: six months ago the team received these proposed requirements, " +
+        "implemented them exactly, and the result caused a serious failure. Treat conformance " +
+        "and failure as premises of the exercise, not historical facts. Before downstream design " +
+        "or implementation, reconstruct which requirement, constraint, assumption, or handoff " +
+        "was missing or misleading. Each finding must explain why faithful implementation could " +
+        "still fail; give the requirements author a precise, evidence-backed preventive change. " +
+        "Use the confirmed customer outcome, proposed handoff, and supplied project knowledge; " +
+        "do not inspect implementation code, workspace diffs, tool history, or built artifacts. " +
+        "This is not QA: do not verify a finished candidate, determine acceptance-criterion " +
+        "results, or authorize release. Return CLEAR if no requirements-level gap is substantiated; " +
+        "the hypothetical failure is not evidence for inventing a cause. Report no more than " +
+        "five findings. Keep the " +
         "entire response under 9,000 characters and each finding field under 800 characters. " +
-        "Evaluate the correctness and completeness of this role's handoff, not whether its " +
-        "acknowledged downstream corrections have already been implemented. An honest failed or " +
-        "blocked QA assessment is a valid handoff to refinement, not an approval. Do not repeat " +
-        "acknowledged failures as new findings or turn optional improvements into requirements " +
+        "Challenge the requirements handoff, not completed product behavior. Do not repeat " +
+        "acknowledged risks as new findings or turn optional improvements into requirements " +
         "outside the confirmed customer brief." +
         $"{Environment.NewLine}{Environment.NewLine}" +
         $"Evaluated agent: {target.AgentName} ({target.AgentRole})" +
@@ -7828,8 +8008,8 @@ public sealed class WorkflowEngine(
         (ownsImplementation
             ? "If a finding is justified, make the focused corrections owned by this role. "
             : "Do not implement downstream product corrections in this turn; revise this role's " +
-              "complete plan, design, or review handoff and assign justified corrections to the " +
-              "responsible downstream owner. Stop tool use once that handoff is evidence-based. ") +
+              "complete requirements or proposal handoff, and justify any finding you reject. " +
+              "Stop tool use once that handoff is evidence-based. ") +
         "Return the complete current deliverable or plan, not a delta. " +
         "The next agent must be able to rely on this response alone. " +
         (preparesOutcome
@@ -8832,6 +9012,16 @@ public sealed class WorkflowEngine(
                         "Studio must be listening before dispatching Delivery verification.")));
     }
 
+    internal static bool IsCompletePublicationJournalRecord(
+        ReviewedPublicationRecord record,
+        OutcomeType outcome) =>
+        record.Stage == ReviewedPublicationStage.Completed ||
+        outcome == OutcomeType.PullRequest &&
+        (record.Stage is
+            ReviewedPublicationStage.AlreadyCurrent or
+            ReviewedPublicationStage.NoPullRequestDiff) &&
+        string.IsNullOrWhiteSpace(record.PullRequestUrl);
+
     /// <summary>
     /// Idempotently completes a Delivery flow whose publication finished before the crash. It
     /// reauthorizes the current readiness, the accepted review, and the publication journal
@@ -8874,7 +9064,7 @@ public sealed class WorkflowEngine(
                 : binding.State != DeliveryReadinessState.ReadyToApprove
                     ? $"the current readiness state is '{binding.State}'"
                     : journal.Any(item =>
-                        item.Stage != ReviewedPublicationStage.Completed ||
+                    !IsCompletePublicationJournalRecord(item, flow.Outcome) ||
                         item.ReviewedCandidateId != binding.Candidate.Id ||
                         item.ReadinessSnapshotId != binding.Record.Id ||
                         item.CustomerReviewGateId != accepted.Id ||
@@ -9164,9 +9354,9 @@ public sealed class WorkflowEngine(
                     ?? throw new InvalidOperationException(
                         "Delivery approval requires a current readiness assessment.");
                 // The durable publication journal is the host's own record of remote side
-                // effects. Whenever rows exist they must all be completed and bound to this
-                // exact readiness, candidate, and accepted-review identity; a mismatch denies
-                // final approval instead of silently trusting the accepted gate.
+                // effects. Rows must be completed or already current on the remote default
+                // branch and bound to this exact readiness, candidate, and accepted review;
+                // a mismatch denies final approval instead of trusting the accepted gate.
                 var journal = await database
                     .ReviewedPublicationRecords
                     .Where(item => item.FlowRunId == flow.Id)
@@ -9174,7 +9364,8 @@ public sealed class WorkflowEngine(
                 var verified =
                     journal.Count == 0 ||
                     journal.All(item =>
-                        item.Stage == ReviewedPublicationStage.Completed &&
+                        IsCompletePublicationJournalRecord(
+                            item, flow.Outcome) &&
                         item.ReviewedCandidateId == current.Candidate.Id &&
                         item.ReadinessSnapshotId == current.Record.Id &&
                         item.CustomerReviewGateId == accepted.Id &&

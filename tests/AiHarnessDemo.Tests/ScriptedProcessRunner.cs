@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using AiHarnessDemo.Services;
 
 namespace AiHarnessDemo.Tests;
@@ -39,6 +40,12 @@ internal sealed class ScriptedProcessRunner : ProcessRunner
 
     /// <summary>The commit the remote branch currently points at; empty means "no branch".</summary>
     public string RemoteBranchHead { get; set; } = string.Empty;
+
+    public Dictionary<string, string> RemoteDefaultHeads { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public Dictionary<string, string> RemoteNoDiffHeads { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public Func<ProcessInvocation, bool>? FailOn { get; set; }
 
@@ -117,6 +124,16 @@ internal sealed class ScriptedProcessRunner : ProcessRunner
     {
         if (arguments.Contains("ls-remote", StringComparer.Ordinal))
         {
+            if (arguments.Contains("--symref", StringComparer.Ordinal))
+            {
+                var repository = RepositoryFromUrl(arguments[^2]);
+                var head = RemoteDefaultHeads.TryGetValue(
+                    repository, out var current)
+                    ? current
+                    : new string('0', 40);
+                return Success(
+                    $"ref: refs/heads/main\tHEAD\n{head}\tHEAD\n");
+            }
             var reference = arguments[^1];
             return string.IsNullOrEmpty(RemoteBranchHead)
                 ? Success(string.Empty)
@@ -169,6 +186,66 @@ internal sealed class ScriptedProcessRunner : ProcessRunner
         if (arguments.Contains("auth", StringComparer.Ordinal))
         {
             return Success("scripted-token\n");
+        }
+        if (arguments.Contains("api", StringComparer.Ordinal))
+        {
+            var endpoint = arguments[1];
+            const string prefix = "repos/";
+            const string refMarker = "/git/ref/heads/";
+            const string compareMarker = "/compare/";
+            if (!endpoint.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"The publication tests do not script GitHub API '{endpoint}'.");
+            }
+            var compareIndex = endpoint.IndexOf(
+                compareMarker, StringComparison.Ordinal);
+            if (compareIndex >= 0)
+            {
+                var comparedRepository = endpoint[prefix.Length..compareIndex];
+                var comparison = endpoint[(compareIndex + compareMarker.Length)..];
+                var separator = comparison.IndexOf(
+                    "...", StringComparison.Ordinal);
+                if (separator < 1)
+                {
+                    throw new InvalidOperationException(
+                        $"The publication tests received an invalid compare URL '{endpoint}'.");
+                }
+                var baseHead = comparison[..separator];
+                var candidateHead = comparison[(separator + 3)..];
+                return RemoteNoDiffHeads.TryGetValue(
+                           comparedRepository, out var noDiffHead) &&
+                       string.Equals(
+                           noDiffHead, candidateHead,
+                           StringComparison.OrdinalIgnoreCase)
+                    ? Success(JsonSerializer.Serialize(new
+                    {
+                        status = "diverged",
+                        ahead_by = 1,
+                        behind_by = 1,
+                        total_commits = 1,
+                        base_commit = new { sha = baseHead },
+                        commits = new[] { new { sha = candidateHead } },
+                        files = Array.Empty<object>()
+                    }))
+                    : new ProcessResult(
+                        1, string.Empty, "gh: Not Found (HTTP 404)");
+            }
+            var refIndex = endpoint.IndexOf(refMarker, StringComparison.Ordinal);
+            if (refIndex < 0)
+            {
+                return Success("""{"default_branch":"main"}""");
+            }
+            var repositoryName = endpoint[prefix.Length..refIndex];
+            var head = RemoteDefaultHeads.TryGetValue(
+                repositoryName, out var current)
+                ? current
+                : new string('0', 40);
+            return Success(
+                JsonSerializer.Serialize(new
+                {
+                    @object = new { sha = head }
+                }));
         }
         var repository = ReadOption(arguments, "--repo");
         if (arguments.Contains("list", StringComparer.Ordinal))
@@ -252,6 +329,14 @@ internal sealed class ScriptedProcessRunner : ProcessRunner
         }
         throw new InvalidOperationException(
             $"The scripted GitHub CLI call is missing '{option}'.");
+    }
+
+    private static string RepositoryFromUrl(string url)
+    {
+        var path = new Uri(url).AbsolutePath.Trim('/');
+        return path.EndsWith(".git", StringComparison.OrdinalIgnoreCase)
+            ? path[..^4]
+            : path;
     }
 
     private static ProcessResult Success(string standardOutput) =>

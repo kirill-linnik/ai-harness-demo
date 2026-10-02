@@ -235,13 +235,30 @@ public sealed class AgentManifestStager
         }
     }
 
-    public async Task<StagedContextDocument> StageContextDocumentAsync(
+    public Task<StagedContextDocument> StageContextDocumentAsync(
         StagedAgentManifest manifest,
         Guid flowId,
         Guid stepId,
         int attempt,
         string name,
         string content,
+        CancellationToken cancellationToken = default) =>
+        StageContextFileAsync(
+            manifest,
+            flowId,
+            stepId,
+            attempt,
+            name,
+            Utf8WithoutBom.GetBytes(content),
+            cancellationToken);
+
+    public async Task<StagedContextDocument> StageContextFileAsync(
+        StagedAgentManifest manifest,
+        Guid flowId,
+        Guid stepId,
+        int attempt,
+        string name,
+        byte[] content,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(manifest);
@@ -255,8 +272,7 @@ public sealed class AgentManifestStager
             throw new InvalidOperationException(
                 "A context document requires an attempt identity and a safe host-issued filename.");
         }
-        var bytes = Utf8WithoutBom.GetBytes(content);
-        if (bytes.Length > MaximumStagedPromptBytes)
+        if (content.Length > MaximumStagedPromptBytes)
         {
             throw new InvalidOperationException("The context document exceeds its staging limit.");
         }
@@ -274,10 +290,11 @@ public sealed class AgentManifestStager
         var path = Path.Combine(directory, name);
         await WriteOrValidateOwnedFileAsync(
             path,
-            bytes,
+            content,
             "The host-owned execution context document",
             cancellationToken);
-        return new StagedContextDocument(path, ComputeSha256(bytes), bytes.LongLength);
+        return new StagedContextDocument(
+            path, ComputeSha256(content), content.LongLength);
     }
 
     public async Task<StagedPrompt> StagePromptAsync(

@@ -185,26 +185,10 @@ public static class IntakeParser
         }
         else
         {
-            var requiresBrief = document.Status is
-                IntakeStatus.AwaitingConfirmation or IntakeStatus.Confirmed;
-            ValidateText(
-                document.Brief.Goal,
-                MaximumGoalCharacters,
-                "Brief.Goal",
-                allowEmpty: !requiresBrief,
-                errors);
-            ValidateList(document.Brief.Details, "Brief.Details", errors);
-            ValidateList(
-                document.Brief.SuccessCriteria,
-                "Brief.SuccessCriteria",
-                errors);
-            ValidateList(
-                document.Brief.Constraints,
-                "Brief.Constraints",
-                errors);
-            ValidateList(
-                document.Brief.Assumptions,
-                "Brief.Assumptions",
+            ValidateBrief(
+                document.Brief,
+                requireGoal: document.Status is
+                    IntakeStatus.AwaitingConfirmation or IntakeStatus.Confirmed,
                 errors);
         }
 
@@ -234,6 +218,55 @@ public static class IntakeParser
     public static string SerializeBrief(IntakeBrief brief) =>
         JsonSerializer.Serialize(brief, JsonOptions);
 
+    public static IntakeBrief ParseBriefJson(string json)
+    {
+        ArgumentNullException.ThrowIfNull(json);
+        if (string.IsNullOrWhiteSpace(json) ||
+            json.Length > MaximumJsonCharacters)
+        {
+            throw new IntakeContractException(
+                ["confirmed brief JSON is empty or oversized"]);
+        }
+
+        IntakeBrief brief;
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new IntakeContractException(
+                    ["confirmed brief JSON must be an object"]);
+            }
+            var shapeErrors = new List<string>();
+            RejectDuplicateProperties(document.RootElement, "Brief", shapeErrors);
+            RequireProperties(
+                document.RootElement,
+                "Brief",
+                ["Goal", "Details", "SuccessCriteria", "Constraints", "Assumptions"],
+                shapeErrors);
+            if (shapeErrors.Count > 0)
+            {
+                throw new IntakeContractException(shapeErrors);
+            }
+            brief = JsonSerializer.Deserialize<IntakeBrief>(json, JsonOptions)
+                ?? throw new IntakeContractException(
+                    ["confirmed brief JSON is null"]);
+        }
+        catch (JsonException exception)
+        {
+            throw new IntakeContractException(
+                [$"confirmed brief JSON is invalid: {exception.Message}"]);
+        }
+
+        var errors = new List<string>();
+        ValidateBrief(brief, requireGoal: true, errors);
+        if (errors.Count > 0)
+        {
+            throw new IntakeContractException(errors);
+        }
+        return NormalizeBrief(brief);
+    }
+
     private static IntakeDocument Normalize(IntakeDocument document) =>
         new()
         {
@@ -241,14 +274,17 @@ public static class IntakeParser
             FlowKind = document.FlowKind,
             TaskTitle = NormalizeText(document.TaskTitle),
             CustomerReply = NormalizeText(document.CustomerReply),
-            Brief = new IntakeBrief
-            {
-                Goal = NormalizeText(document.Brief!.Goal),
-                Details = NormalizeList(document.Brief.Details!),
-                SuccessCriteria = NormalizeList(document.Brief.SuccessCriteria!),
-                Constraints = NormalizeList(document.Brief.Constraints!),
-                Assumptions = NormalizeList(document.Brief.Assumptions!)
-            }
+            Brief = NormalizeBrief(document.Brief!)
+        };
+
+    private static IntakeBrief NormalizeBrief(IntakeBrief brief) =>
+        new()
+        {
+            Goal = NormalizeText(brief.Goal),
+            Details = NormalizeList(brief.Details!),
+            SuccessCriteria = NormalizeList(brief.SuccessCriteria!),
+            Constraints = NormalizeList(brief.Constraints!),
+            Assumptions = NormalizeList(brief.Assumptions!)
         };
 
     private static IReadOnlyList<string> NormalizeList(IEnumerable<string> values) =>
@@ -310,6 +346,23 @@ public static class IntakeParser
                 allowEmpty: false,
                 errors);
         }
+    }
+
+    private static void ValidateBrief(
+        IntakeBrief brief,
+        bool requireGoal,
+        ICollection<string> errors)
+    {
+        ValidateText(
+            brief.Goal,
+            MaximumGoalCharacters,
+            "Brief.Goal",
+            allowEmpty: !requireGoal,
+            errors);
+        ValidateList(brief.Details, "Brief.Details", errors);
+        ValidateList(brief.SuccessCriteria, "Brief.SuccessCriteria", errors);
+        ValidateList(brief.Constraints, "Brief.Constraints", errors);
+        ValidateList(brief.Assumptions, "Brief.Assumptions", errors);
     }
 
     private static IReadOnlyList<string> ValidateShape(JsonElement root)

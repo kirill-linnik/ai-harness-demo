@@ -31,6 +31,7 @@ public static class DemoApi
         api.MapGet("/directories", ListDirectories);
         api.MapPost("/repositories/analyze", AnalyzeRepositoryAsync);
         api.MapPost("/intake", ContinueIntakeAsync);
+        api.MapPost("/intake/attachments", ContinueIntakeWithAttachmentsAsync);
         api.MapGet("/flows", GetFlowsAsync);
         api.MapGet("/flows/{flowId:guid}", GetFlowAsync);
         api.MapPost("/flows/{flowId:guid}/start", StartFlowAsync);
@@ -96,11 +97,15 @@ public static class DemoApi
         var copilotCli = await copilotCliRuntime.GetAsync(
             workflow.Config.Copilot.Command,
             cancellationToken);
+        var githubCli = await GitHubPublicationPrerequisites.CheckAsync(
+            cancellationToken: cancellationToken);
         return Results.Ok(new
         {
             status = copilotCli.Ready && modelCatalog.Current.Ready ? "ready" : "degraded",
             utc = DateTimeOffset.UtcNow,
             copilotCliAvailable = copilotCli.Ready,
+            githubCliAvailable = githubCli.CliAvailable,
+            githubCliAuthenticated = githubCli.Authenticated,
             copilotCli = ToDto(copilotCli),
             modelCatalog = ToDto(modelCatalog.Current)
         });
@@ -152,6 +157,8 @@ public static class DemoApi
             cancellationToken);
         var workflowStatus = workflowProvider.Status();
         var admission = await admissionService.GetStatusAsync(cancellationToken);
+        var githubCli = await GitHubPublicationPrerequisites.CheckAsync(
+            cancellationToken: cancellationToken);
         var factoryDisabledReason = admission.Ready
             ? string.Empty
             : string.Join(" ", admission.Failures);
@@ -168,7 +175,9 @@ public static class DemoApi
             ToDto(catalog.Status()),
             ToDto(admission),
             string.IsNullOrEmpty(factoryDisabledReason),
-            factoryDisabledReason));
+            factoryDisabledReason,
+            githubCli.CliAvailable,
+            githubCli.Authenticated));
     }
 
     private static async Task<IResult> GetSettingsAsync(
@@ -282,6 +291,63 @@ public static class DemoApi
         CancellationToken cancellationToken) =>
         Results.Ok(await coordinator.ContinueAsync(request, cancellationToken));
 
+    private static async Task<IResult> ContinueIntakeWithAttachmentsAsync(
+        HttpRequest httpRequest,
+        IntakeCoordinator coordinator,
+        CancellationToken cancellationToken)
+    {
+        if (!httpRequest.HasFormContentType)
+        {
+            throw new ArgumentException("Attachments must be submitted as multipart form data.");
+        }
+        var form = await httpRequest.ReadFormAsync(cancellationToken);
+        if (form.Files.Count is 0 or > CustomerAttachmentStore.MaximumFilesPerMessage)
+        {
+            throw new ArgumentException(
+                $"Attach 1-{CustomerAttachmentStore.MaximumFilesPerMessage} files.");
+        }
+        var rawFlowId = form["flowId"].ToString();
+        Guid? flowId = null;
+        if (!string.IsNullOrWhiteSpace(rawFlowId))
+        {
+            if (!Guid.TryParse(rawFlowId, out var parsed))
+            {
+                throw new ArgumentException("The intake flow ID is invalid.");
+            }
+            flowId = parsed;
+        }
+
+        var uploads = new List<IntakeAttachment>(form.Files.Count);
+        long total = 0;
+        foreach (var file in form.Files)
+        {
+            if (!string.Equals(file.Name, "files", StringComparison.Ordinal) ||
+                file.Length > CustomerAttachmentStore.MaximumFileBytes)
+            {
+                throw new ArgumentException(
+                    $"Attach files of at most {CustomerAttachmentStore.MaximumFileBytes} bytes each.");
+            }
+            total += file.Length;
+            if (total > CustomerAttachmentStore.MaximumFlowBytes)
+            {
+                throw new ArgumentException(
+                    $"Attach at most {CustomerAttachmentStore.MaximumFlowBytes} bytes per flow.");
+            }
+            await using var buffer = new MemoryStream((int)file.Length);
+            await file.CopyToAsync(buffer, cancellationToken);
+            uploads.Add(new IntakeAttachment(
+                file.FileName,
+                file.ContentType,
+                buffer.ToArray()));
+        }
+        return Results.Ok(await coordinator.ContinueAsync(
+            new IntakeRequest(
+                flowId,
+                form["message"].ToString().ReplaceLineEndings("\n"),
+                uploads),
+            cancellationToken));
+    }
+
     private static async Task<IResult> GetFlowsAsync(
         IDbContextFactory<HarnessDbContext> databaseFactory,
         CancellationToken cancellationToken)
@@ -365,6 +431,10 @@ public static class DemoApi
                 databaseFactory,
                 readinessService,
                 flow,
+                cancellationToken),
+            await LoadFlowAttachmentMetadataAsync(
+                databaseFactory,
+                flowId,
                 cancellationToken)));
     }
 
@@ -503,6 +573,12 @@ public static class DemoApi
         {
             throw new InvalidOperationException("Only an intake flow can be started.");
         }
+        if (flow.Kind == FlowKind.Delivery &&
+            flow.Outcome == OutcomeType.PullRequest)
+        {
+            await GitHubPublicationPrerequisites.RequireAsync(
+                cancellationToken: cancellationToken);
+        }
         var latestAccountManagerMessage = flow.Messages
             .Where(item => item.Role == ConversationRole.AccountManager)
             .OrderByDescending(item => item.CreatedAt)
@@ -540,7 +616,11 @@ public static class DemoApi
             throw new InvalidOperationException("Unable to queue the factory flow.");
         }
 
-        return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
+        return Results.Accepted(
+            $"/api/flows/{flowId}",
+            flow.ToDetailDto(
+                attachmentsByMessage: await LoadFlowAttachmentMetadataAsync(
+                    databaseFactory, flowId, cancellationToken)));
     }
 
     private static async Task<IResult> ReviewFlowAsync(
@@ -617,6 +697,7 @@ public static class DemoApi
         Guid flowId,
         WorkflowEngine engine,
         FlowQueue queue,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
         CancellationToken cancellationToken)
     {
         var flow = await engine.RestartFailedFlowAsync(flowId, cancellationToken);
@@ -625,7 +706,11 @@ public static class DemoApi
             throw new InvalidOperationException("Unable to queue the restarted factory flow.");
         }
 
-        return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
+        return Results.Accepted(
+            $"/api/flows/{flowId}",
+            flow.ToDetailDto(
+                attachmentsByMessage: await LoadFlowAttachmentMetadataAsync(
+                    databaseFactory, flowId, CancellationToken.None)));
     }
 
     private static async Task<IResult> RecoverFlowAsync(
@@ -639,7 +724,11 @@ public static class DemoApi
             databaseFactory,
             flowId,
             CancellationToken.None);
-        return Results.Accepted($"/api/flows/{flowId}", flow.ToDetailDto());
+        return Results.Accepted(
+            $"/api/flows/{flowId}",
+            flow.ToDetailDto(
+                attachmentsByMessage: await LoadFlowAttachmentMetadataAsync(
+                    databaseFactory, flowId, CancellationToken.None)));
     }
 
     private static async Task<IResult> AbandonFlowAsync(
@@ -1437,6 +1526,36 @@ public static class DemoApi
                    .ThenInclude(item => item.GateRecords)
                    .SingleOrDefaultAsync(item => item.Id == flowId, cancellationToken)
                ?? throw new KeyNotFoundException($"Factory flow '{flowId}' was not found.");
+    }
+
+    internal static async Task<IReadOnlyDictionary<Guid, IReadOnlyList<FlowAttachmentDto>>>
+        LoadFlowAttachmentMetadataAsync(
+            IDbContextFactory<HarnessDbContext> databaseFactory,
+            Guid flowId,
+            CancellationToken cancellationToken)
+    {
+        await using var database =
+            await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var rows = await database.FlowAttachments.AsNoTracking()
+            .Where(item => item.FlowRunId == flowId)
+            .OrderBy(item => item.CreatedAt)
+            .ThenBy(item => item.Id)
+            .Select(item => new
+            {
+                item.FlowMessageId,
+                item.Id,
+                item.FileName,
+                item.ContentType,
+                item.Length
+            })
+            .ToListAsync(cancellationToken);
+        return rows.GroupBy(item => item.FlowMessageId)
+            .ToDictionary(
+                group => group.Key,
+                group => (IReadOnlyList<FlowAttachmentDto>)group
+                    .Select(item => new FlowAttachmentDto(
+                        item.Id, item.FileName, item.ContentType, item.Length))
+                    .ToArray());
     }
 
     private static WorkflowStatusDto ToDto(WorkflowRuntimeStatus status) =>

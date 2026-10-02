@@ -191,7 +191,62 @@ public sealed class AssignmentBriefFormatterTests
             """{"Disposition":"Planned","Steps":[""",
             assignment,
             StringComparison.Ordinal);
+        Assert.Contains(
+            "actual product delivers the requested",
+            assignment,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "existing asset conventions",
+            assignment,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Incidental fields in supplied source material",
+            assignment,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "does not authorize its publication",
+            assignment,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "do not expand planning into a second implementation pass",
+            assignment,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Shell, Node, and PowerShell checks (including browser scripts launched from",
+            assignment,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Where the verifier may use either",
+            assignment,
+            StringComparison.Ordinal);
         Assert.Equal(BriefJson, flow.ConsolidatedRequest);
+    }
+
+    [Fact]
+    public void PlanningAssignment_PlacesRiskyRequirementsReviewBeforeDownstreamWorkers()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Plan a risky change",
+            OriginalRequest = "Deliver an observable change.",
+            Kind = FlowKind.Delivery,
+            ConsolidatedRequest = BriefJson
+        };
+
+        var assignment = WorkflowEngine.BuildStudioTeamLeadAssignment(
+            flow,
+            [],
+            TeamPlanValidationContext.ForPersistedPlan(
+                FlowKind.Delivery, [], preMortemEnabled: true),
+            preMortemAvailable: true,
+            maximumPreMortemRounds: 2);
+
+        Assert.Contains("requires an Analyze-duty requirements-authoring step", assignment);
+        Assert.Contains("before the first Design or Implement step", assignment);
+        Assert.Contains("returns findings to the requirements author", assignment);
+        Assert.Contains("Never checkpoint an implemented result or QA", assignment);
+        Assert.Contains("counterfactual premise", assignment);
+        Assert.Contains("requirements gaps rather than code defects", assignment);
     }
 
     [Fact]

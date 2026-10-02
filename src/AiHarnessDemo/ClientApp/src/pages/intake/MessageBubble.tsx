@@ -20,6 +20,13 @@ export function MessageBubble({ message }: { message: FlowMessageDto }) {
           <div className="message-bubble">
             <strong>{label}</strong>
             {message.content}
+            {message.attachments && message.attachments.length > 0 && (
+              <ul className="message-attachments" aria-label="Uploaded files">
+                {message.attachments.map(file => (
+                  <li key={file.id}>{file.fileName} ({Math.ceil(file.length / 1024)} KB)</li>
+                ))}
+              </ul>
+            )}
           </div>
           <div className="message-avatar">{initials}</div>
         </>

@@ -8,6 +8,35 @@ namespace AiHarnessDemo.Tests;
 public sealed class NewWorkAdmissionServiceTests
 {
     [Fact]
+    public async Task PullRequestPrerequisites_DistinguishMissingCliFromMissingAuthentication()
+    {
+        var missingCli = await GitHubPublicationPrerequisites.CheckAsync(
+            () => false,
+            _ => throw new InvalidOperationException(
+                "Authentication must not run without gh."));
+        Assert.False(missingCli.CliAvailable);
+        Assert.False(missingCli.Authenticated);
+        Assert.Equal(
+            GitHubPublicationPrerequisites.MissingCliMessage,
+            missingCli.Error);
+
+        var missingToken = await GitHubPublicationPrerequisites.CheckAsync(
+            () => true,
+            _ => Task.FromResult(false));
+        Assert.True(missingToken.CliAvailable);
+        Assert.False(missingToken.Authenticated);
+        Assert.Equal(
+            GitHubPublicationPrerequisites.MissingAuthenticationMessage,
+            missingToken.Error);
+
+        var ready = await GitHubPublicationPrerequisites.CheckAsync(
+            () => true,
+            _ => Task.FromResult(true));
+        Assert.True(ready.Authenticated);
+        Assert.Null(ready.Error);
+    }
+
+    [Fact]
     public async Task UnversionedProject_WithStudiedKnowledgeIsReady()
     {
         var root = Path.Combine(

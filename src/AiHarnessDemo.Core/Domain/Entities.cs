@@ -687,6 +687,31 @@ public sealed class FlowMessage
     public bool IsQuestion { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    public List<FlowAttachment> Attachments { get; set; } = [];
+}
+
+public sealed class FlowAttachment
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public Guid FlowRunId { get; set; }
+
+    public Guid FlowMessageId { get; set; }
+
+    public FlowMessage? FlowMessage { get; set; }
+
+    public required string FileName { get; set; }
+
+    public required string ContentType { get; set; }
+
+    public long Length { get; set; }
+
+    public required string Digest { get; set; }
+
+    public required byte[] Content { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 public sealed class FlowEvent

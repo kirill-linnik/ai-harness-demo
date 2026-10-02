@@ -1,10 +1,12 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Gating;
+using AiHarnessDemo.Core.Orchestration;
 using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Data;
 using Microsoft.EntityFrameworkCore;
@@ -46,6 +48,12 @@ public sealed partial class VerifiedCandidatePublisher(
 
     internal const string ReviewedPublicationRepositoryEventType =
         "delivery.reviewed-publication.repository-published";
+
+    internal const string ReviewedPublicationAlreadyCurrentEventType =
+        "delivery.reviewed-publication.repository-current";
+
+    internal const string ReviewedPublicationNoDiffEventType =
+        "delivery.reviewed-publication.repository-no-diff";
 
     internal const string ReviewedPublicationCompletedEventType =
         "delivery.reviewed-publication.completed";
@@ -297,6 +305,9 @@ public sealed partial class VerifiedCandidatePublisher(
                     cancellationToken);
                 return alreadyPublished;
             }
+            var pullRequestBody = outcome == OutcomeType.PullRequest
+                ? BuildPullRequestBody(flow, identity)
+                : string.Empty;
             foreach (var repository in identity.Repositories)
             {
                 _ = await OpenRepositoryPublicationIntentAsync(
@@ -350,6 +361,7 @@ public sealed partial class VerifiedCandidatePublisher(
                         identity,
                         candidate,
                         readiness,
+                        pullRequestBody,
                         cancellationToken),
                 _ => throw new UnreachableException()
             };
@@ -478,9 +490,11 @@ public sealed partial class VerifiedCandidatePublisher(
         ReviewedCandidateIdentity identity,
         OutcomeCandidateSnapshot candidate,
         DeliveryReadinessPublicationAuthorization readiness,
+        string pullRequestBody,
         CancellationToken cancellationToken)
     {
         var pullRequests = new Dictionary<string, string>(StringComparer.Ordinal);
+        var noDiffRepositories = new HashSet<string>(StringComparer.Ordinal);
         string? gitHubToken = null;
         IReadOnlyDictionary<string, string?>? ghEnvironment = null;
         foreach (var repository in candidate.Manifest.Repositories)
@@ -509,6 +523,104 @@ public sealed partial class VerifiedCandidatePublisher(
                 flow.WorkspacePath,
                 repository.RelativePath);
             var trustedRemoteUrl = BuildTrustedGitHubRemoteUrl(repositoryName);
+            if ((record.Stage is
+                     ReviewedPublicationStage.Intent or
+                     ReviewedPublicationStage.AlreadyCurrent or
+                     ReviewedPublicationStage.NoPullRequestDiff) &&
+                string.IsNullOrWhiteSpace(record.PullRequestUrl))
+            {
+                gitHubToken ??= await ResolveGitHubTokenAsync(
+                    AppContext.BaseDirectory,
+                    cancellationToken);
+                ghEnvironment ??= BuildGitHubCliEnvironment(gitHubToken);
+                var defaultHead = await ReadRemoteDefaultHeadAsync(
+                    workspaceRepository,
+                    trustedRemoteUrl,
+                    gitHubToken,
+                    cancellationToken);
+                var matchesReviewedHead = string.Equals(
+                    defaultHead,
+                    repository.Head,
+                    StringComparison.OrdinalIgnoreCase);
+                if (record.Stage == ReviewedPublicationStage.AlreadyCurrent &&
+                    !matchesReviewedHead)
+                {
+                    throw new InvalidOperationException(
+                        $"The default branch of '{repositoryName}' no longer holds the reviewed unchanged commit {repository.Head}.");
+                }
+                if (record.Stage == ReviewedPublicationStage.NoPullRequestDiff ||
+                    record.Stage == ReviewedPublicationStage.Intent &&
+                    !matchesReviewedHead)
+                {
+                    var noDiff = await HasNoPullRequestDiffAsync(
+                        repositoryName,
+                        defaultHead,
+                        repository.Head,
+                        ghEnvironment!,
+                        cancellationToken);
+                    if (record.Stage == ReviewedPublicationStage.NoPullRequestDiff &&
+                        !noDiff)
+                    {
+                        throw new InvalidOperationException(
+                            $"The reviewed repository '{repositoryName}' no longer has an empty pull-request diff against the remote default branch.");
+                    }
+                    if (noDiff)
+                    {
+                        if (record.Stage == ReviewedPublicationStage.Intent)
+                        {
+                            _ = await AdvanceRepositoryPublicationAsync(
+                                flow.Id,
+                                publicationRootId,
+                                repository.RelativePath,
+                                ReviewedPublicationStage.NoPullRequestDiff,
+                                pullRequestUrl: null,
+                                cancellationToken);
+                        }
+                        noDiffRepositories.Add(repository.RelativePath);
+                        await RecordReviewedPublicationEventAsync(
+                            flow.Id,
+                            publicationRootId,
+                            ReviewedPublicationNoDiffEventType,
+                            new ReviewedPublicationEventData(
+                                identity.Fingerprint,
+                                repository.RelativePath,
+                                repositoryName,
+                                string.Empty,
+                                repository.Head,
+                                repository.Tree),
+                            $"Reviewed commit {repository.Head} for '{repository.RelativePath}' has no changes relative to the remote default branch; no pull request was needed.",
+                            cancellationToken);
+                        continue;
+                    }
+                }
+                if (matchesReviewedHead)
+                {
+                    if (record.Stage == ReviewedPublicationStage.Intent)
+                    {
+                        _ = await AdvanceRepositoryPublicationAsync(
+                            flow.Id,
+                            publicationRootId,
+                            repository.RelativePath,
+                            ReviewedPublicationStage.AlreadyCurrent,
+                            pullRequestUrl: null,
+                            cancellationToken);
+                    }
+                    await RecordReviewedPublicationEventAsync(
+                        flow.Id,
+                        publicationRootId,
+                        ReviewedPublicationAlreadyCurrentEventType,
+                        new ReviewedPublicationEventData(
+                            identity.Fingerprint,
+                            repository.RelativePath,
+                            repositoryName,
+                            string.Empty,
+                            repository.Head,
+                            repository.Tree),
+                        $"Reviewed commit {repository.Head} for '{repository.RelativePath}' already matches the remote default branch; no pull request was needed.",
+                        cancellationToken);
+                    continue;
+                }
+            }
 
             // A recorded PR URL is the strongest remote identity in the journal. Reconcile that
             // exact PR before looking at the branch: GitHub commonly deletes a head branch after
@@ -516,6 +628,13 @@ public sealed partial class VerifiedCandidatePublisher(
             PublishedPullRequestIdentity? reconciled = null;
             if (!string.IsNullOrWhiteSpace(record.PullRequestUrl))
             {
+                if (record.Stage is
+                    ReviewedPublicationStage.AlreadyCurrent or
+                    ReviewedPublicationStage.NoPullRequestDiff)
+                {
+                    throw new InvalidOperationException(
+                        $"The repository without a pull request '{repository.RelativePath}' cannot have a pull request URL.");
+                }
                 if (gitHubToken is null)
                 {
                     // Acquiring a token is itself a side effect, so it waits until durable state
@@ -603,7 +722,7 @@ public sealed partial class VerifiedCandidatePublisher(
                         "--repo", repositoryName,
                         "--head", flow.BranchName,
                         "--title", Clip(flow.Title, 200),
-                        "--body", BuildPullRequestBody(flow, candidate)
+                        "--body", pullRequestBody
                     ],
                     AppContext.BaseDirectory,
                     TimeSpan.FromMinutes(2),
@@ -674,7 +793,8 @@ public sealed partial class VerifiedCandidatePublisher(
             candidate,
             pullRequests,
             "Host-controlled publication completed without changing the candidate sealed before review.",
-            cancellationToken);
+            cancellationToken,
+            noDiffRepositories);
     }
 
     private async Task<string> CompleteReviewedPublicationAsync(
@@ -685,7 +805,8 @@ public sealed partial class VerifiedCandidatePublisher(
         OutcomeCandidateSnapshot candidate,
         IReadOnlyDictionary<string, string> pullRequests,
         string message,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlySet<string>? noDiffRepositories = null)
     {
         _ = await reviewedCandidateService.VerifyAsync(
             flow,
@@ -708,7 +829,8 @@ public sealed partial class VerifiedCandidatePublisher(
             outcome,
             identity.Fingerprint,
             identity.Repositories,
-            pullRequests);
+            pullRequests,
+            noDiffRepositories);
     }
 
     /// <summary>
@@ -734,7 +856,9 @@ public sealed partial class VerifiedCandidatePublisher(
                 item.FlowRunId == flow.Id &&
                 item.FlowStepId == publicationRootId &&
                 (item.Type == ReviewedPublicationRepositoryEventType ||
-                 item.Type == ReviewedPublicationCompletedEventType))
+                 item.Type == ReviewedPublicationAlreadyCurrentEventType ||
+                item.Type == ReviewedPublicationNoDiffEventType ||
+                item.Type == ReviewedPublicationCompletedEventType))
             .ToListAsync(cancellationToken);
         foreach (var record in records)
         {
@@ -782,6 +906,7 @@ public sealed partial class VerifiedCandidatePublisher(
                 "The durable reviewed publication journal completed a different reviewed candidate.");
         }
         var pullRequests = new Dictionary<string, string>(StringComparer.Ordinal);
+        var noDiffRepositories = new HashSet<string>(StringComparer.Ordinal);
         foreach (var repository in identity.Repositories)
         {
             var record = journal.Records.SingleOrDefault(item =>
@@ -796,22 +921,43 @@ public sealed partial class VerifiedCandidatePublisher(
                 identity,
                 repository,
                 flow.BranchName);
-            if (record.Stage != ReviewedPublicationStage.Completed)
+            if (record.Stage is not (
+                    ReviewedPublicationStage.Completed or
+                    ReviewedPublicationStage.AlreadyCurrent or
+                    ReviewedPublicationStage.NoPullRequestDiff) ||
+                (record.Stage is
+                    ReviewedPublicationStage.AlreadyCurrent or
+                    ReviewedPublicationStage.NoPullRequestDiff) &&
+                outcome != OutcomeType.PullRequest)
             {
                 throw new InvalidOperationException(
                     $"The completed reviewed publication left '{repository.RelativePath}' at stage {record.Stage}.");
             }
-            if (outcome == OutcomeType.PullRequest)
+            if (outcome == OutcomeType.PullRequest &&
+                record.Stage == ReviewedPublicationStage.Completed)
             {
                 pullRequests[repository.RelativePath] =
                     RequirePublishedPullRequestUrl(record);
+            }
+            else if ((record.Stage is
+                          ReviewedPublicationStage.AlreadyCurrent or
+                          ReviewedPublicationStage.NoPullRequestDiff) &&
+                     !string.IsNullOrWhiteSpace(record.PullRequestUrl))
+            {
+                throw new InvalidOperationException(
+                    $"A repository without a pull request '{repository.RelativePath}' cannot have a pull request URL.");
+            }
+            if (record.Stage == ReviewedPublicationStage.NoPullRequestDiff)
+            {
+                noDiffRepositories.Add(repository.RelativePath);
             }
         }
         return BuildReviewedPublicationReport(
             outcome,
             identity.Fingerprint,
             identity.Repositories,
-            pullRequests);
+            pullRequests,
+            noDiffRepositories);
     }
 
     private Task<ReviewedPublicationRecord>
@@ -907,6 +1053,19 @@ public sealed partial class VerifiedCandidatePublisher(
             }
             record.PullRequestUrl = pullRequestUrl;
         }
+        if ((stage is
+                 ReviewedPublicationStage.AlreadyCurrent or
+                 ReviewedPublicationStage.NoPullRequestDiff) &&
+            (record.Stage != ReviewedPublicationStage.Intent ||
+             !string.IsNullOrWhiteSpace(record.PullRequestUrl)) ||
+            (record.Stage is
+                ReviewedPublicationStage.AlreadyCurrent or
+                ReviewedPublicationStage.NoPullRequestDiff) &&
+            stage != record.Stage)
+        {
+            throw new InvalidOperationException(
+                $"The publication journal for '{relativePath}' cannot switch between a no-PR state and a pull request.");
+        }
         record.Stage = (ReviewedPublicationStage)Math.Max(
             (int)record.Stage,
             (int)stage);
@@ -984,6 +1143,141 @@ public sealed partial class VerifiedCandidatePublisher(
             ? throw new InvalidOperationException(
                 $"The durable publication journal for '{record.RelativePath}' has no pull request URL.")
             : record.PullRequestUrl;
+
+    private async Task<bool> HasNoPullRequestDiffAsync(
+        string repositoryName,
+        string defaultHead,
+        string reviewedHead,
+        IReadOnlyDictionary<string, string?> ghEnvironment,
+        CancellationToken cancellationToken)
+    {
+        var compare = await processRunner.RunAsync(
+            "gh",
+            ["api", $"repos/{repositoryName}/compare/{defaultHead}...{reviewedHead}"],
+            AppContext.BaseDirectory,
+            TimeSpan.FromSeconds(30),
+            cancellationToken,
+            environmentVariables: ghEnvironment);
+        if (compare.ExitCode != 0)
+        {
+            if (compare.ExitCode == 1 &&
+                compare.CombinedOutput.Contains(
+                    "Not Found (HTTP 404)", StringComparison.Ordinal))
+            {
+                return false;
+            }
+            throw new InvalidOperationException(
+                $"Unable to compare the reviewed head with the remote default branch in '{repositoryName}': {compare.CombinedOutput}");
+        }
+        return IsVerifiedEmptyCompare(
+            compare.StandardOutput, defaultHead, reviewedHead);
+    }
+
+    internal static bool IsVerifiedEmptyCompare(
+        string response,
+        string defaultHead,
+        string reviewedHead)
+    {
+        using var document = JsonDocument.Parse(response);
+        var comparison = document.RootElement;
+        if (comparison.ValueKind != JsonValueKind.Object ||
+            !comparison.TryGetProperty("base_commit", out var baseCommit) ||
+            baseCommit.ValueKind != JsonValueKind.Object ||
+            !baseCommit.TryGetProperty("sha", out var baseSha) ||
+            !string.Equals(
+                baseSha.GetString(),
+                defaultHead,
+                StringComparison.OrdinalIgnoreCase) ||
+            !comparison.TryGetProperty("status", out var status) ||
+            status.ValueKind != JsonValueKind.String ||
+            status.GetString() is not (
+                "identical" or "ahead" or "behind" or "diverged") ||
+            !comparison.TryGetProperty("ahead_by", out var ahead) ||
+            !ahead.TryGetInt32(out var aheadCount) ||
+            aheadCount < 0 ||
+            !comparison.TryGetProperty("commits", out var commits) ||
+            commits.ValueKind != JsonValueKind.Array ||
+            !comparison.TryGetProperty("files", out var files) ||
+            files.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException(
+                "GitHub returned an incomplete reviewed-candidate comparison.");
+        }
+        if (aheadCount > 0)
+        {
+            if (commits.GetArrayLength() == 0 ||
+                !commits[commits.GetArrayLength() - 1]
+                    .TryGetProperty("sha", out var lastCommit) ||
+                !string.Equals(
+                    lastCommit.GetString(),
+                    reviewedHead,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "GitHub compared a different reviewed head.");
+            }
+        }
+        else if (!comparison.TryGetProperty(
+                     "merge_base_commit", out var mergeBase) ||
+                 mergeBase.ValueKind != JsonValueKind.Object ||
+                 !mergeBase.TryGetProperty("sha", out var mergeSha) ||
+                 !string.Equals(
+                     mergeSha.GetString(),
+                     reviewedHead,
+                     StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "GitHub did not identify the reviewed head as the merge base.");
+        }
+        return files.GetArrayLength() == 0;
+    }
+
+    private async Task<string> ReadRemoteDefaultHeadAsync(
+        string workingDirectory,
+        string remoteUrl,
+        string gitHubToken,
+        CancellationToken cancellationToken)
+    {
+        using var sandbox = TrustedGitSandbox.Create(remoteUrl, gitHubToken);
+        var result = await processRunner.RunAsync(
+            "git",
+            ["ls-remote", "--symref", remoteUrl, "HEAD"],
+            workingDirectory,
+            TimeSpan.FromMinutes(1),
+            cancellationToken,
+            environmentVariables: sandbox.EnvironmentVariables);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to verify the default branch at '{remoteUrl}': {result.CombinedOutput}");
+        }
+        var lines = result.StandardOutput
+            .ReplaceLineEndings("\n")
+            .Split(
+                '\n',
+                StringSplitOptions.RemoveEmptyEntries |
+                StringSplitOptions.TrimEntries);
+        if (lines.Length != 2 ||
+            !lines[0].StartsWith("ref: refs/heads/", StringComparison.Ordinal) ||
+            !lines[0].EndsWith("\tHEAD", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"The default branch at '{remoteUrl}' has no usable symbolic HEAD.");
+        }
+        var parts = lines[1].Split(
+            '\t',
+            StringSplitOptions.RemoveEmptyEntries |
+            StringSplitOptions.TrimEntries);
+        if (parts.Length != 2 ||
+            parts[1] != "HEAD" ||
+            parts[0].Length is not (40 or 64) ||
+            parts[0].Any(character => !char.IsAsciiHexDigit(character)))
+        {
+            throw new InvalidOperationException(
+                $"The default branch at '{remoteUrl}' has no usable commit identity.");
+        }
+        return parts[0].ToLowerInvariant();
+    }
 
     /// <summary>
     /// Reads the remote branch tip without mutating anything, so a retry can tell "already pushed"
@@ -1214,7 +1508,8 @@ public sealed partial class VerifiedCandidatePublisher(
             OutcomeType outcome,
             string fingerprint,
             IReadOnlyList<ReviewedCandidateRepositoryIdentity> repositories,
-            IReadOnlyDictionary<string, string> pullRequests)
+            IReadOnlyDictionary<string, string> pullRequests,
+            IReadOnlySet<string>? noDiffRepositories = null)
     {
         var report = new List<string>
             {
@@ -1227,7 +1522,12 @@ public sealed partial class VerifiedCandidatePublisher(
                 OutcomeType.Commit =>
                     $"Repository {repository.RelativePath}: commit {repository.Head}, tree {repository.Tree}",
                 OutcomeType.PullRequest =>
-                    $"Repository {repository.RelativePath}: reviewed remote commit {repository.Head}, tree {repository.Tree}, pull request {pullRequests[repository.RelativePath]}",
+                    pullRequests.TryGetValue(
+                        repository.RelativePath, out var pullRequest)
+                        ? $"Repository {repository.RelativePath}: reviewed remote commit {repository.Head}, tree {repository.Tree}, pull request {pullRequest}"
+                        : noDiffRepositories?.Contains(repository.RelativePath) == true
+                        ? $"Repository {repository.RelativePath}: reviewed remote commit {repository.Head}, tree {repository.Tree}, no changes relative to the default branch (no PR)"
+                        : $"Repository {repository.RelativePath}: reviewed remote commit {repository.Head}, tree {repository.Tree}, already current on remote default branch (no PR)",
                 _ => throw new ArgumentOutOfRangeException(
                     nameof(outcome),
                     outcome,
@@ -1536,6 +1836,21 @@ public sealed partial class VerifiedCandidatePublisher(
             ["GITHUB_TOKEN"] = gitHubToken
         };
 
+    internal static string GitHubGitAuthorizationHeader(string gitHubToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(gitHubToken);
+        var token = gitHubToken.Trim();
+        if (token.Any(character => character > 127 || char.IsControl(character)))
+        {
+            throw new ArgumentException(
+                "A GitHub Git token must contain only printable ASCII characters.",
+                nameof(gitHubToken));
+        }
+        return "AUTHORIZATION: Basic " +
+            Convert.ToBase64String(
+                Encoding.ASCII.GetBytes($"x-access-token:{token}"));
+    }
+
     private static async Task<ProcessResult> RunGitRequiredAsync(
         ProcessRunner processRunner,
         TrustedGitSandbox sandbox,
@@ -1724,20 +2039,85 @@ public sealed partial class VerifiedCandidatePublisher(
             "Candidate publication");
     }
 
-    private static string BuildPullRequestBody(
+    internal static string BuildPullRequestBody(
         FlowRun flow,
-        OutcomeCandidateSnapshot candidate) =>
-        $"""
-         ## Customer outcome
+        ReviewedCandidateIdentity candidate)
+    {
+        ArgumentNullException.ThrowIfNull(flow);
+        ArgumentNullException.ThrowIfNull(candidate);
 
-         {Clip(flow.ConsolidatedRequest, 3_000)}
+        string goal;
+        IReadOnlyList<string> details;
+        IReadOnlyList<string> criteria;
+        IReadOnlyList<string> constraints;
+        var confirmedRequest = flow.ConsolidatedRequest.TrimStart();
+        if (confirmedRequest.StartsWith('{') ||
+            confirmedRequest.StartsWith('['))
+        {
+            var brief = IntakeParser.ParseBriefJson(flow.ConsolidatedRequest);
+            goal = brief.Goal;
+            details = brief.Details!;
+            criteria = brief.SuccessCriteria!;
+            constraints = brief.Constraints!;
+        }
+        else
+        {
+            // Legacy flows predate structured briefs; use their validated customer-facing outcome.
+            var outcome = FlowOutcomeParser.ParseJson(
+                flow.OutcomeContractJson).Document;
+            goal = outcome.Goal;
+            details = outcome.ImplementationDetails!;
+            criteria = [];
+            constraints = [];
+        }
 
-         ## Verification
+        static string ListItems(IReadOnlyList<string> items)
+        {
+            var lines = items.Take(8)
+                .Select(item =>
+                    "- " + Clip(item.ReplaceLineEndings(" ").Trim(), 600))
+                .ToList();
+            if (items.Count > lines.Count)
+            {
+                lines.Add(
+                    $"- {items.Count - lines.Count} additional confirmed items omitted from this summary.");
+            }
+            return string.Join(Environment.NewLine, lines);
+        }
 
-         - Acceptance plan: `{candidate.Manifest.AcceptancePlanHash}`
-         - Candidate fingerprint: `{candidate.Fingerprint}`
-         - Every repository commit and tree was published from the verified manifest.
-         """;
+        var sections = new List<string>
+        {
+            "## Summary",
+            Clip(goal.ReplaceLineEndings(" ").Trim(), 700)
+        };
+        if (details.Count > 0)
+        {
+            sections.Add("## Scope");
+            sections.Add(ListItems(details));
+        }
+        if (criteria.Count > 0)
+        {
+            sections.Add("## Acceptance checks");
+            sections.Add(ListItems(criteria));
+        }
+        if (constraints.Count > 0)
+        {
+            sections.Add("## Boundaries");
+            sections.Add(ListItems(constraints));
+        }
+        sections.Add("## Review");
+        sections.Add(
+            "Studio sealed and independently verified the candidate before customer approval. " +
+            "This pull request proposes the reviewed commit for this repository.");
+        sections.Add(
+            "<details>\n<summary>Studio verification identifiers</summary>\n\n" +
+            $"- Acceptance plan: `{candidate.AcceptancePlanHash}`\n" +
+            $"- Reviewed candidate: `{candidate.Fingerprint}`\n\n" +
+            "</details>");
+        return string.Join(
+            Environment.NewLine + Environment.NewLine,
+            sections);
+    }
 
     private static string Clip(string value, int maximum) =>
         value.Length <= maximum
@@ -1839,7 +2219,7 @@ public sealed partial class VerifiedCandidatePublisher(
             {
                 config.Add(new(
                     "http.https://github.com/.extraheader",
-                    $"AUTHORIZATION: bearer {gitHubToken.Trim()}"));
+                    GitHubGitAuthorizationHeader(gitHubToken)));
             }
 
             environmentVariables["GIT_CONFIG_COUNT"] = config.Count.ToString();

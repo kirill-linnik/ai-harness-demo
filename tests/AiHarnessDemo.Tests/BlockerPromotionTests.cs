@@ -1207,6 +1207,9 @@ public sealed class BlockerPromotionTests
                 admission,
                 snapshots,
                 lifecycle);
+            intake.GitHubCliAvailableOverride = () => true;
+            intake.GitHubAuthenticationAvailableOverride =
+                _ => Task.FromResult(true);
             var linked = new LinkedFlowCoordinator(
                 factory,
                 snapshots,

@@ -268,13 +268,13 @@ public static class TaskProfileRules
                 Math.Max(8, source.ReasoningDepth),
                 Math.Max(8, source.ContextDemand),
                 Math.Max(6, source.ToolIntensity),
-                [TaskTypeTag.Quality.ToString(), TaskTypeTag.CrossCutting.ToString()],
+                [TaskTypeTag.Planning.ToString(), TaskTypeTag.CrossCutting.ToString()],
                 source.Risk.ToString(),
-                "Independent evidence-based failure reconstruction for the selected handoff.",
+                "Independent evidence-based failure forecast for proposed requirements.",
                 source.Confidence,
                 [
-                    "The review must investigate the evaluated result independently.",
-                    "Only verifiable failure evidence can trigger a revision."
+                    "Challenge the requirements before downstream design or implementation.",
+                    "Only evidence-backed omissions can trigger an author revision."
                 ]),
             source.FlowRunId,
             source.Iteration,

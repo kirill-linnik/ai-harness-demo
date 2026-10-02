@@ -80,6 +80,19 @@ constraints, and assumptions. The host persists that rendered prompt before send
 CLI, so the prompt viewer shows the same content the agent receives. Previously captured prompts
 remain unchanged, including when an interrupted attempt resumes.
 
+Intake messages may also upload bounded files. Their bytes and hashes are stored in
+`FlowAttachments` under the originating customer message, never as paths into the user's home
+directory or as response payloads. Each agent gets a read-only, session-owned copy and a small
+attachment index in its prompt. The original customer submission and later customer inputs are
+also staged as a complete text context document for planning and workers, so a concise confirmed
+brief cannot erase supplied details. Agent definitions stay project-agnostic; each role selects
+only the facts relevant to its assignment rather than copying the entire submission into
+handoffs or output. The snapshot stores exact document bytes and attachment references; recovery
+re-stages uploads from SQLite, verifies their hashes, and never trusts a modified staged file. An
+explicitly named outside-project file that was not uploaded keeps intake open until the customer
+supplies it. The raw submission is evidence for the requested outcome, not blanket authorization
+to publish incidental sensitive fields.
+
 The catalog has three special definitions:
 
 | Agent | Rule |
@@ -111,6 +124,9 @@ A valid plan contains ordered steps with:
 The plan validator rejects disabled or unknown agent IDs, core agents selected as workers, duplicate
 or cyclic dependencies, dependencies on later steps, invalid stages or duties, and missing required
 duties. The accepted plan is immutable for its flow iteration.
+For browser-visible data changes, planning and verification must cover the actual product
+renderer whenever new fields are needed. A self-contained reviewed preview is required but
+cannot prove production pages display a newly stored field.
 
 Required duties are independent of agent names:
 
@@ -142,8 +158,21 @@ files are never a success fallback. The document set has a separate 16 MiB stora
 working-set policy, not a claim to know an unreported model context-window size. There is no parallel
 fan-out or integration join inside a flow.
 
-Optional pre-mortem checkpoints are inserted after their target steps. They run read-only and their
-findings are advisory input; they do not approve or reject a result.
+Optional pre-mortem checkpoints follow a requirements-authoring `Analyze` step before any
+Delivery `Design` or `Implement` worker receives that handoff; Advisory checkpoints can challenge
+a recommendation before customer feedback. The sceptic forecasts failure as though the proposed
+requirements had been implemented, then the requirements author revises or rejects findings
+before downstream work. Sceptic turns are read-only and never carry `Verify` or judge a finished
+candidate. If available, the sceptic is required for Medium-or-higher-risk downstream design or
+implementation and for new Delivery using uploaded customer files; genuinely routine Low-risk
+work without uploads can omit it. The Delivery outcome owner
+alone performs QA after implementation. Previously persisted checkpoint placements remain valid
+on recovery so an active flow cannot be silently replanned under a newer policy.
+The six-month failure is a counterfactual premise, not historical evidence: a finding must show
+a requirements gap that still matters under faithful implementation, or return CLEAR. The
+current `PreMortemReadOnly` CLI profile still permits read-only workspace tools; the
+requirements-only scope is a role and assignment contract, not a claim of code-blind filesystem
+isolation.
 
 If the enabled roster cannot cover the required work, the Team Lead returns
 `MissingQualification`. The Account Manager translates it once into a customer-safe blocker and
@@ -261,10 +290,27 @@ materializes the planned `AfterApproval` Publish-only step. The agent can inspec
 governed read-and-shell policy, but cannot edit the candidate, receive publication credentials, or
 perform the remote write. The host publishes the sealed commit and tree identities, records commit
 or pull-request results, verifies the remote result against the same binding, and only then marks
-the flow `Approved`.
+the flow `Approved`. Pull-request Delivery requires GitHub CLI (`gh`) on the Studio server's
+`PATH` and a token accessible to that process: intake confirmation and customer acceptance refuse
+to advance when either is missing; Advisory and local Commit outcomes remain available. For pull-request delivery,
+repositories already at the reviewed commit on
+their remote default branch receive a durable already-current record instead of an empty branch
+or pull request. A reviewed head with zero files in GitHub's authenticated comparison against the
+current default head also gets a durable no-diff record, even if the branches have different
+histories; neither no-op state publishes a branch or PR. The same remote head and comparison are
+checked again during publication verification.
+Before any remote publication side effect, the host formats the confirmed brief as a concise
+pull-request description with the goal, scope, requested checks, and boundaries. Older flows
+without a structured brief use their validated outcome instead. The description attributes only
+the reviewed commit proposed by that pull request; trace identifiers remain in a collapsible
+section rather than presenting hashes as the customer outcome.
 
 A publication failure is visible and does not create approval. The durable authorization and
-publication identity remain available for an explicit restart.
+publication identity remain available for an explicit restart. When a completed release turn
+failed only because its response contract could not be scheduled, a manual restart verifies the
+persisted output digest and queues a read-only response correction instead of rerunning the
+release work. If remote publication completed but final approval failed, a manual restart retries
+only the host's readiness and journal checks, not the remote push or pull request.
 
 Publication recaps do not overwrite the editable Repository Knowledge baseline. The published
 commit or pull request remains isolated from the configured source checkout until the user

@@ -173,8 +173,40 @@ public sealed class ReviewedPublicationJournalTests
 
         Assert.Contains("https://github.com/example/repository/pull/1", first);
         Assert.Equal(1, scenario.Runner.CountOf("git", "push"));
-        Assert.Equal(1, scenario.Runner.CountOf("git", "ls-remote"));
+        Assert.Equal(2, scenario.Runner.CountOf("git", "ls-remote"));
+        Assert.Single(
+            scenario.Runner.Invocations,
+            invocation =>
+                invocation.Executable == "git" &&
+                invocation.Arguments.Contains("--symref"));
         Assert.Equal(1, scenario.Runner.CountOf("gh", "create"));
+        var create = Assert.Single(
+            scenario.Runner.Invocations,
+            invocation =>
+                invocation.Executable == "gh" &&
+                invocation.Arguments.Contains("create"));
+        var bodyIndex = Array.IndexOf(create.Arguments.ToArray(), "--body");
+        Assert.True(bodyIndex >= 0);
+        var body = create.Arguments[bodyIndex + 1];
+        Assert.Contains(
+            $"## Summary{Environment.NewLine}{Environment.NewLine}Publish a two-speaker meeting.",
+            body);
+        Assert.Contains(
+            $"## Scope{Environment.NewLine}{Environment.NewLine}- Add the meeting and both talks.",
+            body);
+        Assert.Contains(
+            $"## Acceptance checks{Environment.NewLine}{Environment.NewLine}- Two talks appear on the schedule.",
+            body);
+        Assert.Contains(
+            $"## Boundaries{Environment.NewLine}{Environment.NewLine}- Leave unrelated content unchanged.",
+            body);
+        Assert.Contains("## Review", body);
+        Assert.Contains("<details>\n<summary>Studio verification identifiers</summary>", body);
+        Assert.DoesNotContain("""{"Goal":""", body);
+        Assert.DoesNotContain("Every repository commit", body);
+        Assert.True(
+            body.IndexOf("## Summary", StringComparison.Ordinal) <
+            body.IndexOf("<details>", StringComparison.Ordinal));
         var record = Assert.Single(await scenario.ReadRecordsAsync());
         Assert.Equal(ReviewedPublicationStage.Completed, record.Stage);
         Assert.Equal(scenario.Identity.Fingerprint, record.CandidateFingerprint);
@@ -201,6 +233,222 @@ public sealed class ReviewedPublicationJournalTests
         Assert.Single(
             await scenario.ReadPublicationEventsAsync(
                 VerifiedCandidatePublisher.ReviewedPublicationCompletedEventType));
+    }
+
+    [Theory]
+    [InlineData("""{"Goal":"Invalid","Details":[]}""")]
+    [InlineData("""["not-a-brief"]""")]
+    public async Task MalformedConfirmedBrief_IsRejectedBeforePublicationSideEffects(
+        string consolidatedRequest)
+    {
+        using var scenario = await ReviewedPublicationScenario.CreateAsync(
+            OutcomeType.PullRequest,
+            consolidatedRequest: consolidatedRequest);
+
+        await Assert.ThrowsAsync<IntakeContractException>(() =>
+            scenario.PublishAsync());
+
+        Assert.Empty(scenario.Runner.Invocations);
+        Assert.Empty(await scenario.ReadRecordsAsync());
+        Assert.Empty(await scenario.ReadPublicationEventsAsync());
+    }
+
+    [Fact]
+    public async Task PullRequestBody_IdentifiesOmittedItemsInLongBriefs()
+    {
+        var details = Enumerable.Range(1, 10)
+            .Select(index => $"Confirmed detail {index}.")
+            .ToArray();
+        using var scenario = await ReviewedPublicationScenario.CreateAsync(
+            OutcomeType.PullRequest,
+            consolidatedRequest: IntakeParser.SerializeBrief(new IntakeBrief
+            {
+                Goal = "Deliver the agreed outcome.",
+                Details = details,
+                SuccessCriteria = [],
+                Constraints = [],
+                Assumptions = []
+            }));
+
+        var body = VerifiedCandidatePublisher.BuildPullRequestBody(
+            scenario.Flow, scenario.Identity);
+
+        Assert.Contains("Confirmed detail 8.", body);
+        Assert.DoesNotContain("Confirmed detail 9.", body);
+        Assert.Contains("2 additional confirmed items omitted from this summary.", body);
+    }
+
+    [Fact]
+    public async Task LegacyUnstructuredRequest_UsesValidatedOutcomeInPullRequestBody()
+    {
+        using var scenario = await ReviewedPublicationScenario.CreateAsync(
+            OutcomeType.PullRequest,
+            consolidatedRequest: "The original unstructured customer request.");
+
+        _ = await scenario.PublishAsync();
+
+        var create = Assert.Single(
+            scenario.Runner.Invocations,
+            invocation =>
+                invocation.Executable == "gh" &&
+                invocation.Arguments.Contains("create"));
+        var bodyIndex = Array.IndexOf(create.Arguments.ToArray(), "--body");
+        Assert.True(bodyIndex >= 0);
+        var body = create.Arguments[bodyIndex + 1];
+        Assert.Contains(
+            $"## Summary{Environment.NewLine}{Environment.NewLine}Publish.",
+            body);
+        Assert.Contains(
+            $"## Scope{Environment.NewLine}{Environment.NewLine}- Exact bytes.",
+            body);
+        Assert.DoesNotContain("original unstructured customer request", body);
+    }
+
+    [Fact]
+    public async Task AlreadyCurrentRepository_DoesNotPublishAnEmptyPullRequest()
+    {
+        using var scenario = await ReviewedPublicationScenario.CreateAsync(
+            OutcomeType.PullRequest,
+            [
+                ("changed", "example/changed"),
+                ("unchanged", "example/unchanged")
+            ]);
+        var unchanged = scenario.Identity.Repositories.Single(item =>
+            item.RelativePath == "unchanged");
+        scenario.Runner.RemoteDefaultHeads[unchanged.RemoteRepository] =
+            unchanged.Head;
+
+        var report = await scenario.PublishAsync();
+
+        Assert.Single(scenario.Runner.PullRequests);
+        Assert.Contains("already current", report, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            scenario.Runner.Invocations,
+            invocation =>
+                invocation.Executable == "git" &&
+                invocation.Arguments.Contains("push") &&
+                invocation.Arguments.Any(argument =>
+                    argument.Contains("example/unchanged", StringComparison.Ordinal)));
+        Assert.DoesNotContain(
+            scenario.Runner.Invocations,
+            invocation =>
+                invocation.Executable == "gh" &&
+                invocation.Arguments.Contains("create") &&
+                invocation.Arguments.Contains("example/unchanged"));
+        var records = await scenario.ReadRecordsAsync();
+        var noOp = Assert.Single(records, record =>
+            record.RelativePath == "unchanged");
+        Assert.Equal(ReviewedPublicationStage.AlreadyCurrent, noOp.Stage);
+        Assert.Empty(noOp.PullRequestUrl);
+        Assert.Single(await scenario.ReadPublicationEventsAsync(
+            VerifiedCandidatePublisher.ReviewedPublicationAlreadyCurrentEventType));
+        var verified = await scenario.VerifyAsync(report);
+        Assert.Equal("https://github.com/example/changed/pull/1", verified.Url);
+
+        scenario.Runner.Reset();
+        Assert.Equal(report, await scenario.PublishAsync());
+        Assert.Empty(scenario.Runner.Invocations);
+
+        scenario.Runner.RemoteDefaultHeads[unchanged.RemoteRepository] =
+            new string('f', 40);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            scenario.VerifyAsync(report));
+    }
+
+    [Fact]
+    public async Task NoDiffRepository_DoesNotPublishUnrelatedBranchHistory()
+    {
+        using var scenario = await ReviewedPublicationScenario.CreateAsync(
+            OutcomeType.PullRequest,
+            [
+                ("changed", "example/changed"),
+                ("unchanged", "example/unchanged")
+            ]);
+        var unchanged = scenario.Identity.Repositories.Single(item =>
+            item.RelativePath == "unchanged");
+        scenario.Runner.RemoteNoDiffHeads[unchanged.RemoteRepository] =
+            unchanged.Head;
+
+        var report = await scenario.PublishAsync();
+
+        Assert.Single(scenario.Runner.PullRequests);
+        Assert.Contains(
+            "no changes relative to the default branch",
+            report,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            scenario.Runner.Invocations,
+            invocation =>
+                invocation.Executable == "git" &&
+                invocation.Arguments.Contains("push") &&
+                invocation.Arguments.Any(argument =>
+                    argument.Contains("example/unchanged", StringComparison.Ordinal)));
+        Assert.DoesNotContain(
+            scenario.Runner.Invocations,
+            invocation =>
+                invocation.Executable == "gh" &&
+                invocation.Arguments.Contains("create") &&
+                invocation.Arguments.Contains("example/unchanged"));
+        var noDiff = Assert.Single(await scenario.ReadRecordsAsync(), record =>
+            record.RelativePath == "unchanged");
+        Assert.Equal(ReviewedPublicationStage.NoPullRequestDiff, noDiff.Stage);
+        Assert.Empty(noDiff.PullRequestUrl);
+        Assert.Single(await scenario.ReadPublicationEventsAsync(
+            VerifiedCandidatePublisher.ReviewedPublicationNoDiffEventType));
+        var verified = await scenario.VerifyAsync(report);
+        Assert.Equal("https://github.com/example/changed/pull/1", verified.Url);
+
+        scenario.Runner.Reset();
+        Assert.Equal(report, await scenario.PublishAsync());
+        Assert.Empty(scenario.Runner.Invocations);
+
+        scenario.Runner.RemoteNoDiffHeads.Remove(unchanged.RemoteRepository);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            scenario.VerifyAsync(report));
+    }
+
+    [Fact]
+    public async Task NoDiffRepository_DriftOnRetryFailsBeforeAnyRemoteWrite()
+    {
+        using var scenario = await ReviewedPublicationScenario.CreateAsync(
+            OutcomeType.PullRequest);
+        await scenario.SeedRecordAsync(
+            scenario.Repositories[0].Path,
+            ReviewedPublicationStage.NoPullRequestDiff,
+            pullRequestUrl: null);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            scenario.PublishAsync());
+
+        Assert.Contains("no longer has an empty pull-request diff", exception.Message);
+        Assert.Equal(0, scenario.Runner.CountOf("git", "push"));
+        Assert.Equal(0, scenario.Runner.CountOf("gh", "create"));
+        Assert.Equal(
+            ReviewedPublicationStage.NoPullRequestDiff,
+            Assert.Single(await scenario.ReadRecordsAsync()).Stage);
+    }
+
+    [Fact]
+    public async Task AlreadyCurrentRepository_DriftOnRetryFailsBeforeAnyRemoteWrite()
+    {
+        using var scenario = await ReviewedPublicationScenario.CreateAsync(
+            OutcomeType.PullRequest);
+        await scenario.SeedRecordAsync(
+            scenario.Repositories[0].Path,
+            ReviewedPublicationStage.AlreadyCurrent,
+            pullRequestUrl: null);
+        scenario.Runner.RemoteDefaultHeads[RemoteRepository] =
+            new string('f', 40);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            scenario.PublishAsync());
+
+        Assert.Contains("no longer holds the reviewed", exception.Message);
+        Assert.Equal(0, scenario.Runner.CountOf("git", "push"));
+        Assert.Equal(0, scenario.Runner.CountOf("gh", "create"));
+        Assert.Equal(
+            ReviewedPublicationStage.AlreadyCurrent,
+            Assert.Single(await scenario.ReadRecordsAsync()).Stage);
     }
 
     [Fact]
@@ -285,7 +533,7 @@ public sealed class ReviewedPublicationJournalTests
 
         Assert.Contains("https://github.com/example/repository/pull/1", report);
         Assert.Equal(0, scenario.Runner.CountOf("git", "push"));
-        Assert.Equal(1, scenario.Runner.CountOf("git", "ls-remote"));
+        Assert.Equal(2, scenario.Runner.CountOf("git", "ls-remote"));
         Assert.Equal(1, scenario.Runner.CountOf("gh", "create"));
     }
 
@@ -788,7 +1036,8 @@ public sealed class ReviewedPublicationJournalTests
 
         public static async Task<ReviewedPublicationScenario> CreateAsync(
             OutcomeType outcome,
-            IReadOnlyList<(string Path, string Remote)>? repositories = null)
+            IReadOnlyList<(string Path, string Remote)>? repositories = null,
+            string? consolidatedRequest = null)
         {
             repositories ??= [("first", RemoteRepository)];
             var root = Path.Combine(
@@ -815,7 +1064,15 @@ public sealed class ReviewedPublicationJournalTests
             {
                 Title = "Publish the reviewed candidate",
                 OriginalRequest = "Publish the reviewed candidate.",
-                ConsolidatedRequest = "Publish the reviewed candidate.",
+                ConsolidatedRequest = consolidatedRequest ?? IntakeParser.SerializeBrief(
+                    new IntakeBrief
+                    {
+                        Goal = "Publish a two-speaker meeting.",
+                        Details = ["Add the meeting and both talks."],
+                        SuccessCriteria = ["Two talks appear on the schedule."],
+                        Constraints = ["Leave unrelated content unchanged."],
+                        Assumptions = []
+                    }),
                 Kind = FlowKind.Delivery,
                 Status = FlowStatus.Queued,
                 RepositoryPath = workspacePath,

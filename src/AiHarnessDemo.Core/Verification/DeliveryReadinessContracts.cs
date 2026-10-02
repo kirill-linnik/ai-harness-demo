@@ -69,6 +69,9 @@ public static class DeliveryReadinessConflicts
     public const string ReviewStale = "readiness.review-stale";
     public const string BindingInvalid = "readiness.binding-invalid";
     public const string PublicationNotAuthorized = "readiness.publication-not-authorized";
+    public const string PublicationToolUnavailable = "readiness.publication-tool-unavailable";
+    public const string PublicationAuthenticationUnavailable =
+        "readiness.publication-authentication-unavailable";
     public const string ContractInvalid = "readiness.contract-invalid";
 }
 

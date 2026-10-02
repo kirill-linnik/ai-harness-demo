@@ -523,6 +523,309 @@ public sealed class DynamicPlanningTests
     }
 
     [Fact]
+    public void Validator_DeliveryPreMortemOnlyCheckpointsProposalsBeforeImplementation()
+    {
+        var snapshots = new[]
+        {
+            Snapshot("generalist"),
+            Snapshot("product-designer"),
+            Snapshot("publisher"),
+            Snapshot("pre-mortem-sceptic")
+        };
+        var context = Context(
+            FlowKind.Delivery,
+            snapshots,
+            preMortemEnabled: true);
+        var plan = DeliveryProposalPlan();
+
+        var accepted = _validator.Validate(
+            plan.WithCheckpoints(["propose"]), context);
+        Assert.Equal(
+            ["propose"],
+            accepted.Document.PreMortemCheckpoints);
+
+        foreach (var target in new[] { "design", "implement", "prepare" })
+        {
+            var exception = Assert.Throws<TeamPlanContractException>(() =>
+                _validator.Validate(plan.WithCheckpoints([target]), context));
+            Assert.Contains(
+                exception.Errors,
+                error => error.Contains(
+                    "Analyze-duty requirements step before the first Design or Implement",
+                    StringComparison.Ordinal));
+        }
+
+        var lateDesign = new TeamPlanDocument
+        {
+            Disposition = TeamPlanDisposition.Planned,
+            Steps =
+            [
+                Step("propose", "generalist", 10, [PlanDuty.Analyze]),
+                Step("implement", "generalist", 20, [PlanDuty.Implement],
+                    dependencies: ["propose"]),
+                Step("review-design", "generalist", 30, [PlanDuty.Analyze],
+                    dependencies: ["implement"]),
+                Step("prepare", "generalist", 40,
+                    [PlanDuty.Verify, PlanDuty.PrepareOutcome],
+                    owner: true, dependencies: ["review-design"]),
+                Step("publish", "publisher", 50, [PlanDuty.Publish],
+                    dependencies: ["prepare"], stage: PlanStage.AfterApproval,
+                    emptyProfile: true)
+            ],
+            PreMortemCheckpoints = ["review-design"],
+            AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
+            MissingQualification = null
+        };
+        var late = Assert.Throws<TeamPlanContractException>(() =>
+            _validator.Validate(lateDesign, context));
+        Assert.Contains(
+            late.Errors,
+            error => error.Contains(
+                "before the first Design or Implement",
+                StringComparison.Ordinal));
+
+        var existing = _validator.Validate(
+            DeliveryPlan().WithCheckpoints(["implement"]),
+            TeamPlanValidationContext.ForPersistedPlan(
+                FlowKind.Delivery, snapshots, preMortemEnabled: true));
+        Assert.Equal(["implement"], existing.Document.PreMortemCheckpoints);
+
+        var mediumRiskPlan = DeliveryProposalPlan();
+        var missingMediumCheckpoint = Assert.Throws<TeamPlanContractException>(() =>
+            _validator.Validate(mediumRiskPlan, context));
+        Assert.Contains(
+            missingMediumCheckpoint.Errors,
+            error => error.Contains(
+                "medium-or-higher-risk Delivery design or implementation requires a pre-mortem checkpoint",
+                StringComparison.Ordinal));
+        _ = _validator.Validate(
+            mediumRiskPlan.WithCheckpoints(["propose"]), context);
+        _ = _validator.Validate(
+            mediumRiskPlan,
+            context with { PreMortemEnabled = false });
+        _ = _validator.Validate(
+            mediumRiskPlan,
+            TeamPlanValidationContext.ForPersistedPlan(
+                FlowKind.Delivery, snapshots, preMortemEnabled: true));
+
+        var highRiskPlan = DeliveryProposalPlan(TaskRisk.High);
+        var missingRiskCheckpoint = Assert.Throws<TeamPlanContractException>(() =>
+            _validator.Validate(highRiskPlan, context));
+        Assert.Contains(
+            missingRiskCheckpoint.Errors,
+            error => error.Contains(
+                "medium-or-higher-risk Delivery design or implementation requires a pre-mortem checkpoint",
+                StringComparison.Ordinal));
+        _ = _validator.Validate(
+            highRiskPlan.WithCheckpoints(["propose"]), context);
+        _ = _validator.Validate(
+            highRiskPlan,
+            context with { PreMortemEnabled = false });
+        _ = _validator.Validate(
+            highRiskPlan,
+            TeamPlanValidationContext.ForPersistedPlan(
+                FlowKind.Delivery, snapshots, preMortemEnabled: true));
+        _ = _validator.Validate(
+            DeliveryProposalPlan(TaskRisk.Low, TaskRisk.Low), context);
+        var uploadedContext = context with { CustomerUploadsPresent = true };
+        var lowRiskWithUploads = DeliveryProposalPlan(
+            TaskRisk.Low, TaskRisk.Low);
+        var missingUploadCheckpoint = Assert.Throws<TeamPlanContractException>(() =>
+            _validator.Validate(lowRiskWithUploads, uploadedContext));
+        Assert.Contains(
+            missingUploadCheckpoint.Errors,
+            error => error.Contains(
+                "uploaded customer files requires a pre-mortem checkpoint",
+                StringComparison.Ordinal));
+        _ = _validator.Validate(
+            lowRiskWithUploads.WithCheckpoints(["propose"]),
+            uploadedContext);
+        _ = _validator.Validate(
+            lowRiskWithUploads,
+            uploadedContext with { PreMortemEnabled = false });
+        var combinedLowRiskPlan = new TeamPlanDocument
+        {
+            Disposition = TeamPlanDisposition.Planned,
+            Steps =
+            [
+                Step("inspect-and-implement", "generalist", 10,
+                    [PlanDuty.Analyze, PlanDuty.Implement], risk: TaskRisk.Low),
+                Step("prepare", "generalist", 20,
+                    [PlanDuty.Verify, PlanDuty.PrepareOutcome],
+                    owner: true, dependencies: ["inspect-and-implement"]),
+                Step("publish", "publisher", 30,
+                    [PlanDuty.Publish], dependencies: ["prepare"],
+                    stage: PlanStage.AfterApproval, emptyProfile: true)
+            ],
+            PreMortemCheckpoints = [],
+            AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
+            MissingQualification = null
+        };
+        var combined = Assert.Throws<TeamPlanContractException>(() =>
+            _validator.Validate(combinedLowRiskPlan, uploadedContext));
+        Assert.Contains(
+            combined.Errors,
+            error => error.Contains(
+                "uploaded customer files requires a pre-mortem checkpoint",
+                StringComparison.Ordinal));
+
+        var highDesignPlan = DeliveryProposalPlan(
+            designRisk: TaskRisk.Critical);
+        var missingDesignCheckpoint = Assert.Throws<TeamPlanContractException>(() =>
+            _validator.Validate(highDesignPlan, context));
+        Assert.Contains(
+            missingDesignCheckpoint.Errors,
+            error => error.Contains(
+                "medium-or-higher-risk Delivery design or implementation requires a pre-mortem checkpoint",
+                StringComparison.Ordinal));
+        _ = _validator.Validate(
+            highDesignPlan.WithCheckpoints(["propose"]), context);
+    }
+
+    [Fact]
+    public async Task DynamicFlow_PreMortemChallengesProposalBeforeImplementationAndQa()
+    {
+        var plan = DeliveryProposalPlan().WithCheckpoints(["propose"]);
+        await using var harness = await DynamicHarness.CreateAsync(
+            FlowKind.Delivery,
+            plan,
+            [
+                Snapshot("generalist"),
+                Snapshot("product-designer"),
+                Snapshot("publisher"),
+                Snapshot("pre-mortem-sceptic")
+            ],
+            modelRouter: new SeparatedModelRouter());
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var flow = await database.Flows
+            .Include(item => item.Events)
+            .SingleAsync(item => item.Id == harness.FlowId);
+        Assert.True(
+            flow.Status == FlowStatus.WaitingForFeedback,
+            $"{flow.Status}: {flow.FailureReason}{Environment.NewLine}" +
+            string.Join(Environment.NewLine,
+                flow.Events.OrderBy(item => item.CreatedAt)
+                    .TakeLast(10).Select(item => $"{item.Type}: {item.Message}")));
+        var steps = await database.FlowSteps
+            .Where(step => step.FlowRunId == harness.FlowId)
+            .ToListAsync();
+        var proposal = Assert.Single(steps, step => step.PlanStepKey == "propose");
+        var review = Assert.Single(
+            steps, step => step.AgentId == "pre-mortem-sceptic");
+        var design = Assert.Single(steps, step => step.PlanStepKey == "design");
+        var implement = Assert.Single(steps, step => step.PlanStepKey == "implement");
+        var qa = Assert.Single(steps, step => step.PlanStepKey == "prepare");
+        Assert.True(proposal.Sequence < review.Sequence);
+        Assert.True(review.Sequence < design.Sequence);
+        Assert.True(design.Sequence < implement.Sequence);
+        Assert.True(implement.Sequence < qa.Sequence);
+        Assert.Equal(proposal.Id, review.DependsOnStepId);
+        Assert.Equal(review.Id, design.DependsOnStepId);
+        Assert.Equal(design.Id, implement.DependsOnStepId);
+        Assert.Equal(ExecutionInvocationKind.PreMortem, review.InvocationKind);
+        Assert.Equal("""["Analyze"]""", review.PlanDutiesJson);
+        Assert.False(WorkflowEngine.IsDeliveryVerificationStep(review));
+        Assert.True(WorkflowEngine.IsDeliveryVerificationStep(qa));
+        Assert.Contains("Before downstream design or implementation", review.InputSummary);
+        var profile = await database.TaskProfiles.SingleAsync(
+            item => item.FlowStepId == review.Id);
+        Assert.Contains(TaskTypeTag.Planning, TaskProfileRules.ReadTags(profile));
+        Assert.DoesNotContain(TaskTypeTag.Quality, TaskProfileRules.ReadTags(profile));
+        Assert.Equal(
+            ["team-plan", "propose", "pre-mortem:propose:1", "design", "implement", "prepare"],
+            harness.Runner.Contexts.Select(context => context.PlanStepKey));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DynamicFlow_RequirementsAuthorRespondsBeforeDesignerReceivesHandoff(
+        bool rejectFinding)
+    {
+        await using var harness = await DynamicHarness.CreateAsync(
+            FlowKind.Delivery,
+            DeliveryProposalPlan().WithCheckpoints(["propose"]),
+            [
+                Snapshot("generalist"),
+                Snapshot("product-designer"),
+                Snapshot("publisher"),
+                Snapshot("pre-mortem-sceptic")
+            ],
+            modelRouter: new SeparatedModelRouter());
+        harness.Runner.PreMortemFindingsOnFirstReview = true;
+        harness.Runner.RejectFirstFinding = rejectFinding;
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var flow = await database.Flows.SingleAsync(item => item.Id == harness.FlowId);
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        var steps = await database.FlowSteps
+            .Where(step => step.FlowRunId == harness.FlowId)
+            .ToListAsync();
+        var authorSteps = steps
+            .Where(step => step.PlanStepKey == "propose")
+            .OrderBy(step => step.Sequence)
+            .ToArray();
+        Assert.Equal(2, authorSteps.Length);
+        var reviews = steps
+            .Where(step => step.AgentId == "pre-mortem-sceptic")
+            .OrderBy(step => step.Sequence)
+            .ToArray();
+        Assert.Equal(rejectFinding ? 1 : 2, reviews.Length);
+        var design = Assert.Single(steps, step => step.PlanStepKey == "design");
+        var implement = Assert.Single(steps, step => step.PlanStepKey == "implement");
+        var qa = Assert.Single(steps, step => step.PlanStepKey == "prepare");
+        Assert.True(authorSteps[0].Sequence < reviews[0].Sequence);
+        Assert.True(reviews[0].Sequence < authorSteps[1].Sequence);
+        if (rejectFinding)
+        {
+            Assert.True(authorSteps[1].Sequence < design.Sequence);
+        }
+        else
+        {
+            Assert.True(authorSteps[1].Sequence < reviews[1].Sequence);
+            Assert.True(reviews[1].Sequence < design.Sequence);
+        }
+        Assert.True(design.Sequence < implement.Sequence);
+        Assert.True(implement.Sequence < qa.Sequence);
+        Assert.Equal(authorSteps[0].AgentId, authorSteps[1].AgentId);
+        Assert.Equal(
+            authorSteps[0].StableSemanticRootId,
+            authorSteps[1].StableSemanticRootId);
+
+        var revision = Assert.Single(
+            harness.Runner.Contexts,
+            context => context.PlanStepKey == "propose" &&
+                       context.IsPreMortemRevision);
+        Assert.Contains("A missing constraint", revision.Task);
+        Assert.Contains(
+            rejectFinding
+                ? PreMortemRules.UnchangedDisposition
+                : PreMortemRules.AdjustedDisposition,
+            authorSteps[1].OutputSummary);
+        Assert.Contains(
+            rejectFinding
+                ? "already address the boundary"
+                : "requirements now state the boundary",
+            authorSteps[1].OutputSummary);
+        var designRun = Assert.Single(
+            harness.Runner.Contexts,
+            context => context.PlanStepKey == "design");
+        var handoff = Assert.Single(
+            designRun.StudioDependencyOutputs!,
+            dependency => dependency.PlanStepKey == "propose");
+        Assert.Contains(
+            "The assigned plan step attempt 2",
+            handoff.Output);
+        Assert.False(WorkflowEngine.IsDeliveryVerificationStep(reviews[0]));
+        Assert.True(WorkflowEngine.IsDeliveryVerificationStep(qa));
+    }
+
+    [Fact]
     public async Task DynamicFlow_ManualPreMortemRestartKeepsOneCanonicalRoot()
     {
         var plan = AdvisoryPlan(
@@ -1044,6 +1347,80 @@ public sealed class DynamicPlanningTests
             item => item.Type.Contains(
                 "validation-failed",
                 StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task PersistedDeliveryCheckpoint_RunsWithoutReplanningUnderNewPolicy()
+    {
+        var plan = DeliveryPlan().WithCheckpoints(["implement"]);
+        await using var harness = await DynamicHarness.CreateAsync(
+            FlowKind.Delivery,
+            plan,
+            [
+                Snapshot("generalist"),
+                Snapshot("publisher"),
+                Snapshot("pre-mortem-sceptic")
+            ],
+            modelRouter: new SeparatedModelRouter());
+        var rawPlan = TeamPlanParser.Serialize(plan);
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            database.FlowSteps.Add(new FlowStep
+            {
+                FlowRunId = harness.FlowId,
+                Iteration = 1,
+                Sequence = 10,
+                AgentId = "team-lead",
+                AgentName = "Team Lead",
+                AgentRole = "team-lead",
+                Label = "Plan the existing flow",
+                PlanStepKey = WorkflowEngine.TeamLeadPlanStepKey,
+                PlanDutiesJson = """["Analyze","Design"]""",
+                PlanStage = PlanStage.BeforeReview,
+                InvocationKind = ExecutionInvocationKind.Planning,
+                PermissionProfile = ExecutionPermissionProfile.ReadOnlySource,
+                Status = StepStatus.Completed,
+                Phase = AgentRunPhase.Succeeded,
+                OutputSummary =
+                    $"HANDOFF_STATUS: COMPLETE{Environment.NewLine}" +
+                    $"{TeamPlanParser.BeginSentinel}{Environment.NewLine}" +
+                    rawPlan +
+                    $"{Environment.NewLine}{TeamPlanParser.EndSentinel}",
+                CompletedAt = DateTimeOffset.UtcNow
+            });
+            database.FlowPlanDocuments.Add(new FlowPlanDocument
+            {
+                FlowRunId = harness.FlowId,
+                Iteration = 1,
+                Disposition = TeamPlanDisposition.Planned.ToString(),
+                RawJson = rawPlan
+            });
+            await database.SaveChangesAsync();
+        }
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        await using var check = await harness.Factory.CreateDbContextAsync();
+        var flow = await check.Flows.SingleAsync(item => item.Id == harness.FlowId);
+        Assert.Equal(FlowStatus.WaitingForFeedback, flow.Status);
+        var steps = await check.FlowSteps
+            .Where(item => item.FlowRunId == harness.FlowId)
+            .ToListAsync();
+        var implement = Assert.Single(steps, item => item.PlanStepKey == "implement");
+        var review = Assert.Single(
+            steps, item => item.PlanStepKey == "pre-mortem:implement:1");
+        var qa = Assert.Single(steps, item => item.PlanStepKey == "prepare");
+        Assert.True(implement.Sequence < review.Sequence);
+        Assert.True(review.Sequence < qa.Sequence);
+        Assert.Equal("""["Analyze"]""", review.PlanDutiesJson);
+        Assert.False(WorkflowEngine.IsDeliveryVerificationStep(review));
+        Assert.True(WorkflowEngine.IsDeliveryVerificationStep(qa));
+        Assert.Equal(
+            rawPlan,
+            (await check.FlowPlanDocuments
+                .SingleAsync(item => item.FlowRunId == harness.FlowId)).RawJson);
+        Assert.DoesNotContain(harness.Runner.Contexts,
+            item => item.AgentId == "team-lead");
     }
 
     [Fact]
@@ -1581,6 +1958,31 @@ public sealed class DynamicPlanningTests
             MissingQualification = null
         };
 
+    private static TeamPlanDocument DeliveryProposalPlan(
+        TaskRisk implementationRisk = TaskRisk.Medium,
+        TaskRisk designRisk = TaskRisk.Medium) =>
+        new()
+        {
+            Disposition = TeamPlanDisposition.Planned,
+            Steps =
+            [
+                Step("propose", "generalist", 10, [PlanDuty.Analyze]),
+                Step("design", "product-designer", 20, [PlanDuty.Design],
+                    dependencies: ["propose"], risk: designRisk),
+                Step("implement", "generalist", 30, [PlanDuty.Implement],
+                    dependencies: ["design"], risk: implementationRisk),
+                Step("prepare", "generalist", 40,
+                    [PlanDuty.Verify, PlanDuty.PrepareOutcome],
+                    owner: true, dependencies: ["implement"]),
+                Step("publish", "publisher", 50, [PlanDuty.Publish],
+                    dependencies: ["prepare"], stage: PlanStage.AfterApproval,
+                    emptyProfile: true)
+            ],
+            PreMortemCheckpoints = [],
+            AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
+            MissingQualification = null
+        };
+
     private static TeamPlanDocument SeparatedDeliveryPlan() =>
         new()
         {
@@ -1624,7 +2026,8 @@ public sealed class DynamicPlanningTests
         IReadOnlyList<string>? dependencies = null,
         PlanStage stage = PlanStage.BeforeReview,
         string assignment = "Complete the bounded assignment.",
-        bool emptyProfile = false) =>
+        bool emptyProfile = false,
+        TaskRisk risk = TaskRisk.Medium) =>
         new()
         {
             Id = id,
@@ -1645,7 +2048,7 @@ public sealed class DynamicPlanningTests
                     ContextDemand = 5,
                     ToolIntensity = 4,
                     TaskTypeTags = [TaskTypeTag.CrossCutting],
-                    Risk = TaskRisk.Medium,
+                    Risk = risk,
                     RiskReason = "The result crosses a bounded handoff.",
                     Confidence = 0.8,
                     Rationales = ["Repository evidence is required."]
@@ -1953,6 +2356,10 @@ public sealed class DynamicPlanningTests
 
         public bool FailFirstPreMortem { get; set; }
 
+        public bool PreMortemFindingsOnFirstReview { get; set; }
+
+        public bool RejectFirstFinding { get; set; }
+
         public string? InvalidFirstContractAgentId { get; set; }
 
         public Func<AgentExecutionContext, int, string?>?
@@ -2002,12 +2409,19 @@ public sealed class DynamicPlanningTests
             }
             else if (context.AgentId == "pre-mortem-sceptic")
             {
-                output = $$"""
-                    {{PreMortemRules.ClearStatus}}
-                    {{PreMortemRules.FindingsBeginSentinel}}
-                    {"Findings":[]}
-                    {{PreMortemRules.FindingsEndSentinel}}
-                    """;
+                output = PreMortemFindingsOnFirstReview && count == 1
+                    ? $$"""
+                        {{PreMortemRules.FindingsStatus}}
+                        {{PreMortemRules.FindingsBeginSentinel}}
+                        {"Findings":[{"FailureMode":"A missing constraint in the requirements makes the downstream result fail.","Evidence":"The proposed handoff omits an observable boundary.","MissedSignal":"The requirements author did not state the boundary.","Prevention":"State the boundary before design or implementation begins."}]}
+                        {{PreMortemRules.FindingsEndSentinel}}
+                        """
+                    : $$"""
+                        {{PreMortemRules.ClearStatus}}
+                        {{PreMortemRules.FindingsBeginSentinel}}
+                        {"Findings":[]}
+                        {{PreMortemRules.FindingsEndSentinel}}
+                        """;
             }
             else if (string.Equals(
                          context.AgentId,
@@ -2042,6 +2456,19 @@ public sealed class DynamicPlanningTests
                     ## Next owner
                     Continue the accepted plan.
                     """;
+                if (context.IsPreMortemRevision)
+                {
+                    output += Environment.NewLine +
+                        (RejectFirstFinding
+                            ? "The confirmed requirements already address the boundary, " +
+                              "so the proposed failure is not applicable."
+                            : "The revised requirements now state the boundary before " +
+                              "downstream work begins.") +
+                        Environment.NewLine +
+                        (RejectFirstFinding
+                            ? PreMortemRules.UnchangedDisposition
+                            : PreMortemRules.AdjustedDisposition);
+                }
                 if (context.OutcomeContract.Contains(
                         FlowOutcomeParser.BeginSentinel,
                         StringComparison.Ordinal))
@@ -2185,6 +2612,7 @@ file static class TeamPlanTestExtensions
             Disposition = document.Disposition,
             Steps = document.Steps,
             PreMortemCheckpoints = checkpoints,
+            AcceptanceCriteria = document.AcceptanceCriteria,
             MissingQualification = document.MissingQualification
         };
 }

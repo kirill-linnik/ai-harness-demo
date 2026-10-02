@@ -13,6 +13,29 @@ namespace AiHarnessDemo.Tests;
 public sealed class PreMortemWorkflowTests
 {
     [Fact]
+    public void PreMortemAssignment_TreatsFailureAsCounterfactualRequirementsGapNotQa()
+    {
+        var author = new FlowStep
+        {
+            AgentId = "analyst",
+            AgentName = "Analyst",
+            AgentRole = "analyst",
+            PlanDutiesJson = """["Analyze"]""",
+            OutputSummary = "HANDOFF_STATUS: COMPLETE\nProposed requirements."
+        };
+
+        var assignment = WorkflowEngine.BuildPreMortemAssignment(author);
+
+        Assert.Contains("implemented them exactly", assignment);
+        Assert.Contains("not historical facts", assignment);
+        Assert.Contains("why faithful implementation could still fail", assignment);
+        Assert.Contains("do not inspect implementation code", assignment);
+        Assert.Contains("Return CLEAR if no requirements-level gap is substantiated", assignment);
+        Assert.Contains(author.OutputSummary, assignment);
+        Assert.DoesNotContain("QA assessment is a valid handoff", assignment);
+    }
+
+    [Fact]
     public async Task ModelFamilyViolation_PersistsARestartableFailedReview()
     {
         var root = Path.Combine(

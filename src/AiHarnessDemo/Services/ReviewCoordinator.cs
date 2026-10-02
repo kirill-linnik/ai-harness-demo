@@ -41,7 +41,9 @@ public sealed class ReviewCoordinator(
     LinkedFlowCoordinator? linkedFlows = null,
     PermissionProfileResolver? permissionProfileResolver = null,
     DeliveryReadinessService? deliveryReadinessService = null,
-    IDemoRuntimeRevoker? demoRuntimeRevoker = null)
+    IDemoRuntimeRevoker? demoRuntimeRevoker = null,
+    Func<bool>? githubCliAvailable = null,
+    Func<CancellationToken, Task<bool>>? githubAuthenticationAvailable = null)
 {
     private const int MaximumRefinementGoalCharacters = 4_000;
     private const int MaximumRequestedChanges = 24;
@@ -51,6 +53,11 @@ public sealed class ReviewCoordinator(
         permissionProfileResolver ?? new PermissionProfileResolver();
     private readonly DeliveryReadinessService _readiness =
         deliveryReadinessService ?? new DeliveryReadinessService();
+    private readonly Func<bool> _githubCliAvailable =
+        githubCliAvailable ?? GitHubPublicationPrerequisites.IsAvailable;
+    private readonly Func<CancellationToken, Task<bool>> _githubAuthenticationAvailable =
+        githubAuthenticationAvailable ??
+        GitHubPublicationPrerequisites.HasAuthenticationAsync;
 
     public async Task<ReviewCoordinationResult> ReviewAsync(
         Guid flowId,
@@ -211,6 +218,25 @@ public sealed class ReviewCoordinator(
             var now = DateTimeOffset.UtcNow;
             if (intent == ReviewIntent.Accept)
             {
+                if (flow.Kind == FlowKind.Delivery &&
+                    flow.Outcome == OutcomeType.PullRequest)
+                {
+                    var prerequisite = await GitHubPublicationPrerequisites.CheckAsync(
+                        _githubCliAvailable,
+                        _githubAuthenticationAvailable,
+                        cancellationToken);
+                    if (prerequisite.Error is { } error)
+                    {
+                        throw new DeliveryReadinessConflictException(
+                            prerequisite.CliAvailable
+                                ? DeliveryReadinessConflicts.PublicationAuthenticationUnavailable
+                                : DeliveryReadinessConflicts.PublicationToolUnavailable,
+                            error,
+                            readiness?.State,
+                            readiness?.Revision,
+                            readiness?.ContractHash);
+                    }
+                }
                 resolvedForHistory = gateEngine.PrepareReviewResolution(
                     gate,
                     ReviewDecision.Accepted,

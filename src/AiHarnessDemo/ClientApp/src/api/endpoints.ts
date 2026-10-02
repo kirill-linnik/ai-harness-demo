@@ -49,8 +49,22 @@ export const api = {
   },
   analyzeRepository: (body: AnalyzeRepositoryRequest) =>
     request<AnalyzeRepositoryResponse>("/api/repositories/analyze", { method: "POST", body }),
-  continueIntake: (body: IntakeRequest) =>
-    request<IntakeResponse>("/api/intake", { method: "POST", body }),
+  continueIntake: (body: IntakeRequest) => {
+    if (!body.files?.length) {
+      return request<IntakeResponse>("/api/intake", {
+        method: "POST",
+        body: { flowId: body.flowId, message: body.message }
+      });
+    }
+    const form = new FormData();
+    if (body.flowId) form.append("flowId", body.flowId);
+    form.append("message", body.message);
+    for (const file of body.files) form.append("files", file, file.name);
+    return request<IntakeResponse>("/api/intake/attachments", {
+      method: "POST",
+      body: form
+    });
+  },
   flows: () => request<FlowSummaryDto[]>("/api/flows"),
   flow: (flowId: string) => request<FlowDetailDto>(`/api/flows/${flowId}`),
   startFlow: (flowId: string) =>
