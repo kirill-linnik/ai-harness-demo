@@ -125,12 +125,7 @@ public sealed class AgentRunner(
                 MaxDelay = TimeSpan.FromMilliseconds(options.MaxRetryBackoffMs),
                 UseJitter = true,
                 ShouldHandle = new PredicateBuilder<AgentRunResult>()
-                    .Handle<AgentRunException>(exception =>
-                        exception.FailureKind is
-                            AgentRunFailureKind.Transient or
-                            AgentRunFailureKind.TimedOut or
-                            AgentRunFailureKind.Stalled or
-                            AgentRunFailureKind.AmbiguousCrash),
+                    .Handle<AgentRunException>(IsRetryableFailure),
                 OnRetry = arguments =>
                 {
                     var exception = arguments.Outcome.Exception as AgentRunException;
@@ -224,4 +219,9 @@ public sealed class AgentRunner(
         exception.FailureKind is
             AgentRunFailureKind.Stalled or
             AgentRunFailureKind.TimedOut;
+
+    internal static bool IsRetryableFailure(AgentRunException exception) =>
+        exception.FailureKind is AgentRunFailureKind.Transient or
+            AgentRunFailureKind.TimedOut or AgentRunFailureKind.Stalled or
+            AgentRunFailureKind.AmbiguousCrash;
 }

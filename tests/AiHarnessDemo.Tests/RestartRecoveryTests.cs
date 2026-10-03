@@ -1079,8 +1079,11 @@ public sealed class WorkflowRestartRecoveryTests
         Assert.DoesNotContain(badFlow.Id, recoveredFlows);
     }
 
-    [Fact]
-    public async Task RecoveryAutomaticallyContinuesAFailedStallWithCompletedOutput()
+    [Theory]
+    [InlineData(AgentRunPhase.Stalled)]
+    [InlineData(AgentRunPhase.TimedOut)]
+    [InlineData(AgentRunPhase.BudgetExhausted)]
+    public async Task RecoveryAutomaticallyContinuesAFailedRuntimeWithCompletedOutput(AgentRunPhase phase)
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: true,
@@ -1096,7 +1099,7 @@ public sealed class WorkflowRestartRecoveryTests
             flow.Status = FlowStatus.Failed;
             flow.FailureReason = "Agent process produced no output for 300 seconds.";
             failedStep.Status = StepStatus.Failed;
-            failedStep.Phase = AgentRunPhase.Stalled;
+            failedStep.Phase = phase;
             failedStep.CompletedAt = DateTimeOffset.UtcNow;
             flow.Steps.Add(new FlowStep
             {
@@ -1133,6 +1136,49 @@ public sealed class WorkflowRestartRecoveryTests
         Assert.Contains(
             recovered.Events,
             item => item.Type == "flow.completed-output-auto-recovered");
+    }
+
+    [Fact]
+    public async Task ExhaustedAssignment_StaysFailedOnStartupAndManualResumeIsATypedConflict()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false, persistSessionId: true);
+        var deadline = DateTimeOffset.UtcNow.AddHours(-1);
+        Guid stepId;
+        await using (var database = await fixture.DatabaseFactory.CreateDbContextAsync())
+        {
+            var flow = await database.Flows.Include(item => item.Steps).SingleAsync();
+            var step = Assert.Single(flow.Steps);
+            stepId = step.Id;
+            flow.Status = FlowStatus.Failed;
+            flow.FailureReason = AssignmentExecutionBudget.ExhaustedReason;
+            step.Status = StepStatus.Failed;
+            step.Phase = AgentRunPhase.BudgetExhausted;
+            step.ExecutionBudgetRootId = step.Id;
+            step.CompletedAt = DateTimeOffset.UtcNow;
+            database.AgentExecutionBudgets.Add(new AgentExecutionBudget
+            {
+                RootStepId = step.Id,
+                FlowRunId = flow.Id,
+                AgentId = step.AgentId,
+                StartedAt = deadline.AddHours(-4),
+                DeadlineAt = deadline,
+                PolicyJson = JsonSerializer.Serialize(AssignmentExecutionBudget.Policy(
+                    new CopilotConfig(), "original-budget"))
+            });
+            await database.SaveChangesAsync();
+        }
+        Assert.Empty(await fixture.Engine.RecoverInterruptedFlowsAsync(CancellationToken.None));
+        var exception = await Assert.ThrowsAsync<FlowLifecycleException>(() =>
+            fixture.Engine.RestartFailedFlowAsync(fixture.FlowId, CancellationToken.None));
+        Assert.Contains("absolute execution budget is exhausted", exception.Message);
+        await using var verification = await fixture.DatabaseFactory.CreateDbContextAsync();
+        Assert.Equal(FlowStatus.Failed, (await verification.Flows.SingleAsync()).Status);
+        Assert.Equal(stepId, (await verification.FlowSteps.SingleAsync()).Id);
+        Assert.Equal(deadline.ToUnixTimeMilliseconds(),
+            (await verification.AgentExecutionBudgets.SingleAsync()).DeadlineAt.ToUnixTimeMilliseconds());
+        Assert.False(await verification.FlowEvents.AnyAsync(item =>
+            item.Type == "flow.manual-restart" || item.Type == "step.resume-queued"));
     }
 
     [Fact]
@@ -1741,8 +1787,11 @@ public sealed class WorkflowRestartRecoveryTests
             item => item.Type == "agent.session-discovered");
     }
 
-    [Fact]
-    public async Task ManualRestartRecoversCompletedOutputInsteadOfRerunningTheAgent()
+    [Theory]
+    [InlineData(AgentRunPhase.Stalled)]
+    [InlineData(AgentRunPhase.TimedOut)]
+    [InlineData(AgentRunPhase.BudgetExhausted)]
+    public async Task ManualRestartRecoversCompletedOutputInsteadOfRerunningTheAgent(AgentRunPhase phase)
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
             completed: true,
@@ -1755,7 +1804,7 @@ public sealed class WorkflowRestartRecoveryTests
             flow.Status = FlowStatus.Failed;
             flow.FailureReason = "Agent process produced no output for 300 seconds.";
             failedStep.Status = StepStatus.Failed;
-            failedStep.Phase = AgentRunPhase.Stalled;
+            failedStep.Phase = phase;
             failedStep.CompletedAt = DateTimeOffset.UtcNow;
             flow.Steps.Add(new FlowStep
             {

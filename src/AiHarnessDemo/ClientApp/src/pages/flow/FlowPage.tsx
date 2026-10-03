@@ -18,6 +18,7 @@ import { BlockedFlowCard } from "./BlockedFlowCard";
 import { ReviewCard } from "./ReviewCard";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { RecoverFlowButton } from "./RecoverFlowButton";
+import { CustomerDialogue } from "./CustomerDialogue";
 
 const failedTaskRecoveryEvents = new Set([
   "flow.manual-restart",
@@ -247,6 +248,7 @@ export function FlowPage() {
         </nav>
       )}
       {flow.status === "Blocked" && <BlockedFlowCard flow={flow} />}
+      <CustomerDialogue flow={flow} />
       <div className="card lane-card">
         <div className="card-header">
           <div>

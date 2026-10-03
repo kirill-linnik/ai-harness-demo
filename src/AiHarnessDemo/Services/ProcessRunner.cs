@@ -29,7 +29,8 @@ public class ProcessRunner
         CancellationToken cancellationToken = default,
         Action<string>? standardOutputLineReceived = null,
         TimeSpan? stallTimeout = null,
-        IReadOnlyDictionary<string, string?>? environmentVariables = null)
+        IReadOnlyDictionary<string, string?>? environmentVariables = null,
+        AgentExecutionMonitor? executionMonitor = null)
     {
         if (string.IsNullOrWhiteSpace(executable))
         {
@@ -84,6 +85,14 @@ public class ProcessRunner
             }
         }
 
+        if (executionMonitor is not null)
+        {
+            executionMonitor.BeginProcess();
+            var preflight = executionMonitor.Tick(force: true);
+            executionMonitor.ThrowIfTerminated();
+            if (preflight is not null) { executionMonitor.Report?.Invoke(preflight); }
+        }
+        cancellationToken.ThrowIfCancellationRequested();
         using var process = new Process { StartInfo = startInfo };
         if (!process.Start())
         {
@@ -94,6 +103,8 @@ public class ProcessRunner
         void RecordActivity(string line)
         {
             Interlocked.Exchange(ref lastActivityTimestamp, Stopwatch.GetTimestamp());
+            executionMonitor?.ObserveRawOutput();
+            executionMonitor?.Observe(line);
             standardOutputLineReceived?.Invoke(line);
         }
 
@@ -103,14 +114,22 @@ public class ProcessRunner
             cancellationToken);
         var errorTask = ReadOutputAsync(
             process.StandardError,
-            _ => Interlocked.Exchange(ref lastActivityTimestamp, Stopwatch.GetTimestamp()),
+            _ =>
+            {
+                Interlocked.Exchange(ref lastActivityTimestamp, Stopwatch.GetTimestamp());
+                executionMonitor?.ObserveRawOutput();
+            },
             cancellationToken);
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutSource.CancelAfter(timeout);
+        timeoutSource.CancelAfter(executionMonitor is null
+            ? timeout
+            : TimeSpan.FromMilliseconds(executionMonitor.Snapshot().RemainingBudgetMilliseconds));
         using var monitorSource =
             CancellationTokenSource.CreateLinkedTokenSource(timeoutSource.Token);
         var waitTask = process.WaitForExitAsync(timeoutSource.Token);
-        var stallTask = stallTimeout is { } configuredStall && configuredStall > TimeSpan.Zero
+        var stallTask = executionMonitor is not null
+            ? MonitorExecutionAsync(executionMonitor, monitorSource.Token)
+            : stallTimeout is { } configuredStall && configuredStall > TimeSpan.Zero
             ? MonitorStallAsync(
                 () => Interlocked.Read(ref lastActivityTimestamp),
                 configuredStall,
@@ -132,9 +151,19 @@ public class ProcessRunner
             await TerminateAsync(process);
             throw;
         }
+        catch (ProcessBudgetExhaustedException)
+        {
+            await TerminateAsync(process);
+            throw;
+        }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             await TerminateAsync(process);
+            if (executionMonitor is not null)
+            {
+                executionMonitor.Terminate(nameof(Core.Reasoning.AgentRunFailureKind.BudgetExhausted));
+                throw new ProcessBudgetExhaustedException(AssignmentExecutionBudget.ExhaustedReason);
+            }
             throw new TimeoutException(
                 $"'{executable}' did not finish within {timeout.TotalMinutes:0.#} minutes.");
         }
@@ -143,11 +172,40 @@ public class ProcessRunner
             await TerminateAsync(process);
             throw;
         }
+        finally
+        {
+            monitorSource.Cancel();
+            await TerminateAsync(process);
+            if (!stallTask.IsFaulted)
+            {
+                try { await stallTask; }
+                catch (OperationCanceledException) when (monitorSource.IsCancellationRequested) { }
+            }
+        }
 
         return new ProcessResult(
             process.ExitCode,
             await outputTask,
             await errorTask);
+    }
+
+    private static async Task MonitorExecutionAsync(
+        AgentExecutionMonitor monitor,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            if (monitor.PollActivityAsync is { } poll)
+            {
+                await poll(cancellationToken);
+            }
+            if (monitor.Tick() is { } activity)
+            {
+                monitor.Report?.Invoke(activity);
+            }
+            monitor.ThrowIfTerminated();
+            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+        }
     }
 
     private static async Task<string> ReadOutputAsync(

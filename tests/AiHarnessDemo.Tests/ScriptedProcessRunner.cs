@@ -89,7 +89,8 @@ internal sealed class ScriptedProcessRunner : ProcessRunner
         CancellationToken cancellationToken = default,
         Action<string>? standardOutputLineReceived = null,
         TimeSpan? stallTimeout = null,
-        IReadOnlyDictionary<string, string?>? environmentVariables = null)
+        IReadOnlyDictionary<string, string?>? environmentVariables = null,
+        AgentExecutionMonitor? executionMonitor = null)
     {
         var argumentList = arguments.ToArray();
         var invocation = new ProcessInvocation(

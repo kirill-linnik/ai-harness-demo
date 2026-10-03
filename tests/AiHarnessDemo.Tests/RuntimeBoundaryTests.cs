@@ -850,7 +850,7 @@ public sealed class CopilotJsonlParserTests
             item =>
             {
                 Assert.Equal(AgentRunPhase.StreamingTurn, item.Phase);
-                Assert.Equal("Agent response received.", item.Activity);
+                Assert.Equal("Assistant message observed; execution continues.", item.Activity);
             },
             item =>
             {
@@ -2684,8 +2684,10 @@ public sealed class RepositoryBrowserTests
                 "copilot",
                 new AiHarnessDemo.Core.Workflow.CopilotConfig
                 {
-                    TurnTimeoutMs = 20_000,
-                    MaximumQualityStallTimeoutMs = 10_000
+                    ExecutionBudgetMs = 20_000,
+                    InactivityTimeoutMs = 10_000,
+                    SilentToolTimeoutMs = 10_000,
+                    SoftWarningMs = 15_000
                 },
                 fixture.Root,
                 fixture.Inventory,
@@ -2740,8 +2742,10 @@ public sealed class RepositoryBrowserTests
                 "copilot",
                 new AiHarnessDemo.Core.Workflow.CopilotConfig
                 {
-                    TurnTimeoutMs = 20_000,
-                    MaximumQualityStallTimeoutMs = 10_000
+                    ExecutionBudgetMs = 20_000,
+                    InactivityTimeoutMs = 10_000,
+                    SilentToolTimeoutMs = 10_000,
+                    SoftWarningMs = 15_000
                 },
                 fixture.Root,
                 fixture.Inventory,
@@ -3030,7 +3034,8 @@ public sealed class RepositoryBrowserTests
             CancellationToken cancellationToken = default,
             Action<string>? standardOutputLineReceived = null,
             TimeSpan? stallTimeout = null,
-            IReadOnlyDictionary<string, string?>? environmentVariables = null)
+            IReadOnlyDictionary<string, string?>? environmentVariables = null,
+            AgentExecutionMonitor? executionMonitor = null)
         {
             var argumentArray = arguments.ToArray();
             Arguments = argumentArray;

@@ -1839,6 +1839,11 @@ public sealed partial class IntakeCoordinator(
         intakeStep.Status = StepStatus.Failed;
         intakeStep.Phase = exception is AgentRunException
         {
+            FailureKind: AgentRunFailureKind.BudgetExhausted
+        }
+            ? AgentRunPhase.BudgetExhausted
+            : exception is AgentRunException
+        {
             FailureKind: AgentRunFailureKind.TimedOut
         }
             ? AgentRunPhase.TimedOut

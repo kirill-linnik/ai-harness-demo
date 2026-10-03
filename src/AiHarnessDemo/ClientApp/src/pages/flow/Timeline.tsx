@@ -23,6 +23,10 @@ const eventLabels: Readonly<Record<string, string>> = {
   "flow.contract-correction-queued": "Completed work recovered for response correction",
   "agent.contract-correction-scheduled": "Response correction queued",
   "agent.context-snapshot": "Bounded prompt and complete inputs saved",
+  "agent.execution-budget-bound": "Assignment execution budget saved",
+  "agent.soft-limit-warning": "Soft elapsed-time warning",
+  "agent.activity": "Observed tool activity",
+  "agent.execution-terminated": "Execution terminated",
   "step.started": "Agent step started",
   "step.skipped": "Step skipped",
   "step.interrupted": "Agent step interrupted",
@@ -49,14 +53,16 @@ function eventClass(type: string): string {
     type === "flow.failed" ||
     type.endsWith(".failed") ||
     type.includes("retry-limit-exhausted") ||
-    type.includes("recovery-failed")
+    type.includes("recovery-failed") ||
+    type === "agent.execution-terminated"
   ) {
     return "failed";
   }
   if (
     type === "handoff.pushback" ||
     type.includes("blocked") ||
-    type.includes("denied")
+    type.includes("denied") ||
+    type === "agent.soft-limit-warning"
   ) {
     return "warning";
   }

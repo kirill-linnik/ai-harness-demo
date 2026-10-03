@@ -1191,6 +1191,37 @@ summary:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.customer-dialogue .operator-details:first-child {
+  margin-top: 0;
+}
+
+.customer-dialogue .message-bubble {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.customer-dialogue .conversation-log {
+  margin: 12px 0 0;
+  list-style: none;
+}
+
+.dialogue-turn {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dialogue-turn time {
+  align-self: flex-start;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.dialogue-turn.customer time {
+  align-self: flex-end;
+}
+
 .intake-proposal {
   display: grid;
   grid-template-columns: minmax(160px, 0.3fr) minmax(0, 1fr);

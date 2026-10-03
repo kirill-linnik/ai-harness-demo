@@ -5130,6 +5130,11 @@ public sealed class WorkflowEngine(
         step.Status = StepStatus.Failed;
         step.Phase = exception is AgentRunException
         {
+            FailureKind: AgentRunFailureKind.BudgetExhausted
+        }
+            ? AgentRunPhase.BudgetExhausted
+            : exception is AgentRunException
+        {
             FailureKind: AgentRunFailureKind.TimedOut
         }
             ? AgentRunPhase.TimedOut
@@ -5646,7 +5651,8 @@ public sealed class WorkflowEngine(
                         on step.FlowRunId equals flow.Id
                     where step.Status == StepStatus.Failed &&
                           (step.Phase == AgentRunPhase.Stalled ||
-                           step.Phase == AgentRunPhase.TimedOut) &&
+                           step.Phase == AgentRunPhase.TimedOut ||
+                           step.Phase == AgentRunPhase.BudgetExhausted) &&
                           flow.Status == FlowStatus.Failed &&
                           !database.FlowSteps.Any(retry =>
                               retry.FlowRunId == step.FlowRunId &&
@@ -6412,6 +6418,7 @@ public sealed class WorkflowEngine(
                 failedStep.Phase is
                     AgentRunPhase.Stalled or
                     AgentRunPhase.TimedOut or
+                    AgentRunPhase.BudgetExhausted or
                     AgentRunPhase.CanceledByReconciliation;
             var isVerification = IsDeliveryVerificationStep(failedStep);
             if (failedStep.PreMortemReviewStepId is null &&
@@ -6495,7 +6502,8 @@ public sealed class WorkflowEngine(
                 failedStep.Status == StepStatus.Failed &&
                 (IsPreMortemStep(failedStep) ||
                  failedStep.PreMortemReviewStepId is not null ||
-                 failedStep.Phase is AgentRunPhase.Stalled or AgentRunPhase.TimedOut) &&
+                 failedStep.Phase is AgentRunPhase.Stalled or AgentRunPhase.TimedOut or
+                     AgentRunPhase.BudgetExhausted) &&
                 (isVerification ||
                  CopilotReasoningHost.IsRecoverableCompletedOutput(
                      failedStep.AgentRole,
@@ -6568,6 +6576,17 @@ public sealed class WorkflowEngine(
             var canResume = snapshot?.State is
                 CopilotSessionJournalState.Interrupted or
                 CopilotSessionJournalState.Active;
+            var existingBudget = await database.AgentExecutionBudgets.SingleOrDefaultAsync(
+                item => item.RootStepId ==
+                        (failedStep.ExecutionBudgetRootId ??
+                         failedStep.StableSemanticRootId ?? failedStep.RetryOfStepId ?? failedStep.Id) &&
+                        item.AgentId == failedStep.AgentId,
+                cancellationToken);
+            if (existingBudget?.DeadlineAt <= DateTimeOffset.UtcNow)
+            {
+                throw new FlowLifecycleException(flow.Id, flow.Status, FlowStatus.Queued,
+                    AssignmentExecutionBudget.ExhaustedReason);
+            }
             var priorAssignment = failedStep.InputSummary.Trim();
             if (string.IsNullOrWhiteSpace(priorAssignment) ||
                 priorAssignment.StartsWith(

@@ -138,6 +138,9 @@ public sealed class RepositoryKnowledgeSynthesizer(
         var inspectedRepository = false;
         var toolCallCount = 0;
         RepositoryKnowledgeContractException? lastContractError = null;
+        var startedAt = DateTimeOffset.UtcNow;
+        var deadlineAt = startedAt.AddMilliseconds(config.ExecutionBudgetMs);
+        var executionPolicy = AssignmentExecutionBudget.Policy(config, "repository-study");
 
         for (var attempt = 1; attempt <= MaximumContractAttempts; attempt++)
         {
@@ -149,14 +152,13 @@ public sealed class RepositoryKnowledgeSynthesizer(
                     sessionId,
                     resumeSession: attempt > 1),
                 repositoryPath,
-                TimeSpan.FromMilliseconds(config.TurnTimeoutMs),
+                deadlineAt - DateTimeOffset.UtcNow,
                 cancellationToken,
-                stallTimeout: TimeSpan.FromMilliseconds(
-                    config.MaximumQualityStallTimeoutMs),
                 environmentVariables:
                     CopilotReasoningHost.BuildProcessEnvironment(
                         ExecutionInvocationKind.Intake,
-                        allowRemotePublication: false));
+                        allowRemotePublication: false),
+                executionMonitor: new AgentExecutionMonitor(executionPolicy, startedAt, deadlineAt));
             var parsed = CopilotJsonlParser.Parse(
                 result.StandardOutput,
                 result.StandardError,

@@ -37,6 +37,7 @@ public sealed class RoutingObservationRecorder(
             AgentRunFailureKind.ModelUnavailable or
             AgentRunFailureKind.TimedOut or
             AgentRunFailureKind.Stalled or
+            AgentRunFailureKind.BudgetExhausted or
             AgentRunFailureKind.AmbiguousCrash;
         return RecordAsync(
             stepId,
@@ -50,6 +51,7 @@ public sealed class RoutingObservationRecorder(
                 AgentRunFailureKind.DependencyUnavailable => "dependency-unavailable",
                 AgentRunFailureKind.TimedOut => "runtime-timeout",
                 AgentRunFailureKind.Stalled => "runtime-stalled",
+                AgentRunFailureKind.BudgetExhausted => "execution-budget-exhausted",
                 AgentRunFailureKind.AmbiguousCrash => "runtime-ambiguous-crash",
                 _ => "execution-failure"
             },

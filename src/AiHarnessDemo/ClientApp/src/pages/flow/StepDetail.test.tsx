@@ -111,7 +111,53 @@ describe("StepDetail", () => {
       />
     );
 
-    expect(screen.getByText("Agent is reasoning, acting, and observing...")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting an observed response; see execution activity.")).toBeInTheDocument();
+    expect(screen.getByText("Runtime activity is unavailable for this attempt.")).toBeInTheDocument();
+  });
+
+  it("shows safe structured activity, budgets, and a non-terminal soft warning", () => {
+    render(<StepDetail step={{
+      ...step, status: "Running", phase: "StreamingTurn", runtimeActivity: {
+        observedAt: "2026-10-03T13:10:00Z",
+        lastRawOutputAt: "2026-10-03T13:10:00Z",
+        lastStructuredEvent: "tool.execution_start",
+        lastStructuredActivityAt: "2026-10-03T13:00:00Z",
+        activeTool: "powershell",
+        activeToolStartedAt: "2026-10-03T13:00:00Z",
+        activeToolElapsedMilliseconds: 600_000,
+        completedToolCount: 12,
+        totalElapsedMilliseconds: 4_200_000,
+        remainingBudgetMilliseconds: 10_200_000,
+        budgetDeadlineAt: "2026-10-03T16:00:00Z",
+        softWarning: true,
+        terminationReason: null
+      }
+    }} gate={undefined} />);
+    const runtime = within(screen.getByRole("region", { name: "Execution activity" }));
+    expect(runtime.getByRole("status")).toHaveTextContent("Execution continues");
+    expect(runtime.getByText(/tool.execution_start/)).toBeInTheDocument();
+    expect(runtime.getByText(/powershell/)).toBeInTheDocument();
+    expect(runtime.getByText("12")).toBeInTheDocument();
+    expect(runtime.getByText("Remaining absolute budget")).toBeInTheDocument();
+    expect(runtime.getByText("Raw stdout/stderr activity (not progress)")).toBeInTheDocument();
+  });
+
+  it("keeps unavailable lifecycle fields explicit and shows budget exhaustion", () => {
+    render(<StepDetail step={{
+      ...step, phase: "BudgetExhausted", status: "Failed", runtimeActivity: {
+        observedAt: "2026-10-03T16:00:00Z", lastRawOutputAt: null,
+        lastStructuredEvent: null, lastStructuredActivityAt: null,
+        activeTool: null, activeToolStartedAt: null, activeToolElapsedMilliseconds: null,
+        completedToolCount: null, totalElapsedMilliseconds: 14_400_000,
+        remainingBudgetMilliseconds: 0, budgetDeadlineAt: "2026-10-03T16:00:00Z",
+        softWarning: true, terminationReason: "BudgetExhausted"
+      }
+    }} gate={undefined} />);
+    const runtime = within(screen.getByRole("region", { name: "Execution activity" }));
+    expect(runtime.getAllByText("Unavailable")).toHaveLength(4);
+    expect(runtime.getByText(/Termination reason: Budget Exhausted/)).toBeInTheDocument();
+    expect(runtime.getByText("0s")).toBeInTheDocument();
+    expect(runtime.getByRole("status")).not.toHaveTextContent("Execution continues");
   });
 
   it("renders the formatted assignment as sections and lists without hiding literal brief text", () => {

@@ -29,9 +29,10 @@ function HandoffContent({
 }
 
 export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGateRecordDto | undefined }) {
+  const runtime = step.runtimeActivity;
   const outputPlaceholder =
     step.status === "Running"
-      ? "Agent is reasoning, acting, and observing..."
+      ? "Awaiting an observed response; see execution activity."
       : "This handoff has not started.";
 
   return (
@@ -76,6 +77,38 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
         )}
       </div>
       <p className="muted">{step.modelReason || step.inputSummary || "Waiting for Team Lead selection."}</p>
+      <section className="callout" aria-label="Execution activity" style={{ marginTop: 14 }}>
+        <strong>Execution activity</strong>
+        {runtime ? (
+          <>
+            {runtime.softWarning && (
+              <p role="status">Soft elapsed-time limit reached. {step.status === "Running" && !runtime.terminationReason
+                ? "Execution continues within its absolute budget."
+                : "This warning did not terminate execution."}</p>
+            )}
+            <div className="runtime-line">
+              <small>Last structured activity</small>
+              <span>{runtime.lastStructuredEvent ?? "Unavailable"}{runtime.lastStructuredActivityAt
+                ? ` · ${new Date(runtime.lastStructuredActivityAt).toLocaleString()}` : ""}</span>
+            </div>
+            <div className="runtime-line">
+              <small>Active tool</small>
+              <span>{runtime.activeTool ?? (runtime.completedToolCount === null ? "Unavailable" : "None observed active")}
+                {runtime.activeToolElapsedMilliseconds !== null
+                  ? ` · ${runtime.activeToolElapsedMilliseconds === 0 ? "0s" : formatDuration(runtime.activeToolElapsedMilliseconds)}` : ""}</span>
+            </div>
+            <div className="runtime-line"><small>Completed tools this invocation</small><span>{runtime.completedToolCount ?? "Unavailable"}</span></div>
+            <div className="runtime-line"><small>Assignment elapsed (including downtime)</small><span>{runtime.totalElapsedMilliseconds === 0 ? "0s" : formatDuration(runtime.totalElapsedMilliseconds)}</span></div>
+            <div className="runtime-line"><small>Remaining absolute budget</small><span>{runtime.remainingBudgetMilliseconds === 0 ? "0s" : formatDuration(runtime.remainingBudgetMilliseconds)}</span></div>
+            <div className="runtime-line"><small>Assignment deadline</small><span>{new Date(runtime.budgetDeadlineAt).toLocaleString()}</span></div>
+            <div className="runtime-line">
+              <small>Raw stdout/stderr activity (not progress)</small>
+              <span>{runtime.lastRawOutputAt ? new Date(runtime.lastRawOutputAt).toLocaleString() : "Unavailable"}</span>
+            </div>
+            {runtime.terminationReason && <p>Termination reason: {statusLabel(runtime.terminationReason)}</p>}
+          </>
+        ) : <p className="muted">Runtime activity is unavailable for this attempt.</p>}
+      </section>
       {step.routing && (
         <section className="callout" aria-label="Routing decision" style={{ marginTop: 14 }}>
           <strong>
@@ -146,6 +179,12 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
         <details className="operator-details">
           <summary>Effective permission policy</summary>
           <pre>{step.effectivePermissionJson}</pre>
+        </details>
+      )}
+      {step.executionPolicyJson && (
+        <details className="operator-details">
+          <summary>Persisted execution policy</summary>
+          <pre>{step.executionPolicyJson}</pre>
         </details>
       )}
       {gate && (

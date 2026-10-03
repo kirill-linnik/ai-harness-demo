@@ -33,7 +33,8 @@ public enum AgentRunPhase
     Failed,
     TimedOut,
     Stalled,
-    CanceledByReconciliation
+    CanceledByReconciliation,
+    BudgetExhausted
 }
 
 public sealed record AgentRunProgress(
@@ -41,7 +42,30 @@ public sealed record AgentRunProgress(
     string Activity,
     string? ExecutionPrompt = null,
     Guid? CopilotSessionId = null,
-    string? CopilotSessionHome = null);
+    string? CopilotSessionHome = null,
+    AgentRuntimeActivity? RuntimeActivity = null);
+
+public sealed record AgentExecutionPolicy(
+    int InactivityTimeoutMs,
+    int SilentToolTimeoutMs,
+    int SoftWarningMs,
+    int ExecutionBudgetMs,
+    string WorkflowRevision);
+
+public sealed record AgentRuntimeActivity(
+    DateTimeOffset ObservedAt,
+    DateTimeOffset? LastRawOutputAt,
+    string? LastStructuredEvent,
+    DateTimeOffset? LastStructuredActivityAt,
+    string? ActiveTool,
+    DateTimeOffset? ActiveToolStartedAt,
+    long? ActiveToolElapsedMilliseconds,
+    int? CompletedToolCount,
+    long TotalElapsedMilliseconds,
+    long RemainingBudgetMilliseconds,
+    DateTimeOffset BudgetDeadlineAt,
+    bool SoftWarning,
+    string? TerminationReason);
 
 public sealed class AgentRunResult
 {
@@ -100,7 +124,8 @@ public enum AgentRunFailureKind
     Stalled,
     InvalidOutput,
     Cancelled,
-    AmbiguousCrash
+    AmbiguousCrash,
+    BudgetExhausted
 }
 
 public sealed record ReasoningHostConfig(string RuntimeName);

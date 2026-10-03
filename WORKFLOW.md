@@ -25,9 +25,10 @@ agent:
   max_retry_backoff_ms: 3000
 copilot:
   command: copilot
-  turn_timeout_ms: 3600000
-  stall_timeout_ms: 300000
-  maximum_quality_stall_timeout_ms: 1800000
+  inactivity_timeout_ms: 300000
+  silent_tool_timeout_ms: 1800000
+  soft_warning_ms: 3600000
+  execution_budget_ms: 14400000
 studio:
   planning:
     max_steps: 12

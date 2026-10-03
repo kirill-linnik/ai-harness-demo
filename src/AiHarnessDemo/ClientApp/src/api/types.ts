@@ -63,7 +63,8 @@ export type AgentRunPhase =
   | "Failed"
   | "TimedOut"
   | "Stalled"
-  | "CanceledByReconciliation";
+  | "CanceledByReconciliation"
+  | "BudgetExhausted";
 
 export type HandoffActionType =
   | "Advance"
@@ -253,6 +254,24 @@ export interface FlowStepDto {
   completedAt: string | null;
   durationMilliseconds: number;
   toolCalls: AgentToolCallDto[];
+  runtimeActivity?: AgentRuntimeActivity | null;
+  executionPolicyJson?: string;
+}
+
+export interface AgentRuntimeActivity {
+  observedAt: string;
+  lastRawOutputAt: string | null;
+  lastStructuredEvent: string | null;
+  lastStructuredActivityAt: string | null;
+  activeTool: string | null;
+  activeToolStartedAt: string | null;
+  activeToolElapsedMilliseconds: number | null;
+  completedToolCount: number | null;
+  totalElapsedMilliseconds: number;
+  remainingBudgetMilliseconds: number;
+  budgetDeadlineAt: string;
+  softWarning: boolean;
+  terminationReason: string | null;
 }
 
 export interface LinkedFlowDto {

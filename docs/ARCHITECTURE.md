@@ -394,6 +394,126 @@ correction in the preserved workspace, without repeating completed upstream step
 host execution failures separately from actual agent pushback. Queue and execution claims prevent
 two workers from running the same flow concurrently.
 
+## Execution timeout policy and activity
+
+Studio borrows the distinctions in the current
+[OpenAI Symphony specification](https://github.com/openai/symphony/blob/main/SPEC.md):
+section 10.6 defines `codex.turn_timeout_ms` as resettable stream silence, section 8.5 uses event
+inactivity, section 10.4 describes structured events, and section 7.1 distinguishes clean
+same-thread continuation from worker exit. Studio still uses **Copilot CLI**, not Codex app-server,
+and does not claim Symphony conformance. Studio's old `copilot.turn_timeout_ms` was a per-process
+total-runtime cap; it was not Symphony's stream-silence timeout.
+
+The strict `copilot` mapping in `WORKFLOW.md` now defines these independent millisecond settings:
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `inactivity_timeout_ms` | `300000` (5 minutes) | Stop a process with no recognized structured activity. Always positive; never disabled by diagnostic noise. |
+| `silent_tool_timeout_ms` | `1800000` (30 minutes) | A correlated tool start permits silence until this interval from its observed start. It does not grant unlimited protection. |
+| `soft_warning_ms` | `3600000` (1 hour) | Persist one operator-visible warning per assignment; **do not terminate**. |
+| `execution_budget_ms` | `14400000` (4 hours) | Finite absolute assignment deadline, including retry delays and downtime. No fresh budget per process. |
+
+All values must be positive, `inactivity_timeout_ms <= silent_tool_timeout_ms <= execution_budget_ms`,
+and `soft_warning_ms < execution_budget_ms`. Unknown or case-mismatched `copilot` keys fail closed.
+Model quality and latency forecasts no longer infer watchdog extensions. Choose explicit limits
+for the workload; increase the configured budget for **future assignments** when four hours is
+insufficient.
+
+### Explicit migration
+
+Replace all three legacy keys; their presence now rejects the current file with an actionable
+migration error, even if the new settings are also present. There is no compatibility alias or
+silent reinterpretation:
+
+```yaml
+copilot:
+  command: copilot
+  inactivity_timeout_ms: 300000
+  silent_tool_timeout_ms: 1800000
+  soft_warning_ms: 3600000
+  execution_budget_ms: 14400000
+```
+
+For this repository, the previous `turn_timeout_ms: 3600000` is deliberately replaced by a
+one-hour **warning**, not a termination point. `stall_timeout_ms: 300000` becomes the explicit
+structured-inactivity interval; `maximum_quality_stall_timeout_ms: 1800000` is removed and a
+30-minute allowance is configured for trustworthy silent tool lifecycles instead. The new
+four-hour absolute deadline is a separate policy decision. Restart Studio on the new binaries
+after migrating; an older running binary cannot enforce this contract.
+
+`DatabaseInitializer` upgrades existing SQLite ledgers idempotently. At first execution under
+the new policy, an older assignment without a budget is bound to its **earliest known persisted
+step start** (including causal retries), not the migration or resume time. If no prior start
+was recorded, it starts when the budget is first bound; unavailable historical consumption is
+not fabricated. An old assignment already beyond its newly explicit budget fails with
+`BudgetExhausted`, rather than receiving another full allowance.
+
+### Durable assignment boundary
+
+`AgentExecutionBudgets` stores the assignment's semantic root and agent identity, first start,
+absolute UTC deadline, warning timestamp, and exact policy/revision through `HarnessDbContext`.
+Each `FlowStep` binds that root and its serialized policy before dispatch. Runtime retries,
+confirmed-session resumes, manual restarts, response corrections, and application recovery reuse
+that deadline. A distinct new semantic root (for example a new planned assignment or iteration)
+gets a distinct budget; selecting a different model or changing session identity does not reset
+the old assignment. The elapsed and remaining values refer to this wall-clock assignment window,
+not CPU time or an estimate of work completed. Downtime and retry backoff intentionally consume
+it. The running monitor also uses a monotonic clock, so a local clock rollback cannot replenish
+an active process's allowance; persisted deadlines assume the host's UTC clock remains accurate.
+
+Reload affects future assignments. An already bound assignment keeps its timeout policy, and
+an interrupted attempt keeps its exact prompt, revision, and effective permission ceiling.
+The existing permission resolver may only preserve or tighten authority on a retry.
+Invalid reloads still block admission while already admitted recovery retains the last valid
+definition. No agent-definition changes or additional execution backend are involved.
+
+`BudgetExhausted` is a distinct failure kind and phase, excluded from automatic runtime retry and
+confirmed-session auto-resume predicates. The failed-flow restart API returns a typed lifecycle
+conflict when no budget remains. Operators should inspect preserved edits and scope any remaining
+work as a distinct assignment/flow; there is no budget-extension control. A current contract-valid
+completed handoff can still be recovered without running the agent again. Cancellation, the
+60-second completed-handoff shutdown grace, owned process-tree termination, isolated workspaces,
+and ordinary handoff/QA validation remain separate controls. Timeouts never roll back edits.
+Per-session host serialization and active-session journal checks prevent concurrent resumes.
+
+### Activity signals and limits
+
+The Copilot CLI `--output-format json` emits JSONL. The installed CLI was inspected as version
+`1.0.91`; its session journal and the
+[Copilot runtime event definitions](https://github.com/github/copilot-sdk/blob/main/nodejs/src/generated/session-events.ts)
+include assistant message/turn events, reasoning deltas, correlated `tool.execution_start`,
+`tool.execution_complete`, and tool progress/partial-result events. Availability varies by CLI
+version and output mode. Studio recognizes these existing signals and incrementally tails only
+the workspace-bound session's `session-state\<session-id>\events.jsonl` as a supplement to stdout.
+It skips pre-resume history, waits for complete lines, and deduplicates tool lifecycles shared
+by stdout and journal. Missing/unreadable journals do not disable the watchdog; access failures
+are logged and stdout remains usable.
+
+Raw stdout/stderr line arrival is tracked separately and **never** resets structured inactivity.
+Unknown events, ordinary logs, usage/info chatter, malformed JSON, unsafe tool names, and
+uncorrelated tool progress do not prove work. `assistant.message` is activity, not completion.
+An identified start grants a bounded silent allowance; completion removes it, duplicate starts
+do not renew it, and concurrent tools use the oldest still-active start. Subsequent genuine
+structured events may renew the normal inactivity interval, but every execution still shares
+the finite absolute deadline. There is no progress score or repetition-based termination.
+
+`FlowStep.RuntimeActivityJson` and the flow-detail API expose host-observed timestamps, last
+recognized event type, oldest active tool name/start/duration, completed-tool count for the current
+process invocation (including observed subagent tools), assignment elapsed/remaining time, deadline,
+soft-warning state, and termination reason. Timestamps are **host observations**, not claims about
+agent progress. Tool arguments, reasoning/message content, and tool output are not included in
+these activity snapshots. Fields without trustworthy signals remain null and the UI says
+**Unavailable**; no tool lifecycle signals means no completed-tool count, rather than a fabricated
+zero. Snapshots update at most once per ten seconds, plus immediate warning/termination and final
+updates. The ledger records policy binding, the one-time warning, sampled tool-state transitions,
+and termination, not every output line. The flow page shows activity separately from the response
+and the persisted policy separately from permission policy.
+
+Repository initialization remains a bounded one-off CLI command. Repository knowledge study is
+not a resumable flow assignment: its bounded response-correction loop shares one in-memory deadline,
+and an explicit new study operation starts a new assignment. Durable workflow execution budgets
+apply to Studio's persisted `FlowStep` assignments.
+
 ## Permission ceilings
 
 `PermissionProfileResolver` derives the requested profile from the host-owned invocation kind, flow

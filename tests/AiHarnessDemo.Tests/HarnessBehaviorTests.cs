@@ -448,26 +448,21 @@ public sealed class PreviewArtifactCatalogTests
 public sealed class CopilotReasoningHostTests
 {
     [Fact]
-    public void ExecutionTimeouts_GiveMaximumQualityALongerQuietWindow()
+    public void ExecutionPolicy_IsExplicitAndIndependentOfModelForecasts()
     {
         var config = new CopilotConfig
         {
-            TurnTimeoutMs = 1_200_000,
-            StallTimeoutMs = 300_000,
-            MaximumQualityStallTimeoutMs = 900_000
+            ExecutionBudgetMs = 14_400_000,
+            InactivityTimeoutMs = 300_000,
+            SilentToolTimeoutMs = 1_800_000,
+            SoftWarningMs = 3_600_000
         };
 
-        var quality = CopilotReasoningHost.ResolveExecutionTimeouts(
-            config,
-            ModelSelectionStrategy.MaximumQuality,
-            expectedAcceptedTimeSeconds: 400);
-        var fastest = CopilotReasoningHost.ResolveExecutionTimeouts(
-            config,
-            ModelSelectionStrategy.FastestResponse);
-
-        Assert.Equal(TimeSpan.FromMinutes(10), quality.StallTimeout);
-        Assert.Equal(TimeSpan.FromMinutes(5), fastest.StallTimeout);
-        Assert.Equal(TimeSpan.FromMinutes(20), quality.TurnTimeout);
+        var policy = AssignmentExecutionBudget.Policy(config, "revision");
+        Assert.Equal(300_000, policy.InactivityTimeoutMs);
+        Assert.Equal(1_800_000, policy.SilentToolTimeoutMs);
+        Assert.Equal(3_600_000, policy.SoftWarningMs);
+        Assert.Equal(14_400_000, policy.ExecutionBudgetMs);
     }
 
     [Theory]
@@ -1568,6 +1563,7 @@ public sealed class AgentRunnerRecoveryTests
     [InlineData(AgentRunFailureKind.TimedOut, true, true)]
     [InlineData(AgentRunFailureKind.Stalled, false, false)]
     [InlineData(AgentRunFailureKind.Transient, true, false)]
+    [InlineData(AgentRunFailureKind.BudgetExhausted, true, false)]
     public void ResumeRequiresAnInterruptedMaterializedSession(
         AgentRunFailureKind failureKind,
         bool canResume,

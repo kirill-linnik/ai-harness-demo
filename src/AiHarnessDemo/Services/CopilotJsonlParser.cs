@@ -358,7 +358,7 @@ public static partial class CopilotJsonlParser
                     {
                         // A message can request another tool call. It proves the turn is active,
                         // but only the terminal result event means the CLI is finishing.
-                        ReportStreaming("Agent response received.");
+                        ReportStreaming("Assistant message observed; execution continues.");
                     }
                     return;
                 }
@@ -375,9 +375,7 @@ public static partial class CopilotJsonlParser
                 {
                     report(new AgentRunProgress(
                         AgentRunPhase.Failed,
-                        ReadString(payload, "message") is { Length: > 0 } message
-                            ? $"Copilot CLI session failed: {message}"
-                            : "Copilot CLI session failed."));
+                        "Copilot CLI reported a session failure."));
                 }
             }
         };

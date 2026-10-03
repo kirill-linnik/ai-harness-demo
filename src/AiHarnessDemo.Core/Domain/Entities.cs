@@ -388,6 +388,12 @@ public sealed class FlowStep
 
     public string WorkflowRevision { get; set; } = string.Empty;
 
+    public Guid? ExecutionBudgetRootId { get; set; }
+
+    public string ExecutionPolicyJson { get; set; } = string.Empty;
+
+    public string RuntimeActivityJson { get; set; } = string.Empty;
+
     public Guid? StableSemanticRootId { get; set; }
 
     public string Model { get; set; } = string.Empty;
@@ -439,6 +445,23 @@ public sealed class FlowStep
     public List<AgentToolCall> ToolCalls { get; set; } = [];
 
     public List<RoutingDecision> RoutingDecisions { get; set; } = [];
+}
+
+public sealed class AgentExecutionBudget
+{
+    public Guid RootStepId { get; set; }
+
+    public Guid FlowRunId { get; set; }
+
+    public required string AgentId { get; set; }
+
+    public DateTimeOffset StartedAt { get; set; }
+
+    public DateTimeOffset DeadlineAt { get; set; }
+
+    public DateTimeOffset? SoftWarningAt { get; set; }
+
+    public required string PolicyJson { get; set; }
 }
 
 /// <summary>Normalized routing input. Task text and repository content are deliberately excluded.</summary>

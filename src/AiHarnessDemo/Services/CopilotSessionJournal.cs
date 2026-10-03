@@ -948,7 +948,7 @@ public sealed class CopilotSessionJournal
             ? parsed
             : null;
 
-    private static bool PathEquals(string left, string right)
+    internal static bool PathEquals(string left, string right)
     {
         if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
         {

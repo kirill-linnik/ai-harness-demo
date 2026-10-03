@@ -1944,9 +1944,10 @@ public sealed class BlockerPromotionTests
               max_attempts: 1
             copilot:
               command: copilot
-              turn_timeout_ms: 120000
-              stall_timeout_ms: 30000
-              maximum_quality_stall_timeout_ms: 30000
+              execution_budget_ms: 120000
+              soft_warning_ms: 60000
+              inactivity_timeout_ms: 30000
+              silent_tool_timeout_ms: 30000
             studio:
               planning:
                 max_steps: 24

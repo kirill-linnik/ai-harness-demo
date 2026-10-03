@@ -30,6 +30,11 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
   evidence.
 - **Durable orchestration** — plans, attempts, sessions, permissions, events, reviews, links,
   learnings, readiness, and publication state survive restart and remain visible in the dashboard.
+- **Recorded customer dialogue** — every flow page includes a read-only **Customer dialogue**
+  section with expandable, timestamped text messages, including the original customer message,
+  including Account Manager clarifications, customer confirmation, later refinements, and uploaded
+  filenames. The conversation remains available after intake finishes; it does not restart intake
+  or reconstruct missing history from agent handoffs.
 - **Bounded agent context** — working prompts stay within 32 KiB of UTF-8; complete larger
   handoffs and evidence remain available through durable, searchable context documents. Invalid
   QA responses receive a read-only correction without discarding completed work.
@@ -97,6 +102,12 @@ Different flows may run concurrently; steps inside one flow remain sequential.
 
 These are strong controls for a trusted host, not kernel-level sandboxing against a hostile
 same-user process.
+
+Execution now separates structured inactivity (five minutes), bounded silent tools (30 minutes),
+a non-terminating one-hour warning, and a finite four-hour assignment budget shared across retries
+and restarts. The flow page exposes safe observed activity, remaining budget, and termination
+reasons. Legacy timeout keys require explicit migration; see
+[`docs\ARCHITECTURE.md`](docs/ARCHITECTURE.md#execution-timeout-policy-and-activity).
 
 ## Agents
 

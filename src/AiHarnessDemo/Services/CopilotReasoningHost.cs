@@ -8,6 +8,7 @@ using AiHarnessDemo.Core.Workflow;
 using AiHarnessDemo.Data;
 using Microsoft.EntityFrameworkCore;
 using System.Collections.Immutable;
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -36,6 +37,7 @@ public sealed partial class CopilotReasoningHost(
     : ReasoningHost(new ReasoningHostConfig("copilot-cli"))
 {
     private const int MaximumPromptCharacters = 16_000;
+    private static readonly ConcurrentDictionary<Guid, SemaphoreSlim> SessionLocks = new();
     internal const int MaximumInlinePromptCharacters = 8_192;
     internal const int MaximumProcessCommandLineCharacters = 30_000;
     internal const int MaximumPlanningRosterCharacters =
@@ -215,10 +217,17 @@ public sealed partial class CopilotReasoningHost(
         // finally block must best-effort re-resolve it before deciding whether
         // the after_run hook may run.
         WorkspaceHookPolicy? hookPolicy = null;
+        SemaphoreSlim? sessionLock = null;
+        var sessionLockHeld = false;
         try
         {
             context = RequireContext(request);
             workflow = workflowProvider.GetEffective();
+            sessionLock = SessionLocks.GetOrAdd(request.CopilotSessionId, _ => new SemaphoreSlim(1, 1));
+            await sessionLock.WaitAsync(cancellationToken);
+            sessionLockHeld = true;
+            var budget = await AssignmentExecutionBudget.ResolveAsync(
+                context, workflow, databaseFactory, cancellationToken);
             var recoveredInstructions =
                 context.RecoverInterruptedSession
                     ? await LoadPersistedExecutionInstructionsAsync(
@@ -227,6 +236,28 @@ public sealed partial class CopilotReasoningHost(
                         cancellationToken)
                     : null;
             copilotSessionHome = ResolveCopilotSessionHome();
+            var existingSession = await sessionJournal.InspectAsync(
+                copilotSessionHome, request.CopilotSessionId, cancellationToken);
+            if (existingSession.State == CopilotSessionJournalState.Active)
+            {
+                return Failure("Copilot session is still active.",
+                    "Concurrent execution was refused. Reconcile the owned session before launching or resuming.",
+                    AgentRunFailureKind.InvalidOutput);
+            }
+            if (budget.DeadlineAt <= DateTimeOffset.UtcNow)
+            {
+                var exhaustedMonitor = new AgentExecutionMonitor(budget);
+                await AssignmentExecutionBudget.RecordActivityAsync(context,
+                    exhaustedMonitor.Tick(force: true)!, databaseFactory);
+                if (context.RecoverInterruptedSession)
+                {
+                    return await RecoverInterruptedProcessAsync(context, request, copilotSessionHome,
+                        "Assignment execution budget exhausted.", AssignmentExecutionBudget.ExhaustedReason,
+                        AgentRunFailureKind.BudgetExhausted);
+                }
+                return Failure("Assignment execution budget exhausted.",
+                    AssignmentExecutionBudget.ExhaustedReason, AgentRunFailureKind.BudgetExhausted);
+            }
             runWorkspaceHooks = ShouldRunWorkspaceHooks(
                 context.InvocationKind);
             hookPolicy = await ResolveWorkspaceHookPolicyAsync(
@@ -383,10 +414,16 @@ public sealed partial class CopilotReasoningHost(
                     $"The Copilot CLI command line requires {commandLineCharacters} characters, " +
                     $"exceeding the host limit of {MaximumProcessCommandLineCharacters}.");
             }
-            var timeouts = ResolveExecutionTimeouts(
-                workflow.Config.Copilot,
-                context.ModelSelectionStrategy,
-                context.ExpectedAcceptedTimeSeconds);
+            var executionPolicy = AssignmentExecutionBudget.ReadPolicy(budget);
+            var executionMonitor = new AgentExecutionMonitor(budget)
+            {
+                Report = activity => AssignmentExecutionBudget.RecordActivityAsync(
+                    context, activity, databaseFactory).GetAwaiter().GetResult()
+            };
+            await using var activityJournal = new CopilotActivityJournal(
+                copilotSessionHome, request.CopilotSessionId, request.WorkingDirectory,
+                executionMonitor, logger);
+            executionMonitor.PollActivityAsync = activityJournal.PollAsync;
             using var handoffWatchdog = new CopilotHandoffWatchdog(
                 output => IsRecoverableCompletedOutput(
                     context.AgentRole,
@@ -416,8 +453,10 @@ public sealed partial class CopilotReasoningHost(
                 request.Progress?.Invoke(new AgentRunProgress(
                     AgentRunPhase.LaunchingAgentProcess,
                     $"Launching Copilot CLI {copilotCli.Version} with {request.Model}/{request.Effort}; " +
-                    $"{timeouts.StallTimeout.TotalMinutes:0.#}-minute quiet watchdog and " +
-                    $"{timeouts.TurnTimeout.TotalMinutes:0.#}-minute hard limit."));
+                    $"{executionPolicy.InactivityTimeoutMs / 60_000d:0.#}-minute structured inactivity watchdog, " +
+                    $"{executionPolicy.SilentToolTimeoutMs / 60_000d:0.#}-minute bounded silent-tool allowance; " +
+                    $"soft warning at {executionPolicy.SoftWarningMs / 60_000d:0.#} minutes, " +
+                    $"assignment deadline {budget.DeadlineAt:O}."));
                 // Once a process can observe the staged root, retain the entire session-owned
                 // context until the result is conclusive. Interrupted and still-active sessions
                 // need the same agent definition and prompt/seed bytes for a safe resume.
@@ -426,15 +465,15 @@ public sealed partial class CopilotReasoningHost(
                     copilotCli.ResolvedPath,
                     arguments,
                     request.WorkingDirectory,
-                    timeouts.TurnTimeout,
+                    budget.DeadlineAt - DateTimeOffset.UtcNow,
                     handoffWatchdog.Token,
                     line =>
                     {
                         handoffWatchdog.Observe(line);
                         reportProgress(line);
                     },
-                    timeouts.StallTimeout,
-                    environmentVariables);
+                    environmentVariables: environmentVariables,
+                    executionMonitor: executionMonitor);
                 retainStagedContextForRecovery = false;
             }
             catch (OperationCanceledException) when (
@@ -469,6 +508,15 @@ public sealed partial class CopilotReasoningHost(
                      recovered.ProcessTerminationUnconfirmed);
                 return recovered;
             }
+            catch (ProcessBudgetExhaustedException exception)
+            {
+                var recovered = await RecoverInterruptedProcessAsync(
+                    context, request, copilotSessionHome,
+                    "Assignment execution budget exhausted.", exception.Message,
+                    AgentRunFailureKind.BudgetExhausted);
+                retainStagedContextForRecovery = recovered.ProcessTerminationUnconfirmed;
+                return recovered;
+            }
             catch (TimeoutException exception)
             {
                 var recovered = await RecoverInterruptedProcessAsync(
@@ -499,6 +547,14 @@ public sealed partial class CopilotReasoningHost(
                     "A required pre-run workspace hook failed.",
                     exception.Message,
                     AgentRunFailureKind.Transient);
+            }
+            finally
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    executionMonitor.Terminate(nameof(AgentRunFailureKind.Cancelled));
+                }
+                executionMonitor.Report?.Invoke(executionMonitor.Snapshot());
             }
 
             governedGitIsolation?.RestoreAndValidate();
@@ -588,14 +644,21 @@ public sealed partial class CopilotReasoningHost(
                     }
                     finally
                     {
-                        if (stagedAgentAccess is not null &&
-                            copilotSessionHome is not null &&
-                            !retainStagedContextForRecovery)
+                        try
                         {
-                            manifestStager.CleanupSessionRoot(
-                                copilotSessionHome,
-                                request.CopilotSessionId,
-                                stagedAgentAccess.Root);
+                            if (stagedAgentAccess is not null &&
+                                copilotSessionHome is not null &&
+                                !retainStagedContextForRecovery)
+                            {
+                                manifestStager.CleanupSessionRoot(
+                                    copilotSessionHome,
+                                    request.CopilotSessionId,
+                                    stagedAgentAccess.Root);
+                            }
+                        }
+                        finally
+                        {
+                            if (sessionLockHeld) { sessionLock!.Release(); }
                         }
                     }
                 }
@@ -1496,29 +1559,6 @@ public sealed partial class CopilotReasoningHost(
         context.RequiresDeliveryReadinessQa ||
         context.InvocationKind == ExecutionInvocationKind.Planning;
 
-    internal static CopilotExecutionTimeouts ResolveExecutionTimeouts(
-        CopilotConfig config,
-        ModelSelectionStrategy strategy,
-        double expectedAcceptedTimeSeconds = 0)
-    {
-        var stallTimeoutMs = config.StallTimeoutMs;
-        if (strategy == ModelSelectionStrategy.MaximumQuality)
-        {
-            var predictedQuietWindowMs = double.IsFinite(expectedAcceptedTimeSeconds) &&
-                                         expectedAcceptedTimeSeconds > 0
-                ? expectedAcceptedTimeSeconds * 1_500
-                : config.MaximumQualityStallTimeoutMs;
-            stallTimeoutMs = (int)Math.Clamp(
-                predictedQuietWindowMs,
-                config.StallTimeoutMs,
-                config.MaximumQualityStallTimeoutMs);
-        }
-
-        return new CopilotExecutionTimeouts(
-            TimeSpan.FromMilliseconds(config.TurnTimeoutMs),
-            TimeSpan.FromMilliseconds(stallTimeoutMs));
-    }
-
     private async Task<AgentRunResult> RecoverInterruptedProcessAsync(
         AgentExecutionContext context,
         AgentRunRequest request,
@@ -1592,6 +1632,7 @@ public sealed partial class CopilotReasoningHost(
             error,
             failureKind,
             canResumeSession:
+                failureKind != AgentRunFailureKind.BudgetExhausted &&
                 snapshot.State ==
                 CopilotSessionJournalState.Interrupted,
             processTerminationUnconfirmed:
@@ -2325,10 +2366,6 @@ public sealed partial class CopilotReasoningHost(
             ProcessTerminationUnconfirmed =
                 processTerminationUnconfirmed
         };
-
-    internal sealed record CopilotExecutionTimeouts(
-        TimeSpan TurnTimeout,
-        TimeSpan StallTimeout);
 
     internal sealed record RestrictedAgentAccess(
         string Root,

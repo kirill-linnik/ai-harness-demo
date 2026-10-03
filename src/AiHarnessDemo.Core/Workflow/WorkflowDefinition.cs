@@ -163,19 +163,21 @@ public sealed class CopilotConfig
 {
     public string Command { get; set; } = "copilot";
 
-    public int TurnTimeoutMs { get; set; } = 1_200_000;
+    public int InactivityTimeoutMs { get; set; } = 300_000;
 
-    public int StallTimeoutMs { get; set; } = 300_000;
+    public int SilentToolTimeoutMs { get; set; } = 1_800_000;
 
-    public int MaximumQualityStallTimeoutMs { get; set; } = 900_000;
+    public int SoftWarningMs { get; set; } = 3_600_000;
+
+    public int ExecutionBudgetMs { get; set; } = 14_400_000;
 }
 
 public sealed class WorkflowConfigurationException(string message, Exception? innerException = null)
     : Exception(message, innerException);
 
 /// <summary>
-/// Symphony-compatible WORKFLOW.md loader: Markdown prompt body, YAML front matter, typed defaults,
-/// environment/path resolution, forward-compatible unknown keys, and fail-closed validation.
+/// Studio WORKFLOW.md loader: Markdown prompt body, typed defaults, strict Copilot and Studio keys,
+/// environment/path resolution, and fail-closed validation.
 /// </summary>
 public sealed class WorkflowLoader
 {
@@ -262,6 +264,27 @@ public sealed class WorkflowLoader
         {
             throw new WorkflowConfigurationException(
                 "Symphony workflow front matter must be a YAML mapping.");
+        }
+        if (TryGet(root, "copilot", out var copilotNode))
+        {
+            var copilot = RequireMapping(copilotNode, "copilot");
+            foreach (var legacyKey in new[]
+                     {
+                         "turn_timeout_ms", "stall_timeout_ms",
+                         "maximum_quality_stall_timeout_ms"
+                     })
+            {
+                if (TryGet(copilot, legacyKey, out _))
+                {
+                    throw new WorkflowConfigurationException(
+                        $"copilot.{legacyKey} is a legacy timeout setting. Explicitly migrate to " +
+                        "inactivity_timeout_ms, silent_tool_timeout_ms, soft_warning_ms and " +
+                        "execution_budget_ms; turn_timeout_ms is not reinterpreted. " +
+                        "See docs\\ARCHITECTURE.md.");
+                }
+            }
+            RejectUnknown(copilot, "copilot", "command", "inactivity_timeout_ms",
+                "silent_tool_timeout_ms", "soft_warning_ms", "execution_budget_ms");
         }
         if (!TryGet(root, "studio", out var studioNode))
         {
@@ -494,22 +517,15 @@ public sealed class WorkflowLoader
         {
             throw new WorkflowConfigurationException("copilot.command is required.");
         }
-        if (config.Copilot.TurnTimeoutMs <= 0)
-        {
-            throw new WorkflowConfigurationException("copilot.turn_timeout_ms must be positive.");
-        }
-        if (config.Copilot.StallTimeoutMs <= 0 ||
-            config.Copilot.StallTimeoutMs > config.Copilot.TurnTimeoutMs)
-        {
-            throw new WorkflowConfigurationException(
-                "copilot.stall_timeout_ms must be positive and cannot exceed turn_timeout_ms.");
-        }
-        if (config.Copilot.MaximumQualityStallTimeoutMs <= 0 ||
-            config.Copilot.MaximumQualityStallTimeoutMs < config.Copilot.StallTimeoutMs ||
-            config.Copilot.MaximumQualityStallTimeoutMs > config.Copilot.TurnTimeoutMs)
+        if (config.Copilot.InactivityTimeoutMs <= 0 ||
+            config.Copilot.SilentToolTimeoutMs < config.Copilot.InactivityTimeoutMs ||
+            config.Copilot.SoftWarningMs <= 0 ||
+            config.Copilot.ExecutionBudgetMs <= config.Copilot.SoftWarningMs ||
+            config.Copilot.SilentToolTimeoutMs > config.Copilot.ExecutionBudgetMs)
         {
             throw new WorkflowConfigurationException(
-                "copilot.maximum_quality_stall_timeout_ms cannot be smaller than stall_timeout_ms or exceed turn_timeout_ms.");
+                "Copilot timeouts must be positive: inactivity_timeout_ms <= silent_tool_timeout_ms " +
+                "<= execution_budget_ms, and soft_warning_ms < execution_budget_ms.");
         }
         ValidateStudio(config.Studio);
         if (string.IsNullOrWhiteSpace(prompt))

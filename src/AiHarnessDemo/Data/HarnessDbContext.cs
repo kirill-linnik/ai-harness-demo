@@ -19,6 +19,8 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
 
     public DbSet<FlowStep> FlowSteps => Set<FlowStep>();
 
+    public DbSet<AgentExecutionBudget> AgentExecutionBudgets => Set<AgentExecutionBudget>();
+
     public DbSet<FlowMessage> FlowMessages => Set<FlowMessage>();
 
     public DbSet<FlowAttachment> FlowAttachments => Set<FlowAttachment>();
@@ -142,6 +144,8 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
                 .HasConversion<string>();
             entity.Property(item => item.EffectivePermissionJson).HasDefaultValue(string.Empty);
             entity.Property(item => item.WorkflowRevision).HasDefaultValue(string.Empty);
+            entity.Property(item => item.ExecutionPolicyJson).HasDefaultValue(string.Empty);
+            entity.Property(item => item.RuntimeActivityJson).HasDefaultValue(string.Empty);
             entity.Property(item => item.RemotePublicationAllowed).HasDefaultValue(false);
             entity.HasIndex(item => new { item.FlowRunId, item.Iteration, item.Sequence });
             entity.HasIndex(item => item.RetryOfStepId);
@@ -155,6 +159,13 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
             entity.HasOne(item => item.FlowRun)
                 .WithMany(flow => flow.Steps)
                 .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<AgentExecutionBudget>(entity =>
+        {
+            entity.HasKey(item => new { item.RootStepId, item.AgentId });
+            entity.HasOne<FlowRun>().WithMany().HasForeignKey(item => item.FlowRunId)
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
@@ -545,6 +556,7 @@ public static class DatabaseInitializer
         await using var database = await factory.CreateDbContextAsync();
 
         await database.Database.EnsureCreatedAsync();
+        await EnsureExecutionBudgetSchemaAsync(database);
         await EnsureReviewedPreviewArtifactSchemaAsync(database);
         await EnsureFlowAttachmentSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
@@ -564,6 +576,50 @@ public static class DatabaseInitializer
         await scope.ServiceProvider
             .GetRequiredService<AgentCatalog>()
             .LoadAsync();
+    }
+
+    internal static async Task EnsureExecutionBudgetSchemaAsync(HarnessDbContext database)
+    {
+        await database.Database.ExecuteSqlRawAsync(
+                """
+                CREATE TABLE IF NOT EXISTS "AgentExecutionBudgets" (
+                    "RootStepId" TEXT NOT NULL,
+                    "AgentId" TEXT NOT NULL,
+                    "FlowRunId" TEXT NOT NULL,
+                    "StartedAt" INTEGER NOT NULL,
+                    "DeadlineAt" INTEGER NOT NULL,
+                    "SoftWarningAt" INTEGER NULL,
+                    "PolicyJson" TEXT NOT NULL,
+                    CONSTRAINT "PK_AgentExecutionBudgets" PRIMARY KEY ("RootStepId", "AgentId"),
+                    FOREIGN KEY ("FlowRunId") REFERENCES "Flows" ("Id") ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS "IX_AgentExecutionBudgets_FlowRunId"
+                    ON "AgentExecutionBudgets" ("FlowRunId");
+                """);
+        var connection = database.Database.GetDbConnection();
+        await database.Database.OpenConnectionAsync();
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA table_info('FlowSteps');";
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                columns.Add(reader.GetString(1));
+            }
+        }
+        foreach (var (name, statement) in new[]
+                 {
+                     ("ExecutionBudgetRootId", "ALTER TABLE \"FlowSteps\" ADD COLUMN \"ExecutionBudgetRootId\" TEXT NULL;"),
+                     ("ExecutionPolicyJson", "ALTER TABLE \"FlowSteps\" ADD COLUMN \"ExecutionPolicyJson\" TEXT NOT NULL DEFAULT '';"),
+                     ("RuntimeActivityJson", "ALTER TABLE \"FlowSteps\" ADD COLUMN \"RuntimeActivityJson\" TEXT NOT NULL DEFAULT '';")
+                 })
+        {
+            if (!columns.Contains(name))
+            {
+                await database.Database.ExecuteSqlRawAsync(statement);
+            }
+        }
     }
 
     private static async Task EnsureReviewedPreviewArtifactSchemaAsync(

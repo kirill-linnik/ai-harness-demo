@@ -149,7 +149,7 @@ public sealed class WorkflowDefinitionTests
         Assert.Equal("voice", workflow.Config.Tracker.Kind);
         Assert.Equal(7, workflow.Config.Agent.MaxConcurrentAgents);
         Assert.Equal(2, workflow.Config.Agent.MaxAttempts);
-        Assert.Equal(900_000, workflow.Config.Copilot.MaximumQualityStallTimeoutMs);
+        Assert.Equal(1_800_000, workflow.Config.Copilot.SilentToolTimeoutMs);
         Assert.Equal(
             Path.Combine(artifact.Directory, ".worktrees"),
             workflow.Config.Workspace.ResolvedRoot);

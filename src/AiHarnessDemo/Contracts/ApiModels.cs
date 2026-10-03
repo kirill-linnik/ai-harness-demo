@@ -115,7 +115,9 @@ public sealed record FlowStepDto(
     DateTimeOffset? StartedAt,
     DateTimeOffset? CompletedAt,
     long DurationMilliseconds,
-    IReadOnlyList<AgentToolCallDto> ToolCalls);
+    IReadOnlyList<AgentToolCallDto> ToolCalls,
+    AgentRuntimeActivity? RuntimeActivity = null,
+    string ExecutionPolicyJson = "");
 
 public sealed record FlowMessageDto(
     Guid Id,
@@ -852,7 +854,29 @@ public static class ApiMappings
                     item.ToolName,
                     item.ArgumentsSummary,
                     item.Succeeded))
-                .ToList());
+                .ToList(),
+            ReadRuntimeActivity(step),
+            step.ExecutionPolicyJson);
+    }
+
+    private static AgentRuntimeActivity? ReadRuntimeActivity(FlowStep step)
+    {
+        if (string.IsNullOrWhiteSpace(step.RuntimeActivityJson)) { return null; }
+        var activity = JsonSerializer.Deserialize<AgentRuntimeActivity>(step.RuntimeActivityJson);
+        if (activity is null || step.Status != StepStatus.Running ||
+            activity.TerminationReason is not null)
+        {
+            return activity;
+        }
+        var elapsed = Math.Max(0,
+            (long)(DateTimeOffset.UtcNow - activity.ObservedAt).TotalMilliseconds);
+        return activity with
+        {
+            TotalElapsedMilliseconds = activity.TotalElapsedMilliseconds + elapsed,
+            RemainingBudgetMilliseconds = Math.Max(0, activity.RemainingBudgetMilliseconds - elapsed),
+            ActiveToolElapsedMilliseconds = activity.ActiveToolElapsedMilliseconds is { } duration
+                ? duration + elapsed : null
+        };
     }
 
     public static TaskProfileDto ToDto(this TaskProfile profile) =>

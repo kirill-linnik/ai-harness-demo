@@ -154,7 +154,7 @@ public sealed class RepositoryAnalyzer(
                     copilotCommand,
                     ["init"],
                     repositoryPath,
-                    TimeSpan.FromMilliseconds(workflow.Config.Copilot.TurnTimeoutMs),
+                    TimeSpan.FromMilliseconds(workflow.Config.Copilot.ExecutionBudgetMs),
                     cancellationToken);
 
                 initSucceeded = result.ExitCode == 0;

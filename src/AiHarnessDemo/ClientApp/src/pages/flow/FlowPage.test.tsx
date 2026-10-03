@@ -296,6 +296,64 @@ afterEach(() => {
 });
 
 describe("FlowPage manual restart", () => {
+  it.each(["Running", "Approved", "Abandoned"] as const)(
+    "keeps only the customer dialogue accessible when %s",
+    async status => {
+      const flow: FlowDetailDto = {
+        ...failedFlow(),
+        status,
+        failureReason: "",
+        completedAt: null,
+        messages: [
+          {
+            id: "customer-request",
+            role: "Customer",
+            content: "Please modernize the public site.",
+            isQuestion: false,
+            createdAt: timestamp
+          },
+          {
+            id: "account-manager-reply",
+            role: "AccountManager",
+            content: "Do you confirm this Delivery brief?",
+            isQuestion: true,
+            createdAt: timestamp
+          }
+        ]
+      };
+      vi.spyOn(api, "bootstrap").mockResolvedValue(bootstrap);
+      vi.spyOn(api, "flow").mockResolvedValue(flow);
+      const continueIntake = vi.spyOn(api, "continueIntake");
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false, staleTime: Infinity } }
+      });
+      queryClient.setQueryData(queryKeys.bootstrap, bootstrap);
+      queryClient.setQueryData(queryKeys.flow(flowId), flow);
+
+      render(
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <MemoryRouter initialEntries={[`/factory/${flowId}`]}>
+              <Routes>
+                <Route path="/factory/:id" element={<FlowPage />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>
+        </QueryClientProvider>
+      );
+
+      expect(
+        await screen.findByRole("region", { name: "Customer dialogue" })
+      ).toBeInTheDocument();
+      expect(screen.queryByText("Original customer request")).not.toBeInTheDocument();
+      expect(screen.queryByText(flow.originalRequest)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByText("Recorded dialogue (2 messages)"));
+      expect(screen.getByText("Please modernize the public site.")).toBeVisible();
+      expect(screen.getByText("Do you confirm this Delivery brief?")).toBeVisible();
+      expect(continueIntake).not.toHaveBeenCalled();
+    }
+  );
+
   it("offers guarded recovery for an execution stalled after suspension", async () => {
     const running: FlowDetailDto = {
       ...failedFlow(),
