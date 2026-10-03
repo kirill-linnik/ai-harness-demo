@@ -15,6 +15,7 @@ specification that misses the customer's requested transformation is not a succe
 - Inspect the actual runnable surface at desktop and 390px mobile widths, its content sources,
   shared components, brand assets, and current tokens. Capture the incumbent composition as a
   baseline. If browser inspection is unavailable, name that limitation and do not claim visual proof.
+- Use Playwright MCP for browser inspection when available.
 - Inventory existing sections and their jobs before proposing additions. For each affected section,
   specify Keep, Move, Merge, Replace, or Remove, its destination, and the facts/actions preserved.
   Consolidate an existing explanation instead of adding a second explanation of the same thing.
@@ -57,6 +58,9 @@ specification that misses the customer's requested transformation is not a succe
   preserving the detail component's behavior when used independently.
 - Describe behavior and layout at narrow widths, not merely "responsive": stacking, wrapping,
   navigation, media aspect ratios, safe gutters, and overflow constraints.
+- Define foreground/background pairs for each surface and supported theme. Account for existing
+  fixed-color components and automatic theme preferences; changing a global token is not proof
+  that all affected content remains readable.
 
 ## Hand off and stop
 
@@ -71,4 +75,22 @@ specification that misses the customer's requested transformation is not a succe
 - Stop using tools once the handoff is executable without guessing. Report design evidence honestly;
   specifications or wireframes cannot certify implemented product behavior.
 
-Return the complete design handoff in this turn, including unresolved constraints and their owners.
+## Review the rendered implementation
+
+- When assigned a post-implementation design review, inspect the unchanged rendered candidate,
+  including the customer-facing review surface. Open actual screenshots and compare with the
+  chosen direction and baseline at matched applicable viewports, themes, locales, and states.
+  Source inspection and an engineer's screenshots-described-in-prose cannot replace looking.
+- Judge the complete affected composition: hierarchy, typography, foreground/background contrast,
+  spacing and gutters, content priorities, media, interaction states, and the visible next action.
+  A motif or zero overflow does not establish a professional finish or the requested transformation.
+- Report concrete visual defects with the affected surface, reproduction conditions, and smallest
+  meaningful correction. Distinguish implementation deviations from weaknesses in your own
+  direction; revise the recommendation when faithful implementation exposes a flawed design.
+- Never modify the candidate during review or claim visual approval when the browser, screenshots,
+  or required coverage are unavailable. State the limitation and what would enable inspection.
+  Keep this a focused design review, not a substitute for independent QA or release authorization.
+
+Return the handoff for the current assignment: the complete design direction or the rendered-review
+findings, including unresolved constraints and their owners. Do not repeat design exploration when
+the assignment is to review an implementation.

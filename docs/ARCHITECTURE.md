@@ -355,6 +355,23 @@ inheriting a response-correction turn's temporary read-only policy. Because that
 write candidate bytes, it starts a new evidence epoch and cannot cite observations from before the
 continuation.
 
+MCP connectivity belongs to Copilot CLI, following Symphony's coding-runtime boundary rather
+than embedding browser-specific execution in the orchestrator. `copilot.mcp_config_file` names a
+trusted, workflow-relative native `mcpServers` JSON file. Its exact content contributes to the
+workflow revision; both files reload as one effective definition, and invalid configuration
+blocks new dispatch. Servers declare explicit native `tools` lists because CLI tool exposure is
+name-based rather than a server wildcard. Native server fields, including transport, command,
+arguments, environment, and URL, pass through unchanged; the CLI owns their interpretation.
+
+Delivery workers receive configured server definitions and tool approvals through their persisted
+effective permission document. The host stages that snapshot and uses `--additional-mcp-config`,
+`--available-tools`, and exact `server(tool)` approvals. Corrections drop MCP access; permission
+tightening intersects tools and drops changed server launch definitions rather than replacing
+them with broader ones. Old permission documents without MCP definitions retain no MCP access.
+The normal JSONL tool-call pipeline records MCP invocations and results in durable execution
+evidence. Provider errors cannot count as successful observations. This does not add a separate
+provider lifecycle manager, role-name router, or OS/network sandbox.
+
 Before the final verification turn, and again during same-iteration finalization recovery, Studio
 restores only missing host-owned scaffold files from the trusted source. Candidate sealing itself
 never mutates the verified workspace. Changed scaffold bytes and unexpected root files still fail

@@ -153,6 +153,22 @@ public sealed class PermissionProfileResolver
             .Distinct(StringComparer.Ordinal)
             .ToImmutableArray();
 
+        var mcpServers = request.InvocationKind == ExecutionInvocationKind.Worker &&
+                         request.PlanStage == PlanStage.BeforeReview &&
+                         request.FlowKind == FlowKind.Delivery &&
+                         profile != ExecutionPermissionProfile.PreMortemReadOnly
+            ? workflow.McpServers
+                .Select(server => server with
+                {
+                    Tools = server.Tools.Where(tool =>
+                        !deniedTools.Contains(server.Name, StringComparer.Ordinal) &&
+                        !deniedTools.Contains(McpConfigurationParser.PermissionPattern(server.Name, tool), StringComparer.Ordinal) &&
+                        !deniedTools.Contains(McpConfigurationParser.ToolName(server.Name, tool), StringComparer.Ordinal))
+                        .ToImmutableArray()
+                })
+                .Where(server => !server.Tools.IsEmpty)
+                .ToImmutableArray()
+            : [];
         return new EffectiveExecutionPermission(
             profile,
             readOnly
@@ -167,7 +183,15 @@ public sealed class PermissionProfileResolver
             DisallowTemporaryDirectory: readOnly || hostControlledPublish,
             GuardPublicationCredentials: !publish || hostControlledPublish,
             AllowRemotePublication: publish,
-            GovernedGitMetadataIsolation: hostControlledPublish);
+            GovernedGitMetadataIsolation: hostControlledPublish)
+        {
+            McpServers = mcpServers,
+            AllowedTools = (readOnly
+                    ? ReadOnlyTools
+                    : hostControlledPublish ? HostControlledPublishTools : WorkspaceTools)
+                .AddRange(mcpServers.SelectMany(server =>
+                    server.Tools.Select(tool => McpConfigurationParser.ToolName(server.Name, tool))))
+        };
     }
 
     public static WorkflowPermissionRestrictions FromWorkflow(
@@ -188,7 +212,10 @@ public sealed class PermissionProfileResolver
                     Clean(permissions.Publish.AdditionalDeniedTools),
                 [ExecutionPermissionProfile.PreMortemReadOnly] =
                     Clean(permissions.PreMortemReadOnly.AdditionalDeniedTools)
-            }.ToImmutableDictionary());
+            }.ToImmutableDictionary())
+        {
+            McpServers = workflow.Config.Copilot.Mcp.Servers
+        };
     }
 
     public static EffectiveExecutionPermission Tighten(
@@ -220,6 +247,25 @@ public sealed class PermissionProfileResolver
             .Order(StringComparer.OrdinalIgnoreCase)
             .ToImmutableArray();
 
+        var servers = persisted.McpServers.Select(server =>
+            {
+                var match = current.McpServers.SingleOrDefault(item =>
+                    item.Name == server.Name && item.ConfigurationJson == server.ConfigurationJson);
+                return server with
+                {
+                    Tools = match is null
+                        ? []
+                        : server.Tools.Intersect(match.Tools, StringComparer.Ordinal).ToImmutableArray()
+                };
+            })
+            .Where(server => !server.Tools.IsEmpty)
+            .ToImmutableArray();
+        var retainedMcpTools = servers.SelectMany(server => server.Tools.Select(tool =>
+            McpConfigurationParser.ToolName(server.Name, tool))).ToHashSet(StringComparer.Ordinal);
+        var oldMcpTools = persisted.McpServers.SelectMany(server => server.Tools.Select(tool =>
+            McpConfigurationParser.ToolName(server.Name, tool))).ToHashSet(StringComparer.Ordinal);
+        allowed = allowed.Where(tool => !oldMcpTools.Contains(tool) || retainedMcpTools.Contains(tool))
+            .ToImmutableArray();
         return new EffectiveExecutionPermission(
             profile,
             allowed,
@@ -241,7 +287,10 @@ public sealed class PermissionProfileResolver
                 current.AllowRemotePublication,
             GovernedGitMetadataIsolation:
                 persisted.GovernedGitMetadataIsolation ||
-                current.GovernedGitMetadataIsolation);
+                current.GovernedGitMetadataIsolation)
+        {
+            McpServers = servers
+        };
     }
 
     public static bool Equivalent(
@@ -263,7 +312,8 @@ public sealed class PermissionProfileResolver
                left.GuardPublicationCredentials == right.GuardPublicationCredentials &&
                left.AllowRemotePublication == right.AllowRemotePublication &&
                left.GovernedGitMetadataIsolation ==
-               right.GovernedGitMetadataIsolation;
+               right.GovernedGitMetadataIsolation &&
+               JsonEqual(left.McpServers, right.McpServers);
     }
 
     public static EffectiveExecutionPermission ForResponseCorrection(
@@ -279,7 +329,8 @@ public sealed class PermissionProfileResolver
                 .Concat(["write", "shell"])
                 .Distinct(StringComparer.Ordinal)
                 .ToImmutableArray(),
-            DisallowTemporaryDirectory = true
+            DisallowTemporaryDirectory = true,
+            McpServers = []
         };
     }
 
@@ -309,6 +360,13 @@ public sealed class PermissionProfileResolver
         }
         if (request is not null)
         {
+            if (permission.McpServers.Length > 0 &&
+                (request.InvocationKind != ExecutionInvocationKind.Worker ||
+                 request.PlanStage != PlanStage.BeforeReview))
+            {
+                throw new InvalidOperationException(
+                    "MCP access is forbidden for lifecycle, pre-mortem, and publication invocations.");
+            }
             var publicationShape =
                 request.FlowKind == FlowKind.Delivery &&
                 request.PlanStage == PlanStage.AfterApproval &&
@@ -477,7 +535,27 @@ public sealed class PermissionProfileResolver
             throw new InvalidOperationException(
                 "The effective permission document is invalid.");
         }
+        if (permission.McpServers.IsDefault ||
+            permission.McpServers.Any(server => server is null) ||
+            permission.McpServers.Select(server => server.Name).Distinct(StringComparer.Ordinal).Count() !=
+            permission.McpServers.Length)
+        {
+            throw new InvalidOperationException("The effective MCP permission document is invalid.");
+        }
+        foreach (var server in permission.McpServers)
+        {
+            McpConfigurationParser.ValidateServer(server);
+            if (permission.Profile is ExecutionPermissionProfile.Publish or ExecutionPermissionProfile.PreMortemReadOnly ||
+                server.Tools.Any(tool => !permission.AllowedTools.Contains(
+                    McpConfigurationParser.ToolName(server.Name, tool), StringComparer.Ordinal)))
+            {
+                throw new InvalidOperationException("The effective MCP tools exceed the permission document.");
+            }
+        }
     }
+
+    private static bool JsonEqual<T>(T left, T right) =>
+        System.Text.Json.JsonSerializer.Serialize(left) == System.Text.Json.JsonSerializer.Serialize(right);
 
     private static ImmutableArray<string> Clean(IEnumerable<string> values) =>
         values

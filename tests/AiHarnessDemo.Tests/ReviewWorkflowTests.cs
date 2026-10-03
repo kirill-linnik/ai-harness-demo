@@ -1739,6 +1739,60 @@ public sealed class ReviewWorkflowTests
                 item.DataJson == DeliveryReadinessService.SerializeEvidence(issued));
     }
 
+    [Fact]
+    public async Task McpToolCalls_ArePersistedAndExposedInTheExistingStepToolHistory()
+    {
+        await using var harness = await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        var parsed = CopilotJsonlParser.Parse("""
+            {"type":"tool.execution_start","data":{"toolCallId":"mcp-1","toolName":"documentation-search","arguments":{"query":"layout guidance","apiKey":"fixture-private-key"}}}
+            {"type":"tool.execution_complete","data":{"toolCallId":"mcp-1","success":true,"result":{"content":[{"type":"text","text":"Found layout guidance."}]}}}
+            {"type":"tool.execution_start","data":{"toolCallId":"mcp-2","toolName":"playwright-browser_snapshot","arguments":{}}}
+            {"type":"tool.execution_complete","data":{"toolCallId":"mcp-2","success":true,"result":{"isError":true,"content":[{"type":"text","text":"Browser unavailable."}]}}}
+            {"type":"tool.execution_start","data":{"toolCallId":"mcp-3","toolName":"playwright-browser_take_screenshot","arguments":{"filename":"review.png"}}}
+            {"type":"tool.execution_complete","data":{"toolCallId":"mcp-3","success":true,"result":{"content":[{"type":"image","data":"fixture-image-bytes","mimeType":"image/png"},{"type":"text","text":"Captured the candidate."}]}}}
+            {"type":"assistant.message","data":{"content":"Review completed."}}
+            {"type":"assistant.turn_end","data":{}}
+            """, workingDirectory: harness.WorkspacePath);
+        harness.Runner.VerificationToolCallsOverride = _ => parsed.ToolCalls;
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var verification = Assert.Single(harness.Runner.Contexts,
+            context => context.RequiresDeliveryReadinessQa);
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        var step = await database.FlowSteps.Include(item => item.ToolCalls)
+            .SingleAsync(item => item.Id == verification.FlowStepId);
+        Assert.Equal(parsed.ToolCalls.Count, step.ToolCalls.Count);
+        var dto = step.ToDto();
+        Assert.Equal(parsed.ToolCalls.Count, dto.ToolCalls.Count);
+        foreach (var observed in parsed.ToolCalls)
+        {
+            var stored = Assert.Single(step.ToolCalls,
+                call => call.ToolName == observed.ToolName);
+            Assert.Equal(observed.Succeeded, stored.Succeeded);
+            Assert.Equal(observed.ArgumentsSummary, stored.ArgumentsSummary);
+            Assert.Equal(observed.ToolType, stored.ToolType);
+            Assert.Equal(observed.NormalizedArguments, stored.NormalizedArguments);
+            Assert.Equal(observed.WorkingDirectory, stored.WorkingDirectory);
+            Assert.Equal(observed.ResultDigest, stored.ResultDigest);
+            Assert.Equal(observed.ResultSummary, stored.ResultSummary);
+            Assert.StartsWith("sha256:", stored.ResultDigest);
+            var chip = Assert.Single(dto.ToolCalls, call => call.Id == stored.Id);
+            Assert.Equal(stored.ToolName, chip.ToolName);
+            Assert.Equal(stored.ArgumentsSummary, chip.ArgumentsSummary);
+            Assert.Equal(stored.Succeeded, chip.Succeeded);
+        }
+        Assert.False(Assert.Single(step.ToolCalls,
+            call => call.ToolName == "playwright-browser_snapshot").Succeeded);
+        var search = Assert.Single(step.ToolCalls,
+            call => call.ToolName == "documentation-search");
+        Assert.DoesNotContain("fixture-private-key", search.NormalizedArguments);
+        using var arguments = JsonDocument.Parse(search.NormalizedArguments);
+        Assert.Equal("<redacted>", arguments.RootElement.GetProperty("apiKey").GetString());
+        Assert.DoesNotContain("fixture-image-bytes", Assert.Single(step.ToolCalls,
+            call => call.ToolName == "playwright-browser_take_screenshot").ResultSummary);
+    }
+
     private static ReadinessWaiverRequest Waiver(
         Guid gateId,
         Guid candidateId,

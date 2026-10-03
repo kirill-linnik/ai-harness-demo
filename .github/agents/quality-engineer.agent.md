@@ -40,6 +40,7 @@ a sound proposal, a finished inspection, and an acceptable product are different
   malformed input, failures, persistence, concurrency, accessibility, and recovery.
 - For a browser-clickable result, exercise the real application at desktop and mobile sizes.
   A static preview, template inspection, or data record cannot substitute for the real surface.
+- Use Playwright MCP for browser inspection when available.
 - Open every required review artifact through the assigned serving environment with its actual
   sandbox/network restrictions. Require meaningful content, working interactions including
   skip links, faithful feature/locale configuration, and zero page or failed-resource errors.

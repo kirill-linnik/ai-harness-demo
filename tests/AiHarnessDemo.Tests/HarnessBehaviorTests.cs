@@ -228,8 +228,13 @@ public sealed class AgentCatalogTests
     [InlineData("team-lead", "content-uniqueness and reachable-language regression criteria")]
     [InlineData("team-lead", "independently understandable")]
     [InlineData("team-lead", "faithful source-backed media")]
+    [InlineData("team-lead", "separate rendered implementation")]
+    [InlineData("team-lead", "Designer review does not replace independent QA")]
     [InlineData("product-designer", "Keep, Move, Merge, Replace, or Remove")]
     [InlineData("product-designer", "one visible owner")]
+    [InlineData("product-designer", "foreground/background pairs")]
+    [InlineData("product-designer", "Use Playwright MCP for browser inspection when available")]
+    [InlineData("product-designer", "Never modify the candidate during review")]
     [InlineData("pre-mortem-sceptic", "cheapest faithful implementation")]
     [InlineData("software-engineer", "Zero overflow is necessary, not proof of good design")]
     [InlineData("software-engineer", "baseline evidence before labeling a defect pre-existing")]
@@ -240,6 +245,7 @@ public sealed class AgentCatalogTests
     [InlineData("quality-engineer", "waivable risk")]
     [InlineData("quality-engineer", "inspect meaningful visible pixels")]
     [InlineData("quality-engineer", "negative corruption fixture")]
+    [InlineData("quality-engineer", "Use Playwright MCP for browser inspection when available")]
     [InlineData("product-manager", "not automatically")]
     [InlineData("architect", "complete customer outcome")]
     [InlineData("data-engineer", "old-to-new preservation")]
@@ -267,6 +273,10 @@ public sealed class AgentCatalogTests
         var release = File.ReadAllText(Path.Combine(agents, "release-engineer.agent.md"));
 
         Assert.Contains("Do not implement production code", designer);
+        Assert.Contains("Review the rendered implementation", designer);
+        Assert.Contains("matched applicable viewports, themes, locales, and states", designer);
+        Assert.Contains("weaknesses in your own", designer);
+        Assert.Contains("cannot replace looking", designer);
         Assert.Contains("baseline and candidate at matched desktop/mobile viewports", quality);
         Assert.Contains("duplicate explanations", quality);
         Assert.Contains("unavailable coverage, never as tests passed", quality);

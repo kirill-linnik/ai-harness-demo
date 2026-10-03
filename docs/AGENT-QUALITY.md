@@ -19,6 +19,15 @@ content inventory. Refinement preserves the incumbent identity; a requested rede
 replace its composition without losing facts or function. Implementation owns the complete
 composition, not an isolated decorative addition.
 
+When work changes visual design, the Team Lead schedules a separate Product Designer review
+after implementation and before final independent QA. The same role receives a distinct
+assignment to compare the unchanged rendered candidate and customer-facing review surface with
+the chosen direction and baseline. Coverage includes the applicable viewports, themes, locales,
+and states; findings address readability, hierarchy, spacing, coherence, and the requested
+transformation. This is a planning responsibility, not an automatically inserted runtime step.
+Work without design changes does not need this review. Designer approval never substitutes for
+independent QA, and unavailable visual coverage is a limitation rather than approval.
+
 Final QA separates three questions:
 
 | Question | Necessary evidence |
@@ -58,6 +67,35 @@ Offline packaging derives factual content and binary encodings programmatically 
 product. QA independently checks complete rendered copy and decoded, visibly populated media;
 image dimensions and successful load events cannot prove valid pixels. A new fidelity checker
 must reject a negative corruption fixture as well as accept the real candidate.
+
+### Browser tooling
+
+Studio follows Symphony's execution boundary: the coding runtime owns MCP connectivity.
+`copilot.mcp_config_file` in `WORKFLOW.md` names the repository-owned JSON configuration, using
+Copilot CLI's native `mcpServers` shape. The host snapshots the selected server definitions and
+tool names in each step's effective permission document, stages a native configuration for the
+attempt, and passes it through `--additional-mcp-config`. Copilot CLI starts and operates the
+servers; there is no browser implementation or role-name-based MCP router in the execution host.
+
+Server configuration is provider-agnostic. Follow each server author's setup instructions and
+declare its native tool names explicitly. Transport, launch arguments, environment, and URLs
+pass through to Copilot CLI without a provider-specific engine schema. Configure only trusted
+servers and tools appropriate to the execution boundary. Browser providers must use isolated
+sessions rather than personal tabs or profiles.
+
+Delivery worker assignments, including Design-only reviews, can use the configured MCP tools
+without receiving shell or source-write permission. Intake, planning, pre-mortem, Advisory,
+response-only corrections, and publication retain their existing restricted tool surfaces.
+Additional workflow tool denials still apply. Do not add another Verify duty to obtain browser
+access: Delivery reserves that duty for the sole final verification owner.
+
+MCP is a tool channel, not proof of inspection or a network sandbox. Browser access must remain
+within authorized project/review surfaces; provider options and CLI tool approvals do not
+establish an OS-level security boundary. Inspect actual screenshots for visual judgments, not
+just accessibility snapshots. Keep generated evidence outside candidate source using explicit
+artifact filenames, and report missing browser installations or failed tool calls as coverage
+limitations. Structured MCP errors are unsuccessful evidence; image payloads are hashed but
+not copied into textual result summaries.
 
 Candidate sealing respects Git's ignore rules instead of guessing output directories or report
 names. Ignored untracked files are neither published nor included in the source fingerprint;

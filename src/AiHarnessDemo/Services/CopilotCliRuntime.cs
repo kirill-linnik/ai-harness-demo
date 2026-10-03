@@ -25,11 +25,13 @@ public sealed partial class CopilotCliRuntime(
     private static readonly string[] RequiredOptions =
     [
         "--add-dir",
+        "--additional-mcp-config",
         "--acp",
         "--agent",
         "--allow-tool",
         "--available-tools",
         "--disable-builtin-mcps",
+        "--enable-mcp-server",
         "--deny-tool",
         "--deny-url",
         "--disallow-temp-dir",

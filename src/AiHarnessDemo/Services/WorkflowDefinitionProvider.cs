@@ -34,20 +34,32 @@ public sealed class WorkflowDefinitionProvider(
     private readonly Lock _lock = new();
     private readonly string _workflowPath = Path.Combine(paths.Root, "WORKFLOW.md");
     private FileSystemWatcher? _watcher;
+    private FileSystemWatcher? _mcpWatcher;
     private Timer? _reloadTimer;
     private WorkflowDefinition? _effective;
     private bool _currentFileValid;
     private string? _currentFileError;
     private DateTime _lastWriteUtc;
+    private DateTime _lastMcpWriteUtc;
+
+    private bool FilesChanged() =>
+        !_currentFileValid ||
+        (File.Exists(_workflowPath) ? File.GetLastWriteTimeUtc(_workflowPath) : DateTime.MinValue) != _lastWriteUtc ||
+        McpWriteTime() != _lastMcpWriteUtc;
+
+    private DateTime McpWriteTime()
+    {
+        var path = _effective?.Config.Copilot.Mcp.SourcePath;
+        return !string.IsNullOrWhiteSpace(path) && File.Exists(path)
+            ? File.GetLastWriteTimeUtc(path)
+            : DateTime.MinValue;
+    }
 
     public WorkflowDefinition GetEffective()
     {
-        var writeTime = File.Exists(_workflowPath)
-            ? File.GetLastWriteTimeUtc(_workflowPath)
-            : DateTime.MinValue;
         lock (_lock)
         {
-            if (_effective is null || writeTime != _lastWriteUtc)
+            if (_effective is null || FilesChanged())
             {
                 ReloadLocked(throwOnFailure: _effective is null);
             }
@@ -73,12 +85,9 @@ public sealed class WorkflowDefinitionProvider(
 
     public WorkflowRuntimeStatus Status()
     {
-        var writeTime = File.Exists(_workflowPath)
-            ? File.GetLastWriteTimeUtc(_workflowPath)
-            : DateTime.MinValue;
         lock (_lock)
         {
-            if (_effective is null || writeTime != _lastWriteUtc)
+            if (_effective is null || FilesChanged())
             {
                 ReloadLocked(throwOnFailure: false);
             }
@@ -114,6 +123,11 @@ public sealed class WorkflowDefinitionProvider(
         _watcher.Changed += OnWorkflowChanged;
         _watcher.Created += OnWorkflowChanged;
         _watcher.Renamed += OnWorkflowChanged;
+        _watcher.Deleted += OnWorkflowChanged;
+        lock (_lock)
+        {
+            ConfigureMcpWatcher();
+        }
         return Task.CompletedTask;
     }
 
@@ -123,13 +137,57 @@ public sealed class WorkflowDefinitionProvider(
         {
             _watcher.EnableRaisingEvents = false;
         }
+        if (_mcpWatcher is not null)
+        {
+            _mcpWatcher.EnableRaisingEvents = false;
+        }
         return Task.CompletedTask;
+    }
+
+    private void ConfigureMcpWatcher()
+    {
+        if (_watcher is null)
+        {
+            return;
+        }
+        var path = _effective?.Config.Copilot.Mcp.SourcePath;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            _mcpWatcher?.Dispose();
+            _mcpWatcher = null;
+            return;
+        }
+        var directory = Path.GetDirectoryName(path)!;
+        var fileName = Path.GetFileName(path);
+        if (_mcpWatcher?.Path == directory && _mcpWatcher.Filter == fileName)
+        {
+            return;
+        }
+        _mcpWatcher?.Dispose();
+        _mcpWatcher = new FileSystemWatcher(directory, fileName)
+        {
+            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+            EnableRaisingEvents = true
+        };
+        _mcpWatcher.Changed += OnWorkflowChanged;
+        _mcpWatcher.Created += OnWorkflowChanged;
+        _mcpWatcher.Deleted += OnWorkflowChanged;
+        _mcpWatcher.Renamed += OnWorkflowChanged;
     }
 
     private void OnWorkflowChanged(object sender, FileSystemEventArgs eventArgs)
     {
         lock (_lock)
         {
+            var mcpPath = _effective?.Config.Copilot.Mcp.SourcePath;
+            var comparer = OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            if (!string.Equals(eventArgs.FullPath, _workflowPath, comparer) &&
+                !string.Equals(eventArgs.FullPath, mcpPath, comparer))
+            {
+                return;
+            }
             _reloadTimer?.Dispose();
             _reloadTimer = new Timer(
                 _ =>
@@ -154,6 +212,8 @@ public sealed class WorkflowDefinitionProvider(
             _currentFileValid = true;
             _currentFileError = null;
             _lastWriteUtc = File.GetLastWriteTimeUtc(_workflowPath);
+            _lastMcpWriteUtc = McpWriteTime();
+            ConfigureMcpWatcher();
             logger.LogInformation(
                 "Loaded Symphony workflow {Revision} from {WorkflowPath} at {LoadedAt}",
                 workflow.Revision,
@@ -162,14 +222,19 @@ public sealed class WorkflowDefinitionProvider(
         }
         catch (WorkflowConfigurationException exception)
         {
+            var changedFailure = _currentFileValid || _currentFileError != exception.Message;
             _currentFileValid = false;
             _currentFileError = exception.Message;
             _lastWriteUtc = File.Exists(_workflowPath)
                 ? File.GetLastWriteTimeUtc(_workflowPath)
                 : DateTime.MinValue;
-            logger.LogError(
-                exception,
-                "Rejected invalid Symphony workflow reload; continuing with the last known good definition.");
+            _lastMcpWriteUtc = McpWriteTime();
+            if (changedFailure)
+            {
+                logger.LogError(
+                    exception,
+                    "Rejected invalid Symphony workflow reload; continuing with the last known good definition.");
+            }
             if (throwOnFailure)
             {
                 throw;
@@ -180,6 +245,7 @@ public sealed class WorkflowDefinitionProvider(
     public void Dispose()
     {
         _watcher?.Dispose();
+        _mcpWatcher?.Dispose();
         _reloadTimer?.Dispose();
     }
 }

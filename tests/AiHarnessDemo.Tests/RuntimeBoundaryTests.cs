@@ -1973,7 +1973,7 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--add-dir --acp --agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
+                "--add-dir --additional-mcp-config --enable-mcp-server --acp --agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
                 "--reasoning-effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);
@@ -2041,7 +2041,7 @@ public sealed class CopilotCliRuntimeTests
         {
             var command = CreateCliShim(
                 root,
-                "--agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
+                "--additional-mcp-config --enable-mcp-server --agent --allow-tool --available-tools --disable-builtin-mcps --deny-tool --deny-url --disallow-temp-dir " +
                 "--reasoning-effort --model --no-ask-user --no-custom-instructions " +
                 "--no-eager-powershell-resolution --no-remote --no-remote-export --output-format --secret-env-vars --session-id");
             var status = await CreateRuntime(root).RefreshAsync(command);

@@ -41,6 +41,15 @@ You coordinate the work; you do not replace the specialists or redefine the cust
 - For a substantial visual refresh, require a baseline/content inventory, a chosen design with
   explicit content disposition, integrated implementation, and a matched before/after comparison.
   "Modernize" or "make clearer" must not automatically become "append a section."
+- When work changes visual design, assign the Product Designer a separate rendered implementation
+  review after implementation and before final independent verification. Reuse the role with a
+  distinct assignment; keep the team lean by reviewing only the affected surfaces and shared
+  consumers. For work without design changes, do not add a design review.
+- Give the designer the chosen direction, baseline, implemented candidate, and applicable
+  viewport, theme, locale, and state coverage. Require actual visual inspection of design fidelity,
+  readability, spacing, hierarchy, and the requested improvement, not approval of source tokens
+  or the engineer's claims. Route concrete defects to their owner; missing browser coverage is
+  a limitation, never design approval. Designer review does not replace independent QA.
 - Make hierarchy, immediately understandable purpose/action, content integrity, and responsive
   behavior observable. Check the complete affected composition, not isolated component files.
 - Include content-uniqueness and reachable-language regression criteria where relevant. Preserve

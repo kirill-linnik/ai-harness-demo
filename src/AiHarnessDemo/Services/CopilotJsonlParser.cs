@@ -746,6 +746,19 @@ public static partial class CopilotJsonlParser
                         break;
                     }
                 }
+                else if (name == "content" && candidate.ValueKind == JsonValueKind.Array)
+                {
+                    value = string.Join(" ", candidate.EnumerateArray()
+                        .Where(item => item.ValueKind == JsonValueKind.Object &&
+                                       ReadString(item, "type") == "text")
+                        .Select(item => ReadString(item, "text"))
+                        .Where(text => !string.IsNullOrWhiteSpace(text)));
+                    if (string.IsNullOrWhiteSpace(value))
+                    {
+                        value = "MCP returned non-text content.";
+                    }
+                    break;
+                }
             }
         }
         else if (result.ValueKind == JsonValueKind.String)
@@ -774,6 +787,13 @@ public static partial class CopilotJsonlParser
         JsonElement payload,
         int? exitCode)
     {
+        if (payload.TryGetProperty("result", out var result) &&
+            result.ValueKind == JsonValueKind.Object &&
+            result.TryGetProperty("isError", out var isError) &&
+            isError.ValueKind == JsonValueKind.True)
+        {
+            return false;
+        }
         bool? explicitSuccess = null;
         if (payload.TryGetProperty("success", out var successElement) &&
             successElement.ValueKind is JsonValueKind.True or JsonValueKind.False)

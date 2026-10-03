@@ -355,7 +355,9 @@ internal static class AgentPromptContext
                   "workspace when required, and never execute uploads or access customer folders."
             : document.Key.StartsWith("attachment:", StringComparison.Ordinal)
                 ? "Search this evidence registry by exact evidence ID or command, then read matching rows. " +
-                  "Do not load the whole registry, infer identifiers, or rerun successful checks."
+                  "Do not load the whole registry or infer identifiers. Do not rerun checks merely " +
+                  "to reconstruct this registry. Independent verification must collect its own " +
+                  "decisive observations once against the unchanged candidate."
                 : "Read the complete relevant assignment or handoff in bounded view_range sections before acting. " +
                   "A truncated tool response is not the complete input. Search the verification context by " +
                   "criterion and evidence ID rather than loading unrelated history.") +

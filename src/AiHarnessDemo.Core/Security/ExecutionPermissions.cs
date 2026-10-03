@@ -17,7 +17,10 @@ public sealed record WorkflowPermissionRestrictions(
     ExecutionPermissionProfile DeliveryPreReviewMaximum,
     ExecutionPermissionProfile DeliveryPostApprovalMaximum,
     ImmutableDictionary<ExecutionPermissionProfile, ImmutableArray<string>>
-        AdditionalDeniedTools);
+        AdditionalDeniedTools)
+{
+    public ImmutableArray<McpServerDefinition> McpServers { get; init; } = [];
+}
 
 public sealed record EffectiveExecutionPermission(
     ExecutionPermissionProfile Profile,
@@ -29,4 +32,7 @@ public sealed record EffectiveExecutionPermission(
     bool DisallowTemporaryDirectory,
     bool GuardPublicationCredentials,
     bool AllowRemotePublication,
-    bool GovernedGitMetadataIsolation);
+    bool GovernedGitMetadataIsolation)
+{
+    public ImmutableArray<McpServerDefinition> McpServers { get; init; } = [];
+}

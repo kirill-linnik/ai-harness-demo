@@ -25,6 +25,7 @@ agent:
   max_retry_backoff_ms: 3000
 copilot:
   command: copilot
+  mcp_config_file: .github\mcp-config.json
   inactivity_timeout_ms: 300000
   silent_tool_timeout_ms: 1800000
   soft_warning_ms: 3600000
@@ -80,6 +81,11 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
 {{ role.context }}
 
 ## Studio orchestration policy
+
+- MCP servers and tools are supplied by the effective execution permission for this assignment.
+  Use only authorized project and review surfaces. Never use personal browser profiles or browser
+  automation to bypass source, network, publication, or customer-approval restrictions.
+  Report unavailable or failed MCP/browser checks explicitly; configuration is not proof a check ran.
 
 - This is the strict Studio workflow extension. Account Manager confirms `intake`; Team Lead
   selects arbitrary enabled snapshot agents with `team plan`; the declared outcome owner returns

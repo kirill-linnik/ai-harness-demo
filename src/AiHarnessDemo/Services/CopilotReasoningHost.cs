@@ -343,6 +343,9 @@ public sealed partial class CopilotReasoningHost(
             var environmentVariables = MergeProcessEnvironment(
                 publicationGuard?.EnvironmentVariables,
                 governedGitIsolation?.EnvironmentVariables);
+            var stagedMcp = await McpExecutionConfiguration.StageAsync(
+                permission, manifestStager, agentAccess,
+                context.FlowId, context.FlowStepId, context.Attempt, cancellationToken);
 
             async Task<string> StagePromptReferenceAsync()
             {
@@ -379,7 +382,8 @@ public sealed partial class CopilotReasoningHost(
                     permission,
                     copilotCli.ReasoningEffortOption,
                     context.ResumeSession ||
-                    context.RecoverInterruptedSession).ToList();
+                    context.RecoverInterruptedSession,
+                    stagedMcp?.Path).ToList();
                 if (governedGitIsolation is not null)
                 {
                     built.Insert(
@@ -762,7 +766,8 @@ public sealed partial class CopilotReasoningHost(
         string prompt,
         EffectiveExecutionPermission permission,
         string reasoningEffortOption = "--reasoning-effort",
-        bool resumeSession = false)
+        bool resumeSession = false,
+        string? mcpConfigPath = null)
     {
         ArgumentNullException.ThrowIfNull(prompt);
         if (prompt.Length > MaximumInlinePromptCharacters)
@@ -799,6 +804,23 @@ public sealed partial class CopilotReasoningHost(
         ApplyToolPolicy(
             arguments,
             $"--available-tools={string.Join(',', permission.AllowedTools)}");
+        if (permission.McpServers.Length > 0)
+        {
+            if (string.IsNullOrWhiteSpace(mcpConfigPath))
+            {
+                throw new InvalidOperationException("Authorized MCP tools require a staged MCP configuration.");
+            }
+            ApplyToolPolicy(arguments, $"--additional-mcp-config=@{Path.GetFullPath(mcpConfigPath)}");
+            foreach (var server in permission.McpServers)
+            {
+                ApplyToolPolicy(arguments, $"--enable-mcp-server={server.Name}");
+                foreach (var tool in server.Tools)
+                {
+                    ApplyToolPolicy(arguments,
+                        $"--allow-tool={McpConfigurationParser.PermissionPattern(server.Name, tool)}");
+                }
+            }
+        }
         if (permission.DisableBuiltinMcps)
         {
             ApplyToolPolicy(arguments, "--disable-builtin-mcps");

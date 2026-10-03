@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Orchestration;
+using AiHarnessDemo.Core.Security;
 using YamlDotNet.Core;
 using YamlDotNet.RepresentationModel;
 using YamlDotNet.Serialization;
@@ -163,6 +164,11 @@ public sealed class CopilotConfig
 {
     public string Command { get; set; } = "copilot";
 
+    public string? McpConfigFile { get; set; }
+
+    [YamlIgnore]
+    public McpConfiguration Mcp { get; set; } = McpConfiguration.Empty;
+
     public int InactivityTimeoutMs { get; set; } = 300_000;
 
     public int SilentToolTimeoutMs { get; set; } = 1_800_000;
@@ -231,8 +237,15 @@ public sealed class WorkflowLoader
                 $"Symphony workflow path has no parent directory: {fullPath}");
         config.Workspace.ResolvedRoot = ResolvePath(config.Workspace.Root, workflowDirectory);
         Validate(config, prompt);
+        if (config.Copilot.McpConfigFile is not null)
+        {
+            config.Copilot.Mcp = LoadMcpConfiguration(config.Copilot.McpConfigFile, workflowDirectory);
+        }
         var revision = Convert.ToHexString(
-            SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+            SHA256.HashData(Encoding.UTF8.GetBytes(
+                config.Copilot.McpConfigFile is null
+                    ? text
+                    : text + "\nMCP_CONFIGURATION\n" + config.Copilot.Mcp.Content)));
         return new WorkflowDefinition(
             config,
             prompt.Trim(),
@@ -283,9 +296,10 @@ public sealed class WorkflowLoader
                         "See docs\\ARCHITECTURE.md.");
                 }
             }
-            RejectUnknown(copilot, "copilot", "command", "inactivity_timeout_ms",
+            RejectUnknown(copilot, "copilot", "command", "mcp_config_file", "inactivity_timeout_ms",
                 "silent_tool_timeout_ms", "soft_warning_ms", "execution_budget_ms");
         }
+
         if (!TryGet(root, "studio", out var studioNode))
         {
             return;
@@ -532,6 +546,47 @@ public sealed class WorkflowLoader
         {
             throw new WorkflowConfigurationException(
                 "WORKFLOW.md must contain a non-empty prompt template.");
+        }
+    }
+
+    private static McpConfiguration LoadMcpConfiguration(string relativePath, string root)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath))
+        {
+            throw new WorkflowConfigurationException(
+                "copilot.mcp_config_file must be a non-empty path relative to the workflow directory.");
+        }
+        var fullPath = Path.GetFullPath(Path.Combine(root, relativePath.Replace('\\', Path.DirectorySeparatorChar)));
+        var relative = Path.GetRelativePath(root, fullPath);
+        if (relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            throw new WorkflowConfigurationException("MCP configuration must remain inside the workflow directory.");
+        }
+        try
+        {
+            for (var current = new FileInfo(fullPath).Directory; current is not null; current = current.Parent)
+            {
+                if (current.Exists && current.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                {
+                    throw new InvalidOperationException("MCP configuration cannot traverse a linked directory.");
+                }
+                if (current.FullName == Path.GetFullPath(root))
+                {
+                    break;
+                }
+            }
+            if (File.GetAttributes(fullPath).HasFlag(FileAttributes.ReparsePoint))
+            {
+                throw new InvalidOperationException("MCP configuration cannot be a linked file.");
+            }
+            return McpConfigurationParser.Parse(fullPath, File.ReadAllText(fullPath));
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or
+                InvalidOperationException or KeyNotFoundException)
+        {
+            throw new WorkflowConfigurationException(
+                $"MCP configuration '{relativePath}' is invalid or unavailable: {exception.Message}", exception);
         }
     }
 

@@ -164,6 +164,21 @@ dotnet run --project .\src\AiHarnessDemo
 Open `http://localhost:5283`. Runtime state is stored in `data\ai-harness.db`; isolated flow
 workspaces are created under `data\worktrees`.
 
+### MCP tools
+
+Configure MCP servers if you want additional tools for your agents. Studio uses the standard
+[Copilot CLI MCP configuration](https://docs.github.com/copilot/how-tos/copilot-cli)
+and is MCP-provider agnostic. Set `copilot.mcp_config_file` in `WORKFLOW.md` to your
+repository-owned JSON file; omit the setting to run without additional configured servers.
+Choose whichever MCP servers suit your project. Keep credentials out of committed configuration.
+List each server's native tool names explicitly; wildcard tool lists are not supported.
+
+Copilot CLI starts and operates the configured servers. Studio preserves its execution restrictions,
+records tool calls, and snapshots effective configuration for each attempt. Configuration changes
+apply to new attempts; invalid configuration blocks new work rather than silently enabling tools.
+MCP calls use the same persisted per-step tool history and success/failure chips as other agent
+tools, retaining their native names and redacted arguments. Structured MCP errors remain failures.
+
 Startup uses `Database.EnsureCreatedAsync()` to create a fresh schema when the database file is
 absent. The additive reviewed-preview and customer-upload tables are created automatically for
 existing databases; other entity-shape changes are not migrated. After other shape changes, stop

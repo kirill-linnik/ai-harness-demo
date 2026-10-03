@@ -1,0 +1,33 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "local",
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest",
+        "--headless",
+        "--isolated"
+      ],
+      "tools": [
+        "browser_install",
+        "browser_navigate",
+        "browser_navigate_back",
+        "browser_close",
+        "browser_resize",
+        "browser_emulate_media",
+        "browser_snapshot",
+        "browser_find",
+        "browser_take_screenshot",
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_click",
+        "browser_hover",
+        "browser_press_key",
+        "browser_fill_form",
+        "browser_select_option",
+        "browser_tabs",
+        "browser_wait_for"
+      ]
+    }
+  }
+}
