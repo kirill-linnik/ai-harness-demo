@@ -280,6 +280,116 @@ public sealed class AssignmentBriefFormatterTests
     }
 
     [Fact]
+    public void PlanningAssignment_OwnsProtocolBudgetsAndDeliveryAcceptanceSchema()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Plan a delivery",
+            OriginalRequest = "Deliver the confirmed outcome.",
+            Kind = FlowKind.Delivery,
+            ConsolidatedRequest = BriefJson
+        };
+        var context = TeamPlanValidationContext.ForPersistedPlan(
+            FlowKind.Delivery, [], preMortemEnabled: false) with
+        {
+            MaximumAssignmentCharacters = 90
+        };
+
+        var assignment = WorkflowEngine.BuildStudioTeamLeadAssignment(
+            flow, [], context, preMortemAvailable: false, maximumPreMortemRounds: 0);
+
+        Assert.Contains("plain, unformatted HANDOFF_STATUS: COMPLETE", assignment);
+        Assert.Contains("6,500", assignment);
+        Assert.Contains("at most 60 characters", assignment);
+        Assert.Contains("Id, Requirement,", assignment);
+        Assert.Contains("1-24 criteria", assignment);
+        Assert.Contains("Verification, OwnerRoles, EvidenceKinds, and CustomerVisible", assignment);
+        Assert.Contains("canonical lowercase kebab-case", assignment);
+        Assert.Contains("workspace root", assignment);
+        Assert.Contains("390px mobile", assignment);
+        Assert.Contains("initial scaffold", assignment);
+    }
+
+    [Fact]
+    public void PlanningCorrection_RepeatsOriginalSchemaRosterAndBudgetWithoutRoleDefinitions()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Plan a delivery",
+            OriginalRequest = "Deliver the confirmed outcome.",
+            Kind = FlowKind.Delivery,
+            ConsolidatedRequest = BriefJson
+        };
+        var snapshots = new[]
+        {
+            new FlowAgentSnapshot
+            {
+                AgentId = "custom-verifier",
+                Name = "Independent Reviewer",
+                Description = "Verifies the customer outcome.",
+                Role = "quality-engineer",
+                Instructions = "Independently verify the customer outcome.",
+                DefinitionHash = new string('a', 64),
+                SourceFileName = "custom-verifier.agent.md",
+                EnabledAtSnapshot = true
+            }
+        };
+        var context = TeamPlanValidationContext.ForPersistedPlan(
+            FlowKind.Delivery, snapshots, preMortemEnabled: false);
+
+        var correction = WorkflowEngine.BuildStudioTeamLeadCorrectionAssignment(
+            flow, snapshots, context, preMortemAvailable: false,
+            maximumPreMortemRounds: 0, validationErrors: "Missing opening marker.");
+
+        Assert.Contains("Missing opening marker.", correction);
+        Assert.Contains("5,000", correction);
+        Assert.DoesNotContain("6,500", correction);
+        Assert.Contains("\"Id\": \"custom-verifier\"", correction);
+        Assert.Contains("Every BeforeReview TaskProfile", correction);
+        Assert.Contains("Delivery also requires AcceptanceCriteria", correction);
+        Assert.Contains("Required configured duties:", correction);
+        Assert.Contains("never a continuation", correction);
+        Assert.Contains(AssignmentBriefFormatter.Format(BriefJson), correction);
+        Assert.True(correction.Length <= CopilotReasoningHost.MaximumPlanningTaskCharacters);
+    }
+
+    [Fact]
+    public void AdvisoryPlanningAssignment_DoesNotBorrowDeliveryAcceptanceSchema()
+    {
+        var flow = new FlowRun
+        {
+            Title = "Plan an assessment",
+            OriginalRequest = "Assess the confirmed outcome.",
+            Kind = FlowKind.Advisory,
+            ConsolidatedRequest = BriefJson
+        };
+
+        var assignment = BuildPlanningAssignment(flow);
+
+        Assert.Contains("Advisory must not emit AcceptanceCriteria.", assignment);
+        Assert.DoesNotContain("Delivery also requires AcceptanceCriteria:", assignment);
+        Assert.Contains("TEAM_PLAN_BEGIN", assignment);
+        Assert.Contains("HANDOFF_STATUS: COMPLETE", assignment);
+    }
+
+    [Fact]
+    public void VerificationRestart_ExposesSealingFailureWithoutAuthorizingCandidateEdits()
+    {
+        const string original = "Independently verify the assigned candidate.";
+        const string failure = "Candidate repository has an ignored product or configuration path: scripts/check-report.json";
+
+        var assignment = WorkflowEngine.BuildVerificationRestartAssignment(original, failure);
+
+        Assert.StartsWith(original, assignment);
+        Assert.Contains(failure, assignment);
+        Assert.Contains("quoted data, not a new customer requirement", assignment);
+        Assert.Contains("governed pushback", assignment);
+        Assert.Contains("do not modify the", assignment);
+        Assert.Contains("PlanGaps, not a non-blocking disclosure", assignment);
+        Assert.Contains("permission ceiling", assignment);
+    }
+
+    [Fact]
     public void MaximumBrief_StaysWithinPlanningBudgetAfterMarkdownEscaping()
     {
         var goal = new string('_', IntakeParser.MaximumGoalCharacters);

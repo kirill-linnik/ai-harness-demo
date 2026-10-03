@@ -111,9 +111,17 @@ same-user process.
 Agent definitions in `.github\agents` are project-agnostic role contracts, not a place for facts
 from one customer or repository. Each execution can consult its complete, durable flow input,
 but should use and hand off only what its assigned duty and confirmed outcome require.
+Response schemas, markers, budgets, evidence identifiers, artifact paths, and lifecycle rules
+are supplied by the harness, not embedded in editable agents. Planning corrections repeat the
+complete host-owned contract instead of depending on role prose or a partial earlier reply.
 
 Use **Reload catalog** after editing definitions. Invalid optional definitions remain visible for
 diagnostics but cannot be selected; invalid required definitions block new work.
+
+The [agent quality contracts](docs/AGENT-QUALITY.md) describe the team's outcome-first standards,
+research basis, and limitations. Visual delivery requires baseline comparison, explicit content
+consolidation, concrete design decisions, and independent checks of the actual customer experience;
+successful builds and overflow checks alone are not proof of a good result.
 
 ## Run locally
 

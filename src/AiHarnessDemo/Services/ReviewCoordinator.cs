@@ -596,6 +596,7 @@ public sealed class ReviewCoordinator(
         FlowStatus status;
         int iteration;
         var queueFlow = false;
+        HandoffGateRecord? declinedWaiver = null;
         await using (var database =
                      await databaseFactory.CreateDbContextAsync(cancellationToken))
         {
@@ -624,6 +625,12 @@ public sealed class ReviewCoordinator(
                     DeliveryReadinessState.NeedsRefinement,
                 _ => DeliveryReadinessState.Blocked
             };
+            if (action == ReadinessResolutionAction.RequestRefinement &&
+                (await _readiness.LoadCurrentAsync(database, flowId, cancellationToken))?.State ==
+                DeliveryReadinessState.NeedsCustomerWaiver)
+            {
+                required = DeliveryReadinessState.NeedsCustomerWaiver;
+            }
             var binding = action == ReadinessResolutionAction.Abandon
                 ? await _readiness.LoadCurrentAsync(database, flowId, cancellationToken)
                   ?? throw new DeliveryReadinessConflictException(
@@ -653,7 +660,8 @@ public sealed class ReviewCoordinator(
                     "Abandonment is authorized for the current readiness assessment.");
             }
             if (binding.State == DeliveryReadinessState.ReadyToApprove ||
-                binding.State == DeliveryReadinessState.NeedsCustomerWaiver)
+                binding.State == DeliveryReadinessState.NeedsCustomerWaiver &&
+                action != ReadinessResolutionAction.RequestRefinement)
             {
                 throw new DeliveryReadinessConflictException(
                     DeliveryReadinessConflicts.NotReady,
@@ -662,10 +670,25 @@ public sealed class ReviewCoordinator(
                     binding.Revision,
                     binding.ContractHash);
             }
-            if (flow.GateRecords.Any(gate =>
+            var pendingCustomerGates = flow.GateRecords.Where(gate =>
                     !gate.Resolved &&
                     gate.ActionType is HandoffActionType.CustomerReview
-                        or HandoffActionType.CustomerWaiver))
+                        or HandoffActionType.CustomerWaiver).ToArray();
+            if (binding.State == DeliveryReadinessState.NeedsCustomerWaiver)
+            {
+                if (pendingCustomerGates.Length != 1 ||
+                    pendingCustomerGates[0].ActionType != HandoffActionType.CustomerWaiver ||
+                    pendingCustomerGates[0].FlowStepId != binding.Record.OutcomeOwnerStepId)
+                {
+                    throw new DeliveryReadinessConflictException(
+                        DeliveryReadinessConflicts.ReviewStale,
+                        "The current waiver gate is missing or does not match this readiness assessment.",
+                        binding.State,
+                        binding.Revision,
+                        binding.ContractHash);
+                }
+            }
+            else if (pendingCustomerGates.Length > 0)
             {
                 throw new DeliveryReadinessConflictException(
                     DeliveryReadinessConflicts.ReviewStale,
@@ -676,6 +699,24 @@ public sealed class ReviewCoordinator(
             }
 
             var now = DateTimeOffset.UtcNow;
+            if (binding.State == DeliveryReadinessState.NeedsCustomerWaiver)
+            {
+                var gate = pendingCustomerGates[0];
+                declinedWaiver = gateEngine.PrepareResolution(
+                    gate,
+                    approved: false,
+                    resolvedBy: "customer",
+                    note: "Customer requested refinement instead of waiving the disclosed risks.",
+                    resolvedAt: now);
+                ApplyPreparedGate(declinedWaiver, gate);
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = gate.FlowStepId,
+                    Type = "gate.customer-waiver-declined",
+                    Message = "Customer declined the waiver and requested a refined iteration."
+                });
+            }
             var reviewedStep = flow.Steps.SingleOrDefault(
                                    step => step.Id == binding.Record.OutcomeOwnerStepId)
                                ?? throw new DeliveryReadinessConflictException(
@@ -872,6 +913,10 @@ public sealed class ReviewCoordinator(
             await transaction.CommitAsync(cancellationToken);
         }
 
+        if (declinedWaiver is not null)
+        {
+            gateEngine.RestoreHistory([declinedWaiver]);
+        }
         if (queueFlow && !flowQueue.Queue(flowId))
         {
             throw new InvalidOperationException(

@@ -1466,6 +1466,106 @@ public sealed class ReviewWorkflowTests
     }
 
     [Fact]
+    public async Task IgnoredOutputSealFailure_RetriesOnlyHostFinalizationWithoutRepeatingAgents()
+    {
+        await using var harness = await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.ReviewedCandidates.SealFailure =
+            "Candidate repository has an ignored product or configuration path: custom-release/";
+        var failure = await Record.ExceptionAsync(
+            () => harness.Engine.RunAsync(harness.FlowId, CancellationToken.None));
+        if (failure is not null)
+        {
+            Assert.IsType<CandidateValidationException>(failure);
+        }
+        var failed = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Failed, failed.Status);
+        Assert.True(WorkflowEngine.CanRetryStudioFinalization(failed));
+        var executions = harness.Runner.Contexts.Count;
+        var stepCount = failed.Steps.Count;
+        Assert.Equal(1, harness.ReviewedCandidates.SealCalls);
+
+        harness.ReviewedCandidates.SealFailure = null;
+        var queued = await harness.Engine.RestartFailedFlowAsync(
+            harness.FlowId, CancellationToken.None);
+        Assert.Equal(FlowStatus.Queued, queued.Status);
+        Assert.Equal(stepCount, queued.Steps.Count);
+        Assert.Contains(queued.Events, item => item.Type == "flow.finalization-retry-queued");
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Engine.RestartFailedFlowAsync(harness.FlowId, CancellationToken.None));
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var ready = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.WaitingForFeedback, ready.Status);
+        Assert.Equal(executions, harness.Runner.Contexts.Count);
+        Assert.Equal(2, harness.ReviewedCandidates.SealCalls);
+        Assert.Single(ready.GateRecords, gate => gate.ActionType == HandoffActionType.CustomerReview);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        Assert.Equal(DeliveryReadinessState.ReadyToApprove,
+            (await database.DeliveryReadinessSnapshots.SingleAsync(item => item.Active)).State);
+        Assert.Empty(await database.ReadinessWaiverRecords.ToListAsync());
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        Assert.Equal(executions, harness.Runner.Contexts.Count);
+        Assert.Equal(2, harness.ReviewedCandidates.SealCalls);
+    }
+
+    [Fact]
+    public async Task NeedsCustomerWaiver_CanRequestBoundRefinementWithoutGrantingConsent()
+    {
+        await using var harness = await ReviewHarness.CreateAsync(FlowKind.Delivery);
+        harness.Runner.QaBlockOverride = context =>
+            DeliveryReadinessFixtures.QaBlockFromPrompt(
+                context.OutcomeContext,
+                risks: [("RR-001", DeliveryRiskClassification.WaiverRequired)]);
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var (candidateId, revision, hash) = await harness.ReadinessBindingAsync();
+        var before = await harness.LoadFlowAsync();
+        var waiver = Assert.Single(
+            before.GateRecords, gate => gate.ActionType == HandoffActionType.CustomerWaiver);
+
+        var stale = await Assert.ThrowsAsync<DeliveryReadinessConflictException>(
+            () => harness.Reviews.ResolveReadinessAsync(
+                harness.FlowId,
+                new ReadinessResolutionRequest
+                {
+                    ReviewedCandidateId = candidateId,
+                    ReadinessRevision = revision + 1,
+                    ReadinessContractHash = hash,
+                    Action = ReadinessResolutionAction.RequestRefinement,
+                    Refinement = new DirectReviewRefinement { RequestedChanges = ["Resolve the risk."] }
+                }));
+        Assert.Equal(DeliveryReadinessConflicts.ReviewStale, stale.Code);
+        Assert.False((await harness.LoadFlowAsync()).GateRecords.Single(gate => gate.Id == waiver.Id).Resolved);
+
+        var resolved = await harness.Reviews.ResolveReadinessAsync(
+            harness.FlowId,
+            new ReadinessResolutionRequest
+            {
+                ReviewedCandidateId = candidateId,
+                ReadinessRevision = revision,
+                ReadinessContractHash = hash,
+                Action = ReadinessResolutionAction.RequestRefinement,
+                Refinement = new DirectReviewRefinement { RequestedChanges = ["Resolve the risk."] }
+            });
+
+        Assert.Equal(DeliveryReadinessState.NeedsCustomerWaiver, resolved.ResolvedFrom);
+        Assert.Equal(2, resolved.Iteration);
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Reworking, flow.Status);
+        var declined = flow.GateRecords.Single(gate => gate.Id == waiver.Id);
+        Assert.True(declined.Resolved);
+        Assert.False(declined.Approved);
+        Assert.DoesNotContain(flow.GateRecords, gate => gate.ActionType == HandoffActionType.CustomerReview);
+        Assert.Contains(flow.Events, item => item.Type == "gate.customer-waiver-declined");
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        await using var database = await harness.Factory.CreateDbContextAsync();
+        Assert.Empty(await database.ReadinessWaiverRecords.ToListAsync());
+        Assert.Empty(await database.DeliveryReadinessSnapshots
+            .Where(item => item.FlowRunId == harness.FlowId && item.Active).ToListAsync());
+    }
+
+    [Fact]
     public async Task DeliveryReadiness_NonBlockingDisclosureStaysReadyAndRestartIsIdempotent()
     {
         await using var harness =
@@ -3163,6 +3263,8 @@ public sealed class ReviewWorkflowTests
 
         public bool FailVerification { get; set; }
 
+        public string? SealFailure { get; set; }
+
         public Task<ReviewedCandidateIdentity> SealAsync(
             FlowRun flow,
             Guid outcomeOwnerStepId,
@@ -3171,6 +3273,10 @@ public sealed class ReviewWorkflowTests
             CancellationToken cancellationToken = default)
         {
             SealCalls++;
+            if (SealFailure is not null)
+            {
+                throw new CandidateValidationException(SealFailure);
+            }
             var identity = Identity(
                 flow,
                 outcomeOwnerStepId,

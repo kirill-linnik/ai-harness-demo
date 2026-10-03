@@ -44,7 +44,8 @@ export function ReadinessPanel({ flow }: { flow: FlowDetailDto }) {
     readiness.requiredWaiverRiskIds.length > 0;
   const canRequestRefinement =
     readiness.allowedActions.includes("RequestRefinement") &&
-    readiness.state === "NeedsRefinement";
+    (readiness.state === "NeedsRefinement" ||
+      readiness.state === "NeedsCustomerWaiver");
   const canResolveBlock = readiness.state === "Blocked";
 
   async function resolve(
@@ -241,11 +242,11 @@ export function ReadinessPanel({ flow }: { flow: FlowDetailDto }) {
           </div>
         )}
 
-        {readiness.state === "NeedsRefinement" && (
+        {canRequestRefinement && (
           <div className="readiness-resolution">
             <p className="muted">
               Acceptance and publication are unavailable. Request refinement so the team can
-              close the listed gaps.
+              address the listed gaps or risks without requiring a waiver.
             </p>
             <label className="field" htmlFor="readiness-refinement">
               <span>Requested changes (one per line)</span>

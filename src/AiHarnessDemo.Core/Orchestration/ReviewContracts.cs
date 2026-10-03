@@ -87,7 +87,7 @@ public sealed record ReadinessWaiverResponse(
 [JsonConverter(typeof(ExactStringEnumConverter<ReadinessResolutionAction>))]
 public enum ReadinessResolutionAction
 {
-    /// <summary>Queue a new iteration from a <c>NeedsRefinement</c> assessment.</summary>
+    /// <summary>Queue a new iteration from NeedsRefinement or decline a pending customer waiver.</summary>
     RequestRefinement,
 
     /// <summary>Re-run the current blocked iteration.</summary>

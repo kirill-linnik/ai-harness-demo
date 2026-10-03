@@ -2365,6 +2365,10 @@ public sealed partial class CopilotReasoningHost(
               Use only exact roster Id values. Account Manager, Team Lead, and Pre-mortem Sceptic are never workers.
               Return either Planned or MissingQualification and follow every supplied property, enum, bound, duty, stage, dependency, outcome-owner, publication, and checkpoint rule exactly.
               Do not emit additional planning documents, Markdown fences, or duplicate sentinels.
+              Keep the entire reply under the assignment's response budget, including criteria and profiles.
+              Emit a single complete response with plain, unformatted status and sentinel lines.
+              If a response is interrupted, regenerate the whole compact document from its opening status.
+              Never continue a trailing JSON fragment or rely on concatenation with an earlier message.
               """;
         }
         if (invocationKind is

@@ -233,46 +233,52 @@ describe("ReadinessPanel", () => {
     });
   });
 
-  it("offers typed resolution actions when readiness needs refinement", async () => {
-    const resolve = vi.spyOn(api, "resolveReadiness").mockResolvedValue({
-      flowId,
-      action: "RequestRefinement",
-      resolvedFrom: "NeedsRefinement",
-      status: "Reworking",
-      iteration: 2,
-      message: "A new iteration was queued."
-    });
-    const notReady = flow({
-      deliveryReadiness: readiness({
-        state: "NeedsRefinement",
-        label: "Needs refinement",
-        allowedActions: ["RequestRefinement"],
-        reviewGateId: null,
-        publicationAssurance: "Publication is not authorized"
-      })
-    });
+  it.each(["NeedsRefinement", "NeedsCustomerWaiver"] as const)(
+    "offers bound refinement without acceptance or waiver from %s",
+    async state => {
+      const resolve = vi.spyOn(api, "resolveReadiness").mockResolvedValue({
+        flowId,
+        action: "RequestRefinement",
+        resolvedFrom: state,
+        status: "Reworking",
+        iteration: 2,
+        message: "A new iteration was queued."
+      });
+      const notReady = flow({
+        deliveryReadiness: readiness({
+          state,
+          label: "Needs refinement",
+          allowedActions: ["RequestRefinement"],
+          reviewGateId: null,
+          publicationAssurance: "Publication is not authorized"
+        })
+      });
 
-    renderPanel(<ReadinessPanel flow={notReady} />);
-    fireEvent.change(screen.getByLabelText(/Requested changes \(one per line\)/), {
-      target: { value: "Make the archive error state distinguishable." }
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Request refinement" }));
+      renderPanel(<ReadinessPanel flow={notReady} />);
+      fireEvent.change(screen.getByLabelText(/Requested changes \(one per line\)/), {
+        target: { value: "Make the archive error state distinguishable." }
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Request refinement" }));
 
-    await waitFor(() => expect(resolve).toHaveBeenCalledTimes(1));
-    expect(resolve).toHaveBeenCalledWith(flowId, {
-      reviewedCandidateId: candidateId,
-      readinessRevision: 1,
-      readinessContractHash: `sha256:${"a".repeat(64)}`,
-      action: "RequestRefinement",
-      refinement: {
-        goal: null,
-        requestedChanges: ["Make the archive error state distinguishable."]
-      }
-    });
-    expect(
-      screen.queryByRole("button", { name: /^Accept$/ })
-    ).not.toBeInTheDocument();
-  });
+      await waitFor(() => expect(resolve).toHaveBeenCalledTimes(1));
+      expect(resolve).toHaveBeenCalledWith(flowId, {
+        reviewedCandidateId: candidateId,
+        readinessRevision: 1,
+        readinessContractHash: `sha256:${"a".repeat(64)}`,
+        action: "RequestRefinement",
+        refinement: {
+          goal: null,
+          requestedChanges: ["Make the archive error state distinguishable."]
+        }
+      });
+      expect(
+        screen.queryByRole("button", { name: /^Accept$/ })
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: /Acknowledge and waive risks/ })
+      ).not.toBeInTheDocument();
+    }
+  );
 
   it("offers Continue, Replan, and Abandon when readiness is blocked", async () => {
     const resolve = vi.spyOn(api, "resolveReadiness").mockResolvedValue({

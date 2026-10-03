@@ -468,10 +468,6 @@ public sealed class CandidateFingerprintService(
                 repository,
                 cancellationToken,
                 sandbox.EnvironmentVariables);
-            await ValidateIgnoredPathsAsync(
-                repository,
-                cancellationToken,
-                sandbox.EnvironmentVariables);
             var head = await ReadGitIdentityAsync(
                 repository,
                 "HEAD",
@@ -1183,26 +1179,23 @@ public sealed class CandidateFingerprintService(
                 cancellationToken,
                 environmentVariables))
             .ToDictionary(item => item.Path, StringComparer.Ordinal);
-        var ignoredPaths = await ReadIgnoredPathsAsync(
+        var untracked = await RunGitAsync(
             repository,
+            ["ls-files", "-z", "--others", "--exclude-standard"],
+            TimeSpan.FromSeconds(30),
             cancellationToken,
             environmentVariables);
-        var worktreePaths = EnumerateRepositoryWorktreePaths(repository);
-        foreach (var path in worktreePaths.Order(StringComparer.Ordinal))
+        if (untracked.ExitCode != 0)
+        {
+            throw new CandidateValidationException(
+                $"Unable to inspect untracked candidate files at '{repository}': {untracked.CombinedOutput}");
+        }
+        foreach (var path in untracked.StandardOutput.TrimEnd('\r', '\n').Split(
+                     '\0', StringSplitOptions.RemoveEmptyEntries).Order(StringComparer.Ordinal))
         {
             if (trackedEntries.ContainsKey(path) ||
                 IsApprovedGeneratedPath(path))
             {
-                continue;
-            }
-
-            if (TryMatchIgnoredPath(path, ignoredPaths, out var ignoredPath))
-            {
-                if (!IsApprovedIgnoredPath(repository, ignoredPath))
-                {
-                    throw new CandidateValidationException(
-                        $"Candidate repository has an ignored product or configuration path: {ignoredPath}");
-                }
                 continue;
             }
 
@@ -1663,6 +1656,8 @@ public sealed class CandidateFingerprintService(
         var trackedPrefixes = headEntries.Keys
             .Select(path => path + "/")
             .ToArray();
+        var ignoredPaths = await ReadIgnoredPathsAsync(
+            repository, cancellationToken, canonicalEnvironmentVariables);
         var pending = new Stack<string>();
         pending.Push(root);
         while (pending.Count > 0)
@@ -1697,6 +1692,14 @@ public sealed class CandidateFingerprintService(
                 }
 
                 var relativePath = NormalizeRelativePath(root, entry);
+                if (!headEntries.ContainsKey(relativePath) &&
+                    !trackedPrefixes.Any(path => path.StartsWith(
+                        relativePath + "/", StringComparison.Ordinal)) &&
+                    (TryMatchIgnoredPath(relativePath, ignoredPaths, out _) ||
+                     TryMatchIgnoredPath(relativePath + "/", ignoredPaths, out _)))
+                {
+                    continue;
+                }
                 if (IsLink(entry))
                 {
                     if (ShouldExcludeWorktreeEntry(
@@ -1824,64 +1827,6 @@ public sealed class CandidateFingerprintService(
                 canonicalEnvironmentVariables),
             LinkTarget: null);
 
-    private static IReadOnlySet<string> EnumerateRepositoryWorktreePaths(string repository)
-    {
-        var root = Path.GetFullPath(repository);
-        var nestedRepositoryRoots = DiscoverRepositories(root)
-            .Where(path => !PathsEqual(path, root))
-            .Select(Path.GetFullPath)
-            .ToArray();
-        var result = new HashSet<string>(StringComparer.Ordinal);
-        var pending = new Stack<string>();
-        pending.Push(root);
-        while (pending.Count > 0)
-        {
-            var current = pending.Pop();
-            IEnumerable<string> entries;
-            try
-            {
-                entries = Directory.EnumerateFileSystemEntries(current).ToArray();
-            }
-            catch (Exception exception) when (
-                exception is IOException or UnauthorizedAccessException)
-            {
-                throw new CandidateValidationException(
-                    $"Unable to inspect repository worktree '{current}': {exception.Message}");
-            }
-
-            foreach (var entry in entries)
-            {
-                if (string.Equals(
-                        Path.GetFileName(entry),
-                        ".git",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-                if (nestedRepositoryRoots.Any(other => IsContainedOrEqual(other, entry)))
-                {
-                    continue;
-                }
-
-                if (IsLink(entry))
-                {
-                    result.Add(NormalizeRelativePath(root, entry));
-                    continue;
-                }
-
-                if (Directory.Exists(entry))
-                {
-                    pending.Push(entry);
-                    continue;
-                }
-
-                result.Add(NormalizeRelativePath(root, entry));
-            }
-        }
-
-        return result;
-    }
-
     private async Task<IReadOnlyList<string>> ReadIgnoredPathsAsync(
         string repository,
         CancellationToken cancellationToken,
@@ -1910,25 +1855,6 @@ public sealed class CandidateFingerprintService(
             .OrderByDescending(path => path.Length)
             .ThenByDescending(path => path, StringComparer.Ordinal)
             .ToArray();
-    }
-
-    private async Task ValidateIgnoredPathsAsync(
-        string repository,
-        CancellationToken cancellationToken,
-        IReadOnlyDictionary<string, string?>? environmentVariables)
-    {
-        var ignoredPaths = await ReadIgnoredPathsAsync(
-            repository,
-            cancellationToken,
-            environmentVariables);
-        foreach (var path in ignoredPaths)
-        {
-            if (!IsApprovedIgnoredPath(repository, path))
-            {
-                throw new CandidateValidationException(
-                    $"Candidate repository has an ignored product or configuration path: {path}");
-            }
-        }
     }
 
     private static bool TryMatchIgnoredPath(
@@ -3063,6 +2989,7 @@ public sealed class CandidateFingerprintService(
         return IsApprovedTransientFile(
             segments.LastOrDefault() ?? string.Empty);
     }
+
 
     private static bool IsDocumentedPackageOutput(string ownerDirectory) =>
         Directory.Exists(ownerDirectory) &&

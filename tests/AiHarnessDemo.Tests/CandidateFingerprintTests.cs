@@ -895,7 +895,7 @@ public sealed class CandidateFingerprintTests
     }
 
     [Fact]
-    public async Task Candidate_RejectsIgnoredProductConfiguration()
+    public async Task Candidate_ExcludesIgnoredLocalConfiguration()
     {
         using var workspace = CandidateWorkspace.Create();
         await File.WriteAllTextAsync(
@@ -910,19 +910,21 @@ public sealed class CandidateFingerprintTests
             new ProcessRunner(),
             TimeProvider.System);
 
-        var exception = await Assert.ThrowsAsync<CandidateValidationException>(() =>
-            service.PrepareAsync(
+        var candidate = await service.PrepareAsync(
                 workspace.Flow,
                 Digest('a'),
                 Guid.NewGuid(),
-                requiresPreview: false));
+                requiresPreview: false);
 
-        Assert.Contains("ignored product", exception.Message);
-        Assert.Contains("appsettings.Production.json", exception.Message);
+        Assert.Single(candidate.Manifest.Repositories);
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "appsettings.Production.json"),
+            """{"FeatureEnabled":false}""");
+        Assert.True(await service.IsCurrentAsync(workspace.Flow, candidate, requiresPreview: false));
     }
 
     [Fact]
-    public async Task Candidate_DoesNotTreatArbitraryNestedTransientNameAsSafe()
+    public async Task Candidate_ExcludesIgnoredNestedOutput()
     {
         using var workspace = CandidateWorkspace.Create();
         await File.WriteAllTextAsync(
@@ -939,15 +941,13 @@ public sealed class CandidateFingerprintTests
             new ProcessRunner(),
             TimeProvider.System);
 
-        var exception = await Assert.ThrowsAsync<CandidateValidationException>(() =>
-            service.PrepareAsync(
+        var candidate = await service.PrepareAsync(
                 workspace.Flow,
                 Digest('a'),
                 Guid.NewGuid(),
-                requiresPreview: false));
+                requiresPreview: false);
 
-        Assert.Contains("ignored product", exception.Message);
-        Assert.Contains("config", exception.Message);
+        Assert.Single(candidate.Manifest.Repositories);
     }
 
     [Theory]
@@ -990,7 +990,9 @@ public sealed class CandidateFingerprintTests
     [InlineData("bin/generated.txt")]
     [InlineData("dist/generated.txt")]
     [InlineData("build/generated.txt")]
-    public async Task Candidate_RejectsIgnoredTransientNamedRootWithoutProjectManifest(
+    [InlineData("custom-release/generated.txt")]
+    [InlineData("dist-locale/generated.txt")]
+    public async Task Candidate_RespectsIgnoredOutputWithoutGuessingProjectLayout(
         string relativePath)
     {
         using var workspace = CandidateWorkspace.Create();
@@ -1010,18 +1012,15 @@ public sealed class CandidateFingerprintTests
             new ProcessRunner(),
             TimeProvider.System);
 
-        var exception = await Assert.ThrowsAsync<CandidateValidationException>(() =>
-            service.PrepareAsync(
+        await service.SealAsync(workspace.Flow);
+        var candidate = await service.PrepareAsync(
                 workspace.Flow,
                 Digest('a'),
                 Guid.NewGuid(),
-                requiresPreview: false));
+                requiresPreview: false);
 
-        Assert.True(
-            exception.Message.Contains(
-                "ignored product or configuration",
-                StringComparison.Ordinal),
-            exception.Message);
+        Assert.Single(candidate.Manifest.Repositories);
+        Assert.DoesNotContain(relativePath, workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD"));
     }
 
     [Fact]
@@ -2094,7 +2093,103 @@ public sealed class CandidateFingerprintTests
     }
 
     [Fact]
-    public async Task HostSeal_RejectsIgnoredProductFilesInsteadOfCommittingThem()
+    public async Task HostSeal_ExcludesVerifierReportWithoutBlockingOrPublishingIt()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        Directory.CreateDirectory(Path.Combine(workspace.Root, "scripts"));
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "package.json"), """{"name":"test-product"}""");
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "scripts", "verify-assets.js"),
+            "console.log('verification');");
+        await File.AppendAllTextAsync(
+            Path.Combine(workspace.Root, ".gitignore"),
+            $"{Environment.NewLine}*-report.json{Environment.NewLine}");
+        workspace.Git("add", "package.json", ".gitignore", "scripts/verify-assets.js");
+        workspace.Git("commit", "--quiet", "-m", "add verifier");
+        var report = Path.Combine(workspace.Root, "scripts", "verify-assets-report.json");
+        await File.WriteAllTextAsync(report, """{"passed":true}""");
+        var service = new CandidateFingerprintService(new ProcessRunner(), TimeProvider.System);
+
+        await service.SealAsync(workspace.Flow);
+        var candidate = await service.PrepareAsync(
+            workspace.Flow, Digest('a'), Guid.NewGuid(), requiresPreview: false);
+
+        Assert.DoesNotContain(
+            "scripts/verify-assets-report.json",
+            workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD"));
+        Assert.True(File.Exists(report));
+        await File.WriteAllTextAsync(report, """{"passed":true,"timing":123}""");
+        Assert.True(await service.IsCurrentAsync(workspace.Flow, candidate, requiresPreview: false));
+    }
+
+    [Theory]
+    [InlineData("scripts/verify-settings-report.json", false, true)]
+    [InlineData("scripts/verify-settings-report.json", true, false)]
+    [InlineData("config/verify-settings-report.json", true, true)]
+    [InlineData("scripts/runtime-report.json", true, true)]
+    public async Task HostSeal_RespectsIgnoredReportsWithoutNamingOrManifestRequirements(
+        string relativePath,
+        bool matchingScript,
+        bool projectManifest)
+    {
+        using var workspace = CandidateWorkspace.Create();
+        var directory = Path.Combine(
+            workspace.Root, Path.GetDirectoryName(relativePath)!.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(directory);
+        if (projectManifest)
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(workspace.Root, "package.json"), """{"name":"test-product"}""");
+            workspace.Git("add", "package.json");
+        }
+        if (matchingScript)
+        {
+            var stem = Path.GetFileName(relativePath)[..^"-report.json".Length];
+            await File.WriteAllTextAsync(Path.Combine(directory, stem + ".js"), "console.log('check');");
+            workspace.Git("add", $"{Path.GetDirectoryName(relativePath)!.Replace('\\', '/')}/{stem}.js");
+        }
+        await File.AppendAllTextAsync(
+            Path.Combine(workspace.Root, ".gitignore"),
+            $"{Environment.NewLine}*-report.json{Environment.NewLine}");
+        workspace.Git("add", ".gitignore");
+        workspace.Git("commit", "--quiet", "-m", "ignore report-shaped file");
+        await File.WriteAllTextAsync(
+            Path.Combine(directory, Path.GetFileName(relativePath)), """{"FeatureEnabled":true}""");
+        var service = new CandidateFingerprintService(new ProcessRunner(), TimeProvider.System);
+
+        await service.SealAsync(workspace.Flow);
+        Assert.DoesNotContain(relativePath, workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD"));
+    }
+
+    [Fact]
+    public async Task Candidate_ExplicitlyTrackedVerifierReportRemainsProductContent()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        Directory.CreateDirectory(Path.Combine(workspace.Root, "scripts"));
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "package.json"), """{"name":"test-product"}""");
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, "scripts", "check-assets.js"), "console.log('check');");
+        var report = Path.Combine(workspace.Root, "scripts", "check-assets-report.json");
+        await File.WriteAllTextAsync(report, """{"passed":true}""");
+        await File.AppendAllTextAsync(
+            Path.Combine(workspace.Root, ".gitignore"), $"{Environment.NewLine}scripts/{Environment.NewLine}");
+        workspace.Git("add", "package.json", ".gitignore");
+        workspace.Git("add", "--force", "scripts");
+        workspace.Git("commit", "--quiet", "-m", "include verification report");
+        var service = new CandidateFingerprintService(new ProcessRunner(), TimeProvider.System);
+        var candidate = await service.PrepareAsync(
+            workspace.Flow, Digest('a'), Guid.NewGuid(), requiresPreview: false);
+
+        await File.WriteAllTextAsync(report, """{"passed":false}""");
+
+        await Assert.ThrowsAsync<CandidateValidationException>(
+            () => service.IsCurrentAsync(workspace.Flow, candidate, requiresPreview: false));
+    }
+
+    [Fact]
+    public async Task HostSeal_ExcludesIgnoredSecretsInsteadOfCommittingThem()
     {
         using var workspace = CandidateWorkspace.Create();
         var service = new CandidateFingerprintService(
@@ -2109,10 +2204,8 @@ public sealed class CandidateFingerprintTests
             Path.Combine(workspace.Root, ".env"),
             "SECRET=must-not-be-committed");
 
-        var exception = await Assert.ThrowsAsync<CandidateValidationException>(
-            () => service.SealAsync(workspace.Flow));
+        await service.SealAsync(workspace.Flow);
 
-        Assert.Contains("ignored product or configuration", exception.Message);
         Assert.DoesNotContain(
             ".env",
             workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD")
@@ -2126,7 +2219,8 @@ public sealed class CandidateFingerprintTests
     [Theory]
     [InlineData("packages/private/config.json")]
     [InlineData("wwwroot/private/config.json")]
-    public async Task HostSeal_RejectsAmbiguousIgnoredProductDirectories(
+    [InlineData("scripts/private/config.json")]
+    public async Task HostSeal_ExcludesIgnoredDirectoriesFromDelivery(
         string relativePath)
     {
         using var workspace = CandidateWorkspace.Create();
@@ -2149,10 +2243,9 @@ public sealed class CandidateFingerprintTests
             new ProcessRunner(),
             TimeProvider.System);
 
-        var exception = await Assert.ThrowsAsync<CandidateValidationException>(
-            () => service.SealAsync(workspace.Flow));
+        await service.SealAsync(workspace.Flow);
 
-        Assert.Contains("ignored product or configuration", exception.Message);
+        Assert.DoesNotContain(relativePath, workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD"));
     }
 
     private static FlowRun MultiRepositoryFlow(

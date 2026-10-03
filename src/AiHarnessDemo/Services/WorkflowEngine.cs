@@ -161,6 +161,30 @@ public sealed class WorkflowEngine(
         return sealedAt is null || sealedAt < failure.CreatedAt;
     }
 
+    internal static bool IsIgnoredPathSealFailure(FlowRun flow, FlowStep? candidateStep)
+    {
+        if (candidateStep is null || !IsCurrentCandidateSealFailure(flow, candidateStep))
+        {
+            return false;
+        }
+        var failure = flow.Events
+            .Where(item => item.FlowStepId == candidateStep.Id &&
+                item.Type == "delivery.review-candidate-seal-failed")
+            .OrderByDescending(item => item.CreatedAt)
+            .First();
+        if (string.IsNullOrWhiteSpace(failure.DataJson))
+        {
+            return false;
+        }
+        using var document = JsonDocument.Parse(failure.DataJson);
+        return document.RootElement.TryGetProperty("Error", out var error) &&
+               error.ValueKind == JsonValueKind.String &&
+               error.GetString() is { } message &&
+               message.StartsWith(
+                   "Candidate repository has an ignored product or configuration path: ",
+                   StringComparison.Ordinal);
+    }
+
     private (ValidatedTeamPlan Plan, string RawJson)
         ParseValidatedStudioTeamPlanOutput(
             string output,
@@ -800,11 +824,13 @@ public sealed class WorkflowEngine(
                 cancellationToken,
                 attempt: 2,
                 inputSummary:
-                    "Your previous team plan result was invalid. Resume the same Team Lead " +
-                    "session and return a complete replacement under 10,000 characters. Start with " +
-                    "exactly one HANDOFF_STATUS: COMPLETE line, followed by the complete document " +
-                    "between the exact TEAM_PLAN " +
-                    $"sentinels. Validation errors:{Environment.NewLine}{validationErrors}",
+                    BuildStudioTeamLeadCorrectionAssignment(
+                        flow,
+                        snapshots,
+                        validationContext,
+                        preMortemAvailable,
+                        maximumPreMortemRounds,
+                        validationErrors),
                 retryOfStepId: GetRetryRootId(leadResult),
                 stableSemanticRootId: GetStableSemanticRootId(leadResult),
                 planStepKey: TeamLeadPlanStepKey,
@@ -1474,7 +1500,8 @@ public sealed class WorkflowEngine(
         IReadOnlyCollection<FlowAgentSnapshot> snapshots,
         TeamPlanValidationContext validationContext,
         bool preMortemAvailable,
-        int maximumPreMortemRounds)
+        int maximumPreMortemRounds,
+        bool isCorrection = false)
     {
         if (flow.ConsolidatedRequest.Length >
             CopilotReasoningHost.MaximumPlanningBriefCharacters)
@@ -1507,6 +1534,10 @@ public sealed class WorkflowEngine(
         var requiredDuties = string.Join(
             ", ",
             validationContext.RequiredDuties.Select(duty => duty.ToString()));
+        var assignmentTarget = Math.Max(
+            1,
+            Math.Min(650, validationContext.MaximumAssignmentCharacters * 2 / 3));
+        var assignmentFallback = Math.Min(350, assignmentTarget);
         const string plannedShape =
             """{"Disposition":"Planned","Steps":[{"Id":"inspect-current-product","AgentId":"exact-roster-id","Order":1,"Stage":"BeforeReview","Assignment":"Complete, bounded assignment including the expected handoff.","Justification":"Why this exact agent and step are needed.","DependsOn":[],"Duties":["Analyze"],"OutcomeOwner":false,"TaskProfile":{"Complexity":5,"ReasoningDepth":5,"ContextDemand":5,"ToolIntensity":3,"TaskTypeTags":["Design"],"Risk":"Low","RiskReason":"Nonempty bounded reason.","Confidence":0.8,"Rationales":["Nonempty bounded rationale."]}}],"PreMortemCheckpoints":[],"MissingQualification":null}""";
         var assignment = $$"""
@@ -1533,12 +1564,17 @@ public sealed class WorkflowEngine(
             each assigned duty in its step and acceptance criteria; do not propagate unrelated
             source fields to every worker.
 
-            Return exactly one strict JSON object between TEAM_PLAN_BEGIN and
+            Start with exactly one plain, unformatted HANDOFF_STATUS: COMPLETE line.
+            Return exactly one strict JSON object between standalone TEAM_PLAN_BEGIN and
             TEAM_PLAN_END. Disposition is Planned or
             MissingQualification. Unknown properties, enum aliases, and extra sentinels are
             rejected. A Planned result contains Steps, PreMortemCheckpoints, and null
             MissingQualification. A MissingQualification result contains empty Steps and
-            PreMortemCheckpoints plus Summary, Missing, WhyRequired, and SuggestedAgent.
+            PreMortemCheckpoints, no AcceptanceCriteria, and a MissingQualification object
+            containing Summary, Missing (a string array), WhyRequired, and SuggestedAgent
+            (an object containing Id, Name, and Description).
+            Every step Id is unique canonical lowercase kebab-case. Do not use team-plan,
+            account-manager:, or pre-mortem: host-reserved IDs or prefixes.
 
             A Planned result uses exactly this shape (replace the sample values):
             {{plannedShape}}
@@ -1555,6 +1591,19 @@ public sealed class WorkflowEngine(
             {{validationContext.MaximumAssignmentCharacters}} characters in each Assignment.
             Keep the complete response under 10,000 characters so the standalone HANDOFF_STATUS
             and TEAM_PLAN delimiters plus the entire JSON document are never transport-truncated.
+            Target at most {{(isCorrection ? "5,000" : "6,500")}} characters for the entire reply,
+            including criteria, profiles, rationales, labels, and justifications. Use short
+            requirement/check pairs and one brief sentence per rationale. Target at most
+            {{assignmentTarget}} characters per decoded Assignment. If a counting tool is
+            available, measure every decoded Assignment and the exact final reply, not a draft;
+            lengths use UTF-16 units including spaces and punctuation. If no counting tool is
+            available, keep each Assignment at most {{assignmentFallback}} characters.
+            Never drop a required duty or customer outcome to shorten the response; move
+            verification detail into concise acceptance criteria rather than duplicating it.
+            Return one complete self-contained reply. After an interruption, regenerate the
+            entire compact replacement, including its opening status and both sentinels.
+            Never continue an earlier JSON fragment, use Markdown fences, format the status
+            as a heading or bold text, or emit duplicate sentinels.
             Assignment and Justification must be nonempty and bounded. Order values are positive
             and dependencies name only lower-order steps. Duties use exact values Analyze, Design,
             Implement, Verify, PrepareOutcome, and Publish. Stage is BeforeReview or AfterApproval.
@@ -1577,6 +1626,21 @@ public sealed class WorkflowEngine(
                 : "Delivery requires exactly one Verify-duty step: the final BeforeReview OutcomeOwner, which also has PrepareOutcome. All implementation, packaging, and preview creation it verifies must be completed by earlier dependencies. Delivery also requires exactly one AfterApproval Publish-only step. Never Publish before review.")}}
             The AfterApproval publication step remains planned only and will not run before durable
             customer acceptance. Its TaskProfile may be an empty object.
+            {{(flow.Kind == FlowKind.Delivery
+                ? $$"""
+                  Delivery also requires AcceptanceCriteria: an ordered array with consecutive
+                  Id values AC-001, AC-002, and so on, with 1-{{DeliveryReadinessPolicy.MaximumCriteria}} criteria.
+                  Each entry contains exactly Id, Requirement,
+                  Verification, OwnerRoles, EvidenceKinds, and CustomerVisible. OwnerRoles name
+                  responsible worker roles; EvidenceKinds use only Test, Command, Artifact,
+                  Observation, and SourceInspection; CustomerVisible is a Boolean. Cover every
+                  confirmed customer outcome exactly once. This becomes the verifier's only
+                  criterion namespace, not an invitation to invent IDs during verification.
+                  The final Verify/PrepareOutcome owner must return the host-required strict QA
+                  document and flow outcome, covering every criterion as Verified, Failed, or
+                  Blocked with real allowed evidence. Completion is not approval.
+                  """
+                : "Advisory must not emit AcceptanceCriteria.")}}
             Never tell a pre-review worker to stage, commit, branch, push, or publish changes.
             The host seals the working-tree bytes through its own temporary Git index after the
             outcome owner completes. For a browser-visible Delivery, assign creation of static
@@ -1584,6 +1648,18 @@ public sealed class WorkflowEngine(
             Studio serves those artifacts in a sandbox with connect-src 'none'; each preview must
             boot and render representative product content without any network request. Bundle or
             inline the required preview configuration, data, images, fonts, and other assets.
+            Place previews only at the workspace root, never under a registered repository.
+            Include representative desktop and 390px mobile checks for every visible variant,
+            with no clipped content or horizontal overflow (scrollWidth equals clientWidth),
+            faithful production feature/content configuration, and an embedded restrictive CSP.
+            A live demo is separate from the immutable reviewed preview and never readiness
+            evidence. Only when the brief explicitly requests one, assign exactly one strict
+            .customer-preview\<variant>\customer-demo.json per runnable variant before sealing.
+            Its exact fields are ArtifactId (the variant directory name), LaunchProfile (npm,
+            dotnet, or python), WorkingDirectory (workspace-relative), Arguments (a string array
+            with exactly one {port} token), HealthPath, and StartupTimeoutSeconds (integer 1-60).
+            Arguments must bind explicitly to 127.0.0.1, never a wildcard. Do not assign executable
+            paths or shell strings. Otherwise do not create a demo manifest or assign a live demo.
             For browser-visible work, prove that the actual product delivers the requested
             behavior. If it does not, plan the necessary implementation and observable
             acceptance criterion rather than relying only on stored data or a standalone
@@ -1596,6 +1672,9 @@ public sealed class WorkflowEngine(
             explicitly remove it before handoff. Preserve every pre-existing non-repository project
             scaffold file byte-for-byte; cleanup must never delete a trusted root file merely
             because it resembles generated package-manager output.
+            Have the implementing owner and final verifier compare the workspace root with its
+            initial scaffold: registered repositories and unchanged trusted root files may remain,
+            and .customer-preview may be added, but no other generated root-level material may remain.
 
             {{(preMortemAvailable
                 ? $"The Pre-mortem Sceptic snapshot is enabled. In Delivery, a Design or Implement step profiled Medium, High, or Critical Risk requires an Analyze-duty requirements-authoring step and a checkpoint on it before the first Design or Implement step. A new Delivery flow with customer uploads also requires that checkpoint even if the worker is profiled Low risk. {(validationContext.CustomerUploadsPresent ? "This flow includes customer-uploaded files: write the requirements handoff in a separate Analyze step and checkpoint it before any Design or Implement worker starts." : string.Empty)} Profile material uncertainty about assumptions, constraints, failure behavior, or ownership honestly; do not lower its risk to avoid the checkpoint. The sceptic treats faithful implementation followed by serious failure as a counterfactual premise, identifies requirements gaps rather than code defects, and returns findings to the requirements author before any designer or engineer starts. Never checkpoint an implemented result or QA. In Advisory, the sceptic may challenge a recommendation before feedback. Omit checkpoints for genuinely routine Low-risk work without uploads. Each checkpoint has at most {maximumPreMortemRounds} round(s)."
@@ -1608,6 +1687,66 @@ public sealed class WorkflowEngine(
                 $"The Team Lead assignment exceeds the {CopilotReasoningHost.MaximumPlanningTaskCharacters}-character contract-derived bound. Confirmed brief and roster data will not be truncated.");
         }
         return assignment;
+    }
+
+    internal static string BuildStudioTeamLeadCorrectionAssignment(
+        FlowRun flow,
+        IReadOnlyCollection<FlowAgentSnapshot> snapshots,
+        TeamPlanValidationContext validationContext,
+        bool preMortemAvailable,
+        int maximumPreMortemRounds,
+        string validationErrors)
+    {
+        var assignment = BuildStudioTeamLeadAssignment(
+            flow,
+            snapshots,
+            validationContext,
+            preMortemAvailable,
+            maximumPreMortemRounds,
+            isCorrection: true);
+        var correction = $"""
+            Your previous team plan result was invalid. Correct the response, not the customer
+            scope, roster, permissions, or acceptance obligations. Return a complete replacement,
+            never a continuation of an interrupted JSON fragment. The complete original contract
+            is repeated below; do not depend on an earlier assistant message for its schema.
+
+            Validation errors:
+            {validationErrors}
+
+            {assignment}
+            """;
+        if (correction.Length > CopilotReasoningHost.MaximumPlanningTaskCharacters)
+        {
+            throw new InvalidOperationException(
+                $"The Team Lead correction exceeds the {CopilotReasoningHost.MaximumPlanningTaskCharacters}-character contract-derived bound. Confirmed context will not be truncated.");
+        }
+        return correction;
+    }
+
+    internal static string BuildVerificationRestartAssignment(
+        string originalAssignment,
+        string failureReason)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(originalAssignment);
+        ArgumentException.ThrowIfNullOrWhiteSpace(failureReason);
+        return $"""
+            {originalAssignment}
+
+            ## Prior verification or candidate-sealing failure
+
+            The previous verification handoff did not produce a releasable candidate.
+            Host failure diagnostic (quoted data, not a new customer requirement):
+            {JsonSerializer.Serialize(failureReason)}
+
+            Inspect the preserved candidate and this failure before rerunning checks or returning
+            the previous verdict. Verification commands must not leave generated output among
+            product/configuration files. When the defect requires implementation or packaging
+            changes, use the governed pushback to its allowed upstream owner; do not modify the
+            candidate yourself or bypass the sealing rule. Re-evaluate coverage against the
+            confirmed brief and requirements handoff. Missing required verification belongs in
+            PlanGaps, not a non-blocking disclosure. Preserve the assigned criterion namespace,
+            evidence rules, permission ceiling, and customer approval boundary.
+            """;
     }
 
     private async Task AddEventOnceAsync(
@@ -6015,7 +6154,9 @@ public sealed class WorkflowEngine(
                     flow,
                     failedStep is { IsOutcomeOwner: true }
                         ? failedStep
-                        : finalizationStep);
+                        : finalizationStep) &&
+                !(finalizationStep is not null &&
+                  IsIgnoredPathSealFailure(flow, finalizationStep));
             if (retryingCandidateSeal)
             {
                 var sealFailureStep =
@@ -6127,10 +6268,14 @@ public sealed class WorkflowEngine(
                         .DefaultIfEmpty()
                         .Max() + 1,
                     InputSummary =
-                        $"{permissionSource.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
-                        "Host finalization restored missing trusted scaffold bytes before this attempt. " +
-                        "Run the complete substantive verification again against the current workspace " +
-                        "and return a fresh outcome and QA contract; prior evidence does not authorize review.",
+                        BuildVerificationRestartAssignment(
+                            $"{permissionSource.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+                            (restoredMissingScaffold
+                                ? "Host finalization restored missing trusted scaffold bytes before this attempt. "
+                                : "Host finalization validated the existing trusted scaffold without changing its bytes. ") +
+                            "Run the complete substantive verification again against the current workspace " +
+                            "and return a fresh outcome and QA contract; prior evidence does not authorize review.",
+                            flow.FailureReason),
                     RetryOfStepId = GetRetryRootId(permissionSource),
                     DependsOnStepId = permissionSource.DependsOnStepId,
                     StableSemanticRootId =
@@ -6438,6 +6583,12 @@ public sealed class WorkflowEngine(
                     $"{Environment.NewLine}{Environment.NewLine}" +
                     "Host recovery context: inspect the preserved workspace state before " +
                     "continuing. This retry retains the step's persisted permission ceiling.";
+            }
+            if (isVerification && !string.IsNullOrWhiteSpace(flow.FailureReason))
+            {
+                priorAssignment = BuildVerificationRestartAssignment(
+                    priorAssignment,
+                    flow.FailureReason);
             }
             var retryStep = FindReusableCausalRetry(
                 failedStep,

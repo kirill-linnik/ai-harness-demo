@@ -6,8 +6,10 @@
 - Agent definitions are always project-agnostic role contracts. Never embed a customer's name,
   project or repository identifiers, project-specific files or schemas, or incident-specific
   instructions in an agent definition. Keep those facts in the confirmed flow brief, durable
-  customer input and uploads, repository evidence, and the current role assignment. Platform
-  contracts such as `.customer-preview\<variant>` are reusable and may be documented.
+  customer input and uploads, repository evidence, and the current role assignment.
+- Keep editable agents focused on role judgment and reusable working methods. Response schemas,
+  sentinels, character budgets, evidence identifiers, workspace artifact locations, and lifecycle
+  rules belong in harness-owned working assignments and contracts, not agent definitions.
 - Treat the full customer submission as reference material, not a checklist of requirements.
   Agents should select and pass along only the facts needed for their current duty and confirmed
   outcome. Do not promote unrelated or sensitive fields into plans, code, artifacts, or handoffs;

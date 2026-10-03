@@ -460,6 +460,13 @@ public sealed class WorkflowRestartRecoveryTests
             WorkflowEngine.IsCurrentCandidateSealFailure(
                 flow,
                 currentOwner));
+        currentFailure.DataJson =
+            """{"Error":"Candidate repository has an ignored product or configuration path: custom-build/"}""";
+        Assert.True(WorkflowEngine.IsIgnoredPathSealFailure(flow, currentOwner));
+        Assert.False(WorkflowEngine.IsIgnoredPathSealFailure(flow, priorOwner));
+        currentFailure.DataJson =
+            """{"Error":"Host-owned scaffold file changed."}""";
+        Assert.False(WorkflowEngine.IsIgnoredPathSealFailure(flow, currentOwner));
 
         flow.Events.Add(new FlowEvent
         {

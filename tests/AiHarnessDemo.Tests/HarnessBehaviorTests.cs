@@ -138,24 +138,12 @@ public sealed class AgentCatalogTests
             "software-engineer.agent.md",
             File.ReadAllText(Path.Combine(agents, "software-engineer.agent.md")));
 
-        Assert.Contains("390px mobile", teamLead.Instructions);
-        Assert.Contains("scrollWidth", teamLead.Instructions);
-        Assert.Contains("390px mobile", engineer.Instructions);
-        Assert.Contains("scrollWidth", engineer.Instructions);
-        Assert.Contains("host-owned scaffold", engineer.Instructions);
-        Assert.Contains("never leave root-level copies of configuration or data", engineer.Instructions);
-        Assert.Contains(
-            "workspace root with its initial scaffold",
-            teamLead.Instructions);
-        Assert.Contains(
-            "only an `Analyze` step that writes the requirements handoff",
-            teamLead.Instructions);
-        Assert.Contains(
-            "before any designer or engineer receives that handoff",
-            teamLead.Instructions);
-        Assert.Contains(
-            "`Observation`, `Command`, `SourceInspection`, and `Test`",
-            teamLead.Instructions);
+        Assert.Contains("responsive", teamLead.Instructions);
+        Assert.Contains("independent", teamLead.Instructions);
+        Assert.Contains("current assignment's", teamLead.Instructions);
+        Assert.Contains("horizontal overflow", engineer.Instructions);
+        Assert.Contains("trusted project scaffold", engineer.Instructions);
+        Assert.Contains("account for all changed paths", engineer.Instructions);
         Assert.Contains(
             "production-visible",
             engineer.Instructions);
@@ -172,7 +160,8 @@ public sealed class AgentCatalogTests
             qualityEngineer.Instructions);
         Assert.Contains(
             "a static preview, template inspection, or data record cannot substitute",
-            qualityEngineer.Instructions);
+            qualityEngineer.Instructions,
+            StringComparison.OrdinalIgnoreCase);
         Assert.Contains(
             "Read each cited observation's actual result",
             qualityEngineer.Instructions);
@@ -183,8 +172,8 @@ public sealed class AgentCatalogTests
             File.ReadAllText(Path.Combine(agents, "pre-mortem-sceptic.agent.md")));
         Assert.Contains("Counterfactual case file", sceptic.Instructions);
         Assert.Contains("Do not inspect implementation source", sceptic.Instructions);
-        Assert.Contains("Return `CLEAR`", sceptic.Instructions);
-        Assert.Contains("final Verify owner separately validates", sceptic.Instructions);
+        Assert.Contains("finding no gap is a valid outcome", sceptic.Instructions);
+        Assert.Contains("Independent final verification separately validates", sceptic.Instructions);
     }
 
     [Fact]
@@ -230,6 +219,85 @@ public sealed class AgentCatalogTests
             "only facts necessary for the confirmed outcome",
             workflow,
             StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("account-manager", "without prescribing an unverified solution")]
+    [InlineData("analyst", "counterexample")]
+    [InlineData("team-lead", "cheap-but-wrong implementation")]
+    [InlineData("team-lead", "content-uniqueness and reachable-language regression criteria")]
+    [InlineData("team-lead", "independently understandable")]
+    [InlineData("team-lead", "faithful source-backed media")]
+    [InlineData("product-designer", "Keep, Move, Merge, Replace, or Remove")]
+    [InlineData("product-designer", "one visible owner")]
+    [InlineData("pre-mortem-sceptic", "cheapest faithful implementation")]
+    [InlineData("software-engineer", "Zero overflow is necessary, not proof of good design")]
+    [InlineData("software-engineer", "baseline evidence before labeling a defect pre-existing")]
+    [InlineData("software-engineer", "focused composition regressions")]
+    [InlineData("software-engineer", "never hand-transcribe binary encodings")]
+    [InlineData("software-engineer", "negative corruption fixture")]
+    [InlineData("quality-engineer", "technical correctness, design fidelity, and customer-outcome adequacy")]
+    [InlineData("quality-engineer", "waivable risk")]
+    [InlineData("quality-engineer", "inspect meaningful visible pixels")]
+    [InlineData("quality-engineer", "negative corruption fixture")]
+    [InlineData("product-manager", "not automatically")]
+    [InlineData("architect", "complete customer outcome")]
+    [InlineData("data-engineer", "old-to-new preservation")]
+    [InlineData("security-engineer", "preconditions, reachability, customer impact")]
+    [InlineData("release-engineer", "not an independently beautified mockup")]
+    [InlineData("technical-writer", "consolidate")]
+    public void CheckedInRoleContracts_RetainOutcomeQualityObligations(
+        string agentId,
+        string obligation)
+    {
+        var fileName = $"{agentId}.agent.md";
+        var path = Path.Combine(RepositoryRoot(), ".github", "agents", fileName);
+        var manifest = AgentCatalogLoader.Parse(agentId, fileName, File.ReadAllText(path));
+
+        Assert.Contains(obligation, manifest.Instructions, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void VisualQualityContracts_RejectProxyPassesAndPreserveRoleBoundaries()
+    {
+        var agents = Path.Combine(RepositoryRoot(), ".github", "agents");
+        var designer = File.ReadAllText(Path.Combine(agents, "product-designer.agent.md"));
+        var quality = File.ReadAllText(Path.Combine(agents, "quality-engineer.agent.md"));
+        var sceptic = File.ReadAllText(Path.Combine(agents, "pre-mortem-sceptic.agent.md"));
+        var release = File.ReadAllText(Path.Combine(agents, "release-engineer.agent.md"));
+
+        Assert.Contains("Do not implement production code", designer);
+        Assert.Contains("baseline and candidate at matched desktop/mobile viewports", quality);
+        Assert.Contains("duplicate explanations", quality);
+        Assert.Contains("unavailable coverage, never as tests passed", quality);
+        Assert.Contains("acceptance-plan gaps", quality);
+        Assert.Contains("Never modify the", quality);
+        Assert.Contains("Do not inspect implementation source", sceptic);
+        Assert.Contains("not \"all good\", design approval", sceptic);
+        Assert.Contains("renewed verification", release);
+        Assert.Contains("customer approval has been recorded", release);
+    }
+
+    [Fact]
+    public void RoleDefinitions_DoNotOwnHarnessWireProtocolsOrStorageContracts()
+    {
+        var agents = Path.Combine(RepositoryRoot(), ".github", "agents");
+        var protocols = new[]
+        {
+            "TEAM_PLAN_BEGIN", "TEAM_PLAN_END", "HANDOFF_STATUS", "INTAKE_BEGIN",
+            "INTAKE_END", "OUTCOME_QA_BEGIN", "FLOW_OUTCOME_BEGIN", "PUSHBACK_OWNER_STEP_ID",
+            "BeforeReview", "AfterApproval", "TaskProfile", "EvidenceKinds",
+            ".customer-preview", "customer-demo.json", "DURABLE_ADVISORY_PROMOTION_AUTHORIZATION",
+            "host-owned", "the harness", "Studio"
+        };
+        foreach (var path in Directory.GetFiles(agents, "*.agent.md"))
+        {
+            var instructions = File.ReadAllText(path);
+            foreach (var protocol in protocols)
+            {
+                Assert.DoesNotContain(protocol, instructions, StringComparison.OrdinalIgnoreCase);
+            }
+        }
     }
 
     private static string RepositoryRoot()
