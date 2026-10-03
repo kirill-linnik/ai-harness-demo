@@ -81,6 +81,14 @@ const step: FlowStepDto = {
 afterEach(cleanup);
 
 describe("StepDetail", () => {
+  it("uses the stacked detail layout for all multi-content callouts", () => {
+    render(<StepDetail step={step} gate={undefined} />);
+
+    for (const name of ["Execution activity", "Routing decision", "Task profile"]) {
+      expect(screen.getByRole("region", { name })).toHaveClass("callout", "detail-callout");
+    }
+  });
+
   it("shows the prompt and renders the current output as Markdown", () => {
     render(<StepDetail step={step} gate={undefined} />);
 
@@ -134,6 +142,7 @@ describe("StepDetail", () => {
       }
     }} gate={undefined} />);
     const runtime = within(screen.getByRole("region", { name: "Execution activity" }));
+    expect(screen.getByRole("region", { name: "Execution activity" })).toHaveClass("detail-callout");
     expect(runtime.getByRole("status")).toHaveTextContent("Execution continues");
     expect(runtime.getByText(/tool.execution_start/)).toBeInTheDocument();
     expect(runtime.getByText(/powershell/)).toBeInTheDocument();

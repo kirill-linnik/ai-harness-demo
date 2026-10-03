@@ -77,7 +77,7 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
         )}
       </div>
       <p className="muted">{step.modelReason || step.inputSummary || "Waiting for Team Lead selection."}</p>
-      <section className="callout" aria-label="Execution activity" style={{ marginTop: 14 }}>
+      <section className="callout detail-callout" aria-label="Execution activity">
         <strong>Execution activity</strong>
         {runtime ? (
           <>
@@ -110,7 +110,7 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
         ) : <p className="muted">Runtime activity is unavailable for this attempt.</p>}
       </section>
       {step.routing && (
-        <section className="callout" aria-label="Routing decision" style={{ marginTop: 14 }}>
+        <section className="callout detail-callout" aria-label="Routing decision">
           <strong>
             {statusLabel(step.routing.strategy)} · {(step.routing.predictedQuality * 100).toFixed(1)}% conservative quality
           </strong>
@@ -155,7 +155,7 @@ export function StepDetail({ step, gate }: { step: FlowStepDto; gate: HandoffGat
         </section>
       )}
       {step.taskProfile && (
-        <section className="callout" aria-label="Task profile" style={{ marginTop: 14 }}>
+        <section className="callout detail-callout" aria-label="Task profile">
           <strong>
             {step.taskProfile.role} · {step.taskProfile.risk} risk
           </strong>
