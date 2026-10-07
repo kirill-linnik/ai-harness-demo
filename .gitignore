@@ -31,3 +31,5 @@ src/AiHarnessDemo/ClientApp/.vite/
 src/AiHarnessDemo/ClientApp/node_modules/.tmp/
 src/AiHarnessDemo/wwwroot/
 *.log
+.playwright-mcp/*
+.vscode/*

@@ -576,10 +576,14 @@ public sealed partial class CopilotReasoningHost(
                     AgentRunFailureKind.InvalidOutput);
             }
 
+            var parsed = CopilotJsonlParser.Parse(
+                result.StandardOutput,
+                result.StandardError,
+                request.WorkingDirectory);
             if (result.ExitCode != 0)
             {
                 var diagnostic = Tail(result.CombinedOutput, 1_500);
-                return Failure(
+                var failed = Failure(
                     $"Copilot CLI exited with code {result.ExitCode}.",
                     diagnostic,
                     IsModelUnavailableDiagnostic(diagnostic)
@@ -588,12 +592,9 @@ public sealed partial class CopilotReasoningHost(
                     IsModelUnavailableDiagnostic(diagnostic)
                         ? $"{request.Model}/{request.Effort}"
                         : null);
+                failed.ToolCalls.AddRange(parsed.ToolCalls);
+                return failed;
             }
-
-            var parsed = CopilotJsonlParser.Parse(
-                result.StandardOutput,
-                result.StandardError,
-                request.WorkingDirectory);
             if (governedGitIsolation?.UnauthorizedMetadataMutationDetected == true)
             {
                 var details = string.Join(
@@ -1366,9 +1367,16 @@ public sealed partial class CopilotReasoningHost(
         }
 
         ValidateWorkflowRevision(workflow.Revision);
+        if (!string.IsNullOrWhiteSpace(context.ResponseCorrectionInstructions))
+        {
+            _ = promptRenderer.Render(workflow.PromptTemplate,
+                BuildPromptValues(context, agentInstructions, workingDirectory, stagedPromotion));
+        }
         var renderedPrompt = BoundRenderedPrompt(
             context,
-            string.IsNullOrWhiteSpace(context.DirectPrompt)
+            !string.IsNullOrWhiteSpace(context.ResponseCorrectionInstructions)
+                ? BuildResponseCorrectionPrompt(context, preparedContext?.DocumentPaths ?? [])
+                : string.IsNullOrWhiteSpace(context.DirectPrompt)
                 ? promptRenderer.Render(
                     workflow.PromptTemplate,
                     BuildPromptValues(
@@ -1649,7 +1657,7 @@ public sealed partial class CopilotReasoningHost(
                 AgentRunFailureKind.InvalidOutput);
         }
 
-        return Failure(
+        return RetainInterruptedToolEvidence(Failure(
             summary,
             error,
             failureKind,
@@ -1659,7 +1667,29 @@ public sealed partial class CopilotReasoningHost(
                 CopilotSessionJournalState.Interrupted,
             processTerminationUnconfirmed:
                 snapshot.State ==
-                CopilotSessionJournalState.Active);
+                CopilotSessionJournalState.Active),
+            snapshot,
+            context);
+    }
+
+    internal static AgentRunResult RetainInterruptedToolEvidence(
+        AgentRunResult failure,
+        CopilotSessionSnapshot snapshot,
+        AgentExecutionContext context)
+    {
+        if (!failure.Success &&
+            snapshot.SessionId == context.CopilotSessionId &&
+            context.InvocationStartedAt is { } invocationStartedAt &&
+            IsRecoveryCurrent(invocationStartedAt, snapshot.StartedAt) &&
+            Path.IsPathFullyQualified(snapshot.WorkspacePath) &&
+            string.Equals(
+                Path.GetFullPath(snapshot.WorkspacePath),
+                Path.GetFullPath(context.WorkspacePath),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            failure.ToolCalls.AddRange(snapshot.ObservedToolCalls);
+        }
+        return failure;
     }
 
     internal static bool IsRecoverableCompletedOutput(
@@ -1902,8 +1932,17 @@ public sealed partial class CopilotReasoningHost(
                 "the candidate is approved. Report actual Failed or Blocked criteria and their " +
                 "remediation in the strict OUTCOME_QA document; the host derives readiness. " +
                 "A non-blocking disclosure is not a reason to reject a completed assignment. " +
-                "Reserve PUSHBACK for a missing or unusable required upstream deliverable, " +
-                "using the exact owner and actionable missing-input description above.");
+                "Your verdict must either sign off every accepted criterion with qualifying evidence, " +
+                "or request concrete rework from the implementation owner below. Failed or Blocked " +
+                "criteria with remediation and ResponsibleRoles are rework requests, not a terminal " +
+                "flow decision. Missing tests or test infrastructure are implementation work, not " +
+                "a reason to abandon verification. Preserve honest outcomes; never weaken the " +
+                "acceptance criteria or claim that absent checks passed. The host dispatches bounded " +
+                "owner repairs and fresh QA, then Team Lead replanning if they do not converge. " +
+                $"Implementation owner: {context.QaImplementationOwner}. " +
+                "Use that exact agent ID in ResponsibleRoles for implementation or verification " +
+                "infrastructure repairs. Reserve PUSHBACK for a missing or unusable required upstream " +
+                "deliverable, using its exact plan-step ID and an actionable description.");
         }
         if (stagedPromotion is not null)
         {
@@ -2172,7 +2211,21 @@ public sealed partial class CopilotReasoningHost(
     internal static string PrepareWorkspace(string workingDirectory) =>
         $"- **Project root:** `{Path.GetFullPath(workingDirectory)}`{Environment.NewLine}" +
         "- **Boundary:** Work only in this isolated workspace. Treat original source locations " +
-        "as metadata and prefer workspace-relative paths.";
+        "as metadata and prefer workspace-relative paths." + Environment.NewLine +
+        "- **Shell path resolution:** When a command changes directory, use fully qualified " +
+        "paths rooted in the project root above for output, evidence, logs and other path " +
+        "arguments. CLI permission checks can resolve relative arguments against the initial " +
+        "working directory rather than the command's changed directory. A parent-relative " +
+        "path can therefore request access outside this workspace even when its intended " +
+        "destination is inside it. If that happens, correct the path to the same authorized " +
+        "workspace destination and retry under the unchanged permission policy before " +
+        "declaring execution unavailable. Never broaden path, tool or network permissions " +
+        "or retry a genuinely forbidden operation." + Environment.NewLine +
+        "- **Product vs execution artifacts:** Product additions belong inside registered Git " +
+        "repositories. In multi-repository projects, new files outside those repositories and " +
+        "the existing trusted scaffold are execution artifacts: the host preserves their bytes " +
+        "in durable storage and keeps the workspace files available as evidence references. " +
+        "They are not deliverables. Repository-local generated output follows Git ignore rules.";
 
     private static string PrepareScopedWorkspace(
         AgentExecutionContext context,
@@ -2316,6 +2369,26 @@ public sealed partial class CopilotReasoningHost(
         return string.IsNullOrWhiteSpace(repositoryKnowledgeBlock)
             ? workspace
             : $"{workspace}{Environment.NewLine}{Environment.NewLine}{repositoryKnowledgeBlock}";
+    }
+
+    internal static string BuildResponseCorrectionPrompt(
+        AgentExecutionContext context, IReadOnlyList<string> documentPaths)
+    {
+        if (!context.ResumeSession)
+        {
+            throw new InvalidOperationException("A response correction must resume its original Copilot session.");
+        }
+        return "## Correct the previous response in this session" + Environment.NewLine + Environment.NewLine +
+            context.ResponseCorrectionInstructions + Environment.NewLine + Environment.NewLine +
+            "This is a report-only follow-up, not a new implementation or verification task. " +
+            "Keep the original accepted scope, candidate, evidence and execution deadline. " +
+            "Read only the retained response, unchanged contract and exact evidence records needed " +
+            "for this correction. Do not repeat successful checks, browse the candidate or change files." +
+            Environment.NewLine + Environment.NewLine +
+            "## Complete retained correction inputs" + Environment.NewLine +
+            string.Join(Environment.NewLine, documentPaths.Select(path => $"CONTEXT_FILE: {path}")) +
+            Environment.NewLine + context.OutcomeContext +
+            (documentPaths.Count == 0 ? Environment.NewLine + context.Task + Environment.NewLine + context.OutcomeContract : string.Empty);
     }
 
     internal static string BuildDirectPrompt(

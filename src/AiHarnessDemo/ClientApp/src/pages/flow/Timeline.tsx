@@ -22,11 +22,22 @@ const eventLabels: Readonly<Record<string, string>> = {
   "flow.manual-recovery-queued": "Operator recovery queued",
   "flow.contract-correction-queued": "Completed work recovered for response correction",
   "agent.contract-correction-scheduled": "Response correction queued",
+  "agent.continuation-scheduled": "Preserved work queued to continue",
+  "agent.recovery-exhausted": "Automatic recovery needs attention",
+  "handoff.host-repair-required": "Factory routed internal handoff repair",
+  "flow.qa-owner-repair-queued": "Preserved QA defects queued for owner repair",
+  "verification.repaired-candidate-assignment": "Bounded verification of repaired candidate queued",
+  "flow.remaining-work-assignment": "Distinct remaining work scoped by operator",
   "agent.context-snapshot": "Bounded prompt and complete inputs saved",
   "agent.execution-budget-bound": "Assignment execution budget saved",
   "agent.soft-limit-warning": "Soft elapsed-time warning",
   "agent.activity": "Observed tool activity",
   "agent.execution-terminated": "Execution terminated",
+  "workspace.execution-artifact-archived": "Execution artifact preserved",
+  "workspace.preview-preparation-started": "Preparing customer preview",
+  "workspace.preview-prepared": "Customer preview prepared",
+  "workspace.preview-preparation-blocked": "Preview handoff needs repair",
+  "delivery.review-candidate-reverification-queued": "Fresh result verification queued",
   "step.started": "Agent step started",
   "step.skipped": "Step skipped",
   "step.interrupted": "Agent step interrupted",
@@ -54,6 +65,7 @@ function eventClass(type: string): string {
     type.endsWith(".failed") ||
     type.includes("retry-limit-exhausted") ||
     type.includes("recovery-failed") ||
+    type === "agent.recovery-exhausted" ||
     type === "agent.execution-terminated"
   ) {
     return "failed";
@@ -167,6 +179,31 @@ function EventMeta({
   );
 }
 
+function ArtifactDownload({ event }: { event: FlowEventDto }) {
+  if (event.type !== "workspace.execution-artifact-archived" || !event.dataJson) {
+    return null;
+  }
+  let metadata: unknown;
+  try {
+    metadata = JSON.parse(event.dataJson);
+  } catch {
+    return <p className="muted">Artifact download metadata is invalid.</p>;
+  }
+  const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (
+    typeof metadata !== "object" || metadata === null ||
+    !("Id" in metadata) || typeof metadata.Id !== "string" || !guid.test(metadata.Id) ||
+    !("FlowId" in metadata) || typeof metadata.FlowId !== "string" || !guid.test(metadata.FlowId)
+  ) {
+    return <p className="muted">Artifact download metadata is invalid.</p>;
+  }
+  return (
+    <a href={`/api/flows/${metadata.FlowId}/execution-artifacts/${metadata.Id}`} download>
+      Download preserved artifact
+    </a>
+  );
+}
+
 export function Timeline({
   events,
   steps
@@ -250,6 +287,7 @@ export function Timeline({
               <div className="timeline-copy">
                 <strong title={event.type}>{eventLabel(event.type)}</strong>
                 <EventMessage message={event.message} />
+                <ArtifactDownload event={event} />
                 <EventMeta event={event} step={step} />
               </div>
             </li>

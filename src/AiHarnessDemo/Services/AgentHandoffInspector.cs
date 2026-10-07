@@ -151,6 +151,18 @@ internal static partial class AgentHandoffInspector
         return new DynamicHandoffStatus(true, owner, reason);
     }
 
+    internal static string CompleteQaAssessment(string output)
+    {
+        if (!ParseDynamic(output).IsPushback)
+        {
+            throw new InvalidOperationException("Only a validated QA rework handoff can become a completed assessment.");
+        }
+        return string.Join('\n', output.ReplaceLineEndings("\n").Split('\n')
+            .Where(line => !line.TrimStart().StartsWith("PUSHBACK_OWNER_STEP_ID:", StringComparison.Ordinal) &&
+                !line.TrimStart().StartsWith("PUSHBACK_REASON:", StringComparison.Ordinal))
+            .Select(line => HandoffStatusPattern().IsMatch(line) ? "HANDOFF_STATUS: COMPLETE" : line));
+    }
+
     private static string CleanLine(string value)
     {
         var cleaned = value

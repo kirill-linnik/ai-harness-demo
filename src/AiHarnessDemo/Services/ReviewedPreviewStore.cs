@@ -362,7 +362,7 @@ public sealed class ReviewedPreviewStore(
             '/',
             StringSplitOptions.RemoveEmptyEntries);
         if (!normalized.StartsWith(PreviewPrefix, StringComparison.Ordinal) ||
-            segments.Length < 3 ||
+            segments.Length < 2 ||
             segments.Any(segment => segment is "." or "..") ||
             !string.Equals(
                 normalized,

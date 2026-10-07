@@ -83,6 +83,46 @@ public sealed partial class WorkspaceManager(
             ? new WorkspaceRepositoryIdentity[] { new(".", string.Empty) }
             : await ReadTrustedRepositoriesAsync(
                 flow, projectPath, repositories, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(flow.WorkspacePath) &&
+            Directory.Exists(flow.WorkspacePath) &&
+            ResolveMode(flow) == WorkspaceMode.Delivery &&
+            await _advisoryArtifacts.GetWorkspaceModeAsync(flow.Id, cancellationToken) is not
+                (WorkspaceMode.ProvisionalReadOnly or WorkspaceMode.AdvisoryReadOnly))
+        {
+            var authorizedRoot = Path.GetFullPath(
+                workflowProvider.GetValidated().Config.Workspace.ResolvedRoot);
+            var expectedPath = ResolveContained(
+                UnsafeCharacters().Replace(flow.Id.ToString("N")[..16], "_"));
+            if (!PathsEqual(expectedPath, flow.WorkspacePath))
+            {
+                throw new InvalidOperationException(
+                    $"Flow workspace is outside its expected isolated location: {flow.WorkspacePath}");
+            }
+            var recoveredPath = WorkspacePathGuard.ValidateExistingRoot(
+                flow.WorkspacePath, authorizedRoot, "Workspace recovery");
+            CopilotReasoningHost.GovernedGitIsolationScope.RecoverInterrupted(recoveredPath);
+            var recoveredBranch = string.IsNullOrWhiteSpace(flow.BranchName)
+                ? $"ai-harness/{Slug(flow.Title)}-{flow.Id.ToString("N")[..16]}"
+                : flow.BranchName;
+            await VerifyRecoveredDeliveryWorkspaceAsync(
+                projectPath, repositories, recoveredPath, recoveredBranch, cancellationToken);
+            var scope = containingRepository is null ? null : WorkspaceSourceScopeLedger.Read(flow);
+            if (scope is not null)
+            {
+                var expectedScope = Path.GetRelativePath(containingRepository!, projectPath).Replace('\\', '/');
+                if (scope.RelativePath != expectedScope)
+                {
+                    throw new InvalidOperationException("The recovered workspace's durable source scope changed.");
+                }
+                await VerifyBaseAncestorAsync(
+                    containingRepository!, recoveredPath, scope.BaselineCommit, cancellationToken);
+            }
+            return new WorkspaceInfo(
+                recoveredPath, recoveredBranch, CreatedNow: false, trustedRepositories,
+                WorkspaceMode.Delivery,
+                SourceScopeRelativePath: scope?.RelativePath ?? string.Empty,
+                SourceBaselineCommit: scope?.BaselineCommit ?? string.Empty);
+        }
         var baselines = new Dictionary<string, string>();
         foreach (var repository in repositories)
         {
@@ -400,6 +440,20 @@ public sealed partial class WorkspaceManager(
             {
                 throw new InvalidOperationException(
                     $"Recovered Delivery worktree '{repositoryWorkspace}' is not on the durable flow branch '{expectedBranchName}'.");
+            }
+            var sourceDirectory = await processRunner.RunAsync(
+                "git", ["-C", repository, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                repository, TimeSpan.FromSeconds(20), cancellationToken);
+            var workspaceDirectory = await processRunner.RunAsync(
+                "git", ["-C", repositoryWorkspace, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                repositoryWorkspace, TimeSpan.FromSeconds(20), cancellationToken);
+            if (sourceDirectory.ExitCode != 0 || workspaceDirectory.ExitCode != 0 ||
+                string.IsNullOrWhiteSpace(sourceDirectory.StandardOutput) ||
+                string.IsNullOrWhiteSpace(workspaceDirectory.StandardOutput) ||
+                !PathsEqual(sourceDirectory.StandardOutput.Trim(), workspaceDirectory.StandardOutput.Trim()))
+            {
+                throw new InvalidOperationException(
+                    $"Recovered Delivery worktree '{repositoryWorkspace}' does not belong to its configured source repository.");
             }
         }
         if (repositories.Count == 0)

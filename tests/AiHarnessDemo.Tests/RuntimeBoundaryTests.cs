@@ -399,6 +399,21 @@ public sealed class PermissionProfileResolverTests
 public sealed class PromptStagingTests
 {
     [Fact]
+    public void WorkspaceContext_ExplainsScopedShellPathsWithoutBroadeningPermissions()
+    {
+        var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "isolated flow"));
+        var context = CopilotReasoningHost.PrepareWorkspace(root);
+
+        Assert.Contains($"**Project root:** `{root}`", context);
+        Assert.Contains("fully qualified paths rooted in the project root", context);
+        Assert.Contains("initial working directory", context);
+        Assert.Contains("same authorized workspace destination", context);
+        Assert.Contains("unchanged permission policy", context);
+        Assert.Contains("Never broaden path, tool or network permissions", context);
+        Assert.Contains("genuinely forbidden operation", context);
+    }
+
+    [Fact]
     public async Task StagedManifest_PublishesAndCleansTheSessionScopedCliAgent()
     {
         var root = Path.Combine(
@@ -3504,6 +3519,15 @@ public sealed class WorkspaceManagerTests
             });
             Assert.Equal("application",
                 WorkspaceSourceScopeLedger.Read(flow).RelativePath);
+            await CommitAndPushAsync(
+                git, Path.Combine(contributor, "application"), "app.txt",
+                "newer upstream", "main");
+            var resumed = await manager.PrepareAsync(flow);
+            Assert.False(resumed.CreatedNow);
+            Assert.Equal(delivery.SourceBaselineCommit, resumed.SourceBaselineCommit);
+            Assert.Equal("application", resumed.SourceScopeRelativePath);
+            Assert.Equal("latest upstream", await File.ReadAllTextAsync(
+                Path.Combine(resumed.Path, "application", "app.txt")));
             Assert.Equal(1, (await manager.RemoveAsync(flow)).WorktreesRemoved);
         }
         finally
@@ -3593,11 +3617,32 @@ public sealed class WorkspaceManagerTests
             await CommitAndPushAsync(
                 git, Path.Combine(root, "site-contributor"), "site.txt",
                 "newer upstream", baseBranch);
-            var stale = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => manager.PrepareAsync(delivery));
-            Assert.Contains("behind", stale.Message);
+            var recovered = await manager.PrepareAsync(delivery);
+            Assert.False(recovered.CreatedNow);
+            Assert.Equal(workspace.Path, recovered.Path);
             Assert.Equal("new upstream", await File.ReadAllTextAsync(
                 Path.Combine(workspace.Path, "site", "site.txt")));
+            Assert.Equal("initial", await File.ReadAllTextAsync(
+                Path.Combine(project, "site", "site.txt")));
+            var pointerPath = Path.Combine(workspace.Path, "site", ".git");
+            var originalPointer = await File.ReadAllTextAsync(pointerPath);
+            var originalAttributes = File.GetAttributes(pointerPath);
+            var otherCheckout = Path.Combine(root, "site-contributor");
+            await RunGitAsync(git, otherCheckout, ["checkout", "-b", delivery.BranchName]);
+            try
+            {
+                File.SetAttributes(pointerPath, FileAttributes.Normal);
+                await File.WriteAllTextAsync(
+                    pointerPath, $"gitdir: {Path.Combine(otherCheckout, ".git")}\n");
+                var invalidOwner = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => manager.PrepareAsync(delivery));
+                Assert.Contains("configured source repository", invalidOwner.Message);
+            }
+            finally
+            {
+                await File.WriteAllTextAsync(pointerPath, originalPointer);
+                File.SetAttributes(pointerPath, originalAttributes);
+            }
         }
         finally
         {

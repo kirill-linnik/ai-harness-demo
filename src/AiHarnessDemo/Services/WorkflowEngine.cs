@@ -16,7 +16,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AiHarnessDemo.Services;
 
-public sealed class WorkflowEngine(
+public sealed partial class WorkflowEngine(
     IDbContextFactory<HarnessDbContext> databaseFactory,
     AgentCatalog agentCatalog,
     IModelRouter modelRouter,
@@ -262,6 +262,11 @@ public sealed class WorkflowEngine(
             {
                 throw;
             }
+            catch (OwnerRepairBlockedException exception)
+            {
+                logger.LogWarning(exception, "Owner repair blocked for flow {FlowId}", flowId);
+                await BlockOwnerRepairAsync(flowId, exception, cancellationToken);
+            }
             catch (Exception exception)
             {
                 logger.LogError(exception, "Factory flow {FlowId} failed", flowId);
@@ -315,7 +320,7 @@ public sealed class WorkflowEngine(
                      await _lifecycle.EnterAsync(flowId, cancellationToken))
         await using (var database = await databaseFactory.CreateDbContextAsync(cancellationToken))
         {
-            flow = await database.Flows.SingleOrDefaultAsync(
+            flow = await database.Flows.AsSplitQuery().Include(item => item.Events).SingleOrDefaultAsync(
                        item => item.Id == flowId,
                        cancellationToken)
                    ?? throw new KeyNotFoundException($"Factory flow '{flowId}' was not found.");
@@ -329,6 +334,13 @@ public sealed class WorkflowEngine(
             }
             _lifecycle.Transition(flow, FlowStatus.Running);
             flow.FailureReason = string.Empty;
+            if (flow.CurrentBlockerCode == "factory.recovery-exhausted")
+            {
+                flow.CurrentBlockerCode = null;
+                flow.CurrentBlockerSummary = null;
+                flow.CurrentBlockerDataJson = null;
+                flow.CustomerBlockerMessage = null;
+            }
             database.FlowEvents.Add(new FlowEvent
             {
                 FlowRunId = flow.Id,
@@ -1618,6 +1630,11 @@ public sealed class WorkflowEngine(
             text searches can be classified SourceInspection. Where the verifier may use either
             a shell check or direct inspection, allow both Command and SourceInspection. Do not
             restrict a criterion to Test or Observation unless the planned tool issues that kind.
+            Separate visual rendering from behavioral acceptance. For an interaction, route,
+            validation, or state-changing customer requirement, plan an executable check that
+            performs the action and asserts the resulting product state. Use Test or Command
+            evidence for that criterion; do not allow screenshots, static preview artifacts, or
+            source inspection alone to verify it. Plan the actual test command and assertion.
 
             Exactly one final BeforeReview worker is OutcomeOwner and has PrepareOutcome.
             Required configured duties: {{requiredDuties}}.
@@ -1666,15 +1683,15 @@ public sealed class WorkflowEngine(
             preview. Follow the selected project's existing asset conventions for uploaded
             files. Incidental fields in supplied source material are not public requirements;
             restating a sensitive value in a brief does not authorize its publication.
-            `.customer-preview` is the only generated top-level directory allowed to remain outside
-            the registered repositories. Every assignment that creates `_release`, `.previous`,
-            packaging-helper, browser-cache, report, test-result, or other temporary output must
-            explicitly remove it before handoff. Preserve every pre-existing non-repository project
-            scaffold file byte-for-byte; cleanup must never delete a trusted root file merely
-            because it resembles generated package-manager output.
-            Have the implementing owner and final verifier compare the workspace root with its
-            initial scaffold: registered repositories and unchanged trusted root files may remain,
-            and .customer-preview may be added, but no other generated root-level material may remain.
+            Preserve every pre-existing non-repository project scaffold file byte-for-byte.
+            Additional files outside registered repositories are execution artifacts, not product
+            additions: the host catalogs them separately and retains them for evidence references.
+            Do not delete tool traces or baseline captures merely to make the workspace root look
+            clean. Product additions belong inside registered repositories; customer previews belong
+            at the canonical workspace root. Before final verification, the host can materialize
+            an unambiguous repository-local preview there, recording its exact origin and bytes
+            and starting a new evidence epoch. The final verifier must then exercise the actual
+            Studio verification-preview endpoint, not an independently served substitute.
 
             {{(preMortemAvailable
                 ? $"The Pre-mortem Sceptic snapshot is enabled. In Delivery, a Design or Implement step profiled Medium, High, or Critical Risk requires an Analyze-duty requirements-authoring step and a checkpoint on it before the first Design or Implement step. A new Delivery flow with customer uploads also requires that checkpoint even if the worker is profiled Low risk. {(validationContext.CustomerUploadsPresent ? "This flow includes customer-uploaded files: write the requirements handoff in a separate Analyze step and checkpoint it before any Design or Implement worker starts." : string.Empty)} Profile material uncertainty about assumptions, constraints, failure behavior, or ownership honestly; do not lower its risk to avoid the checkpoint. The sceptic treats faithful implementation followed by serious failure as a counterfactual premise, identifies requirements gaps rather than code defects, and returns findings to the requirements author before any designer or engineer starts. Never checkpoint an implemented result or QA. In Advisory, the sceptic may challenge a recommendation before feedback. Omit checkpoints for genuinely routine Low-risk work without uploads. Each checkpoint has at most {maximumPreMortemRounds} round(s)."
@@ -1746,6 +1763,11 @@ public sealed class WorkflowEngine(
             confirmed brief and requirements handoff. Missing required verification belongs in
             PlanGaps, not a non-blocking disclosure. Preserve the assigned criterion namespace,
             evidence rules, permission ceiling, and customer approval boundary.
+            {DeliveryQaEvidenceCitationContract()}
+            Execution artifacts outside registered repositories are not deliverables and need not
+            be deleted. Exercise each preview variant through the supplied Studio verification URL
+            at desktop and 390px; an empty artifact catalog or an unavailable sandbox is a blocking
+            verification gap, never a non-blocking disclosure.
             """;
     }
 
@@ -2257,7 +2279,7 @@ public sealed class WorkflowEngine(
         step.WorkflowRevision = workflow.Revision;
     }
 
-    internal async Task<FlowStep> ExecuteStepAsync(
+    private async Task<FlowStep> ExecuteStepAttemptAsync(
         Guid flowId,
         Guid stepId,
         string workspacePath,
@@ -2270,6 +2292,7 @@ public sealed class WorkflowEngine(
         var remotePublicationAuthorized = false;
         ReviewedCandidateIdentity? reviewedIdentity = null;
         var isStudioContractCorrection = false;
+        string? previewPreparationBlocker = null;
 
         try
         {
@@ -2390,9 +2413,7 @@ public sealed class WorkflowEngine(
                         "The interrupted durable attempt has no recoverable Copilot session; an explicit retry attempt is required.");
                 }
                 var priorSession = persistedSessionId is null &&
-                                   !IsPreMortemStep(step) &&
-                                   !(isStudioContractCorrection &&
-                                     IsDeliveryVerificationStep(step))
+                                   !IsPreMortemStep(step)
                     ? await database.FlowSteps
                         .AsNoTracking()
                         .Where(item =>
@@ -2435,6 +2456,7 @@ public sealed class WorkflowEngine(
                     interruptedDurableAttempt;
                 var resumesSession =
                     resumesPersistedSession ||
+                    isStudioContractCorrection && persistedSessionId is not null ||
                     priorSession is not null;
                 var copilotSessionHome = !string.IsNullOrWhiteSpace(step.CopilotSessionHome)
                     ? step.CopilotSessionHome
@@ -2549,6 +2571,20 @@ public sealed class WorkflowEngine(
                         cancellationToken);
                 var (outcomeContext, outcomeContract) =
                     BuildOutcomePrompt(step, readinessAssignment);
+                var contextDocuments = new List<AgentContextDocument>();
+                if (readinessAssignment is not null)
+                {
+                    contextDocuments.Add(new AgentContextDocument(
+                        "evidence.jsonl",
+                        DeliveryReadinessService.SerializeEvidenceDocument(readinessAssignment.Evidence)));
+                }
+                var repairProposal = await ResolveOwnerRepairProposalAsync(
+                    database, flow, step, cancellationToken);
+                if (repairProposal is not null)
+                {
+                    contextDocuments.Add(repairProposal);
+                }
+                previewPreparationBlocker = readinessAssignment?.PreviewPreparationBlocker;
                 await database.SaveChangesAsync(cancellationToken);
                 executionContext = new AgentExecutionContext(
                     flow.Id,
@@ -2567,6 +2603,8 @@ public sealed class WorkflowEngine(
                         ? BuildPreMortemContextTask(
                             flow.ConsolidatedRequest,
                             step.InputSummary)
+                        : isStudioContractCorrection
+                        ? step.InputSummary
                         : BuildStepTask(flow.ConsolidatedRequest, step.InputSummary),
                     flow.RepositoryKnowledge,
                     flow.RepositoryPath,
@@ -2611,15 +2649,13 @@ public sealed class WorkflowEngine(
                     RequiresDeliveryReadinessQa:
                         DeliveryReadinessService.AppliesTo(flow) &&
                         IsDeliveryVerificationStep(step),
-                    ContextDocuments: readinessAssignment is null
-                        ? null
-                        :
-                        [
-                            new AgentContextDocument(
-                                "evidence.jsonl",
-                                DeliveryReadinessService.SerializeEvidenceDocument(
-                                    readinessAssignment.Evidence))
-                        ]);
+                    ContextDocuments: contextDocuments.Count == 0 ? null : contextDocuments,
+                    ResponseCorrectionInstructions: isStudioContractCorrection
+                        ? BuildStudioContractCorrectionDirective(step, ReadResponseCorrectionError(flow, step))
+                        : string.Empty,
+                    QaImplementationOwner: readinessAssignment is not null
+                        ? await DescribeQaImplementationOwnerAsync(database, flow, step, cancellationToken)
+                        : string.Empty);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -2642,6 +2678,10 @@ public sealed class WorkflowEngine(
         var correctionScheduled = false;
         try
         {
+            if (RequiresOwnerRepairStatus(executionContext) && !isStudioContractCorrection)
+            {
+                await RequireOwnerRepairCapabilitiesAsync(executionContext, cancellationToken);
+            }
             logger.LogInformation(
                 "Starting agent step {StepId} for flow {FlowId}: {AgentId} attempt {Attempt}, " +
                 "{InvocationKind}, session {CopilotSessionId}, model {Model}/{Effort}.",
@@ -2659,6 +2699,14 @@ public sealed class WorkflowEngine(
             var contractError = GetStudioContractCorrectionReason(
                 executionContext,
                 attemptedResult.Output);
+            if (contractError is null && previewPreparationBlocker is not null &&
+                !AgentHandoffInspector.ParseDynamic(attemptedResult.Output).IsPushback)
+            {
+                contractError =
+                    "The host preview preflight is blocked. Return governed PUSHBACK to an " +
+                    "upstream implementation owner instead of accepting unavailable browser verification. " +
+                    previewPreparationBlocker;
+            }
             if (contractError is null && executionContext.RequiresDeliveryReadinessQa)
             {
                 await using var database =
@@ -2668,15 +2716,58 @@ public sealed class WorkflowEngine(
                     .SingleAsync(item => item.Id == flowId, cancellationToken);
                 var step = await database.FlowSteps
                     .SingleAsync(item => item.Id == stepId, cancellationToken);
-                contractError = GetDeliveryQaCorrectionReason(
-                    flow,
-                    step,
-                    attemptedResult);
+                (attemptedResult, contractError) = await PrepareQaAssessmentAsync(
+                    database, flow, step, attemptedResult, cancellationToken);
+                await database.SaveChangesAsync(cancellationToken);
+                if (contractError is null &&
+                    await HasFocusedQaRepairAvailableAsync(database, flow, step, cancellationToken) &&
+                    await TryBuildQaOwnerRepairAsync(
+                        database, flow, step, attemptedResult.Output, cancellationToken,
+                        validatedReport: true) is { } focusedRepair)
+                {
+                    throw focusedRepair;
+                }
+            }
+            if (contractError is not null)
+            {
+                await using (var repairDatabase =
+                             await databaseFactory.CreateDbContextAsync(cancellationToken))
+                {
+                    var repairFlow = await repairDatabase.Flows.Include(item => item.Events)
+                        .SingleAsync(item => item.Id == flowId, cancellationToken);
+                    var repairStep = await repairDatabase.FlowSteps
+                        .SingleAsync(item => item.Id == stepId, cancellationToken);
+                    var preMortemResponse = await TryRecoverPreMortemResponseAsync(
+                        repairDatabase, repairFlow, repairStep, attemptedResult.Output, cancellationToken);
+                    if (preMortemResponse is not null)
+                    {
+                        RecordPreMortemFramingRecovery(
+                            repairDatabase, repairFlow, repairStep, attemptedResult.Output, preMortemResponse);
+                        await repairDatabase.SaveChangesAsync(cancellationToken);
+                        attemptedResult = attemptedResult with { Output = preMortemResponse.Output };
+                        contractError = GetStudioContractCorrectionReason(executionContext, attemptedResult.Output);
+                    }
+                    else if (isStudioContractCorrection &&
+                             (!IsDeliveryVerificationStep(repairStep) ||
+                              !AgentHandoffInspector.HasTerminalStatus(attemptedResult.Output) ||
+                              await GetQaReworkTargetErrorAsync(repairDatabase, repairFlow, repairStep,
+                                  attemptedResult.Output, cancellationToken) is null) &&
+                             await TryBuildQaOwnerRepairAsync(
+                                 repairDatabase, repairFlow, repairStep, attemptedResult.Output,
+                                 cancellationToken) is { } qaRepair)
+                    {
+                        throw qaRepair;
+                    }
+                }
             }
             if (contractError is not null)
             {
                 if (isStudioContractCorrection)
                 {
+                    if (previewPreparationBlocker is not null)
+                    {
+                        throw new HostHandoffRepairRequiredException(stepId, contractError);
+                    }
                     throw new InvalidOperationException(
                         "The bounded Studio response-contract correction remained invalid: " +
                         contractError);
@@ -2699,6 +2790,13 @@ public sealed class WorkflowEngine(
                     planSummary,
                     complexity,
                     cancellationToken);
+            }
+            if (RequiresOwnerRepairStatus(executionContext) &&
+                ReadOwnerRepairStatus(attemptedResult.Output) == "BLOCKED")
+            {
+                throw new OwnerRepairBlockedException(stepId,
+                    "The implementation owner reported that the scoped repair is blocked. " +
+                    "No fresh QA was dispatched as if the repair had succeeded.");
             }
             stopwatch.Stop();
             var completedStep = await CompleteStepAsync(
@@ -2752,13 +2850,25 @@ public sealed class WorkflowEngine(
 
     internal static string? GetStudioContractCorrectionReason(
         AgentExecutionContext context,
-        string output) =>
-        GetStudioContractCorrectionReason(
+        string output)
+    {
+        var error = GetStudioContractCorrectionReason(
             context.InvocationKind,
             context.IsPreMortemRevision,
             context.IsOutcomeOwner,
             context.RequiresDeliveryReadinessQa,
             output);
+        if (error is not null || !RequiresOwnerRepairStatus(context) ||
+            AgentHandoffInspector.ParseDynamic(output).IsPushback)
+        {
+            return error;
+        }
+        return ReadOwnerRepairStatus(output) is null
+            ? "A scoped owner repair must include exactly one standalone REPAIR_STATUS: REPAIRED, " +
+              "REPAIR_STATUS: NO_CHANGE_NEEDED, or REPAIR_STATUS: BLOCKED line. " +
+              "An investigation alone is not a completed repair."
+            : null;
+    }
 
     private static string? GetStudioContractCorrectionReason(
         ExecutionInvocationKind invocationKind,
@@ -2794,7 +2904,7 @@ public sealed class WorkflowEngine(
             {
                 _ = ValidatePreMortemRevisionOutput(output);
             }
-            if (isOutcomeOwner && !handoff.IsPushback)
+            if (isOutcomeOwner && (!handoff.IsPushback || requiresDeliveryReadinessQa))
             {
                 _ = FlowOutcomeParser.Parse(output);
             }
@@ -2809,8 +2919,7 @@ public sealed class WorkflowEngine(
             return exception.Message;
         }
 
-        if (!handoff.IsPushback &&
-            requiresDeliveryReadinessQa &&
+        if (requiresDeliveryReadinessQa &&
             !DeliveryReadinessPolicy.ContainsQaContract(output))
         {
             return
@@ -2838,8 +2947,7 @@ public sealed class WorkflowEngine(
         AgentExecutionResult result)
     {
         if (!DeliveryReadinessService.AppliesTo(flow) ||
-            !IsDeliveryVerificationStep(step) ||
-            AgentHandoffInspector.ParseDynamic(result.Output).IsPushback)
+            !IsDeliveryVerificationStep(step))
         {
             return null;
         }
@@ -3045,6 +3153,9 @@ public sealed class WorkflowEngine(
             AgentName = source.AgentName,
             AgentRole = source.AgentRole,
             Label = StudioContractCorrectionLabelPrefix + source.AgentName,
+            CopilotSessionId = source.CopilotSessionId ??
+                throw new InvalidOperationException("A response correction requires the original Copilot session."),
+            CopilotSessionHome = source.CopilotSessionHome,
             PlanStepKey = source.PlanStepKey,
             PlanDutiesJson = source.PlanDutiesJson,
             PlanStage = source.PlanStage,
@@ -3143,6 +3254,30 @@ public sealed class WorkflowEngine(
         FlowStep source,
         string contractError)
     {
+        return BuildStudioContractCorrectionDirective(source, contractError) +
+            Environment.NewLine + Environment.NewLine +
+            (IsPreMortemStep(source) ? "Previous review to correct:" : "Previous response to correct:") +
+            Environment.NewLine + BoundFailedOutput(source.OutputSummary);
+    }
+
+    private static string ReadResponseCorrectionError(FlowRun flow, FlowStep correction)
+    {
+        var record = flow.Events.Single(item => item.FlowStepId == correction.Id &&
+            item.Type == "agent.contract-correction-scheduled");
+        using var document = JsonDocument.Parse(record.DataJson ??
+            throw new InvalidOperationException("The response correction directive is missing."));
+        if (document.RootElement.GetProperty("CorrectionStepId").GetGuid() != correction.Id)
+        {
+            throw new InvalidOperationException("The response correction directive names a different attempt.");
+        }
+        return document.RootElement.GetProperty("Error").GetString() ??
+            throw new InvalidOperationException("The response correction validation error is missing.");
+    }
+
+    internal static string BuildStudioContractCorrectionDirective(
+        FlowStep source,
+        string contractError)
+    {
         if (IsPreMortemStep(source))
         {
             return
@@ -3153,9 +3288,7 @@ public sealed class WorkflowEngine(
                 "include exactly one valid PRE_MORTEM_FINDINGS_BEGIN/END JSON envelope. Do not " +
                 "emit a HANDOFF_STATUS marker, introductory commentary, or Markdown fences. " +
                 "Keep the response under 9,000 characters and each finding field under 800. " +
-                $"Validation error: {ClipText(contractError, 2_000)}" +
-                $"{Environment.NewLine}{Environment.NewLine}" +
-                $"Previous review to correct:{Environment.NewLine}{source.OutputSummary}";
+                $"Validation error: {ClipText(contractError, 2_000)}";
         }
         var assignment =
             "Your previous Studio response contract was invalid. Do not rerun tools or modify " +
@@ -3178,21 +3311,16 @@ public sealed class WorkflowEngine(
                 "kinds, and success values in the verification context. Do not count or invent " +
                 "identifiers. Select the observations that actually prove each criterion and " +
                 "whose kind is allowed by its unchanged acceptance plan. Never cite a failed " +
-                "call as successful evidence. If the evidence is insufficient, report the honest " +
-                "Failed or Blocked result with remediation rather than claiming PASS." +
-                $"{Environment.NewLine}{Environment.NewLine}" +
-                $"Previous response to correct:{Environment.NewLine}" +
-                BoundFailedOutput(source.OutputSummary);
+                "call as successful evidence. " + DeliveryQaEvidenceCitationContract() +
+                " If the evidence is insufficient, report the honest " +
+                "Failed or Blocked result with remediation rather than claiming PASS.";
         }
         else if (source.InvocationKind == ExecutionInvocationKind.Publication)
         {
             assignment +=
                 " Return the complete repository knowledge recap between its exact sentinels. " +
                 "Correct the invalid fields without changing the reviewed candidate or repeating " +
-                "publication checks." +
-                $"{Environment.NewLine}{Environment.NewLine}" +
-                $"Previous response to correct:{Environment.NewLine}" +
-                BoundFailedOutput(source.OutputSummary);
+                "publication checks.";
         }
         if (source.PreMortemReviewStepId is not null)
         {
@@ -3538,13 +3666,22 @@ public sealed class WorkflowEngine(
         IReadOnlyDictionary<string, AgentRecord> upstreamOwners,
         CancellationToken cancellationToken)
     {
-        var step = await ExecuteStepAsync(
-            flow.Id,
-            stepId,
-            workspacePath,
-            planSummary,
-            complexity,
-            cancellationToken);
+        FlowStep step;
+        try
+        {
+            step = await ExecuteStepAsync(
+                flow.Id,
+                stepId,
+                workspacePath,
+                planSummary,
+                complexity,
+                cancellationToken);
+        }
+        catch (HostHandoffRepairRequiredException exception)
+        {
+            step = await RequireHostHandoffRepairAsync(
+                flow.Id, exception, cancellationToken);
+        }
         if (step.Status != StepStatus.Pushback)
         {
             return step;
@@ -4300,7 +4437,14 @@ public sealed class WorkflowEngine(
         {
             return false;
         }
-        var error = GetDeliveryQaCorrectionReason(flow, step, result);
+        var error = GetStudioContractCorrectionReason(step.InvocationKind,
+            step.PreMortemReviewStepId is not null, step.IsOutcomeOwner,
+            DeliveryReadinessService.AppliesTo(flow) && IsDeliveryVerificationStep(step), result.Output);
+        error ??= GetDeliveryQaCorrectionReason(flow, step, result);
+        if (error is null && IsDeliveryVerificationStep(step))
+        {
+            error = await GetQaReworkTargetErrorAsync(database, flow, step, result.Output, cancellationToken);
+        }
         if (error is null)
         {
             return false;
@@ -4583,6 +4727,23 @@ public sealed class WorkflowEngine(
         var flow = await database.Flows.SingleAsync(
             item => item.Id == flowId,
             cancellationToken);
+        HostHandoffRepairRequiredException? qaRepair = null;
+        if (DeliveryReadinessService.AppliesTo(flow) && IsDeliveryVerificationStep(step))
+        {
+            await database.Entry(flow).Collection(item => item.Events).LoadAsync(cancellationToken);
+            await database.Entry(flow).Collection(item => item.GateRecords).LoadAsync(cancellationToken);
+            var prepared = await PrepareQaAssessmentAsync(database, flow, step, result, cancellationToken);
+            if (prepared.Error is not null)
+            {
+                throw new InvalidOperationException(prepared.Error);
+            }
+            result = prepared.Result;
+            if (await HasFocusedQaRepairAvailableAsync(database, flow, step, cancellationToken))
+            {
+                qaRepair = await TryBuildQaOwnerRepairAsync(database, flow, step, result.Output,
+                    cancellationToken, validatedReport: true);
+            }
+        }
         var observedToolCalls = ToObservedToolCalls(stepId, result);
         if (!await database.AgentToolCalls.AnyAsync(
                 item => item.FlowStepId == stepId,
@@ -4611,6 +4772,10 @@ public sealed class WorkflowEngine(
             try
             {
                 dynamicHandoff = AgentHandoffInspector.ParseDynamic(result.Output);
+                if (qaRepair is not null)
+                {
+                    dynamicHandoff = new DynamicHandoffStatus(true, qaRepair.OwnerPlanStepKey, qaRepair.Message);
+                }
             }
             catch (InvalidOperationException) when (
                 step.InvocationKind == ExecutionInvocationKind.Planning)
@@ -4773,6 +4938,11 @@ public sealed class WorkflowEngine(
         step.ExecutionAttempts = Math.Max(step.ExecutionAttempts, result.ExecutionAttempts);
         step.CompletedAt = completedAt;
         step.DurationMilliseconds = elapsedMilliseconds;
+        if (qaRepair is not null)
+        {
+            await database.SaveChangesAsync(cancellationToken);
+            await StageHostHandoffRepairAsync(database, flow, step, qaRepair, cancellationToken);
+        }
         if (!pushedBack && step.RetryOfStepId is { } retryRootStepId)
         {
             var dependents = await database.FlowSteps
@@ -5099,6 +5269,14 @@ public sealed class WorkflowEngine(
         var step = await database.FlowSteps.SingleAsync(
             item => item.Id == stepId,
             cancellationToken);
+        if (executionResult is null && exception is AgentRunException { ToolCalls.Count: > 0 } failedExecution)
+        {
+            executionResult = new AgentExecutionResult(
+                diagnosticOutput ?? string.Empty,
+                "Host-observed tool activity retained from the failed execution.",
+                failedExecution.ExecutionAttempts,
+                failedExecution.ToolCalls);
+        }
         if (executionResult is not null)
         {
             var observedToolCalls = ToObservedToolCalls(stepId, executionResult);
@@ -5179,6 +5357,8 @@ public sealed class WorkflowEngine(
             DataJson = JsonSerializer.Serialize(new
             {
                 FailureKind = failureKind.ToString(),
+                ProcessTerminationUnconfirmed = exception is AgentRunException
+                    { ProcessTerminationUnconfirmed: true },
                 Reason = step.PushbackReason,
                 OutputCharacters = diagnosticOutput?.Length ?? 0,
                 OutputSha256 = string.IsNullOrWhiteSpace(diagnosticOutput)
@@ -6174,6 +6354,15 @@ public sealed class WorkflowEngine(
                     .Select(step => step.Sequence)
                     .DefaultIfEmpty()
                     .Max() + 10;
+                var preparedPreview = _candidateFingerprints is not null &&
+                    await WorkspacePreviewPreparer.PrepareAsync(
+                        database, flow, sealFailureStep.Id, verificationRetrySequence, cancellationToken);
+                var verifyingNewPreview = preparedPreview ||
+                    await database.FlowEvents.AnyAsync(item =>
+                        item.FlowRunId == flow.Id &&
+                        item.FlowStepId == sealFailureStep.Id &&
+                        item.Type == WorkspacePreviewPreparer.CompletedEventType,
+                        cancellationToken);
                 var restorationEpochPersisted = false;
                 var restoredMissingScaffold =
                     await (_candidateFingerprints ??
@@ -6276,6 +6465,12 @@ public sealed class WorkflowEngine(
                     InputSummary =
                         BuildVerificationRestartAssignment(
                             $"{permissionSource.InputSummary.Trim()}{Environment.NewLine}{Environment.NewLine}" +
+                            (verifyingNewPreview
+                                ? "The host has now materialized the previously missing canonical customer previews. " +
+                                  "This is a distinct assignment to verify the newly available candidate through the real " +
+                                  "Studio sandbox, not a retry of the unavailable preview. Inspect preserved builds and " +
+                                  "scripts before deciding which checks must be repeated. "
+                                : string.Empty) +
                             (restoredMissingScaffold
                                 ? "Host finalization restored missing trusted scaffold bytes before this attempt. "
                                 : "Host finalization validated the existing trusted scaffold without changing its bytes. ") +
@@ -6288,6 +6483,10 @@ public sealed class WorkflowEngine(
                         GetStableSemanticRootId(permissionSource),
                     RemotePublicationAllowed = false
                 };
+                if (verifyingNewPreview)
+                {
+                    verificationRetry.ExecutionBudgetRootId = verificationRetry.Id;
+                }
                 PreserveOrTightenRetryPermission(
                     flow,
                     permissionSource,
@@ -6330,7 +6529,9 @@ public sealed class WorkflowEngine(
                     FlowStepId = verificationRetry.Id,
                     Type = "delivery.review-candidate-reverification-queued",
                     Message =
-                        "Candidate seal recovery queued a fresh substantive verification after restoring trusted scaffold bytes."
+                        verifyingNewPreview
+                            ? "Candidate preparation queued a distinct bounded verification assignment for newly materialized canonical previews; prior assignment deadlines remain unchanged."
+                            : "Candidate seal recovery queued a fresh substantive verification after validating trusted scaffold bytes."
                 });
                 await database.SaveChangesAsync(cancellationToken);
                 return flow;
@@ -6365,6 +6566,73 @@ public sealed class WorkflowEngine(
             {
                 throw new InvalidOperationException(
                     "The failed flow has no unresolved agent step to restart.");
+            }
+            var preMortemResponse = await TryRecoverPreMortemResponseAsync(
+                database, flow, failedStep, failedStep.OutputSummary, cancellationToken);
+            if (preMortemResponse is not null)
+            {
+                await using var transaction = await database.Database.BeginTransactionAsync(cancellationToken);
+                RecordPreMortemFramingRecovery(
+                    database, flow, failedStep, failedStep.OutputSummary, preMortemResponse);
+                var completion = await StageCompletedStepAsync(
+                    database, flow.Id, failedStep.Id,
+                    new AgentExecutionResult(preMortemResponse.Output,
+                        "Recovered the exact complete pre-mortem report without re-executing the assignment.",
+                        failedStep.ExecutionAttempts, []),
+                    failedStep.CompletedAt ?? DateTimeOffset.UtcNow,
+                    failedStep.DurationMilliseconds, null, null, cancellationToken);
+                ThrowIfCompletionBlocked(completion.GateRecord);
+                RetargetSupersededRetryLinks(flow.Steps, failedStep);
+                foreach (var laterStep in flow.Steps.Where(step =>
+                             step.Iteration == flow.Iteration && step.Sequence > failedStep.Sequence &&
+                             step.Status == StepStatus.Skipped && !IsSupersededRetry(step, failedStep)))
+                {
+                    ResetSkippedStep(laterStep);
+                }
+                _lifecycle.Transition(flow, FlowStatus.Queued);
+                flow.FailureReason = string.Empty;
+                flow.CompletedAt = null;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                await database.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                await RecordCompletionObservationAsync(completion, cancellationToken);
+                return flow;
+            }
+            var qaOwnerRepair = await TryBuildQaOwnerRepairAsync(
+                database, flow, failedStep, failedStep.OutputSummary, cancellationToken);
+            if (qaOwnerRepair is not null)
+            {
+                var root = failedStep.PushbackRootStepId ?? failedStep.Id;
+                var pushbackCount = await database.FlowSteps.CountAsync(
+                    item => item.FlowRunId == flow.Id && item.Iteration == flow.Iteration &&
+                        item.PlanStepKey == failedStep.PlanStepKey && item.Status == StepStatus.Pushback &&
+                        (item.Id == root || item.PushbackRootStepId == root), cancellationToken);
+                if (failedStep.Status != StepStatus.Pushback)
+                {
+                    pushbackCount++;
+                }
+                var limit = await GetMaxHandoffRetriesAsync(cancellationToken);
+                if (!HasHandoffRetryAvailable(pushbackCount, limit))
+                {
+                    throw new FlowLifecycleException(flow.Id, flow.Status, FlowStatus.Queued,
+                        "The configured owner repair limit is exhausted; restart cannot reset it.");
+                }
+                await using var transaction = await database.Database.BeginTransactionAsync(cancellationToken);
+                await StageHostHandoffRepairAsync(database, flow, failedStep, qaOwnerRepair, cancellationToken);
+                _lifecycle.Transition(flow, FlowStatus.Queued);
+                flow.FailureReason = string.Empty;
+                flow.CompletedAt = null;
+                flow.UpdatedAt = DateTimeOffset.UtcNow;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = failedStep.Id,
+                    Type = "flow.qa-owner-repair-queued",
+                    Message = "Restart preserved the rejected QA response and queued bounded owner repair, not another format-only replay."
+                });
+                await database.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                return flow;
             }
             if (flow.AgentSnapshots.Count > 0 &&
                 !flow.AgentSnapshots.Any(snapshot =>
@@ -6582,7 +6850,9 @@ public sealed class WorkflowEngine(
                          failedStep.StableSemanticRootId ?? failedStep.RetryOfStepId ?? failedStep.Id) &&
                         item.AgentId == failedStep.AgentId,
                 cancellationToken);
-            if (existingBudget?.DeadlineAt <= DateTimeOffset.UtcNow)
+            var repairedCandidate = await FindUnassignedRepairedCandidateAsync(
+                database, flow, failedStep, cancellationToken);
+            if (existingBudget?.DeadlineAt <= DateTimeOffset.UtcNow && repairedCandidate is null)
             {
                 throw new FlowLifecycleException(flow.Id, flow.Status, FlowStatus.Queued,
                     AssignmentExecutionBudget.ExhaustedReason);
@@ -6626,51 +6896,13 @@ public sealed class WorkflowEngine(
                     }
                 }
 
-                retryStep = new FlowStep
-                {
-                    FlowRunId = flow.Id,
-                    Iteration = flow.Iteration,
-                    Sequence = failedStep.Sequence + 10,
-                    AgentId = failedStep.AgentId,
-                    AgentName = failedStep.AgentName,
-                    AgentRole = failedStep.AgentRole,
-                    Label = $"{ManualRestartLabelPrefix}{failedStep.AgentName}",
-                    PlanStepKey = failedStep.PlanStepKey,
-                    PlanDutiesJson = failedStep.PlanDutiesJson,
-                    PlanStage = failedStep.PlanStage,
-                    InvocationKind = failedStep.InvocationKind,
-                    IsOutcomeOwner = failedStep.IsOutcomeOwner,
-                    PermissionProfile = failedStep.PermissionProfile,
-                    EffectivePermissionJson =
-                        failedStep.EffectivePermissionJson,
-                    WorkflowRevision = failedStep.WorkflowRevision,
-                    Status = StepStatus.Pending,
-                    Phase = canResume
-                        ? AgentRunPhase.CanceledByReconciliation
-                        : AgentRunPhase.PreparingWorkspace,
-                    Attempt = IsPreMortemStep(failedStep)
-                        ? failedStep.Attempt
-                        : flow.Steps
-                            .Where(step =>
-                                step.Iteration == flow.Iteration &&
-                                step.AgentId == failedStep.AgentId)
-                            .Select(step => step.Attempt)
-                            .DefaultIfEmpty()
-                            .Max() + 1,
-                    InputSummary = priorAssignment,
-                    CopilotSessionId = canResume ? snapshot!.SessionId : null,
-                    CopilotSessionHome = canResume
-                        ? snapshot!.CopilotHome
-                        : string.Empty,
-                    RemotePublicationAllowed = failedStep.RemotePublicationAllowed,
-                    RetryOfStepId = GetRetryRootId(failedStep),
-                    DependsOnStepId = failedStep.DependsOnStepId,
-                    PushbackRootStepId = failedStep.PushbackRootStepId,
-                    StableSemanticRootId = GetStableSemanticRootId(failedStep),
-                    PreMortemOriginStepId = failedStep.PreMortemOriginStepId,
-                    PreMortemTargetStepId = failedStep.PreMortemTargetStepId,
-                    PreMortemReviewStepId = failedStep.PreMortemReviewStepId
-                };
+                retryStep = CreateContinuationStep(
+                    flow, failedStep, $"{ManualRestartLabelPrefix}{failedStep.AgentName}", priorAssignment);
+                retryStep.Phase = canResume
+                    ? AgentRunPhase.CanceledByReconciliation
+                    : AgentRunPhase.PreparingWorkspace;
+                retryStep.CopilotSessionId = canResume ? snapshot!.SessionId : null;
+                retryStep.CopilotSessionHome = canResume ? snapshot!.CopilotHome : string.Empty;
                 flow.Steps.Add(retryStep);
                 database.Entry(retryStep).State = EntityState.Added;
             }
@@ -6747,6 +6979,11 @@ public sealed class WorkflowEngine(
                     flow,
                     failedStep,
                     retryStep);
+            if (repairedCandidate is not null)
+            {
+                RecordRepairedCandidateAssignment(
+                    database, flow, retryStep, repairedCandidate, failedStep.PushbackRootStepId!.Value);
+            }
             if (ReviewCoordinator.IsPublicationStep(
                     flow,
                     retryStep))
@@ -7276,7 +7513,7 @@ public sealed class WorkflowEngine(
             FlowStep blockedStep,
             CancellationToken cancellationToken)
     {
-        var handoff = AgentHandoffInspector.ParseDynamic(blockedStep.OutputSummary);
+        var handoff = await ReadRecoveryHandoffAsync(blockedStep, cancellationToken);
         if (!handoff.IsPushback ||
             string.IsNullOrWhiteSpace(handoff.OwnerPlanStepKey))
         {
@@ -7525,15 +7762,80 @@ public sealed class WorkflowEngine(
             upstreamOwnerStep);
         var revisionPolicyTightened = false;
         var retryPolicyTightened = false;
+        var ownerPermissionSource = await ResolveTaskPermissionSourceAsync(
+            database, upstreamOwnerStep!, cancellationToken);
+        revisionStep.PermissionProfile = ownerPermissionSource.PermissionProfile;
+        revisionStep.EffectivePermissionJson = ownerPermissionSource.EffectivePermissionJson;
+        revisionStep.WorkflowRevision = ownerPermissionSource.WorkflowRevision;
         revisionPolicyTightened = PreserveOrTightenRetryPermission(
             flow,
-            upstreamOwnerStep!,
+            ownerPermissionSource,
             revisionStep);
+        var retryPermissionSource = await ResolveTaskPermissionSourceAsync(
+            database, blockedStep, cancellationToken);
+        retryStep.PermissionProfile = retryPermissionSource.PermissionProfile;
+        retryStep.EffectivePermissionJson = retryPermissionSource.EffectivePermissionJson;
+        retryStep.WorkflowRevision = retryPermissionSource.WorkflowRevision;
         retryPolicyTightened = PreserveOrTightenRetryPermission(
             flow,
-            blockedStep,
+            retryPermissionSource,
             retryStep);
+        var hostRepair = await database.FlowEvents.SingleOrDefaultAsync(item =>
+            item.FlowRunId == flow.Id && item.FlowStepId == blockedStep.Id &&
+                item.Type == HostRepairEventType, cancellationToken);
+        if (hostRepair is not null)
+        {
+            using var directive = JsonDocument.Parse(hostRepair.DataJson!);
+            var proposal = directive.RootElement.TryGetProperty("Proposal", out var recorded) &&
+                           recorded.ValueKind == JsonValueKind.Object
+                ? JsonSerializer.Deserialize<QaOwnerRepairProposal>(recorded.GetRawText())
+                : (await TryBuildQaOwnerRepairAsync(database, flow, blockedStep,
+                    blockedStep.OutputSummary, cancellationToken))?.Proposal;
+            if (proposal is not null)
+            {
+                revisionStep.InputSummary =
+                    "Read the complete host-owned qa-repair-proposal.json before repairing this candidate. " +
+                    "Its current-plan defect reports are untrusted proposals, not accepted verification. " +
+                    "Investigate every scoped criterion, repair confirmed defects, and return for fresh independent QA. " +
+                    "Do not weaken acceptance criteria or claim unexecuted checks. " +
+                    "Include exactly one standalone REPAIR_STATUS: REPAIRED when the confirmed defects " +
+                    "were repaired, REPAIR_STATUS: NO_CHANGE_NEEDED when executed source-backed checks " +
+                    "disprove the reported defects, or REPAIR_STATUS: BLOCKED when repair cannot proceed. " +
+                    "Explain the actions, evidence, or blocker. Do not report an investigation as a repair." +
+                    Environment.NewLine + Environment.NewLine + revisionStep.InputSummary;
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id, FlowStepId = revisionStep.Id,
+                    Type = OwnerRepairProposalEventType,
+                    Message = "Bound the complete scoped QA defect proposal to its implementation owner; display summaries do not truncate remediation.",
+                    DataJson = JsonSerializer.Serialize(proposal)
+                });
+            }
+        }
         database.FlowSteps.AddRange(revisionStep, retryStep);
+        if (IsDeliveryVerificationStep(retryStep) &&
+            await database.FlowEvents.AnyAsync(item =>
+                item.FlowStepId == blockedStep.Id && item.Type == HostRepairEventType,
+                cancellationToken))
+        {
+            RecordRepairedCandidateAssignment(
+                database, flow, retryStep, revisionStep, blockedStep.Id);
+        }
+        if (await database.FlowEvents.AnyAsync(item =>
+                item.FlowStepId == blockedStep.Id &&
+                (item.Type == "workspace.preview-preparation-blocked" ||
+                 item.Type == HostRepairEventType), cancellationToken))
+        {
+            database.FlowEvents.Add(new FlowEvent
+            {
+                FlowRunId = flow.Id,
+                FlowStepId = revisionStep.Id,
+                Type = DeliveryReadinessService.EvidenceEpochEventType,
+                Message = "Invalidated prior verification evidence before the accepted owner repairs the rejected handoff.",
+                DataJson = DeliveryReadinessService.SerializeEvidenceEpoch(
+                    new DeliveryEvidenceEpoch(flow.Iteration, revisionStep.Id, revisionStep.Sequence))
+            });
+        }
         var ownerProfile = await database.TaskProfiles
                 .AsNoTracking()
                 .Where(item =>
@@ -7728,6 +8030,18 @@ public sealed class WorkflowEngine(
             $"{revisionStep.AgentName} responded to your pushback. Resume your role and re-attempt " +
             $"the blocked work using this corrected handoff:{Environment.NewLine}{Environment.NewLine}" +
             revisionStep.OutputSummary;
+        if (retryStep.Status == StepStatus.Pending && retryStep.StartedAt is null)
+        {
+            var flow = await database.Flows.SingleAsync(
+                item => item.Id == retryStep.FlowRunId, cancellationToken);
+            var repaired = await FindUnassignedRepairedCandidateAsync(
+                database, flow, retryStep, cancellationToken);
+            if (repaired is not null)
+            {
+                RecordRepairedCandidateAssignment(
+                    database, flow, retryStep, repaired, retryStep.PushbackRootStepId!.Value);
+            }
+        }
         await database.SaveChangesAsync(cancellationToken);
     }
 
@@ -7982,12 +8296,18 @@ public sealed class WorkflowEngine(
               on the same Studio origin; it uses the actual customer-preview sandbox, CSP, and
               bootstrap. Allow only this local preview origin while blocking external network
               access. Exercise the iframe content at representative desktop and mobile sizes.
+              Outbound links use a host-owned confirmation outside the opaque iframe. Click the
+              preview link, verify the exact destination shown by the host, then exercise its
+              explicit confirmation with the destination mocked or external requests blocked.
+              Do not grant popup, same-origin, top-navigation, or network authority to the iframe.
               These unreviewed URLs are available only while this verification task is running.
               Ordinary customer-preview URLs require the later reviewed seal; do not use them
               before review or treat a direct-file check as proof of the harness security layer.
               This endpoint grants no customer approval or publication authority.
               """;
         return $"""
+            {readiness.PreviewPreparationBlocker}
+
             You additionally own the Delivery verification duty for this iteration.
 
             AcceptancePlanHash (copy this value verbatim into the verification document):
@@ -8006,6 +8326,12 @@ public sealed class WorkflowEngine(
             important checks. The host validates every citation against the actual observations.
             If references are invalid, the host preserves your work and supplies the recorded
             identifiers for one response-only correction, without rerunning successful checks.
+            Static previews and screenshots prove rendering only, not working product interactions.
+            For behavioral criteria, exercise the actual product path and assert the expected
+            state change with the planned executable check. A successful click tool call alone
+            does not prove its effect. If required behavior cannot be verified, report Failed or
+            Blocked with specific remediation and responsible roles, never PASS with a preview
+            limitation disclosed as a nonblocking risk.
 
             {preview}
             """;
@@ -8063,6 +8389,15 @@ public sealed class WorkflowEngine(
             Environment.NewLine + string.Join(Environment.NewLine, details);
     }
 
+    internal static string DeliveryQaEvidenceCitationContract() =>
+        $"Each criterion and residual risk EvidenceIds array must contain at most " +
+        $"{DeliveryReadinessPolicy.MaximumEvidenceIdsPerItem} unique host-issued identifiers. " +
+        "Select the smallest sufficient set of successful, allowed-kind observations that proves " +
+        "the complete criterion, not every tool call in the investigation. A retained full-matrix " +
+        "command result can cover multiple cases; do not invent aggregate evidence or omit " +
+        "required coverage to fit the limit. If no bounded set proves the criterion, report " +
+        "Failed or Blocked with actionable remediation instead of claiming Verified.";
+
     internal static string DeliveryQaResponseContract(string acceptancePlanHash) => $$"""
         Also output exactly one strict JSON document between these standalone sentinels:
         {{DeliveryReadinessPolicy.QaBeginMarker}}
@@ -8070,7 +8405,9 @@ public sealed class WorkflowEngine(
         {{DeliveryReadinessPolicy.QaEndMarker}}
         Property names and enum casing are exact. Provide exactly one Criteria entry per planned
         criterion identifier, referencing only host-issued evidence whose successful kind is allowed
-        by that criterion. The execution-record identifier ending in -000 is context only and cannot
+        by that criterion.
+        {{DeliveryQaEvidenceCitationContract()}}
+        The execution-record identifier ending in -000 is context only and cannot
         prove a Verified result. Outcome is
         Verified, Failed, or Blocked. Verified has no responsible roles or remediation. Failed names
         at least one responsible role and includes remediation. Blocked includes remediation and may
@@ -8218,6 +8555,10 @@ public sealed class WorkflowEngine(
         FlowStep source,
         FlowStep retry)
     {
+        if (GetStableSemanticRootId(retry) == GetStableSemanticRootId(source))
+        {
+            retry.ExecutionBudgetRootId ??= source.ExecutionBudgetRootId;
+        }
         if (string.IsNullOrWhiteSpace(retry.EffectivePermissionJson))
         {
             retry.PermissionProfile = source.PermissionProfile;
@@ -8687,7 +9028,9 @@ public sealed class WorkflowEngine(
         else
         {
             var blocked = readiness.State == DeliveryReadinessState.Blocked;
-            if (!blocked &&
+            if ((!blocked || readiness.Contract.Criteria.Any(item =>
+                    item.Outcome == DeliveryCriterionOutcome.Failed) ||
+                    await HasOwnerActionableBlockedCriteriaAsync(database, flow, readiness, cancellationToken)) &&
                 await TryScheduleAutoRefinementAsync(
                     database,
                     flow,
@@ -8882,7 +9225,11 @@ public sealed class WorkflowEngine(
             flow,
             readiness.State,
             readiness.Record.CandidateFingerprint,
-            readiness.Candidate.CandidateFingerprint);
+            readiness.Candidate.CandidateFingerprint,
+            hasFailedCriteria: readiness.Contract.Criteria.Any(item =>
+                item.Outcome == DeliveryCriterionOutcome.Failed),
+            hasOwnerActionableBlockedCriteria:
+                await HasOwnerActionableBlockedCriteriaAsync(database, flow, readiness, cancellationToken));
         ReviewCoordinator.ApplyRefinement(
             flow,
             owner,
@@ -8965,7 +9312,17 @@ public sealed class WorkflowEngine(
         DeliveryAcceptancePlan Plan,
         IReadOnlyList<DeliveryEvidenceItem> Evidence,
         string CurrentStepEvidencePrefix,
-        string? VerificationPreviewUrl = null);
+        string? VerificationPreviewUrl = null,
+        string? PreviewPreparationBlocker = null);
+
+    private static string BuildPreviewPreparationBlocker(string error, string repairOwner) =>
+        "HOST PREVIEW PREFLIGHT BLOCKED: " + error + Environment.NewLine +
+        "Do not run builds or browser verification yet, and do not return COMPLETE. " +
+        "Immediately return governed PUSHBACK to the completed upstream implementation " +
+        $"owner: PUSHBACK_OWNER_STEP_ID: {repairOwner}. Ask that owner to prepare every " +
+        "required variant at workspace-root .customer-preview, preserving existing product " +
+        "work and execution evidence. The host will schedule its bounded repair and then " +
+        "recheck this preflight before substantive QA; this is not a customer requirement gap.";
 
     /// <summary>
     /// Durably records the host-issued evidence identifiers for one plan step. It is idempotent, so
@@ -9059,12 +9416,42 @@ public sealed class WorkflowEngine(
         {
             return null;
         }
+        string? previewPreparationBlocker = null;
+        var responseCorrection = await IsResponseCorrectionAttemptAsync(
+            database, step, cancellationToken);
         if (_candidateFingerprints is not null &&
-            !await IsResponseCorrectionAttemptAsync(
-                database,
-                step,
-                cancellationToken))
+            !responseCorrection)
         {
+            try
+            {
+                await WorkspacePreviewPreparer.PrepareAsync(
+                    database, flow, step.Id, step.Sequence, cancellationToken);
+            }
+            catch (PreviewPreparationRequiredException exception)
+            {
+                var planJson = await database.FlowPlanDocuments
+                    .Where(item => item.FlowRunId == flow.Id && item.Iteration == flow.Iteration)
+                    .Select(item => item.RawJson)
+                    .SingleAsync(cancellationToken);
+                var document = TeamPlanParser.ParseJson(planJson).Document;
+                var repairOwner = (document.Steps ?? throw new InvalidOperationException(
+                        "The accepted plan has no steps for preview repair."))
+                    .Where(item => item.Duties is { } duties && duties.Contains(PlanDuty.Implement) &&
+                        TeamPlanValidator.IsDependencyAncestor(document, item.Id, step.PlanStepKey))
+                    .OrderByDescending(item => item.Order)
+                    .FirstOrDefault()
+                    ?? throw new InvalidOperationException(
+                        "The preview handoff needs repair, but the accepted plan has no upstream implementation owner.");
+                previewPreparationBlocker = BuildPreviewPreparationBlocker(exception.Message, repairOwner.Id);
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = step.Id,
+                    Type = "workspace.preview-preparation-blocked",
+                    Message = "Preview handoff needs an upstream repair before expensive verification; dispatching the governed pushback.",
+                    DataJson = JsonSerializer.Serialize(new { Error = exception.Message, OwnerPlanStepKey = repairOwner.Id })
+                });
+            }
             var restoredMissingScaffold =
                 await _candidateFingerprints
                 .RestoreAndValidateTrustedScaffoldAsync(
@@ -9108,6 +9495,39 @@ public sealed class WorkflowEngine(
                     Message =
                         "Restored and validated missing host-owned scaffold bytes before substantive verification."
                 });
+            }
+        }
+        if (responseCorrection)
+        {
+            var correctionEvent = await database.FlowEvents.AsNoTracking()
+                .SingleOrDefaultAsync(item => item.FlowStepId == step.Id &&
+                    item.Type == "agent.contract-correction-scheduled", cancellationToken);
+            if (correctionEvent is not null)
+            {
+                using var correction = JsonDocument.Parse(correctionEvent.DataJson!);
+                var sourceId = correction.RootElement.GetProperty("SourceStepId").GetGuid();
+                var blocked = await database.FlowEvents.AsNoTracking()
+                    .SingleOrDefaultAsync(item => item.FlowStepId == sourceId &&
+                        item.Type == "workspace.preview-preparation-blocked", cancellationToken);
+                if (blocked is not null)
+                {
+                    using var data = JsonDocument.Parse(blocked.DataJson!);
+                    previewPreparationBlocker = BuildPreviewPreparationBlocker(
+                        data.RootElement.GetProperty("Error").GetString()!,
+                        data.RootElement.GetProperty("OwnerPlanStepKey").GetString()!);
+                    if (!await database.FlowEvents.AnyAsync(item => item.FlowStepId == step.Id &&
+                            item.Type == "workspace.preview-preparation-blocked", cancellationToken))
+                    {
+                        database.FlowEvents.Add(new FlowEvent
+                        {
+                            FlowRunId = flow.Id,
+                            FlowStepId = step.Id,
+                            Type = "workspace.preview-preparation-blocked",
+                            Message = "Response-only correction retains the host's preview repair constraint.",
+                            DataJson = blocked.DataJson
+                        });
+                    }
+                }
             }
         }
         var completedSteps = await database.FlowSteps
@@ -9179,7 +9599,8 @@ public sealed class WorkflowEngine(
                             !address.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
                         .FirstOrDefault()
                     ?? throw new InvalidOperationException(
-                        "Studio must be listening before dispatching Delivery verification.")));
+                        "Studio must be listening before dispatching Delivery verification.")),
+            previewPreparationBlocker);
     }
 
     internal static bool IsCompletePublicationJournalRecord(

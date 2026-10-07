@@ -16,6 +16,43 @@ namespace AiHarnessDemo.Tests;
 public sealed class DurablePromptRecoveryTests
 {
     [Fact]
+    public async Task ResponseCorrection_LeadsWithTheErrorAndStagesOnlyCorrectionInputs()
+    {
+        await using var fixture = await DurablePromptFixture.CreateAsync(executionPrompt: string.Empty);
+        var workflow = await fixture.ReloadWorkflowAsync("{{ task }}\n{{ agent.instructions }}\n{{ outcome.context }}");
+        var stager = new AgentManifestStager();
+        var manifest = await stager.StageAsync(fixture.CopilotHome, DurablePromptFixture.Manifest(), fixture.SessionId);
+        const string error = "Validation error: AC-003 cited a SourceInspection where a Command is required.";
+        var context = fixture.Context with
+        {
+            ResumeSession = true,
+            Task = "Retained response to correct:\n" + new string('r', 12_000),
+            RepositoryKnowledge = new string('k', 20_000),
+            OutcomeContext = "Unchanged accepted criteria and exact evidence.\n" + new string('e', 12_000),
+            OutcomeContract = "Return the exact unchanged response schema.",
+            ResponseCorrectionInstructions = error,
+            StudioDependencyOutputs = [new("implementation", "engineer", StudioDependencyKind.Direct, 1, 1, 10, new string('h', 20_000))]
+        };
+        var prepared = await AgentPromptContext.PrepareAsync(context, new string('i', 6_000),
+            workflow.Revision, manifest, stager, fixture.Factory, CancellationToken.None);
+        var instructions = await CopilotReasoningHost.RenderAndPersistExecutionInstructionsAsync(
+            prepared.Context, workflow, prepared.AgentInstructions, fixture.WorkspacePath, null,
+            new WorkflowPromptRenderer(), fixture.Factory, CancellationToken.None, prepared);
+
+        Assert.StartsWith("## Correct the previous response in this session", instructions.Prompt);
+        Assert.True(instructions.Prompt.IndexOf(error, StringComparison.Ordinal) < 200);
+        Assert.True(Encoding.UTF8.GetByteCount(instructions.Prompt) < 8_000);
+        Assert.All(prepared.DocumentPaths, path => Assert.Contains(path, instructions.Prompt));
+        Assert.DoesNotContain(prepared.DocumentPaths, path => path.EndsWith("repository-knowledge.md", StringComparison.Ordinal));
+        Assert.DoesNotContain(prepared.DocumentPaths, path => path.EndsWith("customer-input.md", StringComparison.Ordinal));
+        Assert.DoesNotContain(prepared.DocumentPaths, path => path.EndsWith("handoff-01.md", StringComparison.Ordinal));
+        Assert.Contains(prepared.DocumentPaths, path => path.EndsWith("assignment.md", StringComparison.Ordinal));
+        Assert.Contains(prepared.DocumentPaths, path => path.EndsWith("response-contract.md", StringComparison.Ordinal));
+        Assert.Throws<InvalidOperationException>(() => CopilotReasoningHost.BuildResponseCorrectionPrompt(
+            context with { ResumeSession = false }, prepared.DocumentPaths));
+    }
+
+    [Fact]
     public async Task LongIntakeSubmission_StagesFullDialogueInsteadOfDroppingLaterTalks()
     {
         await using var fixture = await DurablePromptFixture.CreateAsync(

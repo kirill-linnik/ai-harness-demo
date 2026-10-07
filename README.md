@@ -28,8 +28,21 @@ The host is ASP.NET Core with SQLite persistence; the dashboard is React and Vit
   preview endpoint serve those immutable bytes after restart without rescanning the worktree. An
   optional loopback-only live demo is available for convenience but never counts as readiness
   evidence.
+- **Repairable preview handoffs** — before substantive browser QA, Studio prepares an unambiguous
+  repository-local preview at the canonical workspace root, recording its origin and hashes before
+  copying. Missing or ambiguous output is sent back to its upstream implementation owner through
+  bounded pushback, rather than discovered only after a long verification run. Changed preview
+  inputs invalidate prior evidence and require fresh verification through the actual Studio sandbox.
 - **Durable orchestration** — plans, attempts, sessions, permissions, events, reviews, links,
   learnings, readiness, and publication state survive restart and remain visible in the dashboard.
+- **Separate execution artifacts** — in a project containing multiple repositories, new files
+  outside the registered product repositories and trusted scaffold are tool/agent artifacts, not
+  deliverables. Studio catalogs their paths and digests in SQLite, copies files up to 8 MiB into
+  durable storage, and retains workspace files for downstream evidence references. Larger files
+  remain integrity-checked workspace references rather than bloating the database or stopping
+  the flow. No tool-name, filename, or extension allowlist is needed; artifacts cannot block QA
+  or enter the reviewed candidate. Product additions belong inside a registered repository;
+  repository-local generated output follows that repository's Git ignore rules.
 - **Recorded customer dialogue** — every flow page includes a read-only **Customer dialogue**
   section with expandable, timestamped text messages, including the original customer message,
   including Account Manager clarifications, customer confirmation, later refinements, and uploaded
@@ -90,9 +103,11 @@ Different flows may run concurrently; steps inside one flow remain sequential.
   folder inside a larger repository, Delivery retains the parent Git history but limits reviewed
   changes to that folder. A folder without Git uses its present files; Delivery initializes and
   commits a baseline **only in its isolated workspace**, with commit rather than PR publication.
-  If a remote cannot be checked or fetched, preparation stops; if an existing Delivery branch
-  falls behind, resumption stops instead of merging or rebasing it automatically. Existing guarded
-  snapshots remain fixed to their creation-time source.
+  If a remote cannot be checked or fetched, new preparation stops. Existing Delivery work resumes
+  on its owned flow branch without fetching, merging, or rebasing advancing upstream changes;
+  branch and Git common-directory identity are revalidated. Selected-folder baselines and guarded
+  snapshots remain fixed to their creation-time source. Publication still requires the exact
+  sealed and reviewed candidate.
 - Delivery publication uses sealed, reviewed Git and preview identities. The host revalidates those
   identities and readiness state before and after publishing. For a pull-request outcome, a
   repository whose reviewed commit already matches the remote default branch, or whose verified
@@ -108,6 +123,31 @@ a non-terminating one-hour warning, and a finite four-hour assignment budget sha
 and restarts. The flow page exposes safe observed activity, remaining budget, and termination
 reasons. Legacy timeout keys require explicit migration; see
 [`docs\ARCHITECTURE.md`](docs/ARCHITECTURE.md#execution-timeout-policy-and-activity).
+
+Recoverable pre-review runtime failures continue automatically from preserved work after bounded
+backoff, with durable scheduling across restarts. The existing **Max handoff retries** setting also
+caps factory continuations per assignment; repeated failures without new host-observed evidence
+stop earlier. Continuations share the original absolute deadline and cannot gain permissions.
+Publication, unsafe or unresumable interruptions, unavailable models/dependencies, and exhausted
+budgets are not blindly retried. Missing preview handoffs route back to the accepted implementation
+owner even if the verifier ignores the blocker. Required behavior must be exercised and its effect
+asserted; screenshots prove rendering, not interaction. Unresolved work remains preserved with an
+explicit blocker, never presented as a successful customer result.
+
+After a format-only QA correction fails, a complete, scope-valid defect report can still seed
+bounded implementation-owner repair. Its verification claims remain rejected; fresh QA must pass
+the full evidence contract before review. Known failed criteria are repaired even when other
+criteria are blocked, while external-only blockers still require resolution.
+Verification after host-directed implementation repair is a distinct, finite assignment for the
+repaired candidate. Its budget starts when verification launches, rather than expiring while the
+owner repairs the product. Old deadlines remain unchanged, and retries of the new verification
+share its deadline; neither permissions nor repair limits increase.
+An operator can explicitly scope distinct remaining work after an exhausted pre-review worker
+through `POST /api/flows/{id}/remaining-work` with an `Assignment` of at most 2,000 characters.
+This does not restart the old task: it preserves its deadline, records the new scope, starts a
+fresh CLI session, caps the new budget at 45 minutes and the original policy ceiling, and rejects
+duplicate scopes or assignments beyond the configured handoff limit. Approval and publication
+cannot be bypassed.
 
 ## Agents
 

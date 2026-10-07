@@ -18,6 +18,52 @@ function event(
 }
 
 describe("Timeline", () => {
+  it("distinguishes internal recovery from a completed customer result", () => {
+    render(<Timeline events={[
+      event("continue", "2026-10-04T08:00:00Z", "agent.continuation-scheduled", "Continuing preserved work."),
+      event("repair", "2026-10-04T08:00:01Z", "handoff.host-repair-required", "Owner repair queued."),
+      event("exhausted", "2026-10-04T08:00:02Z", "agent.recovery-exhausted", "Recovery limit exhausted.")
+    ]} steps={[]} />);
+    expect(screen.getByText("Preserved work queued to continue")).toBeInTheDocument();
+    expect(screen.getByText("Factory routed internal handoff repair")).toBeInTheDocument();
+    expect(screen.getByText("Automatic recovery needs attention").closest("li")).toHaveClass("failed");
+  });
+  it("shows internal preview preparation and repair as visible handoff work", () => {
+    render(<Timeline events={[
+      event("preparing", "2026-10-04T05:00:00Z", "workspace.preview-preparation-started", "Preparing the canonical preview."),
+      event("prepared", "2026-10-04T05:00:01Z", "workspace.preview-prepared", "Preview bytes prepared."),
+      event("blocked", "2026-10-04T05:00:02Z", "workspace.preview-preparation-blocked", "Owner repair required."),
+      event("verification", "2026-10-04T05:00:03Z", "delivery.review-candidate-reverification-queued", "Fresh QA queued.")
+    ]} steps={[]} />);
+    expect(screen.getByText("Preparing customer preview")).toBeInTheDocument();
+    expect(screen.getByText("Customer preview prepared")).toBeInTheDocument();
+    expect(screen.getByText("Preview handoff needs repair")).toBeInTheDocument();
+    expect(screen.getByText("Fresh result verification queued")).toBeInTheDocument();
+  });
+
+  it("lets the customer download a preserved execution artifact", () => {
+    const artifact = event(
+      "archived", "2026-10-03T20:00:00Z",
+      "workspace.execution-artifact-archived", "Preserved unknown tool output."
+    );
+    artifact.dataJson = JSON.stringify({ Id: stepId, FlowId: stepId });
+    render(<Timeline events={[artifact]} steps={[]} />);
+    expect(screen.getByText("Execution artifact preserved")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Download preserved artifact" }))
+      .toHaveAttribute("href", `/api/flows/${stepId}/execution-artifacts/${stepId}`);
+  });
+
+  it("does not turn malformed artifact metadata into a download link", () => {
+    const artifact = event(
+      "archived", "2026-10-03T20:00:00Z",
+      "workspace.execution-artifact-archived", "Preserved unknown tool output."
+    );
+    artifact.dataJson = JSON.stringify({ Id: "../other-flow", FlowId: stepId });
+    render(<Timeline events={[artifact]} steps={[]} />);
+    expect(screen.getByText("Artifact download metadata is invalid.")).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
   it("renders causal order, attempt context, and grouped runtime detail", () => {
     const events = [
       event(

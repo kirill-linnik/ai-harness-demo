@@ -25,6 +25,8 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
 
     public DbSet<FlowAttachment> FlowAttachments => Set<FlowAttachment>();
 
+    public DbSet<ExecutionArtifactRecord> ExecutionArtifacts => Set<ExecutionArtifactRecord>();
+
     public DbSet<FlowEvent> FlowEvents => Set<FlowEvent>();
 
     public DbSet<FlowAgentSnapshot> FlowAgentSnapshots => Set<FlowAgentSnapshot>();
@@ -68,6 +70,23 @@ public sealed class HarnessDbContext(DbContextOptions<HarnessDbContext> options)
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<ExecutionArtifactRecord>(entity =>
+        {
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.Id).ValueGeneratedNever();
+            entity.HasIndex(item => new
+            {
+                item.FlowRunId,
+                item.Iteration,
+                item.RelativePath,
+                item.Digest
+            }).IsUnique();
+            entity.HasOne<FlowRun>()
+                .WithMany()
+                .HasForeignKey(item => item.FlowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
         modelBuilder.Entity<HarnessSettings>(entity =>
         {
             entity.HasKey(item => item.Id);
@@ -559,6 +578,7 @@ public static class DatabaseInitializer
         await EnsureExecutionBudgetSchemaAsync(database);
         await EnsureReviewedPreviewArtifactSchemaAsync(database);
         await EnsureFlowAttachmentSchemaAsync(database);
+        await EnsureExecutionArtifactSchemaAsync(database);
         await database.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
 
         if (!await database.Settings.AnyAsync())
@@ -619,6 +639,37 @@ public static class DatabaseInitializer
             {
                 await database.Database.ExecuteSqlRawAsync(statement);
             }
+        }
+    }
+
+    internal static async Task EnsureExecutionArtifactSchemaAsync(HarnessDbContext database)
+    {
+        await database.Database.ExecuteSqlRawAsync(
+            """
+            CREATE TABLE IF NOT EXISTS "ExecutionArtifacts" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_ExecutionArtifacts" PRIMARY KEY,
+                "FlowRunId" TEXT NOT NULL,
+                "FlowStepId" TEXT NULL,
+                "Iteration" INTEGER NOT NULL,
+                "RelativePath" TEXT NOT NULL,
+                "Digest" TEXT NOT NULL,
+                "Length" INTEGER NOT NULL,
+                "Content" BLOB NOT NULL,
+                "ContentStored" INTEGER NOT NULL DEFAULT 1,
+                "CreatedAt" INTEGER NOT NULL,
+                FOREIGN KEY ("FlowRunId") REFERENCES "Flows" ("Id") ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                "IX_ExecutionArtifacts_FlowRunId_Iteration_RelativePath_Digest"
+            ON "ExecutionArtifacts" ("FlowRunId", "Iteration", "RelativePath", "Digest");
+            """);
+        await database.Database.OpenConnectionAsync();
+        await using var command = database.Database.GetDbConnection().CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM pragma_table_info('ExecutionArtifacts') WHERE name = 'ContentStored';";
+        if (Convert.ToInt64(await command.ExecuteScalarAsync()) == 0)
+        {
+            await database.Database.ExecuteSqlRawAsync(
+                """ALTER TABLE "ExecutionArtifacts" ADD COLUMN "ContentStored" INTEGER NOT NULL DEFAULT 1;""");
         }
     }
 

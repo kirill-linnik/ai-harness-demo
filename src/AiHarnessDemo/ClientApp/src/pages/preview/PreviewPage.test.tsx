@@ -95,6 +95,35 @@ function renderPage(value: PreviewDto = preview) {
 }
 
 describe("PreviewPage", () => {
+  it("confirms outbound navigation only from the current opaque preview frame", async () => {
+    renderPage();
+    const frame = await screen.findByTitle<HTMLIFrameElement>("devclub.eu interactive customer preview");
+    const request = (href: string, source: Window | null = frame.contentWindow, origin = "null") => {
+      fireEvent(window, new MessageEvent("message", {
+        source, origin, data: { type: "ai-harness-preview-outbound", href }
+      }));
+    };
+    for (const href of [
+      "javascript:alert(1)", "data:text/html,unsafe", "https://user:pass@example.com/",
+      window.location.origin + "/api/settings", "/relative", "https://" + "x".repeat(8200)
+    ]) request(href);
+    request("https://example.com/video", window);
+    request("https://example.com/video", frame.contentWindow, "https://example.com");
+    expect(screen.queryByRole("region", { name: "External destination" })).not.toBeInTheDocument();
+    request("https://example.com/video");
+    const link = await screen.findByRole("link", { name: "https://example.com/video" });
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("region", { name: "External destination" })).not.toBeInTheDocument();
+    request("https://example.com/video");
+    fireEvent.click(screen.getByRole("button", { name: "devclub.ee" }));
+    expect(screen.queryByRole("region", { name: "External destination" })).not.toBeInTheDocument();
+    request("https://example.com/stale");
+    expect(screen.queryByRole("region", { name: "External destination" })).not.toBeInTheDocument();
+  });
+
   it("embeds the delivered artifact and routes customer review to the flow", async () => {
     renderPage();
 

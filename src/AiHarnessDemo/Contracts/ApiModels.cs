@@ -396,6 +396,8 @@ public sealed record SaveSettingsRequest(
 
 public sealed record ToggleAgentRequest(bool Enabled);
 
+public sealed record ContinueRemainingWorkRequest(string Assignment);
+
 public sealed record AnalyzeRepositoryRequest(string Path, bool RunCopilotInit = true);
 
 public sealed record AnalyzeRepositoryResponse(

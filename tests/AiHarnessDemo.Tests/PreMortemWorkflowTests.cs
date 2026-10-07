@@ -293,7 +293,7 @@ public sealed class PreMortemWorkflowTests
 
             Assert.Equal(FlowStatus.WaitingForFeedback, stored.Status);
             Assert.Equal(3, softwareSteps.Count);
-            var expectedReviews = correctInvalidReview ? 3 : 2;
+            var expectedReviews = 2;
             Assert.Equal(expectedReviews, reviews.Count);
             Assert.All(softwareSteps, step => Assert.Equal("claude-sonnet-5", step.Model));
             Assert.All(reviews, step => Assert.Equal("gpt-5.6-sol", step.Model));
@@ -326,16 +326,12 @@ public sealed class PreMortemWorkflowTests
             if (correctInvalidReview)
             {
                 Assert.Equal(1, reviewRuns[0].Attempt);
-                Assert.Equal(1, reviewRuns[1].Attempt);
-                Assert.Contains(
-                    "Previous review to correct:",
-                    reviewRuns[1].Task,
-                    StringComparison.Ordinal);
-                Assert.Contains(
-                    reviews[0].OutputSummary,
-                    reviewRuns[1].Task,
-                    StringComparison.Ordinal);
-                Assert.Single(stored.Events, item =>
+                var framing = Assert.Single(stored.Events, item =>
+                    item.Type == "agent.pre-mortem-framing-recovered");
+                Assert.Contains("Investigation complete.", framing.DataJson);
+                Assert.StartsWith(PreMortemRules.FindingsStatus, reviews[0].OutputSummary);
+                Assert.Single(PreMortemRules.ParseReview(reviews[0].OutputSummary).Findings);
+                Assert.DoesNotContain(stored.Events, item =>
                     item.Type == "agent.contract-correction-scheduled");
             }
             Assert.Contains(

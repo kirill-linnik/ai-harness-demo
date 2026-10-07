@@ -191,19 +191,25 @@ public sealed class FlowLifecycleCoordinator
     /// schedule its own refinement iteration directly from the verification turn that produced a
     /// <see cref="DeliveryReadinessState.NeedsRefinement"/> assessment, so a recoverable Delivery
     /// failure never has to park on the customer. It is deliberately narrow: only a
-    /// <c>NeedsRefinement</c> binding qualifies, and it can only reach
+    /// <c>NeedsRefinement</c>, or a blocked binding with failed or owner-actionable criteria, qualifies.
+    /// Unassigned external-only blockers remain blocked. This can only reach
     /// <see cref="FlowStatus.Reworking"/>.
     /// </summary>
     public bool ScheduleAutoRefinement(
         FlowRun flow,
         DeliveryReadinessState state,
         string candidateFingerprint,
-        string boundCandidateFingerprint)
+        string boundCandidateFingerprint,
+        bool hasFailedCriteria = false,
+        bool hasOwnerActionableBlockedCriteria = false)
     {
         RequireDeliveryBinding(
             flow,
             state,
-            DeliveryReadinessState.NeedsRefinement,
+            state == DeliveryReadinessState.Blocked &&
+                (hasFailedCriteria || hasOwnerActionableBlockedCriteria)
+                ? DeliveryReadinessState.Blocked
+                : DeliveryReadinessState.NeedsRefinement,
             candidateFingerprint,
             boundCandidateFingerprint,
             FlowStatus.Reworking);

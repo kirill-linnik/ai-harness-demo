@@ -414,8 +414,82 @@ public sealed class PreviewArtifactCatalogTests
         Assert.DoesNotContain("allow-forms", document);
         Assert.DoesNotContain("allow-popups", document);
         Assert.DoesNotContain("allow-top-navigation", document);
-        Assert.DoesNotContain("<script", document, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains($"<script>{DemoApi.PreviewNavigationScript}</script>", document);
+        var scriptDigest = Convert.ToBase64String(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(DemoApi.PreviewNavigationScript)));
+        Assert.DoesNotContain('\r', DemoApi.PreviewNavigationScript);
+        Assert.Contains(
+            $"script-src 'sha256-{scriptDigest}'",
+            context.Response.Headers.ContentSecurityPolicy.ToString());
+        Assert.Contains("target=\"_blank\" rel=\"noopener noreferrer\"", document);
+        Assert.Contains("event.source !== frame.contentWindow", document);
+        Assert.Contains("event.origin !== \"null\"", document);
+        Assert.DoesNotContain("window.open", document);
+        Assert.DoesNotContain("<script>alert(1)</script>", document);
         Assert.DoesNotContain(" onload=", document, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task OutboundPreviewBridge_RequiresTrustedParentConfirmationAndRejectsUnsafeMessages()
+    {
+        var script = $$$"""
+            const vm = require('node:vm');
+            const assert = require('node:assert/strict');
+            const events = {};
+            const frame = {contentWindow: {}, focus() {}};
+            const notice = {hidden: true};
+            const link = {focus() {}, removeAttribute(name) { delete this[name]; }};
+            const dismiss = {addEventListener(name, callback) { this.callback = callback; }};
+            const elements = {'outbound-notice':notice, 'outbound-link':link, 'outbound-dismiss':dismiss};
+            vm.runInNewContext({{{System.Text.Json.JsonSerializer.Serialize(DemoApi.PreviewNavigationScript)}}}, {
+              window: {addEventListener(name, callback) { events[name] = callback; }},
+              document: {querySelector() { return frame; }, getElementById(id) { return elements[id]; }},
+              location: {origin:'http://localhost:5283'}, URL
+            });
+            const send = (href, source=frame.contentWindow, origin='null') =>
+              events.message({source, origin, data:{type:'ai-harness-preview-outbound', href}});
+            for (const href of ['javascript:alert(1)', 'data:text/html,unsafe',
+                                'https://user:pass@example.com/', 'http://localhost:5283/api/settings',
+                                '/relative', 'https://' + 'x'.repeat(8200)]) {
+              send(href);
+              assert.equal(notice.hidden, true);
+              assert.equal(link.href, undefined);
+            }
+            send('https://example.com/video', {});
+            send('https://example.com/video', frame.contentWindow, 'https://example.com');
+            assert.equal(notice.hidden, true);
+            send('https://example.com/video?label=%3Cscript%3E');
+            assert.equal(notice.hidden, false);
+            assert.equal(link.href, 'https://example.com/video?label=%3Cscript%3E');
+            assert.equal(link.textContent, link.href);
+            dismiss.callback();
+            assert.equal(notice.hidden, true);
+            assert.equal(link.href, undefined);
+            """;
+        var start = new System.Diagnostics.ProcessStartInfo("node")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("-e");
+        start.ArgumentList.Add(script);
+        using var process = System.Diagnostics.Process.Start(start)
+            ?? throw new InvalidOperationException("Could not start the preview bridge test.");
+        var errors = process.StandardError.ReadToEndAsync();
+        try
+        {
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.True(process.ExitCode == 0, await errors);
+        }
+        finally
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
     }
 
     [Fact]
@@ -1568,6 +1642,91 @@ public sealed class CopilotReasoningHostTests
 
 public sealed class AgentRunnerRecoveryTests
 {
+    [Fact]
+    public void SuccessfulRetry_RetainsEarlierActualToolsInOrderWithoutPromotingFailures()
+    {
+        var failed = new ToolCallRecord("powershell", "Failed check.", false, "Command",
+            "node --test", ExitCode: 1, ResultSummary: "One check failed.");
+        var passedBeforeStall = new ToolCallRecord("powershell", "Completed before stall.", true,
+            "Command", "node --test", ExitCode: 0, ResultSummary: "All checks passed.");
+        var resumed = new ToolCallRecord("view", "Read the retained report.", true, "Read");
+
+        var observed = AgentRunner.RetainRetryToolCalls(
+            [failed, passedBeforeStall], [resumed]);
+
+        Assert.Equal(new[] { failed, passedBeforeStall, resumed }, observed);
+        Assert.False(observed[0].Succeeded);
+        Assert.Equal(1, observed[0].ExitCode);
+        Assert.True(observed[1].Succeeded);
+        Assert.Equal(0, observed[1].ExitCode);
+        Assert.Equal(2, AgentRunner.RetainRetryToolCalls(
+            [passedBeforeStall], [passedBeforeStall]).Count);
+    }
+
+    [Theory]
+    [InlineData("current", true)]
+    [InlineData("stale", false)]
+    [InlineData("wrong-session", false)]
+    [InlineData("foreign-workspace", false)]
+    [InlineData("unbound", false)]
+    public void InterruptedTools_RequireTheCurrentInvocationSessionAndWorkspace(
+        string scenario, bool retained)
+    {
+        var startedAt = DateTimeOffset.UtcNow;
+        var sessionId = Guid.NewGuid();
+        var workspace = Path.Combine(Path.GetTempPath(), "current-tool-evidence");
+        var observed = new ToolCallRecord("powershell", "Actually executed test.", true,
+            "Command", "node --test", ExitCode: 0, ResultSummary: "Passed.");
+        var context = new AgentExecutionContext(
+            Guid.NewGuid(), 1, "quality-engineer", "Quality Engineer", "quality-engineer",
+            "fixture-model", "max", 1, "Verify.", "", workspace, workspace, sessionId,
+            OutcomeType.None, "", [], [],
+            InvocationStartedAt: scenario == "unbound" ? null : startedAt);
+        var snapshot = new CopilotSessionSnapshot(
+            scenario == "wrong-session" ? Guid.NewGuid() : sessionId,
+            workspace, workspace, CopilotSessionJournalState.Interrupted,
+            scenario == "foreign-workspace" ? workspace + "-foreign" : workspace,
+            "Quality Engineer",
+            scenario == "stale" ? startedAt.AddMinutes(-1) : startedAt,
+            null, null, [], "Interrupted.")
+        {
+            ObservedToolCalls = [observed]
+        };
+        var failure = new AgentRunResult
+        {
+            Success = false,
+            OutputSummary = "Interrupted, not a completed handoff.",
+            FailureKind = AgentRunFailureKind.Stalled,
+            CanResumeSession = true
+        };
+
+        var result = CopilotReasoningHost.RetainInterruptedToolEvidence(failure, snapshot, context);
+
+        Assert.Same(failure, result);
+        Assert.False(result.Success);
+        Assert.Equal(AgentRunFailureKind.Stalled, result.FailureKind);
+        Assert.Equal(retained ? 1 : 0, result.ToolCalls.Count);
+        Assert.Equal(failure.OutputSummary, result.OutputSummary);
+    }
+
+    [Theory]
+    [InlineData(AgentRunFailureKind.Transient)]
+    [InlineData(AgentRunFailureKind.TimedOut)]
+    [InlineData(AgentRunFailureKind.Stalled)]
+    [InlineData(AgentRunFailureKind.AmbiguousCrash)]
+    public void UnconfirmedProcessTermination_NeverRetriesOrResumes(AgentRunFailureKind failureKind)
+    {
+        var failure = new AgentRunException("The process may still be active.", failureKind,
+            canResumeSession: true)
+        {
+            ProcessTerminationUnconfirmed = true
+        };
+
+        Assert.False(AgentRunner.IsRetryableFailure(failure));
+        Assert.False(AgentRunner.ShouldResumeInterruptedSession(failure));
+        Assert.False(WorkflowEngine.CanAutomaticallyContinue(failure));
+    }
+
     [Theory]
     [InlineData(AgentRunFailureKind.Stalled, true, true)]
     [InlineData(AgentRunFailureKind.TimedOut, true, true)]

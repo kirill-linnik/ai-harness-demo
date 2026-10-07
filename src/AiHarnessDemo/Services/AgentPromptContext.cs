@@ -160,9 +160,13 @@ internal static class AgentPromptContext
                 Output = CopilotReasoningHost.RemoveSourceProjectPath(
                     item.Output, context.SourceProjectPath)
             }).ToArray();
-        StageLarge("instructions", "role-contract.md", agentInstructions);
+        var responseCorrection = !string.IsNullOrWhiteSpace(context.ResponseCorrectionInstructions);
+        if (!responseCorrection)
+        {
+            StageLarge("instructions", "role-contract.md", agentInstructions);
+        }
         var attachments = new List<FlowAttachment>();
-        if (context.InvocationKind != ExecutionInvocationKind.Publication)
+        if (context.InvocationKind != ExecutionInvocationKind.Publication && !responseCorrection)
         {
             await using var database =
                 await databaseFactory.CreateDbContextAsync(cancellationToken);
@@ -207,10 +211,20 @@ internal static class AgentPromptContext
         }
         else
         {
-            StageLarge("task", "assignment.md", context.Task);
-            StageLarge("knowledge", "repository-knowledge.md", knowledge);
+            if (responseCorrection)
+            {
+                Add("task", "assignment.md", context.Task);
+            }
+            else
+            {
+                StageLarge("task", "assignment.md", context.Task);
+            }
+            if (!responseCorrection)
+            {
+                StageLarge("knowledge", "repository-knowledge.md", knowledge);
+            }
             StageLarge("outcome", "verification-context.md", context.OutcomeContext);
-            if (dependencies is not null &&
+            if (!responseCorrection && dependencies is not null &&
                 dependencies.Sum(item => (long)Encoding.UTF8.GetByteCount(item.Output)) >
                 InlineSectionBytes)
             {
@@ -223,6 +237,10 @@ internal static class AgentPromptContext
         foreach (var document in context.ContextDocuments ?? [])
         {
             Add($"attachment:{document.Name}", document.Name, document.Content);
+        }
+        if (responseCorrection)
+        {
+            Add("contract", "response-contract.md", context.OutcomeContract);
         }
         var stagedAttachments = new List<(FlowAttachment Attachment, StagedContextDocument Staged)>();
         foreach (var attachment in attachments)

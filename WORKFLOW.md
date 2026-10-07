@@ -174,17 +174,26 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
   turn closed.
 - The host validates the complete QA contract, including evidence membership, kind, success, and
   plan hash, before accepting a handoff. Invalid responses get one read-only response-correction
-  turn using the retained output and actual host-issued evidence, not a rerun of implementation
-  or successful checks. No invalid response can authorize review or publication.
+  follow-up IN THE SAME Copilot session using the retained output and actual host-issued evidence.
+  The exact validation errors lead the short follow-up; the original deadline remains unchanged.
+  This is not a new QA run or a rerun of implementation or successful checks. No invalid response
+  can authorize review or publication.
 - A completed verification may honestly report `Failed` or `Blocked` criteria with remediation.
   `HANDOFF_STATUS: COMPLETE` means the assigned inspection finished, not that the product passed.
+  Either sign off all criteria with qualifying evidence or request concrete rework from the
+  harness-named implementation owner through the strict criterion remediation and responsible
+  roles. Missing tests or test infrastructure are owner work, not a terminal factory outcome.
+  Return the complete QA and outcome documents even when requesting upstream rework.
 - `HANDOFF_STATUS: COMPLETE` and any narrative wording are never authorization. The host derives
   `ReadyToApprove`, `NeedsCustomerWaiver`, `NeedsRefinement`, or `Blocked` from the typed results,
   binds the assessment immutably to the sealed candidate, and only then opens a gate.
 - An ordinary `CustomerReview` exists only for `ReadyToApprove`. `NeedsCustomerWaiver` opens the
   separate `CustomerWaiver` gate, which is informed consent to named disclosed risks and is never
   acceptance. Failed, blocked, or missing criteria are never waivable.
-- `NeedsRefinement` is first resolved by the harness itself. While
+- Failed criteria and owner-actionable `Blocked` criteria first use the remaining same-iteration
+  implementation-owner repair and fresh-QA rounds. Disabled or exhausted local rounds fall back
+  to host-owned refinement, not a failed flow. `NeedsRefinement` and owned verification blockers
+  are resolved by the harness itself. While
   `studio.flow_kinds.delivery.max_auto_refinement_iterations` is not exhausted, the host seeds the
   next iteration from the unmet criteria's own remediation and owning roles and replans without
   customer input, because the verification turn already named the concrete work. The host stops and
@@ -195,7 +204,8 @@ You are {{ agent.name }}. Execute only the current assignment for this role.
 - A customer-resolved `NeedsRefinement` and a `Blocked` assessment use the typed
   readiness-resolution path: `NeedsRefinement` accepts only `RequestRefinement`, and `Blocked`
   accepts only `Continue`, `Replan`, or `Abandon`. None of them can accept a result or waive a
-  risk. `Blocked` is never resolved by the harness on its own.
+  risk. Unassigned external blockers require this explicit resolution; owner-actionable blockers
+  may receive bounded host-owned repair or replanning, never acceptance or a waiver bypass.
 - Review acceptance, publication authorization, remote verification, and final approval each re-read
   the same durable readiness, candidate, waiver, and review identifiers before acting.
 - Browser-visible deliveries always include a self-contained `.customer-preview\<variant>` reviewed

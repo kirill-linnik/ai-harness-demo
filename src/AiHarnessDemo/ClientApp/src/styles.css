@@ -2571,6 +2571,17 @@ summary:focus-visible {
   background: #fff;
 }
 
+.preview-outbound-confirmation {
+  margin-top: 18px;
+}
+
+.preview-outbound-link {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .preview-decision {
   display: grid;
   gap: 18px;

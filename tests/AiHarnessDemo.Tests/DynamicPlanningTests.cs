@@ -2383,8 +2383,8 @@ public sealed class DynamicPlanningTests
                 count == 1)
             {
                 throw new AgentRunException(
-                    "Fixture pre-mortem failure.",
-                    AgentRunFailureKind.Transient);
+                    "Fixture pre-mortem output failure requiring manual restart.",
+                    AgentRunFailureKind.InvalidOutput);
             }
             string output;
             if (context.AgentId == "team-lead")

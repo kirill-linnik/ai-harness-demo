@@ -19,6 +19,42 @@ namespace AiHarnessDemo.Tests;
 
 public sealed class FlowLifecycleCoordinatorTests
 {
+    [Fact]
+    public void MixedBlockedAssessment_CanRepairOnlyWithFailedCriteriaAndExactBinding()
+    {
+        var coordinator = new FlowLifecycleCoordinator();
+        var flow = Flow(FlowStatus.Running);
+        flow.Kind = FlowKind.Delivery;
+        var fingerprint = "sha256:" + new string('a', 64);
+
+        Assert.Throws<FlowLifecycleException>(() =>
+            coordinator.ScheduleAutoRefinement(flow, DeliveryReadinessState.Blocked,
+                fingerprint, fingerprint));
+        Assert.Throws<FlowLifecycleException>(() =>
+            coordinator.ScheduleAutoRefinement(flow, DeliveryReadinessState.Blocked,
+                fingerprint, "sha256:" + new string('b', 64), hasFailedCriteria: true));
+        Assert.Equal(FlowStatus.Running, flow.Status);
+
+        Assert.True(coordinator.ScheduleAutoRefinement(flow, DeliveryReadinessState.Blocked,
+            fingerprint, fingerprint, hasFailedCriteria: true));
+        Assert.Equal(FlowStatus.Reworking, flow.Status);
+    }
+
+    [Theory]
+    [InlineData(DeliveryReadinessState.ReadyToApprove)]
+    [InlineData(DeliveryReadinessState.NeedsCustomerWaiver)]
+    public void FailedCriteriaFlag_CannotBypassOtherReadinessStates(DeliveryReadinessState state)
+    {
+        var flow = Flow(FlowStatus.Running);
+        flow.Kind = FlowKind.Delivery;
+        var fingerprint = "sha256:" + new string('a', 64);
+
+        Assert.Throws<FlowLifecycleException>(() =>
+            new FlowLifecycleCoordinator().ScheduleAutoRefinement(
+                flow, state, fingerprint, fingerprint, hasFailedCriteria: true));
+        Assert.Equal(FlowStatus.Running, flow.Status);
+    }
+
     public static TheoryData<FlowStatus, FlowStatus> AllowedTransitions => new()
     {
         { FlowStatus.Intake, FlowStatus.Queued },

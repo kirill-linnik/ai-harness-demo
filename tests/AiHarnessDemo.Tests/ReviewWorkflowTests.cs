@@ -15,8 +15,190 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AiHarnessDemo.Tests;
 
-public sealed class ReviewWorkflowTests
+public sealed partial class ReviewWorkflowTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingPreviewHandoff_AutomaticallyRepairsThroughOwnerBeforeSubstantiveQa(bool correctResponseFirst)
+    {
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery, enablePreviewPreparation: true);
+        var blockedResponses = 0;
+        var expiredOwnerDeadline = DateTimeOffset.FromUnixTimeMilliseconds(
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 3_600_000);
+        harness.Runner.WorkerOutputOverride = context =>
+        {
+            if (context.OutcomeContext?.Contains("HOST PREVIEW PREFLIGHT BLOCKED:", StringComparison.Ordinal) == true)
+            {
+                blockedResponses++;
+                if (blockedResponses == 1)
+                {
+                    using var database = harness.Factory.CreateDbContext();
+                    var owner = database.FlowSteps.Single(item =>
+                        item.FlowRunId == harness.FlowId && item.PlanStepKey == "implement" && item.Attempt == 1);
+                    owner.ExecutionBudgetRootId = owner.Id;
+                    database.AgentExecutionBudgets.Add(new AgentExecutionBudget
+                    {
+                        FlowRunId = harness.FlowId,
+                        RootStepId = owner.Id,
+                        AgentId = owner.AgentId,
+                        StartedAt = expiredOwnerDeadline.AddHours(-1),
+                        DeadlineAt = expiredOwnerDeadline,
+                        PolicyJson = JsonSerializer.Serialize(AssignmentExecutionBudget.Policy(
+                            harness.WorkflowProvider.GetEffective().Config.Copilot,
+                            harness.WorkflowProvider.GetEffective().Revision))
+                    });
+                    database.SaveChanges();
+                }
+                if (correctResponseFirst && blockedResponses == 1)
+                {
+                    return null;
+                }
+                Assert.Contains("PUSHBACK_OWNER_STEP_ID: implement", context.OutcomeContext);
+                return """
+                    HANDOFF_STATUS: PUSHBACK
+                    PUSHBACK_OWNER_STEP_ID: implement
+                    PUSHBACK_REASON: Host preflight requires canonical previews before browser verification.
+                    """;
+            }
+            if (context.PlanStepKey == "implement" && context.Attempt > 1)
+            {
+                var preview = Path.Combine(harness.WorkspacePath, ".customer-preview", "browser");
+                Directory.CreateDirectory(preview);
+                File.WriteAllText(Path.Combine(preview, "index.html"), "repaired customer result");
+            }
+            return null;
+        };
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.True(flow.Status == FlowStatus.WaitingForFeedback, flow.FailureReason);
+        Assert.Contains(flow.Events, item => item.Type == "workspace.preview-preparation-blocked");
+        Assert.Contains(flow.Events, item => item.Type == "handoff.revision-scheduled");
+        var revision = Assert.Single(flow.Steps, item =>
+            item.PlanStepKey == "implement" && item.Attempt == 2);
+        Assert.Equal(StepStatus.Completed, revision.Status);
+        Assert.Contains(flow.Events, item =>
+            item.FlowStepId == revision.Id && item.Type == DeliveryReadinessService.EvidenceEpochEventType);
+        var verification = harness.Runner.Contexts.Where(item => item.RequiresDeliveryReadinessQa).ToArray();
+        Assert.Equal(3, verification.Length);
+        Assert.Contains("HOST PREVIEW PREFLIGHT BLOCKED:", verification[0].OutcomeContext);
+        Assert.DoesNotContain("HOST PREVIEW PREFLIGHT BLOCKED:", verification[^1].OutcomeContext);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+        Assert.Single(flow.GateRecords, item => item.ActionType == HandoffActionType.CustomerReview);
+        var repairBudget = await AssignmentExecutionBudget.ResolveAsync(
+            harness.Runner.Contexts.Last(item => item.PlanStepKey == "implement"),
+            harness.WorkflowProvider.GetEffective(), harness.Factory, CancellationToken.None);
+        Assert.Equal(revision.Id, repairBudget.RootStepId);
+        Assert.True(repairBudget.DeadlineAt > DateTimeOffset.UtcNow);
+        await using var budgets = await harness.Factory.CreateDbContextAsync();
+        Assert.Equal(expiredOwnerDeadline, (await budgets.AgentExecutionBudgets.SingleAsync(
+            item => item.RootStepId != revision.Id)).DeadlineAt);
+    }
+
+    [Fact]
+    public async Task PreviewPreflight_CannotBeIgnoredByACompleteVerificationResponse()
+    {
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery, enablePreviewPreparation: true);
+
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+
+        var flow = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Failed, flow.Status);
+        Assert.Contains("host preview preflight is blocked", flow.FailureReason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(flow.GateRecords, item => item.ActionType == HandoffActionType.CustomerReview);
+        Assert.Equal(0, harness.CandidatePublisher.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CandidateSealRecovery_NewBudgetRequiresNewlyPreparedPreview(bool previewMoved)
+    {
+        await using var harness = await ReviewHarness.CreateAsync(
+            FlowKind.Delivery, enablePreviewPreparation: true, nestedPreviewRepository: true);
+        var canonical = Path.Combine(harness.WorkspacePath, ".customer-preview", "browser", "index.html");
+        harness.Runner.WorkerOutputOverride = context =>
+        {
+            if (context.PlanStepKey == "implement")
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(canonical)!);
+                File.WriteAllText(canonical, "customer result");
+            }
+            return null;
+        };
+        harness.Runner.VerificationToolCallsOverride = _ =>
+        [
+            new ToolCallRecord("observe", "Fresh browser verification.", Succeeded: true,
+                ToolType: "Observation",
+                ResultDigest: OutcomeVerificationRules.ComputeSha256("observed browser"),
+                ResultSummary: "The current sandbox was observed.")
+        ];
+        harness.Runner.QaBlockOverride = context => DeliveryReadinessFixtures.QaBlockFromPrompt(
+            context.OutcomeContext,
+            evidenceOverride: [DeliveryReadinessFixtures.CurrentEvidenceIdFromPrompt(context.OutcomeContext)]);
+        harness.ReviewedCandidates.SealFailure = "Fixture seal requires fresh verification.";
+        await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+        var failed = await harness.LoadFlowAsync();
+        Assert.Equal(FlowStatus.Failed, failed.Status);
+        var original = Assert.Single(failed.Steps, item => item.IsOutcomeOwner);
+        var oldDeadline = DateTimeOffset.FromUnixTimeMilliseconds(
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 3_600_000);
+        await using (var database = await harness.Factory.CreateDbContextAsync())
+        {
+            (await database.FlowSteps.SingleAsync(item => item.Id == original.Id))
+                .ExecutionBudgetRootId = original.Id;
+            database.AgentExecutionBudgets.Add(new AgentExecutionBudget
+            {
+                FlowRunId = harness.FlowId,
+                RootStepId = original.Id,
+                AgentId = original.AgentId,
+                StartedAt = oldDeadline.AddHours(-1),
+                DeadlineAt = oldDeadline,
+                PolicyJson = JsonSerializer.Serialize(AssignmentExecutionBudget.Policy(
+                    harness.WorkflowProvider.GetEffective().Config.Copilot,
+                    harness.WorkflowProvider.GetEffective().Revision))
+            });
+            await database.SaveChangesAsync();
+        }
+        if (previewMoved)
+        {
+            var misplaced = Path.Combine(harness.WorkspacePath, "site", ".customer-preview", "browser", "index.html");
+            Directory.CreateDirectory(Path.GetDirectoryName(misplaced)!);
+            File.Move(canonical, misplaced);
+        }
+        harness.ReviewedCandidates.SealFailure = null;
+        var queued = await harness.Engine.RestartFailedFlowAsync(harness.FlowId, CancellationToken.None);
+        var next = Assert.Single(queued.Steps, item => item.IsOutcomeOwner && item.Status == StepStatus.Pending);
+        Assert.Equal(original.EffectivePermissionJson, next.EffectivePermissionJson);
+        Assert.False(next.RemotePublicationAllowed);
+        Assert.Equal(previewMoved ? next.Id : original.Id, next.ExecutionBudgetRootId);
+        var originalContext = harness.Runner.Contexts.Last(item => item.RequiresDeliveryReadinessQa);
+        var budget = await AssignmentExecutionBudget.ResolveAsync(
+            originalContext with { FlowStepId = next.Id },
+            harness.WorkflowProvider.GetEffective(), harness.Factory, CancellationToken.None);
+        if (previewMoved)
+        {
+            Assert.True(budget.DeadlineAt > DateTimeOffset.UtcNow);
+            Assert.Equal(next.Id, budget.RootStepId);
+            Assert.Equal("customer result", File.ReadAllText(canonical));
+            await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
+            var completed = await harness.LoadFlowAsync();
+            Assert.True(completed.Status == FlowStatus.WaitingForFeedback, completed.FailureReason);
+            Assert.Equal(0, harness.CandidatePublisher.Calls);
+        }
+        else
+        {
+            Assert.Equal(oldDeadline, budget.DeadlineAt);
+        }
+        await using var verification = await harness.Factory.CreateDbContextAsync();
+        Assert.Equal(oldDeadline, (await verification.AgentExecutionBudgets.SingleAsync(
+            item => item.RootStepId == original.Id)).DeadlineAt);
+    }
+
     [Fact]
     public void DirectReviewRequest_RejectsUnknownProperties()
     {
@@ -1236,10 +1418,9 @@ public sealed class ReviewWorkflowTests
     [Fact]
     public async Task NeedsRefinement_HarnessClosesTheGapItselfWithoutAskingTheCustomer()
     {
-        // The verification turn already names the remediation and its owner, so a recoverable
-        // Delivery failure must produce another iteration, not a question for the customer.
+        // Broader refinement remains available when focused handoff repair is disabled.
         await using var harness =
-            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+            await ReviewHarness.CreateAsync(FlowKind.Delivery, maxHandoffRetries: 0);
         var qaCalls = 0;
         harness.Runner.QaBlockOverride = context =>
             DeliveryReadinessFixtures.QaBlockFromPrompt(
@@ -1359,7 +1540,7 @@ public sealed class ReviewWorkflowTests
     public async Task DeliveryReadiness_BlockedCriterionBlocksTheFlowWithoutAnyCustomerGate()
     {
         await using var harness =
-            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+            await ReviewHarness.CreateAsync(FlowKind.Delivery, maxHandoffRetries: 0, maxAutoRefinementIterations: 0);
         harness.Runner.QaBlockOverride = context => DeliveryReadinessFixtures.QaBlockFromPrompt(context.OutcomeContext, outcome: DeliveryCriterionOutcome.Blocked);
 
         await harness.Engine.RunAsync(harness.FlowId, CancellationToken.None);
@@ -1697,10 +1878,11 @@ public sealed class ReviewWorkflowTests
         Assert.Equal(2, verificationTurns);
         var verificationContexts = harness.Runner.Contexts
             .Where(context => context.RequiresDeliveryReadinessQa).ToArray();
-        Assert.False(verificationContexts[1].ResumeSession);
-        Assert.NotEqual(
+        Assert.True(verificationContexts[1].ResumeSession);
+        Assert.Equal(
             verificationContexts[0].CopilotSessionId,
             verificationContexts[1].CopilotSessionId);
+        Assert.Contains("Validation error:", verificationContexts[1].ResponseCorrectionInstructions);
         Assert.Single(harness.Runner.Contexts, context => context.PlanStepKey == "implement");
         Assert.DoesNotContain(flow.Events, item => item.Type is "flow.failed" or "handoff.pushback");
         var correctionEvent = Assert.Single(
@@ -2174,7 +2356,7 @@ public sealed class ReviewWorkflowTests
     public async Task Blocked_ResolvesThroughContinueWithoutAnyAcceptOrWaiverBypass()
     {
         await using var harness =
-            await ReviewHarness.CreateAsync(FlowKind.Delivery);
+            await ReviewHarness.CreateAsync(FlowKind.Delivery, maxHandoffRetries: 0, maxAutoRefinementIterations: 0);
         harness.Runner.QaBlockOverride = context =>
             DeliveryReadinessFixtures.QaBlockFromPrompt(
                 context.OutcomeContext,
@@ -2244,6 +2426,11 @@ public sealed class ReviewWorkflowTests
         Assert.Contains(
             "host-owned scaffold files",
             continuation.InputSummary);
+        Assert.Contains("Current host-bound blocked criteria", continuation.InputSummary);
+        Assert.Contains("\"CriterionId\":\"AC-001\"", continuation.InputSummary);
+        Assert.Contains("\"AllowedEvidenceKinds\"", continuation.InputSummary);
+        Assert.Contains("a Test does not become an Observation", continuation.InputSummary);
+        Assert.Contains("new evidence epoch", continuation.InputSummary);
         var continuationPermission =
             JsonSerializer.Deserialize<EffectiveExecutionPermission>(
                 continuation.EffectivePermissionJson)!;
@@ -2683,10 +2870,14 @@ public sealed class ReviewWorkflowTests
             RecordingPublicationVerifier? publicationVerifier = null,
             int maxAutoRefinementIterations = 3,
             bool githubCliAvailable = true,
-            bool githubAuthenticationAvailable = true)
+            bool githubAuthenticationAvailable = true,
+            bool enablePreviewPreparation = false,
+            bool nestedPreviewRepository = false,
+            int? maxHandoffRetries = null,
+            int recoveryDelayMs = 1)
         {
             var root = Path.Combine(
-                AppContext.BaseDirectory,
+                enablePreviewPreparation ? Path.GetTempPath() : AppContext.BaseDirectory,
                 "review-workflow-tests",
                 Guid.NewGuid().ToString("N"));
             var agentsDirectory = Path.Combine(root, ".github", "agents");
@@ -2694,6 +2885,30 @@ public sealed class ReviewWorkflowTests
             Directory.CreateDirectory(agentsDirectory);
             Directory.CreateDirectory(workspacePath);
             Directory.CreateDirectory(Path.Combine(workspacePath, ".git"));
+            var sourcePath = root;
+            if (enablePreviewPreparation)
+            {
+                sourcePath = Path.Combine(root, "source");
+                Directory.CreateDirectory(sourcePath);
+                foreach (var repository in new[] { sourcePath, workspacePath })
+                {
+                    var gitRoot = nestedPreviewRepository ? Path.Combine(repository, "site") : repository;
+                    Directory.CreateDirectory(gitRoot);
+                    if (nestedPreviewRepository && Directory.Exists(Path.Combine(repository, ".git")))
+                    {
+                        Directory.Delete(Path.Combine(repository, ".git"));
+                    }
+                    var git = new ProcessRunner();
+                    var initialized = await git.RunAsync(
+                        "git", ["init", "--quiet"], gitRoot, TimeSpan.FromSeconds(30));
+                    Assert.True(initialized.ExitCode == 0, initialized.CombinedOutput);
+                    var committed = await git.RunAsync(
+                        "git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                            "commit", "--quiet", "--allow-empty", "-m", "Fixture baseline"],
+                        gitRoot, TimeSpan.FromSeconds(30));
+                    Assert.True(committed.ExitCode == 0, committed.CombinedOutput);
+                }
+            }
             await File.WriteAllTextAsync(
                 Path.Combine(root, "WORKFLOW.md"),
                 """
@@ -2703,6 +2918,8 @@ public sealed class ReviewWorkflowTests
                 agent:
                   max_concurrent_agents: 1
                   max_attempts: 1
+                  retry_base_delay_ms: {{RECOVERY_DELAY}}
+                  max_retry_backoff_ms: {{RECOVERY_DELAY}}
                 studio:
                   planning:
                     max_steps: 24
@@ -2742,7 +2959,9 @@ public sealed class ReviewWorkflowTests
                     "{{MAX_AUTO_REFINEMENT}}",
                     maxAutoRefinementIterations.ToString(
                         System.Globalization.CultureInfo.InvariantCulture),
-                    StringComparison.Ordinal));
+                    StringComparison.Ordinal).Replace(
+                    "{{RECOVERY_DELAY}}", recoveryDelayMs.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal));
 
             var plan = kind == FlowKind.Advisory
                 ? AdvisoryPlan()
@@ -2754,12 +2973,25 @@ public sealed class ReviewWorkflowTests
                 ConsolidatedRequest = "Produce a customer-reviewable result.",
                 Kind = kind,
                 Status = FlowStatus.Queued,
-                RepositoryPath = root,
+                RepositoryPath = sourcePath,
                 RepositoryKnowledge = "A configured test repository.",
                 Outcome = kind == FlowKind.Advisory
                     ? OutcomeType.None
                     : OutcomeType.PullRequest
             };
+            if (enablePreviewPreparation)
+            {
+                flow.WorkspacePath = workspacePath;
+                flow.Events.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    Type = StudioWorkspaceRepositoryMapLedger.EventType,
+                    Message = "Trusted fixture repository.",
+                    DataJson = StudioWorkspaceRepositoryMapLedger.Serialize(
+                        StudioWorkspaceRepositoryMapLedger.Create(
+                            flow, workspacePath, [new WorkspaceRepositoryIdentity(nestedPreviewRepository ? "site" : ".", "")]))
+                });
+            }
             var snapshots = new List<FlowAgentSnapshot>
             {
                 Snapshot(flow.Id, "account-manager", "Account Manager", "account-manager"),
@@ -2799,11 +3031,18 @@ public sealed class ReviewWorkflowTests
                 {
                     RepositoryPath = root,
                     RepositoryKnowledge = "A configured test repository.",
-                    MaxHandoffRetries = 0
+                    MaxHandoffRetries = maxHandoffRetries ?? (enablePreviewPreparation ? 2 : 0)
                 });
                 database.Flows.Add(flow);
                 database.FlowAgentSnapshots.AddRange(snapshots);
                 await database.SaveChangesAsync();
+                if (maxHandoffRetries is not null)
+                {
+                    var settings = database.Settings.Local.Single();
+                    settings.MaxHandoffRetries = maxHandoffRetries.Value;
+                    database.Entry(settings).Property(item => item.MaxHandoffRetries).IsModified = true;
+                    await database.SaveChangesAsync();
+                }
             }
 
             var paths = new HarnessPaths(root, agentsDirectory, databasePath);
@@ -2847,7 +3086,10 @@ public sealed class ReviewWorkflowTests
                 flowAgentSnapshotService: snapshotService,
                 teamPlanValidator: new TeamPlanValidator(),
                 reviewedCandidateService: reviewedCandidates,
-                flowQueue: flowQueue);
+                flowQueue: flowQueue,
+                candidateFingerprintService: enablePreviewPreparation
+                    ? new CandidateFingerprintService(new ProcessRunner(), TimeProvider.System, databaseFactory: factory)
+                    : null);
             var reviews = new ReviewCoordinator(
                 factory,
                 gate,
@@ -2996,6 +3238,15 @@ public sealed class ReviewWorkflowTests
             Gate.Dispose();
             try
             {
+                foreach (var file in Directory.EnumerateFiles(Root, "*", new EnumerationOptions
+                         {
+                             RecurseSubdirectories = true,
+                             AttributesToSkip = FileAttributes.ReparsePoint,
+                             IgnoreInaccessible = false
+                         }))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
                 Directory.Delete(Root, recursive: true);
             }
             catch (IOException)
@@ -3023,7 +3274,7 @@ public sealed class ReviewWorkflowTests
                 MissingQualification = null
             };
 
-        private static TeamPlanDocument DeliveryPlan() =>
+        public static TeamPlanDocument DeliveryPlan(int criterionCount = 1) =>
             new()
             {
                 Disposition = TeamPlanDisposition.Planned,
@@ -3057,7 +3308,7 @@ public sealed class ReviewWorkflowTests
                         dependsOn: ["prepare"])
                 ],
                 PreMortemCheckpoints = [],
-                AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(),
+                AcceptanceCriteria = DeliveryReadinessFixtures.Criteria(criterionCount),
                 MissingQualification = null
             };
 
@@ -3116,7 +3367,7 @@ public sealed class ReviewWorkflowTests
                 SourceFileName = $"{id}.agent.md"
             };
 
-        private static string WrapPlan(TeamPlanDocument plan) =>
+        public static string WrapPlan(TeamPlanDocument plan) =>
             $"{TeamPlanParser.BeginSentinel}{Environment.NewLine}" +
             TeamPlanParser.Serialize(plan) +
             $"{Environment.NewLine}{TeamPlanParser.EndSentinel}";
@@ -3156,11 +3407,20 @@ public sealed class ReviewWorkflowTests
         public Func<AgentExecutionContext, IReadOnlyList<ToolCallRecord>>?
             VerificationToolCallsOverride { get; set; }
 
+        public Func<AgentExecutionContext, string?>? WorkerOutputOverride { get; set; }
+
+        public string? PlanningOutputOverride { get; set; }
+
         public Task<AgentExecutionResult> ExecuteAsync(
             AgentExecutionContext context,
             CancellationToken cancellationToken = default)
         {
             Contexts.Add(context);
+            var workerOutput = WorkerOutputOverride?.Invoke(context);
+            if (workerOutput is not null)
+            {
+                return Task.FromResult(new AgentExecutionResult(workerOutput, "Fixture worker handoff.", 1, []));
+            }
             var publicationOutput = context.AgentId == "sky-publisher"
                 ? PublicationOutputFactory?.Invoke(context) ??
                   PublicationOutputOverride
@@ -3176,7 +3436,7 @@ public sealed class ReviewWorkflowTests
             var output = context.AgentId switch
             {
                 "team-lead" =>
-                    $"HANDOFF_STATUS: COMPLETE{Environment.NewLine}{plan}",
+                    PlanningOutputOverride ?? $"HANDOFF_STATUS: COMPLETE{Environment.NewLine}{plan}",
                 "account-manager" => $$$"""
                   HANDOFF_STATUS: COMPLETE
                   {{{IntakeParser.BeginSentinel}}}
@@ -3204,6 +3464,10 @@ public sealed class ReviewWorkflowTests
                   Continue the accepted plan.
                   """
             };
+            if (WorkflowEngine.RequiresOwnerRepairStatus(context))
+            {
+                output += Environment.NewLine + "REPAIR_STATUS: NO_CHANGE_NEEDED";
+            }
             if (context.OutcomeContract.Contains(
                     FlowOutcomeParser.BeginSentinel,
                     StringComparison.Ordinal))

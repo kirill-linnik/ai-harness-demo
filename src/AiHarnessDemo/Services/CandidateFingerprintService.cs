@@ -1,8 +1,11 @@
 using System.Security.Cryptography;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using AiHarnessDemo.Core.Domain;
 using AiHarnessDemo.Core.Verification;
+using AiHarnessDemo.Data;
+using Microsoft.EntityFrameworkCore;
 
 namespace AiHarnessDemo.Services;
 
@@ -42,8 +45,12 @@ public sealed class CandidateFingerprintService(
     ProcessRunner processRunner,
     TimeProvider timeProvider,
     ICandidateSealFaultInjector? sealFaultInjector = null,
-    WorkflowDefinitionProvider? workflowProvider = null)
+    WorkflowDefinitionProvider? workflowProvider = null,
+    IDbContextFactory<HarnessDbContext>? databaseFactory = null)
 {
+    private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _artifactGates = new();
+    internal const int MaximumStoredExecutionArtifactBytes = 8 * 1024 * 1024;
+
     private static void ValidateSelectedFolderPaths(
         FlowRun flow,
         IEnumerable<string> changedPaths)
@@ -1884,7 +1891,7 @@ public sealed class CandidateFingerprintService(
         }
     }
 
-    private static async Task<(
+    private async Task<(
         IReadOnlyList<CandidateScaffoldFile> Files,
         bool RestoredMissingFiles)>
         ValidateNonRepositoryFilesAsync(
@@ -1936,6 +1943,36 @@ public sealed class CandidateFingerprintService(
             sourceRepositories,
             applyWorkspaceCopyExclusions: true,
             excludedWorkspaceRoot);
+        var executionArtifacts = workspaceFiles.Keys
+            .Except(sourceFiles.Keys, StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (executionArtifacts.Length > 0 && databaseFactory is not null)
+        {
+            var gate = _artifactGates.GetOrAdd(flow.Id, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                workspaceFiles = EnumerateNonRepositoryFiles(
+                    workspace, workspaceRepositories, applyWorkspaceCopyExclusions: false);
+                executionArtifacts = workspaceFiles.Keys
+                    .Except(sourceFiles.Keys, StringComparer.Ordinal)
+                    .Order(StringComparer.Ordinal)
+                    .ToArray();
+                await ArchiveExecutionArtifactsAsync(
+                    flow, workspaceFiles, executionArtifacts, cancellationToken);
+                workspaceFiles = EnumerateNonRepositoryFiles(
+                    workspace,
+                    workspaceRepositories,
+                    applyWorkspaceCopyExclusions: false)
+                    .Where(item => !executionArtifacts.Contains(item.Key, StringComparer.Ordinal))
+                    .ToDictionary(item => item.Key, item => item.Value, StringComparer.Ordinal);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
         var workspacePaths = workspaceFiles.Keys
             .Order(StringComparer.Ordinal)
             .ToArray();
@@ -2015,7 +2052,9 @@ public sealed class CandidateFingerprintService(
             workspaceFiles = EnumerateNonRepositoryFiles(
                 workspace,
                 workspaceRepositories,
-                applyWorkspaceCopyExclusions: false);
+                applyWorkspaceCopyExclusions: false)
+                .Where(item => !executionArtifacts.Contains(item.Key, StringComparer.Ordinal))
+                .ToDictionary(item => item.Key, item => item.Value, StringComparer.Ordinal);
             workspacePaths = workspaceFiles.Keys
                 .Order(StringComparer.Ordinal)
                 .ToArray();
@@ -2060,6 +2099,104 @@ public sealed class CandidateFingerprintService(
                 "sha256:" + sourceDigest.ToLowerInvariant()));
         }
         return (trustedFiles, restoredMissingFiles);
+    }
+
+    private async Task ArchiveExecutionArtifactsAsync(
+        FlowRun flow,
+        IReadOnlyDictionary<string, string> workspaceFiles,
+        IReadOnlyList<string> relativePaths,
+        CancellationToken cancellationToken)
+    {
+        await using var database = await databaseFactory!
+            .CreateDbContextAsync(cancellationToken);
+        var stepId = await database.FlowSteps
+            .Where(step => step.FlowRunId == flow.Id &&
+                           step.Iteration == flow.Iteration &&
+                           (step.Status == StepStatus.Running ||
+                            step.Status == StepStatus.Failed ||
+                            step.Status == StepStatus.Completed))
+            .OrderByDescending(step => step.Sequence)
+            .Select(step => (Guid?)step.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+        foreach (var relativePath in relativePaths)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var path = workspaceFiles[relativePath];
+            // Preserve downstream file references while committing an exact, write-locked copy.
+            await using var stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read,
+                FileShare.Read);
+            var length = stream.Length;
+            var contentStored = length <= MaximumStoredExecutionArtifactBytes;
+            byte[] content = [];
+            string digest;
+            if (contentStored)
+            {
+                content = new byte[checked((int)length)];
+                await stream.ReadExactlyAsync(content, cancellationToken);
+                digest = "sha256:" +
+                    Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
+            }
+            else
+            {
+                digest = "sha256:" + Convert.ToHexString(
+                    await SHA256.HashDataAsync(stream, cancellationToken)).ToLowerInvariant();
+            }
+            var archived = await database.ExecutionArtifacts.AsNoTracking().SingleOrDefaultAsync(
+                item => item.FlowRunId == flow.Id &&
+                        item.Iteration == flow.Iteration &&
+                        item.RelativePath == relativePath &&
+                        item.Digest == digest,
+                cancellationToken);
+            if (archived is not null &&
+                (archived.Length != length ||
+                 archived.ContentStored != contentStored ||
+                 !archived.Content.AsSpan().SequenceEqual(content)))
+            {
+                throw new CandidateValidationException(
+                    $"The durable execution artifact '{relativePath}' failed its integrity check.");
+            }
+            if (archived is null)
+            {
+                var artifact = new ExecutionArtifactRecord
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = stepId,
+                    Iteration = flow.Iteration,
+                    RelativePath = relativePath,
+                    Digest = digest,
+                    Length = length,
+                    Content = content,
+                    ContentStored = contentStored,
+                    CreatedAt = timeProvider.GetUtcNow()
+                };
+                database.ExecutionArtifacts.Add(artifact);
+                database.FlowEvents.Add(new FlowEvent
+                {
+                    FlowRunId = flow.Id,
+                    FlowStepId = stepId,
+                    Type = "workspace.execution-artifact-archived",
+                    Message =
+                        $"Preserved execution artifact '{relativePath}' " +
+                        (contentStored
+                            ? "with an exact durable copy"
+                            : "in the flow workspace with a durable digest and path; its size exceeds the inline archive threshold") +
+                        "; it is outside the registered product repositories and is not part of the delivery.",
+                    DataJson = JsonSerializer.Serialize(new
+                    {
+                        artifact.Id,
+                        FlowId = flow.Id,
+                        artifact.Iteration,
+                        artifact.RelativePath,
+                        artifact.Digest,
+                        artifact.Length,
+                        artifact.ContentStored
+                    }),
+                    CreatedAt = artifact.CreatedAt
+                });
+                await database.SaveChangesAsync(cancellationToken);
+            }
+        }
     }
 
     private static IReadOnlyDictionary<string, string> EnumerateNonRepositoryFiles(

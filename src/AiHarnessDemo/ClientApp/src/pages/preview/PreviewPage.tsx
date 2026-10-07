@@ -8,6 +8,7 @@ import { BootScreen } from "../../components/BootScreen";
 import { BackIcon, CheckIcon, ExternalIcon, RefreshIcon } from "../../lib/icons";
 import { formatDuration } from "../../lib/format";
 import { useToast } from "../../lib/toast";
+import { PreviewArtifactFrame } from "./PreviewArtifactFrame";
 
 function openPreviewInNewTab(event: MouseEvent<HTMLAnchorElement>, url: string) {
   if (
@@ -289,13 +290,8 @@ export function PreviewPage() {
               ))}
             </div>
           ) : selectedArtifact?.interactive ? (
-            <iframe
-              className="preview-frame"
-              src={selectedArtifact.url}
-              title={`${selectedArtifact.label} interactive customer preview`}
-              sandbox="allow-scripts"
-              referrerPolicy="no-referrer"
-            />
+            <PreviewArtifactFrame key={selectedArtifact.url}
+              url={selectedArtifact.url} label={selectedArtifact.label} />
           ) : (
             <div className="pushback-callout">
               {advisory

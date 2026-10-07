@@ -671,11 +671,11 @@ public sealed class IntakeAdvisoryTests
                 assignment,
                 StringComparison.Ordinal);
             Assert.Contains(
-                "the only generated top-level directory allowed",
+                "execution artifacts, not product",
                 assignment,
                 StringComparison.Ordinal);
             Assert.Contains(
-                "`_release`, `.previous`",
+                "Do not delete tool traces or baseline captures",
                 assignment,
                 StringComparison.Ordinal);
             Assert.Contains(

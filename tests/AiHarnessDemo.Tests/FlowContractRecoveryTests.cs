@@ -11,6 +11,40 @@ namespace AiHarnessDemo.Tests;
 
 public sealed class FlowContractRecoveryTests
 {
+    [Fact]
+    public void QaCitationLimit_IsRepeatedInInitialCorrectionAndLegacyRestartAssignments()
+    {
+        var source = new FlowStep
+        {
+            AgentId = "quality-engineer",
+            AgentName = "Quality Engineer",
+            AgentRole = "quality-engineer",
+            PlanDutiesJson = """["Verify","PrepareOutcome"]""",
+            IsOutcomeOwner = true,
+            OutputSummary = "HANDOFF_STATUS: COMPLETE\nRetained independent verification."
+        };
+        var failure =
+            $"criterion 'AC-003' evidenceIds must contain at most " +
+            $"{DeliveryReadinessPolicy.MaximumEvidenceIdsPerItem} entries";
+        var citationContract = WorkflowEngine.DeliveryQaEvidenceCitationContract();
+        var assignments = new[]
+        {
+            WorkflowEngine.DeliveryQaResponseContract("unchanged-acceptance-plan-hash"),
+            WorkflowEngine.BuildStudioContractCorrectionAssignment(source, failure),
+            WorkflowEngine.BuildVerificationRestartAssignment("Verify the unchanged candidate.", failure)
+        };
+
+        Assert.Contains(
+            $"at most {DeliveryReadinessPolicy.MaximumEvidenceIdsPerItem} unique host-issued identifiers",
+            citationContract);
+        Assert.Contains("do not invent aggregate evidence", citationContract);
+        Assert.Contains("Failed or Blocked", citationContract);
+        Assert.All(assignments, assignment => Assert.Contains(citationContract, assignment));
+        Assert.Contains(source.OutputSummary, assignments[1]);
+        Assert.Contains("Do not rerun tools or modify", assignments[1]);
+        Assert.Contains("permission ceiling", assignments[2]);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

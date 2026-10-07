@@ -79,6 +79,7 @@ public sealed class IncidentReplayTests
 
         var flow = await harness.LoadFlowAsync();
 
+        Assert.True(flow.Status != FlowStatus.Failed, flow.FailureReason);
         // The replay really did use the captured request and the captured contradictory outcome.
         Assert.Equal(reference.OriginalRequest, flow.OriginalRequest);
         Assert.Equal(reference.OutcomeContractJson, flow.OutcomeContractJson);
@@ -719,6 +720,10 @@ public sealed class IncidentReplayTests
             if (context.RequiresDeliveryReadinessQa && QaBlock is not null)
             {
                 output += Environment.NewLine + QaBlock(context);
+            }
+            if (WorkflowEngine.RequiresOwnerRepairStatus(context))
+            {
+                output += Environment.NewLine + "REPAIR_STATUS: NO_CHANGE_NEEDED";
             }
             if (context.InvocationKind == ExecutionInvocationKind.Publication)
             {

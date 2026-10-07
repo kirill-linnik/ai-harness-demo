@@ -7,6 +7,8 @@ using AiHarnessDemo.Core.Verification;
 using AiHarnessDemo.Data;
 using AiHarnessDemo.Infrastructure;
 using AiHarnessDemo.Services;
+using AiHarnessDemo.Api;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -212,8 +214,10 @@ public sealed class CandidateFingerprintTests
         }
     }
 
-    [Fact]
-    public async Task ReviewedPreviewStore_PersistsImmutablePreviewBytes()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReviewedPreviewStore_PersistsImmutablePreviewBytes(bool includeRootMetadata)
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -227,6 +231,12 @@ public sealed class CandidateFingerprintTests
         var content = Encoding.UTF8.GetBytes(
             "<h1>sealed durable preview</h1>");
         await File.WriteAllBytesAsync(previewPath, content);
+        var metadata = Encoding.UTF8.GetBytes("Preview generation instructions");
+        if (includeRootMetadata)
+        {
+            await File.WriteAllBytesAsync(
+                Path.Combine(root, ".customer-preview", "README.md"), metadata);
+        }
         var flow = new FlowRun
         {
             Title = "Durable preview",
@@ -263,8 +273,8 @@ public sealed class CandidateFingerprintTests
             fingerprint,
             0,
             0,
-            1,
-            content.LongLength,
+            includeRootMetadata ? 2 : 1,
+            content.LongLength + (includeRootMetadata ? metadata.LongLength : 0),
             [
                 new ReviewedCandidateRepositoryIdentity(
                     ".",
@@ -277,6 +287,15 @@ public sealed class CandidateFingerprintTests
             ".customer-preview/eu/index.html",
             content.LongLength,
             digest);
+        var previewArtifacts = new List<CandidatePreviewArtifact> { previewArtifact };
+        if (includeRootMetadata)
+        {
+            previewArtifacts.Add(new CandidatePreviewArtifact(
+                ".customer-preview/README.md",
+                metadata.LongLength,
+                "sha256:" + Convert.ToHexString(
+                    System.Security.Cryptography.SHA256.HashData(metadata)).ToLowerInvariant()));
+        }
         var snapshot = new OutcomeCandidateSnapshot(
             new CandidateManifest(
                 flow.Iteration,
@@ -289,7 +308,7 @@ public sealed class CandidateFingerprintTests
                         "example/repository")
                 ],
                 [],
-                [previewArtifact]),
+                previewArtifacts),
             fingerprint,
             ownerStepId,
             DateTimeOffset.UtcNow);
@@ -323,11 +342,30 @@ public sealed class CandidateFingerprintTests
                 await factory.CreateDbContextAsync();
             var stored = await verification.ReviewedPreviewArtifacts
                 .AsNoTracking()
-                .SingleAsync();
+                .SingleAsync(item => item.RelativePath == previewArtifact.RelativePath);
             Assert.Equal(identity.Fingerprint, stored.CandidateFingerprint);
             Assert.Equal(
                 "<h1>sealed durable preview</h1>",
                 Encoding.UTF8.GetString(stored.Content));
+            var artifacts = await verification.ReviewedPreviewArtifacts
+                .AsNoTracking()
+                .Select(item => new ReviewedPreviewArtifactMetadata(
+                    item.RelativePath, item.Length, item.Digest))
+                .ToListAsync();
+            Assert.Equal(includeRootMetadata ? 2 : 1, artifacts.Count);
+            Assert.Equal("eu", Assert.Single(
+                new PreviewArtifactCatalog().DescribeStored(flow.Id, artifacts)).Id);
+            if (includeRootMetadata)
+            {
+                var storedMetadata = await verification.ReviewedPreviewArtifacts
+                    .AsNoTracking()
+                    .SingleAsync(item => item.RelativePath == ".customer-preview/README.md");
+                Assert.Equal(metadata, storedMetadata.Content);
+                await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+                    previewStore.ReadAsync(
+                        new ReviewedPreviewSnapshot(identity, artifacts, Materialized: true),
+                        "eu", "../README.md"));
+            }
 
             stored.Content = Encoding.UTF8.GetBytes(
                 "<h1>tampered durable preview</h1>");
@@ -1158,7 +1196,7 @@ public sealed class CandidateFingerprintTests
     public async Task Candidate_RejectsChangedFilesOutsideRepositoriesInProjectWorkspace()
     {
         var root = Path.Combine(
-            AppContext.BaseDirectory,
+            Path.GetTempPath(),
             "candidate-project-tests",
             Guid.NewGuid().ToString("N"));
         var source = Path.Combine(root, "source");
@@ -1560,6 +1598,249 @@ public sealed class CandidateFingerprintTests
         {
             ClearAndDelete(root);
         }
+    }
+
+    [Theory]
+    [InlineData(".playwright-mcp/console-2026-10-03T18-57-40-232Z.log")]
+    [InlineData(".playwright-mcp/page-2026-10-03T18-57-40-640Z.yml")]
+    [InlineData(".playwright-mcp/screenshot.png")]
+    [InlineData(".playwright-browsers/chromium/debug.log")]
+    [InlineData("baseline-mobile.png")]
+    [InlineData("unknown-mcp/native-output.custom")]
+    [InlineData("config/dist/runtime.json")]
+    public async Task ExecutionArtifacts_DoNotChangeMultiRepositoryCandidateOrBlockRecovery(
+        string relativePath)
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            $"cand-browser-diagnostics-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var workspace = Path.Combine(root, "workspace");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(workspace);
+        try
+        {
+            CandidateWorkspace.InitializeRepositoryAt(Path.Combine(source, "repo"));
+            CandidateWorkspace.InitializeRepositoryAt(Path.Combine(workspace, "repo"));
+            foreach (var directory in new[] { source, workspace })
+            {
+                await File.WriteAllTextAsync(
+                    Path.Combine(directory, "solution.slnx"),
+                    "trusted scaffold");
+            }
+            var flow = MultiRepositoryFlow(source, workspace, "repo");
+            var factory = new CandidateDbContextFactory(
+                new DbContextOptionsBuilder<HarnessDbContext>()
+                    .UseSqlite($"Data Source={Path.Combine(root, "artifacts.db")};Pooling=False")
+                    .Options);
+            await using (var database = await factory.CreateDbContextAsync())
+            {
+                await database.Database.EnsureCreatedAsync();
+                database.Flows.Add(flow);
+                await database.SaveChangesAsync();
+            }
+            var service = new CandidateFingerprintService(
+                new ProcessRunner(),
+                TimeProvider.System,
+                databaseFactory: factory);
+            var preparedBy = Guid.NewGuid();
+            var before = await service.PrepareAsync(
+                flow, Digest('a'), preparedBy, requiresPreview: false);
+            var diagnostic = Path.Combine(
+                workspace,
+                relativePath.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(diagnostic)!);
+            await File.WriteAllTextAsync(diagnostic, "generated by browser verification");
+
+            Assert.False(await service.RestoreAndValidateTrustedScaffoldAsync(
+                flow,
+                _ => throw new InvalidOperationException(
+                    "Browser diagnostics must not trigger scaffold restoration.")));
+            _ = await service.SealAsync(flow);
+            var after = await service.PrepareAsync(
+                flow, Digest('a'), preparedBy, requiresPreview: false);
+            Assert.Equal(before.Fingerprint, after.Fingerprint);
+            Assert.Equal(
+                "solution.slnx",
+                Assert.Single(after.Manifest.TrustedScaffoldFiles).RelativePath);
+            Assert.True(await service.IsCurrentAsync(
+                flow, before, requiresPreview: false));
+
+            Assert.True(File.Exists(diagnostic));
+            await File.WriteAllTextAsync(diagnostic, "generated by browser verification");
+            service = new CandidateFingerprintService(
+                new ProcessRunner(), TimeProvider.System, databaseFactory: factory);
+            Assert.False(await service.RestoreAndValidateTrustedScaffoldAsync(
+                flow,
+                _ => throw new InvalidOperationException(
+                    "Replayed artifact cleanup must not trigger scaffold restoration.")));
+            Assert.True(await service.IsCurrentAsync(
+                flow, before, requiresPreview: false));
+            await using var verification = await factory.CreateDbContextAsync();
+            var artifact = Assert.Single(await verification.ExecutionArtifacts.ToListAsync());
+            Assert.Equal(relativePath, artifact.RelativePath);
+            Assert.True(artifact.ContentStored);
+            Assert.Equal(
+                "generated by browser verification",
+                Encoding.UTF8.GetString(artifact.Content));
+            Assert.Single(await verification.FlowEvents
+                .Where(item => item.Type == "workspace.execution-artifact-archived")
+                .ToListAsync());
+            var download = Assert.IsAssignableFrom<IFileHttpResult>(
+                await DemoApi.GetExecutionArtifactAsync(
+                    flow.Id, artifact.Id, new DefaultHttpContext(), factory, CancellationToken.None));
+            Assert.Equal("application/octet-stream", download.ContentType);
+            Assert.Equal(relativePath.Split('/')[^1], download.FileDownloadName);
+            await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+                DemoApi.GetExecutionArtifactAsync(
+                    Guid.NewGuid(), artifact.Id, new DefaultHttpContext(), factory, CancellationToken.None));
+            await File.WriteAllTextAsync(diagnostic, "later execution artifact version");
+            Assert.True(await service.IsCurrentAsync(flow, before, requiresPreview: false));
+            Assert.Equal(2, await verification.ExecutionArtifacts.CountAsync());
+
+            await File.WriteAllTextAsync(
+                Path.Combine(workspace, "solution.slnx"), "changed product scaffold");
+            var exception = await Assert.ThrowsAsync<CandidateValidationException>(() =>
+                service.SealAsync(flow));
+            Assert.Contains("changed an untracked project scaffold file", exception.Message);
+
+            artifact.Content = Encoding.UTF8.GetBytes("corrupted archive");
+            verification.Entry(artifact).State = EntityState.Modified;
+            await verification.SaveChangesAsync();
+            await File.WriteAllTextAsync(diagnostic, "generated by browser verification");
+            await Assert.ThrowsAsync<CandidateValidationException>(() =>
+                service.SealAsync(flow));
+            Assert.True(File.Exists(diagnostic));
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                DemoApi.GetExecutionArtifactAsync(
+                    flow.Id, artifact.Id, new DefaultHttpContext(), factory, CancellationToken.None));
+        }
+        finally
+        {
+            ClearAndDelete(root);
+        }
+    }
+
+    [Fact]
+    public async Task ExecutionArtifactSchema_UpgradesExistingDatabaseIdempotently()
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var database = new HarnessDbContext(
+            new DbContextOptionsBuilder<HarnessDbContext>().UseSqlite(connection).Options);
+        await database.Database.EnsureCreatedAsync();
+        await database.Database.ExecuteSqlRawAsync("DROP TABLE ExecutionArtifacts;");
+        var flow = new FlowRun { Title = "Existing flow", OriginalRequest = "Keep this flow" };
+        database.Flows.Add(flow);
+        await database.SaveChangesAsync();
+
+        await DatabaseInitializer.EnsureExecutionArtifactSchemaAsync(database);
+        await DatabaseInitializer.EnsureExecutionArtifactSchemaAsync(database);
+
+        Assert.Equal(flow.Id, (await database.Flows.SingleAsync()).Id);
+        Assert.Empty(await database.ExecutionArtifacts.ToListAsync());
+        await database.Database.ExecuteSqlRawAsync(
+            """ALTER TABLE "ExecutionArtifacts" DROP COLUMN "ContentStored";""");
+        await DatabaseInitializer.EnsureExecutionArtifactSchemaAsync(database);
+        Assert.Empty(await database.ExecutionArtifacts.ToListAsync());
+    }
+
+    [Fact]
+    public async Task LargeExecutionArtifacts_DoNotBlockCandidateOrAllocateDatabaseBlobs()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"cand-large-artifact-{Guid.NewGuid():N}");
+        var source = Path.Combine(root, "source");
+        var workspace = Path.Combine(root, "workspace");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(workspace);
+        try
+        {
+            CandidateWorkspace.InitializeRepositoryAt(Path.Combine(source, "repo"));
+            CandidateWorkspace.InitializeRepositoryAt(Path.Combine(workspace, "repo"));
+            var flow = MultiRepositoryFlow(source, workspace, "repo");
+            var factory = new CandidateDbContextFactory(
+                new DbContextOptionsBuilder<HarnessDbContext>()
+                    .UseSqlite($"Data Source={Path.Combine(root, "artifacts.db")};Pooling=False").Options);
+            await using (var database = await factory.CreateDbContextAsync())
+            {
+                await database.Database.EnsureCreatedAsync();
+                database.Flows.Add(flow);
+                await database.SaveChangesAsync();
+            }
+            var service = new CandidateFingerprintService(
+                new ProcessRunner(), TimeProvider.System, databaseFactory: factory);
+            var before = await service.PrepareAsync(
+                flow, Digest('a'), Guid.NewGuid(), requiresPreview: false);
+            var output = Path.Combine(workspace, "unknown-tool-output.bin");
+            var length = CandidateFingerprintService.MaximumStoredExecutionArtifactBytes + 1L;
+            await using (var stream = File.Create(output))
+            {
+                stream.SetLength(length);
+            }
+            Assert.True(await service.IsCurrentAsync(flow, before, requiresPreview: false));
+            await using var verification = await factory.CreateDbContextAsync();
+            var artifact = await verification.ExecutionArtifacts.SingleAsync();
+            Assert.False(artifact.ContentStored);
+            Assert.Empty(artifact.Content);
+            Assert.Equal(length, artifact.Length);
+            await using (var download = await ExecutionArtifactStore.OpenWorkspaceContentAsync(
+                             workspace, artifact, CancellationToken.None))
+            {
+                Assert.Equal(length, download.Length);
+            }
+            var escaping = new ExecutionArtifactRecord
+            {
+                FlowRunId = flow.Id,
+                RelativePath = "../outside.bin",
+                Digest = artifact.Digest,
+                Content = [],
+                ContentStored = false,
+                Length = length
+            };
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                ExecutionArtifactStore.OpenWorkspaceContentAsync(
+                    workspace, escaping, CancellationToken.None));
+            await File.WriteAllTextAsync(output, "changed after capture");
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                ExecutionArtifactStore.OpenWorkspaceContentAsync(
+                    workspace, artifact, CancellationToken.None));
+        }
+        finally
+        {
+            ClearAndDelete(root);
+        }
+    }
+
+    [Fact]
+    public async Task HostSeal_DoesNotPublishGitIgnoredToolArtifacts()
+    {
+        using var workspace = CandidateWorkspace.Create();
+        await File.WriteAllTextAsync(
+            Path.Combine(workspace.Root, ".gitignore"),
+            ".unknown-tool-output/\n");
+        workspace.Git("add", ".gitignore");
+        workspace.Git("commit", "--quiet", "-m", "ignore execution artifacts");
+        var diagnostics = Path.Combine(workspace.Root, ".unknown-tool-output");
+        Directory.CreateDirectory(diagnostics);
+        await File.WriteAllTextAsync(
+            Path.Combine(diagnostics, "page.yml"),
+            "browser snapshot");
+        var service = new CandidateFingerprintService(
+            new ProcessRunner(),
+            TimeProvider.System);
+
+        var seal = await service.SealAsync(workspace.Flow);
+        Assert.False(Assert.Single(seal.Repositories).Changed);
+        Assert.DoesNotContain(
+            ".unknown-tool-output",
+            workspace.GitOutput("ls-tree", "-r", "--name-only", "HEAD"));
+        var candidate = await service.PrepareAsync(
+            workspace.Flow, Digest('a'), Guid.NewGuid(), requiresPreview: false);
+        await File.WriteAllTextAsync(
+            Path.Combine(diagnostics, "console.log"),
+            "another browser observation");
+        Assert.True(await service.IsCurrentAsync(
+            workspace.Flow, candidate, requiresPreview: false));
     }
 
     [Fact]
@@ -2486,7 +2767,7 @@ public sealed class CandidateFingerprintTests
         public static CandidateWorkspace Create(bool multipleRepositories = false)
         {
             var root = Path.Combine(
-                AppContext.BaseDirectory,
+                multipleRepositories ? Path.GetTempPath() : AppContext.BaseDirectory,
                 "candidate-tests",
                 Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);

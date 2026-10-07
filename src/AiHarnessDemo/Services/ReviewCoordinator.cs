@@ -792,6 +792,28 @@ public sealed class ReviewCoordinator(
                 var effectivePermission = PermissionProfileResolver.Tighten(
                     persistedPermission,
                     currentPermission);
+                var (acceptancePlan, acceptancePlanHash, planErrors) =
+                    DeliveryReadinessService.TryReadAcceptancePlan(flow);
+                if (acceptancePlan is null || planErrors.Count > 0 ||
+                    acceptancePlanHash != binding.Contract.AcceptancePlanHash)
+                {
+                    throw new DeliveryReadinessConflictException(
+                        DeliveryReadinessConflicts.ReviewStale,
+                        "The blocked verification continuation requires its unchanged valid acceptance plan.");
+                }
+                var blockers = binding.Contract.Criteria
+                    .Where(criterion => criterion.Outcome == DeliveryCriterionOutcome.Blocked)
+                    .Select(criterion => new
+                    {
+                        criterion.CriterionId,
+                        criterion.Requirement,
+                        criterion.Rationale,
+                        criterion.Remediation,
+                        AllowedEvidenceKinds = acceptancePlan.Criteria
+                            .Single(planned => planned.Id == criterion.CriterionId).EvidenceKinds!
+                            .Select(kind => kind.ToString()).ToArray()
+                    })
+                    .ToArray();
                 var continuation = new FlowStep
                 {
                     FlowRunId = flow.Id,
@@ -832,7 +854,16 @@ public sealed class ReviewCoordinator(
                         "Unchanged host-owned scaffold files validated by candidate sealing are allowed " +
                         "and are not stray workspace output. For missing browser evidence, run one bounded " +
                         "browser-automation command per variant and viewport and print a compact result " +
-                        "that names that variant, viewport, scrollWidth, and clientWidth.",
+                        "that names that variant, viewport, scrollWidth, and clientWidth. " +
+                        "Resolve the exact host-bound blockers below, not a guessed product defect. " +
+                        "For an evidence-kind gap, use an allowed observation or command tool to capture " +
+                        "the complete required journey; a Test does not become an Observation by " +
+                        "renaming it. Do not change the candidate or weaken its acceptance plan to " +
+                        "repair a reporting limitation. Re-establish all required verification in " +
+                        "the new evidence epoch, and return the complete strict outcome and QA documents." +
+                        $"{Environment.NewLine}{Environment.NewLine}" +
+                        "Current host-bound blocked criteria and allowed evidence kinds:" +
+                        $"{Environment.NewLine}{JsonSerializer.Serialize(blockers)}",
                     RetryOfStepId = reviewedStep.RetryOfStepId ?? reviewedStep.Id,
                     DependsOnStepId = reviewedStep.DependsOnStepId
                 };

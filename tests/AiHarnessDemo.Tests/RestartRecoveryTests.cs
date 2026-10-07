@@ -153,6 +153,26 @@ public sealed class CopilotSessionJournalTests
     }
 
     [Fact]
+    public async Task InspectAsync_RetainsCompletedToolsWithoutAcceptingInterruptedHandoff()
+    {
+        await using var fixture = await RecoveryFixture.CreateAsync(
+            completed: false,
+            persistSessionId: true,
+            includeToolCall: true);
+
+        var snapshot = await CopilotSessionJournal.InspectDirectoryAsync(
+            fixture.CopilotHome, fixture.SessionDirectory, fixture.SessionId);
+
+        Assert.Equal(CopilotSessionJournalState.Interrupted, snapshot.State);
+        Assert.Null(snapshot.Result);
+        var observed = Assert.Single(snapshot.ObservedToolCalls);
+        Assert.True(observed.Succeeded);
+        Assert.Equal("dotnet test", observed.NormalizedCommand);
+        Assert.Equal(0, observed.ExitCode);
+        Assert.Contains("passed", observed.ResultSummary);
+    }
+
+    [Fact]
     public async Task InspectAsync_DoesNotReuseAnEarlierCompletedTurnAfterResume()
     {
         await using var fixture = await RecoveryFixture.CreateAsync(
@@ -2166,36 +2186,36 @@ internal sealed class RecoveryFixture : IAsyncDisposable
                     turnId = "0"
                 })
         };
+        if (includeToolCall)
+        {
+            events.Add(Serialize(
+                "tool.execution_start",
+                startedAt.AddMilliseconds(2500),
+                new
+                {
+                    toolCallId = "qa-test",
+                    toolName = "powershell",
+                    arguments = new
+                    {
+                        command = "dotnet test"
+                    }
+                }));
+            events.Add(Serialize(
+                "tool.execution_complete",
+                startedAt.AddMilliseconds(2750),
+                new
+                {
+                    toolCallId = "qa-test",
+                    success = true,
+                    result = new
+                    {
+                        exitCode = 0,
+                        content = "All tests passed."
+                    }
+                }));
+        }
         if (completed)
         {
-            if (includeToolCall)
-            {
-                events.Add(Serialize(
-                    "tool.execution_start",
-                    startedAt.AddMilliseconds(2500),
-                    new
-                    {
-                        toolCallId = "qa-test",
-                        toolName = "powershell",
-                        arguments = new
-                        {
-                            command = "dotnet test"
-                        }
-                    }));
-                events.Add(Serialize(
-                    "tool.execution_complete",
-                    startedAt.AddMilliseconds(2750),
-                    new
-                    {
-                        toolCallId = "qa-test",
-                        success = true,
-                        result = new
-                        {
-                            exitCode = 0,
-                            content = "All tests passed."
-                        }
-                    }));
-            }
             events.Add(Serialize(
                 "assistant.message",
                 startedAt.AddSeconds(3),

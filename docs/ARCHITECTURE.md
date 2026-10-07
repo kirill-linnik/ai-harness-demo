@@ -212,11 +212,13 @@ fresh snapshot, fresh workspace, and normal Account Manager intake.
 Delivery work starts an isolated Git worktree at the fetched base commit. For a selected folder
 inside a repository, the worktree retains its parent's history, while agent instructions and
 candidate sealing restrict edits to the selected folder. The selected-folder baseline commit is
-recorded in the flow ledger and advanced there when a reconciled flow resumes. Without source
+recorded in the flow ledger and preserved when a reconciled flow resumes. Without source
 control, Studio copies the source into an isolated workspace, initializes Git and commits a
 baseline there only, and selects a local commit outcome instead of a pull request. On recovery,
-each flow branch must contain its repository's current base commit; a branch that falls behind
-stops for explicit reconciliation instead of being merged or rebased automatically. Pre-review
+each worktree must retain its owned flow branch and the configured source repository's exact
+Git common directory. Upstream advancement does not invalidate in-flight work: recovery does
+not fetch, merge, or rebase it. Selected-folder ancestry is checked against the pinned ledger
+commit rather than a moving remote ref. Review and publication still bind the exact candidate. Pre-review
 duties that need to change or validate the candidate run under at most `WorkspaceWrite`; remote
 publication remains unavailable.
 
@@ -258,12 +260,20 @@ For browser-visible work, `.customer-preview\<variant>` is part of the sealed ca
 sealing, the host validates every preview file, copies its exact bytes into immutable
 `ReviewedPreviewArtifacts` SQLite rows, and binds each row to the flow iteration and candidate
 fingerprint. Customer requests verify only the selected stored BLOB's length and digest; they never
-rescan or serve from the mutable worktree. The directory must be at the flow workspace root rather
+rescan or serve from the mutable worktree. Preview-root metadata such as
+`.customer-preview\README.md` is sealed too, but does not become a browser artifact or bypass
+variant-scoped path authorization. The directory must be at the flow workspace root rather
 than inside a registered repository. Candidate sealing fails when a required preview is missing or
 when a `customer-demo.json` has an invalid artifact ID, launch policy, working directory, host
 binding, port placeholder, health path, or startup timeout. Its reviewed representation is
 network-disabled. A separately requested loopback live demo is convenience only and contributes no
 readiness evidence or publication authority.
+
+Outbound links in the isolated preview request a host-owned confirmation showing the exact
+destination. Only an explicit second click in that trusted confirmation can open the destination
+with `noopener` and `noreferrer`. The bridge authenticates the opaque frame's message source,
+rejects unsafe URL schemes and credentials, and runs under an exact script hash. The iframe retains
+script-only sandbox authority: no popup, same-origin, top-navigation, or network permissions are added.
 
 The flow-detail projection shows **Open reviewed preview** from the current durable seal without
 touching the workspace. Preview metadata and file endpoints authorize the active reviewed-candidate
@@ -278,6 +288,25 @@ renderer, sandbox, CSP, and bootstrap, so QA can exercise the real isolation pol
 exists. These separate endpoints require the current iteration's running `BeforeReview` verification
 owner, preserve workspace path containment, and close when that task stops. They neither create a
 reviewed seal nor open customer approval or publication.
+
+Before substantive QA dispatch, the host checks the preview handoff. An unambiguous preview under a
+registered repository can be materialized at workspace-root `.customer-preview\<variant>`. A durable
+preparation intent records the origin and exact file identities, and starts an evidence epoch before
+filesystem mutation. Interrupted preparation replays only those identities; links and unrelated
+destination bytes are rejected. Canonical worker-authored previews remain authoritative.
+Host-owned copies can follow subsequent source changes without replacing a worker's independent
+canonical result. Preview file and aggregate byte limits are checked before browser verification.
+
+Missing or ambiguous previews produce a durable host preflight blocker in the verification
+assignment. The verifier must immediately push back to the planned upstream implementation owner;
+the host rejects COMPLETE even during response-only correction. If that correction still ignores
+the blocker, a durable host repair directive routes to the accepted dependency owner without
+rewriting the agent's original response. Existing bounded pushback recovery
+resumes that owner, preserves permission ceilings, invalidates earlier evidence before repair, and
+rechecks the handoff before dispatching substantive QA. Sealing remains strict and never repairs
+already-verified bytes implicitly. Recovery of an older seal failure also prepares previews before
+scheduling fresh QA. Only a newly materialized candidate receives a distinct verification budget;
+the original deadline is unchanged, and retries/corrections retain their assignment budget identity.
 
 ### Customer review and publication
 
@@ -345,6 +374,25 @@ response and evidence, rather than resuming an already bloated conversation. Its
 attempt still resumes exactly. An interrupted completed QA session follows this same bounded
 path during restart reconciliation.
 
+Initial QA, response correction, and legacy restart assignments all repeat the validator's
+maximum of 12 unique host-issued evidence identifiers per criterion or residual risk. The
+verifier selects a sufficient allowed-kind subset, including genuine aggregate command
+results where appropriate; the host never truncates citations, invents aggregate evidence,
+or weakens verification to accept an oversized response.
+
+A governed continuation of blocked verification repeats each exact host-bound blocker,
+its remediation, and the unchanged plan's allowed evidence kinds. An evidence-only gap
+requires a genuine new observation of the complete journey, not relabeling a Test as an
+Observation or weakening the acceptance plan. The substantive continuation re-establishes
+verification in its new evidence epoch under the original permission ceiling.
+
+When a CLI process stalls after successful checks, the interrupted journal retains its
+completed tool observations without accepting its partial handoff. Only observations bound
+to that invocation's session, start time and workspace can be retained. A successful runtime
+resume preserves those earlier observations in execution order alongside its own calls,
+including failed checks with their original failure status, so reading a report during the
+resume cannot erase the actual test execution that produced it.
+
 Shell-driven browser automation is recorded as `Command`, Playwright test-runner invocations as
 `Test`, and successful host image views as `Observation`. Browser-visible acceptance criteria
 therefore permit `Observation`, `Command`, `SourceInspection`, and `Test`; this keeps the hashed plan
@@ -374,8 +422,24 @@ provider lifecycle manager, role-name router, or OS/network sandbox.
 
 Before the final verification turn, and again during same-iteration finalization recovery, Studio
 restores only missing host-owned scaffold files from the trusted source. Candidate sealing itself
-never mutates the verified workspace. Changed scaffold bytes and unexpected root files still fail
-closed. Before copying any missing bytes, Studio durably starts a new evidence epoch; interrupted
+never mutates verified product files. The registered repository map and existing trusted scaffold
+define the product boundary, not tool-specific output names. Additional non-repository files are
+execution artifacts: their path, digest, length, iteration, and capture-step attribution are committed
+through `HarnessDbContext` to `ExecutionArtifacts`, with a visible
+`workspace.execution-artifact-archived` event. The original workspace files remain available to
+downstream agents, so preserving tool output does not break evidence references. Replay
+deduplicates by flow, iteration, path, and digest across restarts. Artifacts are not scaffold,
+previews, reviewed content, or publication inputs. This covers
+unknown MCP outputs and agent-written screenshots without adding directory or extension exceptions.
+Repository-local generated files continue to follow Git ignore rules; new product files belong
+inside registered repositories. Changed scaffold bytes, links, and repository-map drift still fail
+closed. Files up to 8 MiB also receive an exact SQLite BLOB copy. Larger files use an explicit
+workspace-reference storage mode rather than a size-triggered flow failure or unbounded BLOB
+allocation. Their download requires the original file to exist inside the same flow workspace,
+without links, and still match its recorded digest; unlike BLOB-backed artifacts, they are not
+available after workspace removal. Artifact download links in the execution ledger serve
+attachments, never active preview content. Before copying any missing scaffold bytes, Studio
+durably starts a new evidence epoch; interrupted
 restoration therefore cannot make pre-restoration evidence eligible after restart. Flow abandonment
 deletes known Copilot sessions by deterministic ID and uses lightweight workspace metadata for
 fallback discovery. An active fallback match is checked against the complete journal, process start
@@ -512,7 +576,125 @@ uncorrelated tool progress do not prove work. `assistant.message` is activity, n
 An identified start grants a bounded silent allowance; completion removes it, duplicate starts
 do not renew it, and concurrent tools use the oldest still-active start. Subsequent genuine
 structured events may renew the normal inactivity interval, but every execution still shares
-the finite absolute deadline. There is no progress score or repetition-based termination.
+the finite absolute deadline. The running-process watchdog has no progress score or
+repetition-based termination; repetition suppression between failed attempts is separate.
+
+### Bounded factory continuation
+
+After the CLI runtime's own retries are exhausted, pre-review `Transient` failures and confirmed
+resumable `TimedOut`/`Stalled` failures can schedule a causal continuation in the same flow workspace.
+`agent.continuation-scheduled` persists the source/retry identity, semantic budget root, failure
+fingerprint, recovery count, and due time in `FlowEvent`, atomically with the pending `FlowStep`,
+task profile, and dependency rewiring. Restart reconciliation retains that pending work and backoff;
+dispatch checks the absolute deadline both before and after waiting. Resumable interruptions use
+the confirmed Copilot session with a new persisted turn-specific prompt, not an exact-instruction
+replay of the failed step. Exact replay is reserved for interruption of that same durable turn.
+Other continuations inspect preserved work before further edits.
+
+The existing Max handoff retries setting caps continuations per semantic assignment. Backoff uses
+`agent.retry_base_delay_ms` and `agent.max_retry_backoff_ms`. The frozen assignment budget and
+permission ceiling remain authoritative; downtime and delay consume the original budget. Failed
+CLI tool observations are retained, and an identical failure/output/evidence fingerprint stops
+repetition before the count limit. Timestamps or diagnostic chatter are not proof of progress.
+Implementation continuation invalidates earlier candidate evidence before any further writes.
+
+Publication and remotely authorized steps are excluded. Model/dependency unavailability, invalid
+output or guard violations, unresumable interruptions, ambiguous crashes, cancellation, and
+exhausted budgets do not trigger blind factory continuation. Contract corrections, accepted-owner
+handoff repairs, and failed-acceptance refinement retain their existing independently bounded
+paths. Exhaustion emits `agent.recovery-exhausted` and a customer-safe preserved-work blocker;
+successful resumption clears only that recovery blocker, not unrelated readiness blockers.
+
+Behavioral acceptance must plan executable actions and assertions with Test or Command evidence.
+The verification assignment explicitly rejects a screenshot, source inspection, or a successful
+click invocation alone as proof of the required product effect. Host evidence-kind and candidate
+binding checks remain strict; unverified behavior must be reported Failed/Blocked for repair,
+not converted into customer review.
+
+A rejected QA response is not an accepted assessment, but a complete strict QA envelope with the
+current acceptance hash and actionable failed criteria can serve as an untrusted remediation
+proposal. The host routes reports attributed to the completed implementation dependency directly
+to that owner through the existing bounded handoff loop, rather than spending a format-only
+correction on a candidate already reported defective. If a correction returns a truncated or
+malformed envelope, recovery may use only the exact completed source report named by its durable
+correction event, with matching current iteration, verifier, plan step, semantic lineage, and
+acceptance hash. A parseable newer report supersedes the source; recovery never scans arbitrary
+older reports or splices response fragments together.
+Responsible roles may name the pinned owner's exact agent ID, role, or display name; a display
+name is matched only after the accepted dependency graph has selected that implementation owner.
+The directive retains the exact source-step identity and complete scoped criterion/remediation
+payload. Owner execution receives it as `qa-repair-proposal.json` in host-owned context, rather
+than relying on a clipped display reason or the malformed correction text. Staging is idempotent:
+restart reuses an existing directive, and exhausted/disabled handoff limits remain typed conflicts
+without duplicate ledger events or reset repair counts.
+Owner continuations and manual retries resolve that immutable context through the same semantic
+root, validating the current iteration, agent, implementation plan step, invocation and stage;
+they do not lose the document when a new attempt ID is allocated.
+The original response and failed citations remain visible; no claim or evidence is normalized
+into success. Legacy failed flows use this same route on restart rather than replaying formatting.
+Owner repair starts an evidence epoch. The ensuing substantive verification restores the
+original verification task's permission ceiling (tightened by current policy), not the
+format-only correction's temporary tool restriction. Verification of the repaired candidate is a
+distinct bounded assignment, recorded in `verification.repaired-candidate-assignment`, with its
+own budget root bound on launch. Earlier deadlines remain unchanged. Runtime retries and
+response corrections of that new verification share its root and cannot reset it. Legacy
+failed verification can receive this assignment once per completed host-directed implementation
+revision; subsequent exhaustion for the same repaired candidate remains a typed conflict.
+The existing bounded handoff count, pinned execution policy, and approval boundary still apply.
+Valid QA reports with actionable failed or blocked criteria owned by the existing implementation dependency
+also use the remaining same-iteration handoff rounds before whole-iteration refinement. The
+configured handoff retry count is a maximum, not a minimum: passing fresh QA closes the repair
+immediately; disabled or exhausted rounds leave the valid assessment for ordinary readiness and
+bounded broader refinement. Reports requiring a different owner are not forced into that loop.
+Missing test infrastructure assigned to an implementation owner is an actionable verification
+blocker, not a terminal factory outcome. When local repairs do not converge, the host starts the
+next iteration with the preserved workspace and Team Lead replanning from the complete unmet
+criteria. Unassigned external blockers remain explicit blockers; no readiness or approval guard
+is weakened.
+Invalid agent output first receives one read-only follow-up in the same recorded Copilot session,
+with the original budget root and deadline. The exact validation error leads a short working
+prompt; only the retained response, unchanged response contract and relevant evidence are staged.
+The correction remains a distinct durable sub-attempt, not a fresh verification assignment.
+If a corrected QA assessment requests upstream rework, its original request remains recorded
+while the host routes the validated negative assessment through repair or bounded replanning.
+Implementation repair permissions resolve the original task through the durable response-correction
+lineage, then tighten against current policy. A read-only report correction is not the permission
+ceiling of later coding work; its own restrictions and earlier execution deadlines remain intact.
+Before launching a scoped owner repair, the host checks the effective tool capabilities, not just
+the profile label. Direct-write and shell capabilities are evaluated independently, preserving
+both group and individual tool denials. If neither is authorized, the lifecycle becomes explicitly Blocked
+without dispatching an investigation as a repair or broadening access.
+Scoped owner assignments require one exact `REPAIR_STATUS: REPAIRED`, `REPAIR_STATUS: NO_CHANGE_NEEDED`,
+or `REPAIR_STATUS: BLOCKED` line. No-change reports must explain executed source-backed checks
+disproving the proposal; neither repaired nor no-change claims establish readiness without fresh
+independent QA. A blocked report stops before the dependent verifier, records
+`handoff.owner-repair-blocked`, and preserves all work. Investigation-only `COMPLETE` output must
+correct its missing disposition through the existing bounded report-only correction contract.
+Host-owned workspace context also distinguishes shell execution directories from CLI path
+authorization. Commands that change directory use fully qualified, workspace-bound paths for
+logs, evidence and other path arguments. A relative-path approval request must first be checked
+against its intended authorized destination; correcting that path does not grant broader access.
+Genuine tool, path and network denials remain blockers, and execution evidence is never inferred
+from a denied call.
+Pre-mortem framing is recovered deterministically when the complete strict report is already
+available: the single exact status line is moved first, retaining all other text and JSON bytes.
+The unchanged strict parser still enforces markers, schema, field lengths and status/findings
+consistency. No broken JSON escapes or missing findings are synthesized. If a format correction
+damages its report, only its ledger-bound completed source in the same flow, iteration, agent,
+semantic lineage and requirements target may supply the intact report. Newer valid results take
+precedence. Original responses and recovered framing are recorded in FlowEvent; legacy restart
+uses normal step completion without re-execution, deadline extension or customer acceptance.
+Explicit operator rescoping of an exhausted pre-review worker uses a distinct assignment and
+budget root, not an extended retry. `flow.remaining-work-assignment` records the full bounded
+scope and causal source. Its fresh session avoids replaying a long interrupted turn; the new
+45-minute ceiling can only tighten the previous and current policies. Duplicate scopes and
+rescoping beyond the configured handoff limit are typed conflicts. This path is unavailable
+after acceptance, for publication, or for pre-mortem work, and never marks failed work completed.
+
+Valid mixed Failed/Blocked assessments can schedule bounded refinement when there are concrete
+failed criteria to repair. The lifecycle coordinator still requires the exact candidate binding;
+Blocked-only assessments cannot use this path. Refinement limits and no-progress detection remain
+unchanged, and no blocked result can open acceptance or publication.
 
 `FlowStep.RuntimeActivityJson` and the flow-detail API expose host-observed timestamps, last
 recognized event type, oldest active tool name/start/duration, completed-tool count for the current

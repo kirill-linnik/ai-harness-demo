@@ -162,4 +162,8 @@ public sealed class AgentRunException(
     public bool CanResumeSession { get; } = canResumeSession;
 
     public int ExecutionAttempts { get; set; } = 1;
+
+    public IReadOnlyList<ToolCallRecord> ToolCalls { get; init; } = [];
+
+    public bool ProcessTerminationUnconfirmed { get; init; }
 }

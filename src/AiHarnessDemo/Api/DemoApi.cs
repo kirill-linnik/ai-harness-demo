@@ -34,8 +34,12 @@ public static class DemoApi
         api.MapPost("/intake/attachments", ContinueIntakeWithAttachmentsAsync);
         api.MapGet("/flows", GetFlowsAsync);
         api.MapGet("/flows/{flowId:guid}", GetFlowAsync);
+        api.MapGet(
+            "/flows/{flowId:guid}/execution-artifacts/{artifactId:guid}",
+            GetExecutionArtifactAsync);
         api.MapPost("/flows/{flowId:guid}/start", StartFlowAsync);
         api.MapPost("/flows/{flowId:guid}/restart", RestartFlowAsync);
+        api.MapPost("/flows/{flowId:guid}/remaining-work", ContinueRemainingWorkAsync);
         api.MapPost("/flows/{flowId:guid}/recover", RecoverFlowAsync);
         api.MapPost("/flows/{flowId:guid}/review", ReviewFlowAsync);
         api.MapPost(
@@ -85,6 +89,45 @@ public static class DemoApi
             GetPreviewArtifactAsync);
 
         return endpoints;
+    }
+
+    internal static async Task<IResult> GetExecutionArtifactAsync(
+        Guid flowId,
+        Guid artifactId,
+        HttpContext httpContext,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        CancellationToken cancellationToken)
+    {
+        await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken);
+        var artifact = await database.ExecutionArtifacts.AsNoTracking()
+            .SingleOrDefaultAsync(
+                item => item.FlowRunId == flowId && item.Id == artifactId,
+                cancellationToken)
+            ?? throw new KeyNotFoundException("The flow execution artifact was not found.");
+        httpContext.Response.Headers.XContentTypeOptions = "nosniff";
+        httpContext.Response.Headers.ContentSecurityPolicy = "default-src 'none'; sandbox";
+        if (!artifact.ContentStored)
+        {
+            var workspace = await database.Flows.Where(item => item.Id == flowId)
+                .Select(item => item.WorkspacePath).SingleAsync(cancellationToken);
+            var stream = await ExecutionArtifactStore.OpenWorkspaceContentAsync(
+                workspace, artifact, cancellationToken);
+            return Results.Stream(
+                stream,
+                "application/octet-stream",
+                fileDownloadName: artifact.RelativePath.Split('/')[^1]);
+        }
+        var digest = "sha256:" + Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(artifact.Content)).ToLowerInvariant();
+        if (artifact.Length != artifact.Content.LongLength ||
+            !string.Equals(artifact.Digest, digest, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("The durable execution artifact failed its integrity check.");
+        }
+        return Results.File(
+            artifact.Content,
+            "application/octet-stream",
+            fileDownloadName: artifact.RelativePath.Split('/')[^1]);
     }
 
     private static async Task<IResult> GetHealthAsync(
@@ -713,6 +756,29 @@ public static class DemoApi
                     databaseFactory, flowId, CancellationToken.None)));
     }
 
+    private static async Task<IResult> ContinueRemainingWorkAsync(
+        Guid flowId,
+        ContinueRemainingWorkRequest request,
+        WorkflowEngine engine,
+        FlowQueue queue,
+        IDbContextFactory<HarnessDbContext> databaseFactory,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Assignment) || request.Assignment.Length > 2_000)
+        {
+            return Results.BadRequest("A remaining-work assignment of 1-2000 characters is required.");
+        }
+        var flow = await engine.ContinueRemainingWorkAsync(flowId, request.Assignment, cancellationToken);
+        if (!queue.Queue(flowId))
+        {
+            throw new InvalidOperationException("Unable to queue the scoped remaining-work assignment.");
+        }
+        return Results.Accepted(
+            $"/api/flows/{flowId}",
+            flow.ToDetailDto(attachmentsByMessage: await LoadFlowAttachmentMetadataAsync(
+                databaseFactory, flowId, CancellationToken.None)));
+    }
+
     private static async Task<IResult> RecoverFlowAsync(
         Guid flowId,
         IFlowRecoveryController recoveryController,
@@ -1271,6 +1337,20 @@ public static class DemoApi
                   });
                 }
               }
+              document.addEventListener("click", event => {
+                const anchor = event.target instanceof Element
+                  ? event.target.closest("a[href]") : null;
+                if (!anchor || window.parent === window) return;
+                let destination;
+                try { destination = new URL(anchor.href); } catch { return; }
+                if (!["https:", "http:", "mailto:"].includes(destination.protocol) ||
+                    destination.origin === new URL(document.baseURI).origin) return;
+                event.preventDefault();
+                window.parent.postMessage({
+                  type: "ai-harness-preview-outbound",
+                  href: destination.href
+                }, new URL(document.baseURI).origin);
+              }, true);
             })();
             </script>
             """;
@@ -1298,6 +1378,34 @@ public static class DemoApi
             httpContext,
             "Customer preview");
 
+    internal static readonly string PreviewNavigationScript = """
+        (() => {
+          const frame = document.querySelector("iframe");
+          const notice = document.getElementById("outbound-notice");
+          const link = document.getElementById("outbound-link");
+          const dismiss = document.getElementById("outbound-dismiss");
+          window.addEventListener("message", event => {
+            if (event.source !== frame.contentWindow || event.origin !== "null" ||
+                event.data?.type !== "ai-harness-preview-outbound" ||
+                typeof event.data.href !== "string" || event.data.href.length > 8192) return;
+            let destination;
+            try { destination = new URL(event.data.href); } catch { return; }
+            if (!["https:", "http:", "mailto:"].includes(destination.protocol) ||
+                destination.username || destination.password ||
+                destination.origin === location.origin) return;
+            link.href = destination.href;
+            link.textContent = destination.href;
+            notice.hidden = false;
+            link.focus();
+          });
+          dismiss.addEventListener("click", () => {
+            notice.hidden = true;
+            link.removeAttribute("href");
+            frame.focus();
+          });
+        })();
+        """.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+
     private static IResult CreateIsolatedPreviewView(
         string artifactUrl,
         HttpContext httpContext,
@@ -1313,14 +1421,24 @@ public static class DemoApi
               <title>{{title}}</title>
               <style>
                 html,body,iframe{box-sizing:border-box;width:100%;height:100%;margin:0;border:0;background:#fff}
+                body{display:flex;flex-direction:column}
+                iframe{flex:1;min-height:0}
+                aside{padding:12px;max-height:40vh;overflow:auto;font:14px system-ui;overflow-wrap:anywhere}
+                aside[hidden]{display:none}
               </style>
             </head>
             <body>
+              <aside id="outbound-notice" aria-label="External destination" aria-live="polite" hidden>
+                <p>This link leaves the offline preview. Open only if you trust this destination.</p>
+                <a id="outbound-link" target="_blank" rel="noopener noreferrer"></a>
+                <button id="outbound-dismiss" type="button">Dismiss</button>
+              </aside>
               <iframe
                 src="{{artifactUrl}}"
                 title="Interactive customer preview"
                 sandbox="allow-scripts"
                 referrerpolicy="no-referrer"></iframe>
+              <script>{{PreviewNavigationScript}}</script>
             </body>
             </html>
             """;
@@ -1349,6 +1467,7 @@ public static class DemoApi
     {
         response.Headers["Content-Security-Policy"] =
             "default-src 'none'; frame-src 'self'; " +
+            $"script-src 'sha256-{Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(PreviewNavigationScript)))}'; " +
             "style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; " +
             "object-src 'none'; base-uri 'none'; " +
             "frame-ancestors 'none'";

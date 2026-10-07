@@ -307,7 +307,8 @@ public sealed class AssignmentBriefFormatterTests
         Assert.Contains("canonical lowercase kebab-case", assignment);
         Assert.Contains("workspace root", assignment);
         Assert.Contains("390px mobile", assignment);
-        Assert.Contains("initial scaffold", assignment);
+        Assert.Contains("execution artifacts, not product", assignment);
+        Assert.Contains("Studio verification-preview endpoint", assignment);
     }
 
     [Fact]

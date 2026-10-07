@@ -26,7 +26,10 @@ internal sealed record CopilotSessionSnapshot(
     DateTimeOffset? CompletedAt,
     AgentRunResult? Result,
     IReadOnlyList<int> ActiveProcessIds,
-    string Detail);
+    string Detail)
+{
+    public IReadOnlyList<ToolCallRecord> ObservedToolCalls { get; init; } = [];
+}
 
 public sealed class CopilotSessionJournal
 {
@@ -614,7 +617,10 @@ public sealed class CopilotSessionJournal
                 completedAt,
                 null,
                 activeProcessIds,
-                "Copilot session is still owned by a live process.");
+                "Copilot session is still owned by a live process.")
+            {
+                ObservedToolCalls = parsed.ToolCalls
+            };
         }
 
         return new CopilotSessionSnapshot(
@@ -630,7 +636,10 @@ public sealed class CopilotSessionJournal
             activeProcessIds,
             shutdownFailed
                 ? "Copilot session shut down with an error."
-                : "Copilot session ended before producing a final handoff.");
+                : "Copilot session ended before producing a final handoff.")
+        {
+            ObservedToolCalls = parsed.ToolCalls
+        };
     }
 
     private static CopilotSessionSnapshot Missing(

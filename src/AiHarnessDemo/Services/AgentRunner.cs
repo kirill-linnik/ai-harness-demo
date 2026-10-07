@@ -68,7 +68,9 @@ public sealed record AgentExecutionContext(
     FlowKind? FlowKind = null,
     bool RequiresDeliveryReadinessQa = false,
     IReadOnlyList<AgentContextDocument>? ContextDocuments = null,
-    bool UsesBoundedWorkingPrompt = false);
+    bool UsesBoundedWorkingPrompt = false,
+    string ResponseCorrectionInstructions = "",
+    string QaImplementationOwner = "");
 
 public sealed record AgentExecutionResult(
     string Output,
@@ -113,6 +115,7 @@ public sealed class AgentRunner(
 
         var options = workflowProvider.GetValidated().Config.Agent;
         var attempts = 0;
+        var failedToolCalls = new List<ToolCallRecord>();
         var resumeInterruptedSession = false;
         var pipelineBuilder = new ResiliencePipelineBuilder<AgentRunResult>();
         if (options.MaxAttempts > 1)
@@ -182,11 +185,16 @@ public sealed class AgentRunner(
 
                     if (!runResult.Success)
                     {
+                        failedToolCalls.AddRange(runResult.ToolCalls);
                         throw new AgentRunException(
                             runResult.Error ?? "Agent run reported failure without an error.",
                             runResult.FailureKind ?? AgentRunFailureKind.InvalidOutput,
                             runResult.FailedDependency,
-                            runResult.CanResumeSession);
+                            runResult.CanResumeSession)
+                        {
+                            ToolCalls = failedToolCalls.ToArray(),
+                            ProcessTerminationUnconfirmed = runResult.ProcessTerminationUnconfirmed
+                        };
                     }
 
                     return runResult;
@@ -206,21 +214,29 @@ public sealed class AgentRunner(
             throw;
         }
 
+        var observedToolCalls = RetainRetryToolCalls(failedToolCalls, result.ToolCalls);
         return new AgentExecutionResult(
             result.OutputSummary,
-            $"{host.Config.RuntimeName}: {result.ToolCalls.Count} observable tool call(s).",
+            $"{host.Config.RuntimeName}: {observedToolCalls.Count} observable tool call(s).",
             attempts,
-            result.ToolCalls);
+            observedToolCalls);
     }
+
+    internal static IReadOnlyList<ToolCallRecord> RetainRetryToolCalls(
+        IReadOnlyList<ToolCallRecord> interrupted,
+        IReadOnlyList<ToolCallRecord> completed) =>
+        [.. interrupted, .. completed];
 
     internal static bool ShouldResumeInterruptedSession(
         AgentRunException? exception) =>
         exception?.CanResumeSession == true &&
+        !exception.ProcessTerminationUnconfirmed &&
         exception.FailureKind is
             AgentRunFailureKind.Stalled or
             AgentRunFailureKind.TimedOut;
 
     internal static bool IsRetryableFailure(AgentRunException exception) =>
+        !exception.ProcessTerminationUnconfirmed &&
         exception.FailureKind is AgentRunFailureKind.Transient or
             AgentRunFailureKind.TimedOut or AgentRunFailureKind.Stalled or
             AgentRunFailureKind.AmbiguousCrash;
